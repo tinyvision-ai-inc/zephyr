@@ -13,6 +13,9 @@
 #include <zephyr/types.h>
 #include <zephyr/arch/riscv/irq.h>
 
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(intc_vexriscv, LOG_LEVEL_DBG);
+
 #define IRQ_MASK		DT_INST_REG_ADDR_BY_NAME(0, irq_mask)
 #define IRQ_PENDING		DT_INST_REG_ADDR_BY_NAME(0, irq_pending)
 
@@ -25,6 +28,8 @@
 #define I2S_TX_IRQ		DT_IRQN(DT_NODELABEL(i2s_tx))
 
 #define GPIO_IRQ		DT_IRQN(DT_NODELABEL(gpio_in))
+
+#define UDC0_IRQ		DT_IRQN(DT_NODELABEL(zephyr_udc0))
 
 static inline void vexriscv_litex_irq_setmask(uint32_t mask)
 {
@@ -103,10 +108,18 @@ static void vexriscv_litex_irq_handler(const void *device)
 		ite = &_sw_isr_table[GPIO_IRQ];
 		ite->isr(ite->arg);
 	}
+
+#ifdef CONFIG_UDC_USB23
+	if (irqs & (1 << UDC0_IRQ)) {
+		ite = &_sw_isr_table[UDC0_IRQ];
+		ite->isr(ite->arg);
+	}
+#endif
 }
 
 void arch_irq_enable(unsigned int irq)
 {
+	LOG_DBG("%s irq=%d", __func__, irq);
 	vexriscv_litex_irq_setmask(vexriscv_litex_irq_getmask() | (1 << irq));
 }
 
