@@ -5,6 +5,6 @@ config UDC_USB23
 	bool "Lattice USB device controller driver"
 	imply UDC_WORKQUEUE
 	default y
-	depends on DT_HAS_LATTICE_USB23_USBD_ENABLED
+	depends on DT_HAS_LATTICE_USB23_ENABLED
 	help
 	  Lattice USB23 USB device controller driver.

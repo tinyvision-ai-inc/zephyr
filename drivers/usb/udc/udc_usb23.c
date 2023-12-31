@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define DT_DRV_COMPAT lattice_usb23_usbd
+#define DT_DRV_COMPAT lattice_usb23
 
 /*
  * USB device controller (UDC) for Lattice USB2 and USB3 hardened FPGA core.
