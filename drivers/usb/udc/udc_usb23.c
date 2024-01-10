@@ -1427,6 +1427,8 @@ static int usb23_init(const struct device *dev)
 	uint32_t reg;
 	int err = 0;
 
+	usb23_dump_registers(dev);
+
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
 	LOG_INF("coreid=0x%04lx rel=0x%04lx", GETFIELD(reg, USB23_GCOREID_CORE),
@@ -1499,7 +1501,7 @@ static int usb23_init(const struct device *dev)
 		| USB23_DEVTEN_ERRTICERREN
 		| USB23_DEVTEN_HIBERNATIONREQEVTEN
 		| USB23_DEVTEN_WKUPEVTEN
-	//	| USB23_DEVTEN_ULSTCNGEN
+		| USB23_DEVTEN_ULSTCNGEN
 		| USB23_DEVTEN_CONNECTDONEEN
 		| USB23_DEVTEN_USBRSTEN
 		| USB23_DEVTEN_DISCONNEVTEN
