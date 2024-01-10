@@ -1,7 +1,12 @@
 /*
+ * SPDX-License-Identifier: MIT
  * Copyright (c) 2023 tinyVision.ai
  *
- * SPDX-License-Identifier: MIT
+ * Driver for the USB23 physical core as found on Lattice CrosslinkU-NX FPGAs.
+ * https://www.latticesemi.com/products/designsoftwareandip/intellectualproperty/ipcore/ipcores05/usb-2_0-3_2-ip-core
+ *
+ * Being an FPGA, a soft CPU core such as a RISC-V running Zephyr must be
+ * present in the FPGA hardware design. This driver is to be run on it.
  */
 
 #define DT_DRV_COMPAT lattice_usb23
@@ -29,7 +34,7 @@ LOG_MODULE_REGISTER(usb23, LOG_LEVEL_INF);
 #define HI32(n) ((uint32_t)((uint64_t)(n) >> 32))
 #define U64(a, b) (((uint64_t)(a)) << 32 | (((uint64_t)(b)) & 0xffffffff))
 #define MEM32(addr) (*(volatile uint32_t *)(addr))
-#define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
+#define CASE(label, ...) case label: LOG_INF(#label ": " __VA_ARGS__)
 #define GETFIELD(reg, prefix) ((reg & prefix##_MASK) >> prefix##_SHIFT)
 
 /*
@@ -282,6 +287,11 @@ struct usb23_reg usb23_regs[] = {
 	R(DEPCMDPAR2(5)), R(DEPCMDPAR1(5)), R(DEPCMDPAR0(5)), R(DEPCMD(5)),
 	R(DEPCMDPAR2(6)), R(DEPCMDPAR1(6)), R(DEPCMDPAR0(6)), R(DEPCMD(6)),
 	R(DEPCMDPAR2(7)), R(DEPCMDPAR1(7)), R(DEPCMDPAR0(7)), R(DEPCMD(7)),
+
+	/* Hardware parameters */
+	R(GHWPARAMS0), R(GHWPARAMS1), R(GHWPARAMS2), R(GHWPARAMS3),
+	R(GHWPARAMS4), R(GHWPARAMS5), R(GHWPARAMS6), R(GHWPARAMS7),
+	R(GHWPARAMS8),
 };
 
 struct usb23_reg *usb23_get_reg(uint32_t addr)
@@ -298,18 +308,59 @@ struct usb23_reg *usb23_get_reg(uint32_t addr)
 
 void usb23_dump_registers(const struct device *dev)
 {
-	LOG_DBG("%s", __func__);
+	LOG_INF("%s", __func__);
 	for (int i = 0; i < ARRAY_SIZE(usb23_regs); i++) {
 		struct usb23_reg *ureg = &usb23_regs[i];
 		uint32_t data;
 
 		data = usb23_io_read(dev, ureg->addr);
 		if (data != ureg->last) {
-			LOG_DBG("\treg 0x%08x == 0x%08x  (was 0x%08x)  // %s",
+			LOG_INF("\treg 0x%08x == 0x%08x  (was 0x%08x)  // %s",
 				ureg->addr, data, ureg->last, ureg->name);
 			ureg->last = data;
 		}
 	}
+}
+
+void usb23_dump_link_state(const struct device *dev)
+{
+	uint32_t reg;
+
+	reg = usb23_io_read(dev, USB23_DSTS);
+	switch (reg & USB23_DSTS_CONNECTSPD_MASK) {
+	CASE(USB23_DSTS_CONNECTSPD_HS); goto usb2;
+	CASE(USB23_DSTS_CONNECTSPD_FS); goto usb2;
+	CASE(USB23_DSTS_CONNECTSPD_SS); goto usb3;
+	default: LOG_INF("unknown speed"); return;
+	}
+usb2:
+	switch (reg & USB23_DSTS_USBLNKST_MASK) {
+	CASE(USB23_DSTS_USBLNKST_USB2_ON_STATE); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_SLEEP_STATE); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_DISCONNECTED); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_RESET); break;
+	CASE(USB23_DSTS_USBLNKST_USB2_RESUME); break;
+	}
+	return;
+usb3:
+	switch (reg & USB23_DSTS_USBLNKST_MASK) {
+	CASE(USB23_DSTS_USBLNKST_USB3_U0); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_U1); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_U2); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_U3); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_SS_DIS); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_RX_DET); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_SS_INACT); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_POLL); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_RECOV); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_HRESET); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_CMPLY); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_LPBK); break;
+	CASE(USB23_DSTS_USBLNKST_USB3_RESET_RESUME); break;
+	}
+	return;
 }
 
 void usb23_dump_events(const struct device *dev)
@@ -753,7 +804,6 @@ static void usb23_on_connect_done(const struct device *dev)
 	__ASSERT_NO_MSG(mps != 0);
 
 	/* Letting GCTL unchanged */
-	usb23_io_write(dev, USB23_GCTL, 0x30c12004); // TODO decode
 
 	/* Reapply the parameters adjusted to the right connection speed */
 	ep0_cfg->mps = ep1_cfg->mps = mps;
@@ -1089,6 +1139,7 @@ static void usb23_on_event(struct k_work *work)
 		union usb23_evt evt = usb23_get_next_evt(dev);
 
 		LOG_DBG("");
+		usb23_dump_link_state(dev);
 
 		/* We can already release the resource now that we copied it */
 		usb23_io_write(dev, USB23_GEVNTCOUNT(0), sizeof(evt));
@@ -1195,7 +1246,7 @@ static int usb23_set_address(const struct device *dev, const uint8_t addr)
 	LOG_INF("ADDR %d", addr);
 
 	/* Configure the new address */
-	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED
+	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_DEVSPD_SUPER_SPEED
 			| addr << USB23_DCFG_DEVADDR_SHIFT);
 
 	/* Re-apply the same endpoint configuration */
@@ -1306,6 +1357,8 @@ static int usb23_init(const struct device *dev)
 	uint32_t reg, core, rel;
 	int err = 0;
 
+	usb23_dump_registers(dev);
+
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
 	core = GETFIELD(reg, USB23_GCOREID_CORE);
@@ -1313,18 +1366,29 @@ static int usb23_init(const struct device *dev)
 	LOG_INF("coreid=0x%04x release=0x%04x", core, rel);
 	__ASSERT_NO_MSG(core == 0x5533);
 
-	/* Initialize USB 2.0 PHY and USB 3.0 PHY */
-	usb23_io_write(dev, USB23_GUSB2PHYCFG, 0x00102400); // TODO decode
-	usb23_io_write(dev, USB23_GUSB3PIPECTL, 0x010c0002); // TODO decode
+	/* Issue a soft reset to the core and USB2 and USB3 PHY */
+	usb23_io_set(dev, USB23_GCTL, USB23_GCTL_CORESOFTRESET);
+	usb23_io_set(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_PHYSOFTRST);
+	usb23_io_set(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
+	k_sleep(K_MSEC(1)); // TODO: reduce amount of wait time
 
-	/* Initialize USB 2.0 PHY and USB 3.0 PHY Lattice wrappers */
+	/* Teriminate the reset of the USB2 and USB3 PHY first */
+	k_sleep(K_MSEC(1)); // TODO: reduce amount of wait time
+	usb23_io_clear(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_PHYSOFTRST);
+	usb23_io_clear(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
+
+	/* Teriminate the reset of the USB23 core after */
+	usb23_io_clear(dev, USB23_GCTL, USB23_GCTL_CORESOFTRESET);
+
+	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
+
+	/* Initialize USB2 PHY Lattice wrappers */
 	usb23_io_set(dev, USB23_U2PHYCTRL1, USB23_U2PHYCTRL1_SEL_INTERNALCLK);
 	usb23_io_set(dev, USB23_U2PHYCTRL2, USB23_U2PHYCTRL2_REFCLK_SEL);
-	usb23_io_write(dev, USB23_U3PHYCTRL0, 0x00000040);
-	usb23_io_write(dev, USB23_U3PHYCTRL1, 0x90940001);
-	usb23_io_write(dev, USB23_U3PHYCTRL2, 0x3f7a03d0);
-	usb23_io_write(dev, USB23_U3PHYCTRL3, 0x03d09000);
-	usb23_io_write(dev, USB23_U3PHYCTRL5, 0x00060000);
+
+	/* Initialize USB3 PHY Lattice wrappers */
+	usb23_io_set(dev, USB23_U3PHYCTRL1, BIT(22));
+	usb23_io_clear(dev, USB23_U3PHYCTRL4, USB23_U3PHYCTRL4_INT_CLOCK);
 
 	/* Configure and reset the Device Controller */
 	usb23_io_write(dev, USB23_DCTL, 0x40f00000); // TODO decode
@@ -1333,13 +1397,9 @@ static int usb23_init(const struct device *dev)
 	/* Letting GSBUSCFG0 and GSBUSCFG1 unchanged */
 	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
 
-	/* Issue a soft reset to USB 2.0 PHY */
+	/* Issue a soft reset to USB2 PHY */
 	usb23_io_set(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
 	usb23_io_clear(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
-
-	/* Issue a soft reset to USB 3.0 PHY */
-	usb23_io_set(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_PHYSOFTRST);
-	usb23_io_clear(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_PHYSOFTRST);
 
 	/* Setting fifo size for both TX and RX */
 	usb23_io_write(dev, USB23_GTXFIFOSIZ(0), 64);
@@ -1356,11 +1416,9 @@ static int usb23_init(const struct device *dev)
 	usb23_io_write(dev, USB23_GEVNTSIZ(0), sizeof(priv->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTCOUNT(0), 0);
 
-	/* Letting GCTL unchanged */
-
 	/* TODO remove this to let it to SuperSpeed (default) */
 	usb23_io_write(dev, USB23_DCFG,
-			USB23_DCFG_DEVSPD_FULL_SPEED | USB23_DCFG_PERFRINT_90);
+			USB23_DCFG_DEVSPD_SUPER_SPEED | USB23_DCFG_PERFRINT_90);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
@@ -1371,7 +1429,7 @@ static int usb23_init(const struct device *dev)
 		| USB23_DEVTEN_ERRTICERREN
 		| USB23_DEVTEN_HIBERNATIONREQEVTEN
 		| USB23_DEVTEN_WKUPEVTEN
-	//	| USB23_DEVTEN_ULSTCNGEN
+		| USB23_DEVTEN_ULSTCNGEN
 		| USB23_DEVTEN_CONNECTDONEEN
 		| USB23_DEVTEN_USBRSTEN
 		| USB23_DEVTEN_DISCONNEVTEN

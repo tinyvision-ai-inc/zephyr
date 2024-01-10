@@ -1,8 +1,9 @@
-/* SPDX-License-Identifier: MIT
+/*
+ * SPDX-License-Identifier: MIT
  * Copyright (c) 2023 tinyVision.ai
- * Author: Josuah Demangeon <me@josuah.net>
  *
- * Hardware registers used by this driver.
+ * Hardware registers and definitions used by the USB23 driver.
+ * https://www.latticesemi.com/products/designsoftwareandip/intellectualproperty/ipcore/ipcores05/usb-2_0-3_2-ip-core
  */
 
 #include <zephyr/sys/util.h>
@@ -231,7 +232,7 @@ union usb23_evt {
 #define USB23_DCFG_DEVSPD_MASK			GENMASK(2, 0)
 #define USB23_DCFG_DEVSPD_HIGH_SPEED		(0x0 << 0)
 #define USB23_DCFG_DEVSPD_FULL_SPEED		(0x1 << 0)
-#define USB23_DCFG_DEVSPD_SUPER_SPEED		(0x2 << 0)
+#define USB23_DCFG_DEVSPD_SUPER_SPEED		(0x4 << 0)
 
 /* Global control register */
 #define USB23_GCTL				0xc110
@@ -483,3 +484,15 @@ union usb23_evt {
 
 /* USB 3.0 PHY Internal Configuration register (undocumented) */
 #define USB23_U3PHYCTRL5			0x00014010
+
+/* Hardware parameters */
+#define USB23_GHWPARAMS0			0xc140
+#define USB23_GHWPARAMS1			0xc144
+#define USB23_GHWPARAMS2			0xc148
+#define USB23_GHWPARAMS3			0xc14c
+#define USB23_GHWPARAMS4			0xc150
+#define USB23_GHWPARAMS5			0xc154
+#define USB23_GHWPARAMS6			0xc158
+#define USB23_GHWPARAMS6_USB3_HSPHY_INTERFACE	GENMASK(5, 4)
+#define USB23_GHWPARAMS7			0xc15c
+#define USB23_GHWPARAMS8			0xc600
