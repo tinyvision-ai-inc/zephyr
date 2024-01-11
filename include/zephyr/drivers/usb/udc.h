@@ -26,6 +26,7 @@ enum udc_mps0 {
 	UDC_MPS0_16,
 	UDC_MPS0_32,
 	UDC_MPS0_64,
+	UDC_MPS0_512,
 };
 
 /**
@@ -43,7 +44,7 @@ struct udc_device_caps {
 	/** Controller expects device address to be set before status stage */
 	uint32_t addr_before_status : 1;
 	/** Maximum packet size for control endpoint */
-	enum udc_mps0 mps0 : 2;
+	enum udc_mps0 mps0 : 3;
 };
 
 /**

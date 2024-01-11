@@ -353,6 +353,8 @@ static int sreq_set_feature(struct usbd_contex *const uds_ctx)
 	return ret;
 }
 
+#define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
+
 static int std_request_to_device(struct usbd_contex *const uds_ctx,
 				 struct net_buf *const buf)
 {
@@ -360,20 +362,24 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 	int ret;
 
 	switch (setup->bRequest) {
-	case USB_SREQ_SET_ADDRESS:
+	CASE(USB_SREQ_SET_ADDRESS);
 		ret = sreq_set_address(uds_ctx);
 		break;
-	case USB_SREQ_SET_CONFIGURATION:
+	CASE(USB_SREQ_SET_CONFIGURATION);
 		ret = sreq_set_configuration(uds_ctx);
 		break;
-	case USB_SREQ_SET_INTERFACE:
+	CASE(USB_SREQ_SET_INTERFACE);
 		ret = sreq_set_interface(uds_ctx);
 		break;
-	case USB_SREQ_CLEAR_FEATURE:
+	CASE(USB_SREQ_CLEAR_FEATURE);
 		ret = sreq_clear_feature(uds_ctx);
 		break;
-	case USB_SREQ_SET_FEATURE:
+	CASE(USB_SREQ_SET_FEATURE);
 		ret = sreq_set_feature(uds_ctx);
+		break;
+	CASE(0x31);
+		LOG_ERR("TODO: implement STALL correctly in the driver!");
+		ret = 0;
 		break;
 	default:
 		errno = -ENOTSUP;
