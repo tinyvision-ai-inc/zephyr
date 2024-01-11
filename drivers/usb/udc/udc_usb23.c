@@ -797,7 +797,7 @@ static void usb23_on_connect_done(const struct device *dev)
 		usb23_io_set(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_SUSPENDENABLE);
 		break;
 	CASE(USB23_DSTS_CONNECTSPD_SS);
-		mps = 512; // TODO is that not expectd to be 1024?
+		mps = 512;
 		usb23_io_set(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_SUSPHY);
 		break;
 	}
@@ -1139,7 +1139,6 @@ static void usb23_on_event(struct k_work *work)
 		union usb23_evt evt = usb23_get_next_evt(dev);
 
 		LOG_DBG("");
-		usb23_dump_link_state(dev);
 
 		/* We can already release the resource now that we copied it */
 		usb23_io_write(dev, USB23_GEVNTCOUNT(0), sizeof(evt));
@@ -1159,8 +1158,6 @@ void usb23_irq_handler(void *ptr)
 	const struct device *dev = ptr;
 	const struct usb23_config *config = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
-
-	LOG_DBG("::");
 
 	config->irq_clear_func();
 	usb23_on_event(&priv->work);
@@ -1218,7 +1215,7 @@ static int usb23_ep_set_halt(const struct device *dev,
 {
 	LOG_WRN("Setting stall state on endpoint EPx%02x", ep_cfg->addr);
 
-	//usb23_cmd_set_stall(dev, ep_cfg);
+	usb23_cmd_set_stall(dev, ep_cfg);
 	//ep_cfg->stat.halted = true;
 	return 0;
 }
@@ -1355,7 +1352,7 @@ static int usb23_init(const struct device *dev)
 {
 	struct usb23_data *priv = udc_get_private(dev);
 	uint32_t reg, core, rel;
-	int err = 0;
+	int err = 0, mps;
 
 	usb23_dump_registers(dev);
 
@@ -1402,8 +1399,8 @@ static int usb23_init(const struct device *dev)
 	usb23_io_clear(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
 
 	/* Setting fifo size for both TX and RX */
-	usb23_io_write(dev, USB23_GTXFIFOSIZ(0), 64);
-	usb23_io_write(dev, USB23_GRXFIFOSIZ(0), 64);
+	usb23_io_write(dev, USB23_GTXFIFOSIZ(0), 512);
+	usb23_io_write(dev, USB23_GRXFIFOSIZ(0), 512);
 
 	/* Setup the event buffer address, size and start event reception */
 	for (int i = 0; i < ARRAY_SIZE(priv->evt_buf); i++) {
@@ -1439,11 +1436,12 @@ static int usb23_init(const struct device *dev)
 	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, 0));
 	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, 1));
 
-	/* Configure the control endpoint with MPS set to 64 bytes */
+	/* Configure the control endpoint with MPS set to 64 or 512 bytes */
+	mps = 512; // TODO: use 64 for FullSpeed or HighSpeed
 	err |= udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT,
-			USB_EP_TYPE_CONTROL, 64, 0);
+			USB_EP_TYPE_CONTROL, mps, 0);
 	err |= udc_ep_enable_internal(dev, USB_CONTROL_EP_IN,
-			USB_EP_TYPE_CONTROL, 64, 0);
+			USB_EP_TYPE_CONTROL, mps, 0);
 	if (err != 0) {
 		LOG_ERR("Failed to enable control endpoint");
 		return err;
@@ -1511,7 +1509,7 @@ static int usb23_driver_preinit(const struct device *dev)
 	k_work_init(&priv->work, &usb23_on_event);
 
 	data->caps.rwup = true;
-	data->caps.mps0 = UDC_MPS0_64;
+	data->caps.mps0 = UDC_MPS0_512;
 	switch (config->speed_idx) {
 	case 2:
 		data->caps.hs = true;

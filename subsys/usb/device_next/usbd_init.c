@@ -255,6 +255,9 @@ static void usbd_init_update_mps0(struct usbd_contex *const uds_ctx)
 	case UDC_MPS0_64:
 		desc->bMaxPacketSize0 = 64;
 		break;
+	case UDC_MPS0_512:
+		desc->bMaxPacketSize0 = 9;
+		break;
 	}
 }
 
