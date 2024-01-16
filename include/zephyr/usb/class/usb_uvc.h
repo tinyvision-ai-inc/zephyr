@@ -214,7 +214,7 @@ struct uvc_vc_status_packet {
 	uint8_t bSelector;
 	uint8_t bAttribute;
 	uint8_t bValue;
-};
+} __packed;
 
 /** Video Streaming Interface Status Packet Format */
 struct uvc_vs_status_packet {
@@ -222,7 +222,7 @@ struct uvc_vs_status_packet {
 	uint8_t bOriginator;
 	uint8_t bEvent;
 	uint8_t bValue;
-};
+} __packed;
 
 /** Video and Still Image Payload Headers */
 struct uvc_payload_header {
@@ -240,33 +240,8 @@ struct uvc_payload_header {
 	/* uint64_t scrSourceClock; (optional) */
 } __packed;
 
-/** Interface Association Descriptor */
-struct uvc_interface_association_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bFirstInterface;
-	uint8_t bInterfaceCount;
-	uint8_t bFunctionClass;
-	uint8_t bFunctionSubClass;
-	uint8_t bFunctionProtocol;
-	uint8_t iFunction;
-};
-
-/** Standard VC Interface Descriptor */
-struct uvc_vc_interface_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bInterfaceNumber;
-	uint8_t bAlternateSetting;
-	uint8_t bNumEndpoints;
-	uint8_t bInterfaceClass;
-	uint8_t bInterfaceSubClass;
-	uint8_t bInterfaceProtocol;
-	uint8_t iInterface;
-};
-
 /** Class-Specific VC Interface Descriptor */
-struct uvc_vc_class_interface_descriptor {
+struct uvc_vc_if_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubType;
@@ -275,7 +250,7 @@ struct uvc_vc_class_interface_descriptor {
 	uint32_t dwClockFrequency;
 	uint8_t bInCollection;
 	uint8_t baInterfaceNr_baInterfaceNr[];
-};
+} __packed;
 
 /** Input Terminal Descriptor */
 struct uvc_input_terminal_descriptor {
@@ -287,7 +262,7 @@ struct uvc_input_terminal_descriptor {
 	uint8_t bAssocTerminal;
 	uint8_t iTerminal;
 	uint8_t bExtraFields[];
-};
+} __packed;
 
 /** Output Terminal Descriptor */
 struct uvc_output_terminal_descriptor {
@@ -300,7 +275,7 @@ struct uvc_output_terminal_descriptor {
 	uint8_t bSourceID;
 	uint8_t iTerminal;
 	uint8_t bExtraFields[];
-};
+} __packed;
 
 /** Camera Terminal Descriptor */
 struct uvc_camerma_terminal_descriptor {
@@ -316,7 +291,7 @@ struct uvc_camerma_terminal_descriptor {
 	uint16_t wOcularFocalLength;
 	uint8_t bControlSize;
 	uint8_t bmControls[3];
-};
+} __packed;
 
 /** Selector Unit Descriptor */
 struct uvc_selector_unit_descriptor {
@@ -326,7 +301,7 @@ struct uvc_selector_unit_descriptor {
 	uint8_t bUnitID;
 	uint8_t bNrInPins;
 	uint8_t baSourceID_iSelector[];
-};
+} __packed;
 
 /** Processing Unit Descriptor */
 struct uvc_processing_unit_descriptor {
@@ -340,7 +315,7 @@ struct uvc_processing_unit_descriptor {
 	uint8_t bmControls[3];
 	uint8_t iProcessing;
 	uint8_t bmVideoStandards;
-};
+} __packed;
 
 /** Encoding Unit Descriptor */
 struct uvc_encoding_unit_descriptor {
@@ -353,7 +328,7 @@ struct uvc_encoding_unit_descriptor {
 	uint8_t bControlSize;
 	uint8_t bmControls[3];
 	uint8_t bmControlsRuntime[3];
-};
+} __packed;
 
 /** Extension Unit Descriptor */
 struct uvc_extension_unit_descriptor {
@@ -368,41 +343,18 @@ struct uvc_extension_unit_descriptor {
 	uint8_t bControlSize;
 	uint8_t bmControls;
 	uint8_t iExtension;
-};
-
-/** Standard VC Interrupt Endpoint Descriptor */
-struct uvc_vc_interrupt_endpoint_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bEndpointAddress;
-	uint8_t bmAttributes;
-	uint16_t wMaxPacketSize;
-	uint8_t bInterval;
-};
+} __packed;
 
 /** Class-specific VC Interrupt Endpoint Descriptor */
-struct uvc_vc_class_interrupt_endpoint_descriptor {
+struct uvc_vc_interrupt_ep_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubType;
 	uint16_t wMaxTransferSize;
-};
-
-/** Standard VS Interface Descriptor */
-struct uvc_vs_interface_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bInterfaceNumber;
-	uint8_t bAlternateSetting;
-	uint8_t bNumEndpoints;
-	uint8_t bInterfaceClass;
-	uint8_t bInterfaceSubClass;
-	uint8_t bInterfaceProtocol;
-	uint8_t iInterface;
-};
+} __packed;
 
 /** Class-specific VS Interface Input Header Descriptor */
-struct uvc_vs_class_interface_input_header_descriptor {
+struct uvc_vs_input_header_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubtype;
@@ -416,10 +368,10 @@ struct uvc_vs_class_interface_input_header_descriptor {
 	uint8_t bTriggerUsage;
 	uint8_t bControlSize;
 	uint8_t bmaControls[];
-};
+} __packed;
 
 /** Class-specific VS Interface Output Header Descriptor */
-struct uvc_vs_class_interface_output_header_descriptor {
+struct uvc_vs_output_header_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubtype;
@@ -429,7 +381,7 @@ struct uvc_vs_class_interface_output_header_descriptor {
 	uint8_t bTerminalLink;
 	uint8_t bControlSize;
 	uint8_t bmaControls[];
-};
+} __packed;
 
 /** Still Image Frame Descriptor */
 struct uvc_still_image_frame_descriptor {
@@ -445,7 +397,7 @@ struct uvc_still_image_frame_descriptor {
 	uint8_t bNumCompression ;
 	uint8_t Pattern;
 	uint8_t bCompression[];
-};
+} __packed;
 
 /** Color Matching Descriptor */
 struct uvc_color_matching_descriptor {
@@ -455,36 +407,6 @@ struct uvc_color_matching_descriptor {
 	uint8_t bColorPrimaries;
 	uint8_t bTransferCharacteristics;
 	uint8_t bMatrixCoefficients;
-};
+} __packed;
 
-/** Standard VS Isochronous Video Data Endpoint Descriptor */
-struct uvc_vs_isochronous_video_data_endpoint_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bEndpointAddress;
-	uint8_t bmAttributes;
-	uint15_t wMaxPacketSize;
-	uint8_t bInterval;
-};
-
-/** Standard VS Bulk Video Data Endpoint Descriptor */
-struct uvc_bulk_video_data_endpoint_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bEndpointAddress;
-	uint8_t bmAttributes;
-	uint8_t wMaxPacketSize;
-	uint8_t bInterval;
-};
-
-/**  Standard VS Bulk Still Image Data Endpoint Descriptor */
-struct uvc_bulk_still_image_data_endpoint_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bEndpointAddress;
-	uint8_t bmAttributes;
-	uint16_t wMaxPacketSize;
-	uint8_t bInterval;
-};
-
-#endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_CDC_H_ */
+#endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_ */
