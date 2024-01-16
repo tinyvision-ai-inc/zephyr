@@ -1509,11 +1509,21 @@ static int usb23_driver_preinit(const struct device *dev)
 	k_work_init(&priv->work, &usb23_on_event);
 
 	data->caps.rwup = true;
-	data->caps.mps0 = UDC_MPS0_512;
 	switch (config->speed_idx) {
-	case 2:
+	case 3:
+		data->caps.mps0 = UDC_MPS0_512;
+		data->caps.ss = true;
 		data->caps.hs = true;
 		mps = 1024;
+		break;
+	case 2:
+		data->caps.mps0 = UDC_MPS0_64;
+		data->caps.hs = true;
+		mps = 1024;
+		break;
+	case 1:
+		data->caps.mps0 = UDC_MPS0_64; // TODO: adjust
+		mps = 1024; // TODO: adjust
 		break;
 	default:
 		LOG_ERR("Not implemented");

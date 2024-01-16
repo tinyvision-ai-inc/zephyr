@@ -37,6 +37,8 @@ enum udc_mps0 {
 struct udc_device_caps {
 	/** USB high speed capable controller */
 	uint32_t hs : 1;
+	/** USB super speed capable controller */
+	uint32_t ss : 1;
 	/** Controller supports USB remote wakeup */
 	uint32_t rwup : 1;
 	/** Controller performs status OUT stage automatically */
@@ -218,7 +220,7 @@ typedef int (*udc_event_cb_t)(const struct device *dev,
  * @brief UDC driver API
  * This is the mandatory API any USB device controller driver needs to expose
  * with exception of:
- *   device_speed(), test_mode() are only required for HS controllers
+ *   device_speed(), test_mode() are only required for HS and SS controllers
  */
 struct udc_api {
 	enum udc_bus_speed (*device_speed)(const struct device *dev);
@@ -397,7 +399,7 @@ int udc_shutdown(const struct device *dev);
  * @brief Get USB device controller capabilities
  *
  * Obtain the capabilities of the controller
- * such as full speed (FS), high speed (HS), and more.
+ * such as full speed (FS), high speed (HS), super speed (SS), and more.
  *
  * @param[in] dev    Pointer to device struct of the driver instance
  *

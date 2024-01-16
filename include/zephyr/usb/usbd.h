@@ -286,7 +286,7 @@ struct usbd_class_node {
 	desc_##device_name = {						\
 		.bLength = sizeof(struct usb_device_descriptor),	\
 		.bDescriptorType = USB_DESC_DEVICE,			\
-		.bcdUSB = sys_cpu_to_le16(USB_SRN_2_0),			\
+		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_1),			\
 		.bDeviceClass = USB_BCC_MISCELLANEOUS,			\
 		.bDeviceSubClass = 2,					\
 		.bDeviceProtocol = 1,					\
@@ -310,7 +310,7 @@ struct usbd_class_node {
 	qual_desc_##name = {						\
 		.bLength = sizeof(struct usb_device_qual_descriptor),	\
 		.bDescriptorType = USB_DESC_DEVICE_QUALIFIER,		\
-		.bcdUSB = sys_cpu_to_le16(USB_SRN_2_0),			\
+		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_1),			\
 		.bDeviceClass = USB_BCC_MISCELLANEOUS,			\
 		.bDeviceSubClass = 2,					\
 		.bDeviceProtocol = 1,					\
@@ -319,6 +319,18 @@ struct usbd_class_node {
 	};								\
 	static struct usbd_desc_node name = {				\
 		.desc = &qual_desc_##name,				\
+	}
+
+#define USBD_BOS_DEFINE(name)						\
+	static struct usb_bos_descriptor				\
+	bos_desc_##name = {						\
+		.bLength = sizeof(struct usb_bos_descriptor),		\
+		.bDescriptorType = USB_DESC_BOS,			\
+		.wTotalLength = sizeof(struct usb_bos_descriptor),	\
+		.bNumDeviceCaps = 0					\
+	};								\
+	static struct usbd_desc_node name = {				\
+		.desc = &bos_desc_##name,				\
 	}
 
 #define USBD_CONFIGURATION_DEFINE(name, attrib, power)			\

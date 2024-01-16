@@ -176,6 +176,14 @@ struct usb_device_qual_descriptor {
 	uint8_t reserved;
 } __packed;
 
+/** USB BOS Descriptor defined in spec. Table 9-12 */
+struct usb_bos_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint16_t wTotalLength;
+	uint8_t bNumDeviceCaps;
+} __packed;
+
 /** USB Standard Configuration Descriptor defined in spec. Table 9-10 */
 struct usb_cfg_descriptor {
 	uint8_t bLength;
@@ -268,6 +276,8 @@ struct usb_association_descriptor {
 #define USB_SRN_1_1			0x0110
 #define USB_SRN_2_0			0x0200
 #define USB_SRN_2_1			0x0210
+#define USB_SRN_3_0			0x0300
+#define USB_SRN_3_1			0x0310
 
 #define USB_DEC_TO_BCD(dec)	((((dec) / 10) << 4) | ((dec) % 10))
 
