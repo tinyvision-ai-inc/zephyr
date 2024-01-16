@@ -424,6 +424,7 @@ static void *test_udc_device_get(void)
 
 	caps = udc_caps(dev);
 	LOG_INF("UDC device HS: %u", caps.hs);
+	LOG_INF("UDC device SS: %u", caps.ss);
 
 	k_thread_create(&test_udc_thread_data, test_udc_stack,
 			K_KERNEL_STACK_SIZEOF(test_udc_stack),

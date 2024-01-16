@@ -1,0 +1,18 @@
+# Copyright (c) 2024 tinyVision.ai
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config USBD_UVC_CLASS
+	bool "USB UVC implementation [EXPERIMENTAL]"
+	depends on DT_HAS_ZEPHYR_UVC_ENABLED
+	help
+	  USB device UVC class implementation.
+
+if USBD_UVC_CLASS
+
+module = USBD_UVC
+module-str = usbd uvc
+default-count = 1
+source "subsys/logging/Kconfig.template.log_config"
+
+endif

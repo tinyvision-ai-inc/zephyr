@@ -273,8 +273,8 @@ static void ep_update_mps(const struct device *dev,
 			  uint16_t *const mps)
 {
 	struct udc_device_caps caps = udc_caps(dev);
-	const uint16_t spec_int_mps = caps.hs ? 1024 : 64;
-	const uint16_t spec_bulk_mps = caps.hs ? 512 : 64;
+	const uint16_t spec_int_mps = (caps.hs || caps.ss) ? 1024 : 64;
+	const uint16_t spec_bulk_mps = (caps.hs || caps.ss) ? 512 : 64;
 
 	/*
 	 * TODO: It does not take into account the actual speed of the

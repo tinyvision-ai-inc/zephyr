@@ -83,6 +83,8 @@ enum uhc_event_type {
 	UHC_EVT_DEV_CONNECTED_FS,
 	/** High speed device connected */
 	UHC_EVT_DEV_CONNECTED_HS,
+	/** Super speed device connected */
+	UHC_EVT_DEV_CONNECTED_SS,
 	/** Device (peripheral) removed */
 	UHC_EVT_DEV_REMOVED,
 	/** Bus reset operation finished */
@@ -147,6 +149,8 @@ typedef int (*uhc_event_cb_t)(const struct device *dev,
 struct uhc_device_caps {
 	/** USB high speed capable controller */
 	uint32_t hs : 1;
+	/** USB super speed capable controller */
+	uint32_t ss : 1;
 };
 
 /**
@@ -515,7 +519,7 @@ int uhc_shutdown(const struct device *dev);
  * @brief Get USB host controller capabilities
  *
  * Obtain the capabilities of the controller
- * such as high speed (HS), and more.
+ * such as high speed (HS), super speed (SS), and more.
  *
  * @param[in] dev    Pointer to device struct of the driver instance
  *
