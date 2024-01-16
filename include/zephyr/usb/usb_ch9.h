@@ -191,6 +191,14 @@ struct usb_device_qual_descriptor {
 	uint8_t reserved;
 } __packed;
 
+/** USB BOS Descriptor defined in spec. Table 9-12 */
+struct usb_bos_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint16_t wTotalLength;
+	uint8_t bNumDeviceCaps;
+} __packed;
+
 /** USB Standard Configuration Descriptor defined in spec. Table 9-10 */
 struct usb_cfg_descriptor {
 	uint8_t bLength;

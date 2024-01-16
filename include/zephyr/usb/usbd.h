@@ -321,6 +321,18 @@ struct usbd_class_node {
 		.desc = &qual_desc_##name,				\
 	}
 
+#define USBD_BOS_DEFINE(name)						\
+	static struct usb_bos_descriptor				\
+	bos_desc_##name = {						\
+		.bLength = sizeof(struct usb_bos_descriptor),		\
+		.bDescriptorType = USB_DESC_BOS,			\
+		.wTotalLength = sizeof(struct usb_bos_descriptor),	\
+		.bNumDeviceCaps = 0					\
+	};								\
+	static struct usbd_desc_node name = {				\
+		.desc = &bos_desc_##name,				\
+	}
+
 #define USBD_CONFIGURATION_DEFINE(name, attrib, power)			\
 	static struct usb_cfg_descriptor				\
 	cfg_desc_##name = {						\
