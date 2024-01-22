@@ -36,7 +36,7 @@
 #define UVC_CS_INTERFACE			0x24
 #define UVC_CS_ENDPOINT				0x25
 
-/** Video Class-Specific VC Interface Descriptor Subtypes */
+/** Video Class-Specific Video Control Interface Descriptor Subtypes */
 #define UVC_VC_DESCRIPTOR_UNDEFINED		0x00
 #define UVC_VC_HEADER				0x01
 #define UVC_VC_INPUT_TERMINAL			0x02
@@ -46,7 +46,7 @@
 #define UVC_VC_EXTENSION_UNIT			0x06
 #define UVC_VC_ENCODING_UNIT			0x07
 
-/** Video Class-Specific VS Interface Descriptor Subtypes */
+/** Video Class-Specific Video Stream Interface Descriptor Subtypes */
 #define UVC_VS_UNDEFINED			0x00
 #define UVC_VS_INPUT_HEADER			0x01
 #define UVC_VS_OUTPUT_HEADER			0x02
@@ -207,7 +207,7 @@
 #define UVC_COMPONENT_CONNECTOR			0x0403
 
 /** Video Control Interface Status Packet Format */
-struct uvc_vc_status_packet {
+struct uvc_control_status_packet {
 	uint8_t bStatusType;
 	uint8_t bOriginator;
 	uint8_t bEvent;
@@ -217,7 +217,7 @@ struct uvc_vc_status_packet {
 } __packed;
 
 /** Video Streaming Interface Status Packet Format */
-struct uvc_vs_status_packet {
+struct uvc_stream_status_packet {
 	uint8_t bStatusType;
 	uint8_t bOriginator;
 	uint8_t bEvent;
@@ -240,8 +240,8 @@ struct uvc_payload_header {
 	/* uint64_t scrSourceClock; (optional) */
 } __packed;
 
-/** Class-Specific VC Interface Descriptor */
-struct uvc_vc_if_descriptor {
+/** Class-Specific Video Control Interface Descriptor */
+struct uvc_control_if_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubType;
@@ -345,16 +345,16 @@ struct uvc_extension_unit_descriptor {
 	uint8_t iExtension;
 } __packed;
 
-/** Class-specific VC Interrupt Endpoint Descriptor */
-struct uvc_vc_interrupt_ep_descriptor {
+/** Class-specific Video Control Interrupt Endpoint Descriptor */
+struct uvc_control_interrupt_ep_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubType;
 	uint16_t wMaxTransferSize;
 } __packed;
 
-/** Class-specific VS Interface Input Header Descriptor */
-struct uvc_vs_input_header_descriptor {
+/** Class-specific Video Stream Interface Input Header Descriptor */
+struct uvc_stream_input_header_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubtype;
@@ -370,8 +370,8 @@ struct uvc_vs_input_header_descriptor {
 	uint8_t bmaControls[];
 } __packed;
 
-/** Class-specific VS Interface Output Header Descriptor */
-struct uvc_vs_output_header_descriptor {
+/** Class-specific Video Stream Interface Output Header Descriptor */
+struct uvc_stream_output_header_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubtype;
@@ -393,7 +393,7 @@ struct uvc_still_image_frame_descriptor {
 	struct {
 		uint16_t wWidth;
 		uint16_t wHeight;
-	} wWidth_wHeight[] __packed;
+	} n[] __packed;
 	uint8_t bNumCompression ;
 	uint8_t Pattern;
 	uint8_t bCompression[];
@@ -407,6 +407,24 @@ struct uvc_color_matching_descriptor {
 	uint8_t bColorPrimaries;
 	uint8_t bTransferCharacteristics;
 	uint8_t bMatrixCoefficients;
+} __packed;
+
+struct uvc_descriptors {
+	struct uvc_control_status_packet control_status_packet;
+	struct uvc_stream_status_packet stream_status_packet;
+	struct uvc_payload_header payload_header;
+	struct uvc_control_if_descriptor control_if_descriptor;
+	struct uvc_input_terminal_descriptor input_terminal_descriptor;
+	struct uvc_output_terminal_descriptor output_terminal_descriptor;
+	struct uvc_camerma_terminal_descriptor camerma_terminal_descriptor;
+	struct uvc_selector_unit_descriptor selector_unit_descriptor;
+	struct uvc_processing_unit_descriptor processing_unit_descriptor;
+	struct uvc_encoding_unit_descriptor encoding_unit_descriptor;
+	struct uvc_extension_unit_descriptor extension_unit_descriptor;
+	struct uvc_control_interrupt_ep_descriptor control_interrupt_ep_descriptor;
+	struct uvc_stream_input_header_descriptor stream_input_header_descriptor;
+	struct uvc_stream_output_header_descriptor stream_output_header_descriptor;
+	struct uvc_still_image_frame_descriptor still_image_frame_descriptor;
 } __packed;
 
 #endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_ */

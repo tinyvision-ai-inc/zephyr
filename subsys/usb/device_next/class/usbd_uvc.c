@@ -20,8 +20,8 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 struct usbd_uvc_desc {
 	struct usb_association_descriptor iad_uvc;
 	struct usb_if_descriptor if0;
-	struct cdc_header_descriptor if0_header;
-	struct cdc_cm_descriptor if0_cm;
+	struct uvc_input_terminal_descriptor if0_input;
+	struct uvc_encoding_unit_descriptor if0_encoding;
 	struct cdc_acm_descriptor if0_acm;
 	struct cdc_union_descriptor if0_union;
 	struct usb_ep_descriptor if0_int_ep;
@@ -35,98 +35,6 @@ struct usbd_uvc_desc {
 
 #define UVC_DEFINE_DESCRIPTOR(n)						\
 static struct usbd_uvc_desc uvc_desc_##n = {					\
-	.iad_uvc = {								\
-		.bLength = sizeof(struct usb_association_descriptor),		\
-		.bDescriptorType = USB_DESC_INTERFACE_ASSOC,			\
-		.bFirstInterface = 0,						\
-		.bInterfaceCount = 0x02,					\
-		.bFunctionClass = USB_BCC_CDC_CONTROL,				\
-		.bFunctionSubClass = ACM_SUBCLASS,				\
-		.bFunctionProtocol = 0,						\
-		.iFunction = 0,							\
-	},									\
-										\
-	.if0 = {								\
-		.bLength = sizeof(struct usb_if_descriptor),			\
-		.bDescriptorType = USB_DESC_INTERFACE,				\
-		.bInterfaceNumber = 0,						\
-		.bAlternateSetting = 0,						\
-		.bNumEndpoints = 1,						\
-		.bInterfaceClass = USB_BCC_CDC_CONTROL,				\
-		.bInterfaceSubClass = ACM_SUBCLASS,				\
-		.bInterfaceProtocol = 0,					\
-		.iInterface = 0,						\
-	},									\
-										\
-	.if0_header = {								\
-		.bFunctionLength = sizeof(struct cdc_header_descriptor),	\
-		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
-		.bDescriptorSubtype = HEADER_FUNC_DESC,				\
-		.bcdCDC = sys_cpu_to_le16(USB_SRN_1_1),				\
-	},									\
-										\
-	.if0_cm = {								\
-		.bFunctionLength = sizeof(struct cdc_cm_descriptor),		\
-		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
-		.bDescriptorSubtype = CALL_MANAGEMENT_FUNC_DESC,		\
-		.bmCapabilities = 0,						\
-		.bDataInterface = 1,						\
-	},									\
-										\
-	.if0_acm = {								\
-		.bFunctionLength = sizeof(struct cdc_acm_descriptor),		\
-		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
-		.bDescriptorSubtype = ACM_FUNC_DESC,				\
-		/* See CDC PSTN Subclass Chapter 5.3.2 */			\
-		.bmCapabilities = BIT(1),					\
-	},									\
-										\
-	.if0_union = {								\
-		.bFunctionLength = sizeof(struct cdc_union_descriptor),		\
-		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
-		.bDescriptorSubtype = UNION_FUNC_DESC,				\
-		.bControlInterface = 0,						\
-		.bSubordinateInterface0 = 1,					\
-	},									\
-										\
-	.if0_int_ep = {								\
-		.bLength = sizeof(struct usb_ep_descriptor),			\
-		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x81,					\
-		.bmAttributes = USB_EP_TYPE_INTERRUPT,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_ACM_DEFAULT_INT_EP_MPS),	\
-		.bInterval = CDC_ACM_DEFAULT_INT_INTERVAL,			\
-	},									\
-										\
-	.if1 = {								\
-		.bLength = sizeof(struct usb_if_descriptor),			\
-		.bDescriptorType = USB_DESC_INTERFACE,				\
-		.bInterfaceNumber = 1,						\
-		.bAlternateSetting = 0,						\
-		.bNumEndpoints = 2,						\
-		.bInterfaceClass = USB_BCC_CDC_DATA,				\
-		.bInterfaceSubClass = 0,					\
-		.bInterfaceProtocol = 0,					\
-		.iInterface = 0,						\
-	},									\
-										\
-	.if1_in_ep = {								\
-		.bLength = sizeof(struct usb_ep_descriptor),			\
-		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x82,					\
-		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_ACM_DEFAULT_BULK_EP_MPS),	\
-		.bInterval = 0,							\
-	},									\
-										\
-	.if1_out_ep = {								\
-		.bLength = sizeof(struct usb_ep_descriptor),			\
-		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x01,					\
-		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_ACM_DEFAULT_BULK_EP_MPS),	\
-		.bInterval = 0,							\
-	},									\
 										\
 	.nil_desc = {								\
 		.bLength = 0,							\
