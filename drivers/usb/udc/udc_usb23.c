@@ -183,7 +183,7 @@ static int usb23_get_ep_fifo_num(struct udc_ep_config *const ep_cfg)
 static struct udc_ep_config *const usb23_get_ep_cfg(const struct device *dev,
 		int epn)
 {
-	return udc_get_ep_cfg(dev, ((epn & 0x00000001) << 7) | (epn >> 1));
+	return udc_get_ep_cfg(dev, ((epn & 1) << 7) | (epn >> 1));
 }
 
 static struct usb23_ep_data *usb23_get_ep_data(const struct device *dev,
@@ -382,8 +382,8 @@ void usb23_dump_trbs(const struct device *dev)
 	const struct usb23_config *config = dev->config;
 
 	for (int i = 0; i < config->num_of_eps; i++) {
-		struct udc_ep_config *ei = udc_get_ep_cfg(dev, 0x00 | i);
-		struct udc_ep_config *eo = udc_get_ep_cfg(dev, 0x80 | i);
+		struct udc_ep_config *ei = udc_get_ep_cfg(dev, USB_EP_DIR_IN | i);
+		struct udc_ep_config *eo = udc_get_ep_cfg(dev, USB_EP_DIR_OUT | i);
 		struct usb23_trb ti = usb23_get_trb(dev, ei);
 		struct usb23_trb to = usb23_get_trb(dev, eo);
 
@@ -783,8 +783,8 @@ static void usb23_on_usb_reset(const struct device *dev)
 
 static void usb23_on_connect_done(const struct device *dev)
 {
-	struct udc_ep_config *ep0_cfg = udc_get_ep_cfg(dev, 0);
-	struct udc_ep_config *ep1_cfg = udc_get_ep_cfg(dev, 1);
+	struct udc_ep_config *ep0_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
+	struct udc_ep_config *ep1_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
 	int mps = 0;
 
 	LOG_DBG("%s", __func__);
@@ -1213,10 +1213,12 @@ static int usb23_ep_disable(const struct device *dev,
 static int usb23_ep_set_halt(const struct device *dev,
 		struct udc_ep_config *const ep_cfg)
 {
-	LOG_WRN("Setting stall state on endpoint EPx%02x", ep_cfg->addr);
+	LOG_WRN("Setting stall state on endpoint EPx00 and EPx80");
 
-	usb23_cmd_set_stall(dev, ep_cfg);
-	//ep_cfg->stat.halted = true;
+	usb23_cmd_set_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
+	usb23_cmd_set_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
+
+	ep_cfg->stat.halted = true;
 	return 0;
 }
 
@@ -1224,7 +1226,8 @@ static int usb23_ep_clear_halt(const struct device *dev,
 		struct udc_ep_config *const ep_cfg)
 {
 	LOG_WRN("Clearing stall state on endpoint EPx%02x", ep_cfg->addr);
-	usb23_cmd_clear_stall(dev, ep_cfg);
+	usb23_cmd_clear_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
+	usb23_cmd_clear_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
 	ep_cfg->stat.halted = false;
 	return 0;
 }
@@ -1247,8 +1250,8 @@ static int usb23_set_address(const struct device *dev, const uint8_t addr)
 			| addr << USB23_DCFG_DEVADDR_SHIFT);
 
 	/* Re-apply the same endpoint configuration */
-	usb23_cmd_ep_config(dev, udc_get_ep_cfg(dev, 0));
-	usb23_cmd_ep_config(dev, udc_get_ep_cfg(dev, 1));
+	usb23_cmd_ep_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
+	usb23_cmd_ep_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
 
 	return 0;
 }
@@ -1433,8 +1436,8 @@ static int usb23_init(const struct device *dev)
 	);
 
 	/* Only to be done for endpoint 0 and 1 at this stage */
-	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, 0));
-	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, 1));
+	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
+	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
 
 	/* Configure the control endpoint with MPS set to 64 or 512 bytes */
 	mps = 512; // TODO: use 64 for FullSpeed or HighSpeed
@@ -1530,8 +1533,8 @@ static int usb23_driver_preinit(const struct device *dev)
 	}
 
 	for (int i = 0; i < config->num_of_eps; i++) {
-		usb23_ep_preinit(dev, &ep_cfg_out[i], USB_EP_DIR_OUT | i, mps);
-		usb23_ep_preinit(dev, &ep_cfg_in[i], USB_EP_DIR_IN | i, mps);
+		usb23_ep_preinit(dev, &ep_cfg_out[i], i | USB_EP_DIR_OUT, mps);
+		usb23_ep_preinit(dev, &ep_cfg_in[i], i | USB_EP_DIR_IN, mps);
 	}
 
 	return 0;
