@@ -146,6 +146,12 @@ static void usb23_io_clear(const struct device *dev, uint32_t addr,
 	usb23_io_write(dev, addr, usb23_io_read(dev, addr) & ~mask);
 }
 
+static void usb23_io_field(const struct device *dev, uint32_t addr,
+		uint32_t mask, uint32_t val)
+{
+	usb23_io_write(dev, addr, (usb23_io_read(dev, addr) & ~mask) | val);
+}
+
 /*------------------------------------------------------------------------------
 --  Getters
 --------------------------------------------------------------------------------
@@ -382,15 +388,20 @@ void usb23_dump_trbs(const struct device *dev)
 	const struct usb23_config *config = dev->config;
 
 	for (int i = 0; i < config->num_of_eps; i++) {
-		struct udc_ep_config *ei = udc_get_ep_cfg(dev, USB_EP_DIR_IN | i);
-		struct udc_ep_config *eo = udc_get_ep_cfg(dev, USB_EP_DIR_OUT | i);
-		struct usb23_trb ti = usb23_get_trb(dev, ei);
-		struct usb23_trb to = usb23_get_trb(dev, eo);
+		struct udc_ep_config *ep_cfg;
+		struct usb23_trb trb;
 
+		ep_cfg = udc_get_ep_cfg(dev, USB_EP_DIR_OUT | i);
+		trb = usb23_get_trb(dev, ep_cfg);
 		LOG_DBG("EPx%02x: addr=0x%08x%08x stat=0x%08x ctrl=0x%08x",
-				ei->addr, ti.addr_hi, ti.addr_lo, ti.status, ti.ctrl);
+				ep_cfg->addr, trb.addr_hi, trb.addr_lo,
+				trb.status, trb.ctrl);
+
+		ep_cfg = udc_get_ep_cfg(dev, USB_EP_DIR_IN | i);
+		trb = usb23_get_trb(dev, ep_cfg);
 		LOG_DBG("EPx%02x: addr=0x%08x%08x stat=0x%08x ctrl=0x%08x",
-				eo->addr, to.addr_hi, to.addr_lo, to.status, to.ctrl);
+				ep_cfg->addr, trb.addr_hi, trb.addr_lo,
+				trb.status, trb.ctrl);
 	}
 }
 
@@ -783,8 +794,7 @@ static void usb23_on_usb_reset(const struct device *dev)
 
 static void usb23_on_connect_done(const struct device *dev)
 {
-	struct udc_ep_config *ep0_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
-	struct udc_ep_config *ep1_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
+	struct udc_ep_config *ep_cfg;
 	int mps = 0;
 
 	LOG_DBG("%s", __func__);
@@ -805,15 +815,20 @@ static void usb23_on_connect_done(const struct device *dev)
 
 	/* Letting GCTL unchanged */
 
-	/* Reapply the parameters adjusted to the right connection speed */
-	ep0_cfg->mps = ep1_cfg->mps = mps;
-	usb23_cmd_ep_config(dev, ep0_cfg);
-	usb23_cmd_ep_config(dev, ep1_cfg);
+	/* Reconfigure EPx00 connection speed */
+	ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
+	ep_cfg->mps = mps;
+	usb23_cmd_ep_config(dev, ep_cfg);
+
+	/* Reconfigure EPx80 connection speed */
+	ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
+	ep_cfg->mps = mps;
+	usb23_cmd_ep_config(dev, ep_cfg);
 
 	/* Letting GTXFIFOSIZn unchanged */
 
 	/* Check the pending buffers again */
-	usb23_xfer_process_queue(dev, ep0_cfg);
+	usb23_xfer_process_queue(dev, ep_cfg);
 }
 
 static void usb23_on_link_state_event(const struct device *dev)
@@ -1246,8 +1261,8 @@ static int usb23_set_address(const struct device *dev, const uint8_t addr)
 	LOG_INF("ADDR %d", addr);
 
 	/* Configure the new address */
-	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_DEVSPD_SUPER_SPEED
-			| addr << USB23_DCFG_DEVADDR_SHIFT);
+	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_DEVADDR_MASK,
+			addr << USB23_DCFG_DEVADDR_SHIFT);
 
 	/* Re-apply the same endpoint configuration */
 	usb23_cmd_ep_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
@@ -1354,10 +1369,10 @@ static int usb23_ep_enable(const struct device *dev,
 static int usb23_init(const struct device *dev)
 {
 	struct usb23_data *priv = udc_get_private(dev);
+	struct udc_data *data = dev->data;
+	struct udc_ep_config *ep_cfg;
 	uint32_t reg, core, rel;
-	int err = 0, mps;
-
-	usb23_dump_registers(dev);
+	int err = 0;
 
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
@@ -1377,10 +1392,8 @@ static int usb23_init(const struct device *dev)
 	usb23_io_clear(dev, USB23_GUSB3PIPECTL, USB23_GUSB3PIPECTL_PHYSOFTRST);
 	usb23_io_clear(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
 
-	/* Teriminate the reset of the USB23 core after */
+	/* Teriminate the reset of the USB23 core after it */
 	usb23_io_clear(dev, USB23_GCTL, USB23_GCTL_CORESOFTRESET);
-
-	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
 
 	/* Initialize USB2 PHY Lattice wrappers */
 	usb23_io_set(dev, USB23_U2PHYCTRL1, USB23_U2PHYCTRL1_SEL_INTERNALCLK);
@@ -1416,9 +1429,15 @@ static int usb23_init(const struct device *dev)
 	usb23_io_write(dev, USB23_GEVNTSIZ(0), sizeof(priv->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTCOUNT(0), 0);
 
-	/* TODO remove this to let it to SuperSpeed (default) */
-	usb23_io_write(dev, USB23_DCFG,
-			USB23_DCFG_DEVSPD_SUPER_SPEED | USB23_DCFG_PERFRINT_90);
+	/* Set the USB device configuration, including max supported speed */
+	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_PERFRINT_90);
+	if (data->caps.ss) {
+		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_SUPER_SPEED);
+	} else if (data->caps.hs) {
+		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_HIGH_SPEED);
+	} else {
+		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED);
+	}
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
@@ -1439,19 +1458,18 @@ static int usb23_init(const struct device *dev)
 	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
 	usb23_cmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
 
-	/* Configure the control endpoint with MPS set to 64 or 512 bytes */
-	mps = 512; // TODO: use 64 for FullSpeed or HighSpeed
-	err |= udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT,
-			USB_EP_TYPE_CONTROL, mps, 0);
-	err |= udc_ep_enable_internal(dev, USB_CONTROL_EP_IN,
-			USB_EP_TYPE_CONTROL, mps, 0);
-	if (err != 0) {
-		LOG_ERR("Failed to enable control endpoint");
-		return err;
-	}
+	/* Configure the control OUT endpoint */
+	ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
+	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT, USB_EP_TYPE_CONTROL, ep_cfg->mps, 0);
+	__ASSERT_NO_MSG(err == 0);
 
-	usb23_dump_registers(dev);
-	return 0;
+	/* Configure the control IN endpoint */
+	ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
+	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL,
+		ep_cfg->mps, 0);
+	__ASSERT_NO_MSG(err == 0);
+
+	return err;
 }
 
 /*------------------------------------------------------------------------------
@@ -1464,12 +1482,11 @@ static int usb23_init(const struct device *dev)
 static int usb23_ep_preinit(const struct device *dev,
 		struct udc_ep_config *const ep_cfg, int addr, int mps)
 {
-	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	int err;
 
 	/* Generic properties for Zephyr */
 	ep_cfg->addr = addr;
-	if (ep_cfg->addr & 0x80) {
+	if (ep_cfg->addr & USB_EP_DIR_IN) {
 		ep_cfg->caps.in = 1;
 	} else {
 		ep_cfg->caps.out = 1;
