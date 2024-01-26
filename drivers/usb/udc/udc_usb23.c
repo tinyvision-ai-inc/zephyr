@@ -1151,6 +1151,7 @@ static void usb23_on_endpoint_event(const struct device *dev, struct usb23_depev
 	switch (depevt.type) {
 	CASE(USB23_DEPEVT_TYPE_XFERCOMPLETE, "ep=0x%02x", ep_cfg->addr);;
 		__ASSERT_NO_MSG((depevt.status & USB23_DEPEVT_STATUS_BUSERR) == 0);
+		__ASSERT_NO_MSG((depevt.status & USB23_DEPEVT_STATUS_SHORT) == 0);
 		usb23_on_xfer_complete(dev, ep_cfg);
 		break;
 	CASE(USB23_DEPEVT_TYPE_XFERNOTREADY, "ep=0x%02x", ep_cfg->addr);;
