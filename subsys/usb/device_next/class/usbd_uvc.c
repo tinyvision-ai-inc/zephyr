@@ -6,7 +6,6 @@
 
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/sys/byteorder.h>
 
 #include <zephyr/usb/usbd.h>
@@ -22,8 +21,8 @@ struct usbd_uvc_desc {
 	struct usb_if_descriptor if0;
 	struct uvc_input_terminal_descriptor if0_input;
 	struct uvc_encoding_unit_descriptor if0_encoding;
-	struct cdc_acm_descriptor if0_acm;
-	struct cdc_union_descriptor if0_union;
+//	struct uvc_descriptor if0_uvc;
+//	struct uvc_union_descriptor if0_union;
 	struct usb_ep_descriptor if0_int_ep;
 
 	struct usb_if_descriptor if1;
@@ -42,6 +41,49 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 	},									\
 }
 
+static int usbd_uvc_request(struct usbd_class_node *const c_nd,
+				struct net_buf *buf, int err)
+{
+	return 0;
+}
+
+static void usbd_uvc_update(struct usbd_class_node *const c_nd,
+				uint8_t iface, uint8_t alternate)
+{
+}
+
+static int usbd_uvc_cth(struct usbd_class_node *const c_nd,
+			    const struct usb_setup_packet *const setup,
+			    struct net_buf *const buf)
+{
+	return 0;
+}
+
+static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
+			    const struct usb_setup_packet *const setup,
+			    const struct net_buf *const buf)
+{
+	return 0;
+}
+
+static int usbd_uvc_init(struct usbd_class_node *const c_nd)
+{
+	return 0;
+}
+
+struct usbd_class_api usbd_uvc_api = {
+	.request = usbd_uvc_request,
+	.update = usbd_uvc_update,
+	.control_to_host = usbd_uvc_cth,
+	.control_to_dev = usbd_uvc_ctd,
+	.init = usbd_uvc_init,
+};
+
+static int usbd_uvc_preinit(const struct device *dev)
+{
+	return 0;
+}
+
 #define DT_DRV_COMPAT zephyr_uvc
 
 #define USBD_UVC_DT_DEVICE_DEFINE(n)						\
@@ -51,24 +93,17 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 										\
 	UVC_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_class_data usbd_cdc_acm_data_##n;			\
+	static struct usbd_class_data usbd_uvc_data_##n;			\
+	USBD_DEFINE_CLASS(uvc_##n, &usbd_uvc_api, &usbd_uvc_data_##n);		\
 										\
-	USBD_DEFINE_CLASS(cdc_acm_##n,						\
-			  &usbd_cdc_acm_api,					\
-			  &usbd_cdc_acm_data_##n);				\
-										\
-	static struct cdc_acm_uart_data uart_data_##n = {			\
-		.line_coding = CDC_ACM_DEFAULT_LINECODING,			\
-		.c_nd = &cdc_acm_##n,						\
-		.rx_fifo.rb = &cdc_acm_rb_rx_##n,				\
-		.tx_fifo.rb = &cdc_acm_rb_tx_##n,				\
-		.notif_sem = Z_SEM_INITIALIZER(uart_data_##n.notif_sem, 0, 1),	\
-	};									\
-										\
-	static struct usbd_class_data usbd_cdc_acm_data_##n = {			\
-		.desc = (struct usb_desc_header *)&cdc_acm_desc_##n,		\
+	static struct usbd_class_data usbd_uvc_data_##n = {			\
+		.desc = (struct usb_desc_header *)&uvc_desc_##n,		\
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),			\
 	};									\
-
+										\
+	DEVICE_DT_INST_DEFINE(n, usbd_uvc_preinit, NULL,			\
+		&usbd_uvc_data_##n, NULL,					\
+		POST_KERNEL, 50,						\
+		&usbd_uvc_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_UVC_DT_DEVICE_DEFINE);
