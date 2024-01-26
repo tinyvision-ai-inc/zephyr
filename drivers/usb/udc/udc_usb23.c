@@ -93,7 +93,6 @@ struct usb23_data {
 	const struct device *dev;
 };
 
-// TODO for debug only, remove when stable
 struct usb23_reg {
 	uint32_t addr;
 	char *name;
@@ -1226,12 +1225,15 @@ static int usb23_ep_disable(const struct device *dev,
  * Halt endpoint. Halted endpoint should respond with a STALL handshake.
  */
 static int usb23_ep_set_halt(const struct device *dev,
-		struct udc_ep_config *const ep_cfg)
+		struct udc_ep_config *ep_cfg)
 {
-	LOG_WRN("Setting stall state on endpoint EPx00 and EPx80");
+	LOG_WRN("Setting stall state on endpoint EPx%02x", ep_cfg->addr);
 
-	usb23_cmd_set_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
-	usb23_cmd_set_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
+	if (ep_cfg->addr == USB_CONTROL_EP_IN) {
+		/* For the control endpoint, only OUT is stalled */
+		ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
+	}
+	usb23_cmd_set_stall(dev, ep_cfg);
 
 	ep_cfg->stat.halted = true;
 	return 0;
@@ -1241,8 +1243,10 @@ static int usb23_ep_clear_halt(const struct device *dev,
 		struct udc_ep_config *const ep_cfg)
 {
 	LOG_WRN("Clearing stall state on endpoint EPx%02x", ep_cfg->addr);
-	usb23_cmd_clear_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
-	usb23_cmd_clear_stall(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
+	__ASSERT_NO_MSG(ep_cfg->addr != USB_CONTROL_EP_OUT);
+	__ASSERT_NO_MSG(ep_cfg->addr != USB_CONTROL_EP_IN);
+
+	usb23_cmd_clear_stall(dev, ep_cfg);
 	ep_cfg->stat.halted = false;
 	return 0;
 }
