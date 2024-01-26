@@ -230,12 +230,12 @@ struct uvc_payload_header {
 	uint8_t bmHeaderInfo;
 #define UVC_BMHEADERINFO_FRAMEID		(1 << 0)
 #define UVC_BMHEADERINFO_END_OF_FRAME		(1 << 1)
-#DEFINE UVC_BMHEADERINFO_HAS_PRESENTATIONTIME	(1 << 2)
-#DEFINE UVC_BMHEADERINFO_HAS_SOURCECLOCK	(1 << 3)
-#DEFINE UVC_BMHEADERINFO_PAYLOAD_SPECIFIC_BIT	(1 << 4)
-#DEFINE UVC_BMHEADERINFO_STILL_IMAGE		(1 << 5)
-#DEFINE UVC_BMHEADERINFO_ERROR			(1 << 6)
-#DEFINE UVC_BMHEADERINFO_END_OF_HEADER		(1 << 7)
+#define UVC_BMHEADERINFO_HAS_PRESENTATIONTIME	(1 << 2)
+#define UVC_BMHEADERINFO_HAS_SOURCECLOCK	(1 << 3)
+#define UVC_BMHEADERINFO_PAYLOAD_SPECIFIC_BIT	(1 << 4)
+#define UVC_BMHEADERINFO_STILL_IMAGE		(1 << 5)
+#define UVC_BMHEADERINFO_ERROR			(1 << 6)
+#define UVC_BMHEADERINFO_END_OF_HEADER		(1 << 7)
 	/* uint32_t dwPresentationTime; (optional) */
 	/* uint64_t scrSourceClock; (optional) */
 } __packed;
@@ -249,7 +249,7 @@ struct uvc_control_if_descriptor {
 	uint16_t wTotalLength;
 	uint32_t dwClockFrequency;
 	uint8_t bInCollection;
-	uint8_t baInterfaceNr_baInterfaceNr[];
+	uint8_t baInterfaceNr_baInterfaceNr[1];
 } __packed;
 
 /** Input Terminal Descriptor */
@@ -261,7 +261,7 @@ struct uvc_input_terminal_descriptor {
 	uint16_t wTerminalType;
 	uint8_t bAssocTerminal;
 	uint8_t iTerminal;
-	uint8_t bExtraFields[];
+	uint8_t bExtraFields[1];
 } __packed;
 
 /** Output Terminal Descriptor */
@@ -274,7 +274,7 @@ struct uvc_output_terminal_descriptor {
 	uint8_t bAssocTerminal;
 	uint8_t bSourceID;
 	uint8_t iTerminal;
-	uint8_t bExtraFields[];
+	uint8_t bExtraFields[1];
 } __packed;
 
 /** Camera Terminal Descriptor */
@@ -300,7 +300,7 @@ struct uvc_selector_unit_descriptor {
 	uint8_t bDescriptorSubtype;
 	uint8_t bUnitID;
 	uint8_t bNrInPins;
-	uint8_t baSourceID_iSelector[];
+	uint8_t baSourceID_iSelector[1];
 } __packed;
 
 /** Processing Unit Descriptor */
@@ -339,7 +339,7 @@ struct uvc_extension_unit_descriptor {
 	uint8_t guidExtensionCode[16];
 	uint8_t bNumControls;
 	uint8_t bNrInPins;
-	uint8_t baSourceID[];
+	uint8_t baSourceID[1];
 	uint8_t bControlSize;
 	uint8_t bmControls;
 	uint8_t iExtension;
@@ -367,7 +367,7 @@ struct uvc_stream_input_header_descriptor {
 	uint8_t bTriggerSupport;
 	uint8_t bTriggerUsage;
 	uint8_t bControlSize;
-	uint8_t bmaControls[];
+	uint8_t bmaControls[1];
 } __packed;
 
 /** Class-specific Video Stream Interface Output Header Descriptor */
@@ -380,7 +380,7 @@ struct uvc_stream_output_header_descriptor {
 	uint8_t bEndpointAddress;
 	uint8_t bTerminalLink;
 	uint8_t bControlSize;
-	uint8_t bmaControls[];
+	uint8_t bmaControls[1];
 } __packed;
 
 /** Still Image Frame Descriptor */
@@ -393,10 +393,10 @@ struct uvc_still_image_frame_descriptor {
 	struct {
 		uint16_t wWidth;
 		uint16_t wHeight;
-	} n[] __packed;
+	} n[1] __packed;
 	uint8_t bNumCompression ;
 	uint8_t Pattern;
-	uint8_t bCompression[];
+	uint8_t bCompression[1];
 } __packed;
 
 /** Color Matching Descriptor */

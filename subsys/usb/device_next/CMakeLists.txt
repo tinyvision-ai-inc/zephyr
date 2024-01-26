@@ -61,4 +61,9 @@ zephyr_library_sources_ifdef(
 	class/usbd_uac2.c
 )
 
+zephyr_library_sources_ifdef(
+	CONFIG_USBD_UVC_CLASS
+	class/usbd_uvc.c
+)
+
 zephyr_linker_sources(DATA_SECTIONS usbd_data.ld)
