@@ -542,22 +542,27 @@ int udc_ep_enqueue(const struct device *dev, struct net_buf *const buf)
 	struct udc_buf_info *bi;
 	int ret;
 
+	LOG_DBG("%s: enqueueing device %p buf %p", __func__, dev, buf);
+
 	api->lock(dev);
 
 	if (!udc_is_enabled(dev)) {
 		ret = -EPERM;
+		LOG_DBG("%s: !udc_is_enabled(dev)", __func__);
 		goto ep_enqueue_error;
 	}
 
 	bi = udc_get_buf_info(buf);
 	if (bi->ep == USB_CONTROL_EP_OUT) {
 		ret = -EPERM;
+		LOG_DBG("%s: bi->ep == USB_CONTROL_EP_OUT", __func__);
 		goto ep_enqueue_error;
 	}
 
 	cfg = udc_get_ep_cfg(dev, bi->ep);
 	if (cfg == NULL) {
 		ret = -ENODEV;
+		LOG_DBG("%s: cfg == NULL", __func__);
 		goto ep_enqueue_error;
 	}
 

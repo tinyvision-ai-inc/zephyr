@@ -19,6 +19,8 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_cdc_uvc, CONFIG_USBD_CDC_UVC_LOG_LEVEL);
 
+NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
+
 #define CDC_UVC_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
 #define CDC_UVC_DEFAULT_BULK_EP_MPS	0
 #define CDC_UVC_DEFAULT_INT_EP_MPS	16
@@ -40,6 +42,17 @@ struct usbd_cdc_uvc_desc {
 	struct usb_desc_header nil_desc;
 } __packed;
 
+struct usbd_class_node *const cdc_uvc_c_nd;
+
+char cdc_uvc_buf_in[] = "0123456789abcdefghijklmnopqrstuvwxyz\r\n";
+char cdc_uvc_buf_out[512];
+
+static uint8_t cdc_uvc_get_int_in(struct usbd_class_node *const c_nd)
+{
+	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
+
+	return desc->if0_int_ep.bEndpointAddress;
+}
 
 static uint8_t cdc_uvc_get_bulk_in(struct usbd_class_node *const c_nd)
 {
@@ -55,11 +68,108 @@ static uint8_t cdc_uvc_get_bulk_out(struct usbd_class_node *const c_nd)
 	return desc->if1_out_ep.bEndpointAddress;
 }
 
+void cdc_uvc_notif_in(const struct device *dev)
+{
+	struct cdc_acm_notification notif = {
+		.bmRequestType = 0xA1,
+		.bNotificationType = USB_CDC_SERIAL_STATE,
+		.wValue = 0,
+		.wIndex = 0,
+		.wLength = sys_cpu_to_le16(sizeof(uint16_t)),
+		.data = sys_cpu_to_le16(0x00),
+	};
+	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
+	struct net_buf *buf;
+	uint8_t ep;
+	int ret;
+
+	ep = cdc_uvc_get_int_in(c_nd);
+	buf = usbd_ep_buf_alloc(c_nd, ep, sizeof(struct cdc_acm_notification));
+	if (buf == NULL) {
+		LOG_DBG("%s buf=%p err=alloc", __func__, buf);
+		return;
+	}
+
+	net_buf_add_mem(buf, &notif, sizeof(struct cdc_acm_notification));
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
+		goto err;
+	}
+
+	LOG_DBG("%s buf=%p err=ok", __func__, buf);
+	return;
+err:
+	net_buf_unref(buf);
+}
+
+void cdc_uvc_enqueue_in(void)
+{
+	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
+	struct net_buf *buf;
+	struct udc_buf_info *bi;
+	int ret;
+
+	buf = net_buf_alloc_with_data(&cdc_uvc_ep_pool,
+		cdc_uvc_buf_in, sizeof(cdc_uvc_buf_in), K_NO_WAIT);
+	if (buf == NULL) {
+		LOG_DBG("%s buf=NULL err=alloc", __func__);
+		return;
+	}
+
+	bi = udc_get_buf_info(buf);
+	memset(bi, 0, sizeof(struct udc_buf_info));
+	bi->ep = cdc_uvc_get_bulk_in(c_nd);
+
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
+		goto err;
+	}
+
+	LOG_DBG("%s buf=%p err=ok", __func__, buf);
+	return;
+err:
+	net_buf_unref(buf);
+}
+
+void cdc_uvc_enqueue_out(void)
+{
+	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
+	struct net_buf *buf;
+	struct udc_buf_info *bi;
+	int ret;
+
+	buf = net_buf_alloc_with_data(&cdc_uvc_ep_pool,
+		cdc_uvc_buf_out, sizeof(cdc_uvc_buf_out), K_NO_WAIT);
+	if (buf == NULL) {
+		LOG_DBG("%s buf=NULL err=alloc", __func__);
+		return;
+	}
+
+	bi = udc_get_buf_info(buf);
+	memset(bi, 0, sizeof(struct udc_buf_info));
+	bi->ep = cdc_uvc_get_bulk_out(c_nd);
+
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
+		goto err;
+	}
+
+	LOG_DBG("%s buf=%p err=ok", __func__, buf);
+	return;
+err:
+	net_buf_unref(buf);
+}
+
 static int usbd_cdc_uvc_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
 {
 	struct usbd_contex *uds_ctx = c_nd->data->uds_ctx;
 	struct udc_buf_info *bi;
+
+	LOG_DBG("%s buf=%p err=%d", __func__, buf, err);
 
 	bi = udc_get_buf_info(buf);
 	if (err) {
@@ -239,6 +349,7 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 	USBD_DEFINE_CLASS(cdc_uvc_##n,						\
 			  &usbd_cdc_uvc_api,					\
 			  &usbd_cdc_uvc_data_##n);				\
+	struct usbd_class_node *const cdc_uvc_c_nd = &cdc_uvc_##n;		\
 										\
 	static struct usbd_class_data usbd_cdc_uvc_data_##n = {			\
 		.desc = (struct usb_desc_header *)&cdc_uvc_desc_##n,		\
