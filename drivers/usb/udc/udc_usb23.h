@@ -112,6 +112,16 @@ union usb23_evt {
 	uint32_t raw;
 };
 
+/*
+ * Memory layout for the different TRBs and the Event together
+ */
+#define USB23_EVT_NUM 32
+#define USB23_TRB_NUM 32
+struct usb23_dma {
+	union  usb23_evt evt_buf[USB23_EVT_NUM];
+	struct usb23_trb trb_buf[][USB23_TRB_NUM]; /* Depends on number of USB endpoints */
+};
+
 /* Device Endpoint Commands and Parameters */
 #define USB23_DEPCMDPAR2(n)			(0xc800 + 16 * (n))
 #define USB23_DEPCMDPAR1(n)			(0xc804 + 16 * (n))

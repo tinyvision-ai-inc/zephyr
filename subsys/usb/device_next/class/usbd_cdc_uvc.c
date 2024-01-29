@@ -44,16 +44,6 @@ struct usbd_cdc_uvc_desc {
 
 struct usbd_class_node *const cdc_uvc_c_nd;
 
-char cdc_uvc_buf_in[] = "0123456789abcdefghijklmnopqrstuvwxyz\r\n";
-char cdc_uvc_buf_out[512];
-
-static uint8_t cdc_uvc_get_int_in(struct usbd_class_node *const c_nd)
-{
-	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
-
-	return desc->if0_int_ep.bEndpointAddress;
-}
-
 static uint8_t cdc_uvc_get_bulk_in(struct usbd_class_node *const c_nd)
 {
 	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
@@ -68,42 +58,7 @@ static uint8_t cdc_uvc_get_bulk_out(struct usbd_class_node *const c_nd)
 	return desc->if1_out_ep.bEndpointAddress;
 }
 
-void cdc_uvc_notif_in(const struct device *dev)
-{
-	struct cdc_acm_notification notif = {
-		.bmRequestType = 0xA1,
-		.bNotificationType = USB_CDC_SERIAL_STATE,
-		.wValue = 0,
-		.wIndex = 0,
-		.wLength = sys_cpu_to_le16(sizeof(uint16_t)),
-		.data = sys_cpu_to_le16(0x00),
-	};
-	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
-	struct net_buf *buf;
-	uint8_t ep;
-	int ret;
-
-	ep = cdc_uvc_get_int_in(c_nd);
-	buf = usbd_ep_buf_alloc(c_nd, ep, sizeof(struct cdc_acm_notification));
-	if (buf == NULL) {
-		LOG_DBG("%s buf=%p err=alloc", __func__, buf);
-		return;
-	}
-
-	net_buf_add_mem(buf, &notif, sizeof(struct cdc_acm_notification));
-	ret = usbd_ep_enqueue(c_nd, buf);
-	if (ret) {
-		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
-		goto err;
-	}
-
-	LOG_DBG("%s buf=%p err=ok", __func__, buf);
-	return;
-err:
-	net_buf_unref(buf);
-}
-
-void cdc_uvc_enqueue_in(void)
+void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
 {
 	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
 	struct net_buf *buf;
@@ -111,7 +66,7 @@ void cdc_uvc_enqueue_in(void)
 	int ret;
 
 	buf = net_buf_alloc_with_data(&cdc_uvc_ep_pool,
-		cdc_uvc_buf_in, sizeof(cdc_uvc_buf_in), K_NO_WAIT);
+		data_buf, data_len, K_NO_WAIT);
 	if (buf == NULL) {
 		LOG_DBG("%s buf=NULL err=alloc", __func__);
 		return;
@@ -120,36 +75,6 @@ void cdc_uvc_enqueue_in(void)
 	bi = udc_get_buf_info(buf);
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = cdc_uvc_get_bulk_in(c_nd);
-
-	ret = usbd_ep_enqueue(c_nd, buf);
-	if (ret) {
-		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
-		goto err;
-	}
-
-	LOG_DBG("%s buf=%p err=ok", __func__, buf);
-	return;
-err:
-	net_buf_unref(buf);
-}
-
-void cdc_uvc_enqueue_out(void)
-{
-	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
-	struct net_buf *buf;
-	struct udc_buf_info *bi;
-	int ret;
-
-	buf = net_buf_alloc_with_data(&cdc_uvc_ep_pool,
-		cdc_uvc_buf_out, sizeof(cdc_uvc_buf_out), K_NO_WAIT);
-	if (buf == NULL) {
-		LOG_DBG("%s buf=NULL err=alloc", __func__);
-		return;
-	}
-
-	bi = udc_get_buf_info(buf);
-	memset(bi, 0, sizeof(struct udc_buf_info));
-	bi->ep = cdc_uvc_get_bulk_out(c_nd);
 
 	ret = usbd_ep_enqueue(c_nd, buf);
 	if (ret) {
