@@ -16,7 +16,6 @@
  */
 #include "udc_common.h"
 #include "udc_usb23.h"
-#include "vexriscv.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -119,14 +118,14 @@ static uint32_t usb23_io_read(const struct device *dev, uint32_t addr)
 {
 	const struct usb23_config *config = dev->config;
 
-	return MEM32(config->base + addr);
+	return MEM32(config->base_reg + addr);
 }
 
 static void usb23_io_write(const struct device *dev, uint32_t addr, uint32_t data)
 {
 	const struct usb23_config *config = dev->config;
 
-	MEM32(config->base + addr) = data;
+	MEM32(config->base_reg + addr) = data;
 }
 
 static void usb23_io_wait_go_low(const struct device *dev, uint32_t addr, uint32_t mask)
@@ -382,6 +381,7 @@ void usb23_dump_events(const struct device *dev)
 {
 	const struct usb23_config *config = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
+	volatile struct usb23_dma *dma = (void *)config->base_dma;
 
 	for (int i = 0; i < CONFIG_USB23_EVT_NUM; i++) {
 		union usb23_evt evt = config->evt_buf[i];
@@ -1239,7 +1239,7 @@ static int usb23_ep_dequeue(const struct device *dev, struct udc_ep_config *cons
 	unsigned int lock_key;
 	struct net_buf *buf;
 
-	LOG_DBG("%s", __func__);
+	LOG_INF("%s", __func__);
 
 	lock_key = irq_lock();
 
