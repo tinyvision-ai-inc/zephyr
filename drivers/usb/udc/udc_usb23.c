@@ -16,6 +16,7 @@
  */
 #include "udc_common.h"
 #include "udc_usb23.h"
+#include "vexriscv.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -49,9 +50,8 @@ struct usb23_config {
 	/* USB device configuration */
 	int speed_idx;
 
-	/* Base address at which is mapped the USB23 core */
-	uintptr_t base_reg;
-	uintptr_t base_dma;
+	/* Base address at which the USB23 core registers are mapped */
+	uintptr_t base;
 
 	/* Functions pointers for managing the IRQs from LiteX */
 	void (*irq_enable_func)(void);
@@ -85,6 +85,12 @@ struct usb23_data {
 
 	/* Back-reference to parent */
 	const struct device *dev;
+
+	/* Pointers to per-endpoint TRB buffers fetched by USB23 with DMA */
+	volatile struct usb23_trb (*trb_buf)[USB23_TRB_NUM];
+
+	/* Pointers to event buffer fetched by USB23 with DMA */
+	volatile union usb23_evt *evt_buf;
 };
 
 struct usb23_reg {
@@ -110,7 +116,7 @@ static uint32_t usb23_io_read(const struct device *dev, uint32_t addr)
 {
 	const struct usb23_config *config = dev->config;
 
-	return MEM32(config->base_reg + addr);
+	return MEM32(config->base + addr);
 }
 
 static void usb23_io_write(const struct device *dev, uint32_t addr,
@@ -118,7 +124,7 @@ static void usb23_io_write(const struct device *dev, uint32_t addr,
 {
 	const struct usb23_config *config = dev->config;
 
-	MEM32(config->base_reg + addr) = data;
+	MEM32(config->base + addr) = data;
 }
 
 static void usb23_io_wait_go_low(const struct device *dev, uint32_t addr,
@@ -199,35 +205,39 @@ static struct usb23_ep_data *usb23_get_ep_data(const struct device *dev,
 static struct usb23_trb usb23_get_trb(const struct device *dev,
 		struct udc_ep_config *const ep_cfg)
 {
-	const struct usb23_config *config = dev->config;
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
+	struct usb23_data *priv = udc_get_private(dev);
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 
-	return dma->trb_buf[epn][0];
+	flush_l2_cache();
+	flush_cpu_dcache();
+	return priv->trb_buf[epn][0];
 }
 
 static void usb23_set_trb(const struct device *dev,
 		struct udc_ep_config *const ep_cfg, struct usb23_trb *trb)
 {
-	const struct usb23_config *config = dev->config;
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
+	struct usb23_data *priv = udc_get_private(dev);
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 
-	dma->trb_buf[epn][0] = *trb;
+	priv->trb_buf[epn][0] = *trb;
+	flush_cpu_dcache();
+	flush_l2_cache();
 }
 
 static union usb23_evt usb23_get_next_evt(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
 	struct usb23_data *priv = udc_get_private(dev);
 	volatile union usb23_evt evt;
 
 	/* Cache the current event */
-	evt = dma->evt_buf[priv->evt_next];
+	flush_l2_cache();
+	flush_cpu_dcache();
+	evt = priv->evt_buf[priv->evt_next];
 
 	/* Clear it on the event buffer */
-	dma->evt_buf[priv->evt_next].raw = 0x00000000;
+	priv->evt_buf[priv->evt_next].raw = 0x00000000;
+	flush_l2_cache();
+	flush_cpu_dcache();
 
 	/* This is a ring buffer, wrap around */
 	priv->evt_next++;
@@ -366,12 +376,10 @@ void usb23_dump_link_state(const struct device *dev)
 
 void usb23_dump_events(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
 
 	for (int i = 0; i < USB23_EVT_NUM; i++) {
-		union usb23_evt evt = dma->evt_buf[i];
+		union usb23_evt evt = priv->evt_buf[i];
 		char *s = (i == priv->evt_next) ? " <-" : "";
 
 //		if (evt.raw != 0x00000000) {
@@ -515,9 +523,8 @@ static void usb23_cmd_start_xfer(const struct device *dev,
 {
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
-	const struct usb23_config *config = dev->config;
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
-	volatile struct usb23_trb *trb_buf = dma->trb_buf[epn];
+	struct usb23_data *priv = udc_get_private(dev);
+	volatile struct usb23_trb *trb_buf = priv->trb_buf[epn];
 	uint32_t idx;
 
 	usb23_io_write(dev, USB23_DEPCMDPAR0(epn), HI32((uintptr_t)trb_buf));
@@ -593,7 +600,7 @@ static void usb23_trb_ctrl_setup(const struct device *dev,
 {
 	uint32_t ctrl = 0;
 
-	LOG_INF("\tTRB EPx%02x TRB_CONTROL_SETUP size=%d", ep_cfg->addr, size);
+	LOG_INF("\tTRB EPx%02x CONTROL_SETUP size=%d", ep_cfg->addr, size);
 	ctrl |= USB23_TRB_CTRL_IOC;
 	ctrl |= USB23_TRB_CTRL_LST;
 	ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP;
@@ -608,11 +615,11 @@ static void usb23_trb_ctrl_data(const struct device *dev,
 	ctrl |= USB23_TRB_CTRL_IOC;
 	ctrl |= USB23_TRB_CTRL_LST;
 	if (ep_cfg->addr & USB_EP_DIR_IN) {
-		LOG_INF("\tTRB EPx%02x TRB_CONTROL_DATA_1 size=%d", ep_cfg->addr, size);
+		LOG_INF("\tTRB EPx%02x CONTROL_DATA_1 size=%d", ep_cfg->addr, size);
 		ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1;
 	} else {
 		// TODO This should not be required
-		LOG_INF("\tTRB EPx%02x TRB_CONTROL_STATUS_3 size=%d", ep_cfg->addr, size);
+		LOG_INF("\tTRB EPx%02x CONTROL_STATUS_3 size=%d", ep_cfg->addr, size);
 		ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
 	}
 	usb23_trb_single_buf(dev, ep_cfg, data, size, ctrl);
@@ -623,7 +630,7 @@ static void usb23_trb_ctrl_status(const struct device *dev,
 {
 	uint32_t ctrl = 0;
 
-	LOG_INF("\tTRB EPx%02x TRB_CONTROL_STATUS_2 size=%d", ep_cfg->addr, size);
+	LOG_INF("\tTRB EPx%02x CONTROL_STATUS_2 size=%d", ep_cfg->addr, size);
 	ctrl |= USB23_TRB_CTRL_IOC;
 	ctrl |= USB23_TRB_CTRL_LST;
 	ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2;
@@ -775,12 +782,12 @@ static void usb23_on_usb_reset(const struct device *dev)
 	/* Reset all ongoing transfers on non-0 endpoints */
 	for (int i = 1; i < config->num_of_eps; i++) {
 		if (!usb23_trb_is_free(dev, &config->ep_cfg_in[i])) {
-			usb23_cmd_end_xfer(dev, &config->ep_cfg_in[i]);
+			//usb23_cmd_end_xfer(dev, &config->ep_cfg_in[i]);
 		}
 		usb23_cmd_clear_stall(dev, &config->ep_cfg_in[i]);
 
 		if (!usb23_trb_is_free(dev, &config->ep_cfg_out[i])) {
-			usb23_cmd_end_xfer(dev, &config->ep_cfg_out[i]);
+			//usb23_cmd_end_xfer(dev, &config->ep_cfg_out[i]);
 		}
 		usb23_cmd_clear_stall(dev, &config->ep_cfg_out[i]);
 	}
@@ -1373,8 +1380,7 @@ static int usb23_ep_enable(const struct device *dev,
  */
 static int usb23_init(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
+	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_data *data = dev->data;
 	struct udc_ep_config *ep_cfg;
 	uint32_t reg, core, rel;
@@ -1426,11 +1432,13 @@ static int usb23_init(const struct device *dev)
 
 	/* Setup the event buffer address, size and start event reception */
 	for (int i = 0; i < USB23_EVT_NUM; i++) {
-		dma->evt_buf[i] = (union usb23_evt){0};
+		priv->evt_buf[i] = (union usb23_evt){0};
 	}
-	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)dma->evt_buf));
-	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)dma->evt_buf));
-	usb23_io_write(dev, USB23_GEVNTSIZ(0), USB23_EVT_NUM * sizeof(*dma->evt_buf));
+	flush_l2_cache();
+	flush_cpu_dcache();
+	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)priv->evt_buf));
+	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)priv->evt_buf));
+	usb23_io_write(dev, USB23_GEVNTSIZ(0), USB23_EVT_NUM * sizeof(*priv->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTCOUNT(0), 0);
 
 	/* Set the USB device configuration, including max supported speed */
@@ -1600,8 +1608,7 @@ static const struct udc_api usb23_api = {
 	static struct udc_ep_config						\
 		ep_cfg_in[DT_INST_PROP(n, num_bidir_endpoints)];		\
 	static const struct usb23_config usb23_config_##n = {			\
-		.base_reg = DT_INST_REG_ADDR_BY_NAME(n, base_reg),		\
-		.base_dma = DT_INST_REG_ADDR_BY_NAME(n, base_dma),		\
+		.base = DT_INST_REG_ADDR_BY_NAME(n, base),			\
 		.num_of_eps = DT_INST_PROP(n, num_bidir_endpoints),		\
 		.ep_cfg_out = ep_cfg_out,					\
 		.ep_cfg_in = ep_cfg_in,						\
@@ -1610,11 +1617,17 @@ static const struct udc_api usb23_api = {
 		.irq_clear_func = usb23_irq_clear,				\
 	};									\
 										\
+	union usb23_evt usb23_dma_evt_buf_##n[USB23_EVT_NUM];			\
+	struct usb23_trb usb23_dma_trb_buf_##n[					\
+		DT_INST_PROP(n, num_bidir_endpoints) * 2][USB23_TRB_NUM];	\
+										\
 	static struct usb23_ep_data						\
 		ep_data[DT_INST_PROP(n, num_bidir_endpoints) * 2];		\
 	static struct usb23_data udc_priv_##n = {				\
 		.dev = DEVICE_DT_INST_GET(n),					\
 		.ep_data = ep_data,						\
+		.evt_buf = usb23_dma_evt_buf_##n,				\
+		.trb_buf = usb23_dma_trb_buf_##n,				\
 	};									\
 										\
 	static struct udc_data udc_data_##n = {					\
