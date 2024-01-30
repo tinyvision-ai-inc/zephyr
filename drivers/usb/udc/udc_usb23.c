@@ -16,6 +16,7 @@
  */
 #include "udc_common.h"
 #include "udc_usb23.h"
+#include "vexriscv.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -101,6 +102,12 @@ struct usb23_data {
 
 	/* Back-reference to parent */
 	const struct device *dev;
+
+	/* Pointers to per-endpoint TRB buffers fetched by USB23 with DMA */
+	volatile struct usb23_trb (*trb_buf)[USB23_TRB_NUM];
+
+	/* Pointers to event buffer fetched by USB23 with DMA */
+	volatile union usb23_evt *evt_buf;
 };
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
@@ -118,14 +125,14 @@ static uint32_t usb23_io_read(const struct device *dev, uint32_t addr)
 {
 	const struct usb23_config *config = dev->config;
 
-	return MEM32(config->base_reg + addr);
+	return MEM32(config->base + addr);
 }
 
 static void usb23_io_write(const struct device *dev, uint32_t addr, uint32_t data)
 {
 	const struct usb23_config *config = dev->config;
 
-	MEM32(config->base_reg + addr) = data;
+	MEM32(config->base + addr) = data;
 }
 
 static void usb23_io_wait_go_low(const struct device *dev, uint32_t addr, uint32_t mask)
@@ -379,9 +386,7 @@ void usb23_dump_link_state(const struct device *dev)
 
 void usb23_dump_events(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
-	volatile struct usb23_dma *dma = (void *)config->base_dma;
 
 	for (int i = 0; i < CONFIG_USB23_EVT_NUM; i++) {
 		union usb23_evt evt = config->evt_buf[i];
