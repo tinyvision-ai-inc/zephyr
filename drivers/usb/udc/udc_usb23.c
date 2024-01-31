@@ -1244,7 +1244,7 @@ static int usb23_ep_dequeue(const struct device *dev, struct udc_ep_config *cons
 	unsigned int lock_key;
 	struct net_buf *buf;
 
-	LOG_INF("%s", __func__);
+	LOG_DBG("%s", __func__);
 
 	lock_key = irq_lock();
 
