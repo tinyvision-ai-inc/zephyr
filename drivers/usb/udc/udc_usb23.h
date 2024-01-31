@@ -116,8 +116,8 @@ union usb23_evt {
  * Number of events in the event buffer. Ad-hoc value adjusted for practical
  * use-cases. This value might be good for every use-cases.
  */
-#define USB23_EVT_NUM				32
-#define USB23_TRB_NUM				4
+#define USB23_EVT_NUM				8
+#define USB23_TRB_NUM				2
 
 /* Device Endpoint Commands and Parameters */
 #define USB23_DEPCMDPAR2(n)			(0xc800 + 16 * (n))
