@@ -27,7 +27,20 @@
 /** Device capability type codes */
 enum usb_bos_capability_types {
 	USB_BOS_CAPABILITY_EXTENSION = 0x02,
+	USB_BOS_CAPABILITY_SUPERSPEED_USB = 0x03,
 	USB_BOS_CAPABILITY_PLATFORM = 0x05,
+};
+
+enum usb_bos_attributes {
+	USB_BOS_ATTRIBUTES_LPM = BIT(1),
+	USB_BOS_ATTRIBUTES_BESL = BIT(2)
+};
+
+enum usb_bos_speed {
+	USB_BOS_SPEED_LOWSPEED = 0x00,
+	USB_BOS_SPEED_FULLSPEED = 0x01,
+	USB_BOS_SPEED_HIGHSPEED = 0x02,
+	USB_BOS_SPEED_SUPERSPEED_GEN1 = 0x03,
 };
 
 /** BOS USB 2.0 extension capability descriptor */
@@ -36,6 +49,17 @@ struct usb_bos_capability_lpm {
 	uint8_t bDescriptorType;
 	uint8_t bDevCapabilityType;
 	uint32_t bmAttributes;
+} __packed;
+
+struct usb_bos_capability_superspeed_usb {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDevCapabilityType;
+	uint8_t bmAttributes;
+	uint16_t wSpeedsSupported;
+	uint8_t bFunctionnalSupport;
+	uint8_t bU1DevExitLat;
+	uint16_t wU2DevExitLat;
 } __packed;
 
 /** BOS platform capability descriptor */
