@@ -116,7 +116,7 @@ static int usbd_cdc_uvc_request(struct usbd_class_node *const c_nd,
 			LOG_ERR("request ep 0x%02x, len %u failed",
 				bi->ep, buf->len);
 		}
-		return usbd_ep_buf_free(uds_ctx, buf);
+		goto err;
 	}
 
 	if (bi->ep == cdc_uvc_get_bulk_out(c_nd)) {
@@ -126,8 +126,8 @@ static int usbd_cdc_uvc_request(struct usbd_class_node *const c_nd,
 	if (bi->ep == cdc_uvc_get_bulk_in(c_nd)) {
 		/* TX transfer completion */
 	}
-
-	return 0;
+err:
+	return usbd_ep_buf_free(uds_ctx, buf);
 }
 
 static void usbd_cdc_uvc_update(struct usbd_class_node *const c_nd,
