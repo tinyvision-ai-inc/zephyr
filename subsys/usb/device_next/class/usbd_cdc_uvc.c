@@ -26,6 +26,14 @@ NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
 #define CDC_UVC_DEFAULT_INT_EP_MPS	16
 #define CDC_UVC_DEFAULT_INT_INTERVAL	0x0A
 
+struct usb_ep_companion_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bMaxBurst;
+	uint8_t bmAttributes;
+	uint16_t wBytesPerInterval;
+} __packed;
+
 struct usbd_cdc_uvc_desc {
 	struct usb_association_descriptor iad_cdc;
 	struct usb_if_descriptor if0;
@@ -34,10 +42,13 @@ struct usbd_cdc_uvc_desc {
 	struct cdc_acm_descriptor if0_acm;
 	struct cdc_union_descriptor if0_union;
 	struct usb_ep_descriptor if0_int_ep;
+	struct usb_ep_companion_descriptor if0_int_ep_comp;
 
 	struct usb_if_descriptor if1;
 	struct usb_ep_descriptor if1_in_ep;
+	struct usb_ep_companion_descriptor if1_in_ep_comp;
 	struct usb_ep_descriptor if1_out_ep;
+	struct usb_ep_companion_descriptor if1_out_ep_comp;
 
 	struct usb_desc_header nil_desc;
 } __packed;
@@ -224,6 +235,14 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bInterval = CDC_UVC_DEFAULT_INT_INTERVAL,			\
 	},									\
 										\
+	.if0_int_ep_comp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 2,						\
+	},									\
+										\
 	.if1 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
@@ -245,6 +264,14 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bInterval = 0,							\
 	},									\
 										\
+	.if1_in_ep_comp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 2,						\
+	},									\
+										\
 	.if1_out_ep = {								\
 		.bLength = sizeof(struct usb_ep_descriptor),			\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
@@ -252,6 +279,14 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
 		.wMaxPacketSize = sys_cpu_to_le16(CDC_UVC_DEFAULT_BULK_EP_MPS),	\
 		.bInterval = 0,							\
+	},									\
+										\
+	.if1_out_ep_comp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 2,						\
 	},									\
 										\
 	.nil_desc = {								\

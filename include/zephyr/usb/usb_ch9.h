@@ -120,6 +120,7 @@ static inline bool usb_reqtype_is_to_device(const struct usb_setup_packet *setup
 #define USB_DESC_INTERFACE_ASSOC	11
 #define USB_DESC_BOS			15
 #define USB_DESC_DEVICE_CAPABILITY	16
+#define USB_DESC_ENDPOINT_COMPANION	48
 
 /** Class-Specific Descriptor Types as defined by
  *  USB Common Class Specification
