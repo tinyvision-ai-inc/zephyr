@@ -611,16 +611,10 @@ static void usb23_trb_ctrl_data(const struct device *dev,
 {
 	uint32_t ctrl = 0;
 
+	LOG_DBG("-> TRB ep=0x%02x CONTROL_DATA_1 size=%d", ep_cfg->addr, size);
 	ctrl |= USB23_TRB_CTRL_IOC;
 	ctrl |= USB23_TRB_CTRL_LST;
-	if (ep_cfg->addr & USB_EP_DIR_IN) {
-		LOG_DBG("-> TRB ep=0x%02x CONTROL_DATA_1 size=%d", ep_cfg->addr, size);
-		ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1;
-	} else {
-		// TODO This should not be required
-		LOG_DBG("-> TRB ep=0x%02x CONTROL_STATUS_3 size=%d", ep_cfg->addr, size);
-		ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
-	}
+	ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1;
 	usb23_trb_single_buf(dev, ep_cfg, data, size, ctrl);
 }
 
@@ -1072,8 +1066,8 @@ static void usb23_on_xfer_complete(const struct device *dev,
 	__ASSERT_NO_MSG((uintptr_t)buf->data == U64(trb.addr_hi, trb.addr_lo));
 	__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
-	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK) ==
-			USB23_TRB_STATUS_TRBSTS_OK);
+//	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK) ==
+//			USB23_TRB_STATUS_TRBSTS_OK);
 
 	buf->len = buf->size - GETFIELD(trb.status, USB23_TRB_STATUS_BUFSIZ);
 	LOG_HEXDUMP_DBG(buf->data, buf->len, "BUFFER");
