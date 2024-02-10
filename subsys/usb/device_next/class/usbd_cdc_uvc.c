@@ -26,14 +26,6 @@ NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
 #define CDC_UVC_DEFAULT_INT_EP_MPS	16
 #define CDC_UVC_DEFAULT_INT_INTERVAL	0x0A
 
-struct usb_ep_companion_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bMaxBurst;
-	uint8_t bmAttributes;
-	uint16_t wBytesPerInterval;
-} __packed;
-
 struct usbd_cdc_uvc_desc {
 	struct usb_association_descriptor iad_cdc;
 	struct usb_if_descriptor if0;
