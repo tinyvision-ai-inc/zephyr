@@ -552,6 +552,8 @@ static int sreq_get_descriptor(struct usbd_contex *const uds_ctx,
 		return sreq_get_desc(uds_ctx, buf, USB_DESC_DEVICE_QUALIFIER, 0);
 	CASE(USB_DESC_BOS);
 		return sreq_get_desc_bos(uds_ctx, buf);
+	CASE(USB_DESC_DEBUG);
+		return 0;
 	CASE(USB_DESC_INTERFACE);
 		break;
 	CASE(USB_DESC_ENDPOINT);
@@ -559,6 +561,7 @@ static int sreq_get_descriptor(struct usbd_contex *const uds_ctx,
 	CASE(USB_DESC_OTHER_SPEED);
 		break;
 	default:
+		LOG_ERR("%s: unsupported descriptor", __func__);
 		break;
 	}
 

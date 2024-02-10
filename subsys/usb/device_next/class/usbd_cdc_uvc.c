@@ -26,14 +26,6 @@ NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
 #define CDC_UVC_DEFAULT_INT_EP_MPS	16
 #define CDC_UVC_DEFAULT_INT_INTERVAL	0x0A
 
-struct usb_ep_companion_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bMaxBurst;
-	uint8_t bmAttributes;
-	uint16_t wBytesPerInterval;
-} __packed;
-
 struct usbd_cdc_uvc_desc {
 	struct usb_association_descriptor iad_cdc;
 	struct usb_if_descriptor if0;
@@ -305,10 +297,8 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 	CDC_UVC_DEFINE_DESCRIPTOR(n);						\
 										\
 	static struct usbd_class_data usbd_cdc_uvc_data_##n;			\
-										\
-	USBD_DEFINE_CLASS(cdc_uvc_##n,						\
-			  &usbd_cdc_uvc_api,					\
-			  &usbd_cdc_uvc_data_##n);				\
+	USBD_DEFINE_CLASS(cdc_uvc_##n, &usbd_cdc_uvc_api,			\
+		&usbd_cdc_uvc_data_##n);\
 	struct usbd_class_node *const cdc_uvc_c_nd = &cdc_uvc_##n;		\
 										\
 	static struct usbd_class_data usbd_cdc_uvc_data_##n = {			\
@@ -317,7 +307,7 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL,					\
-		NULL, NULL,							\
+		&usbd_cdc_uvc_data_##n, NULL,					\
 		POST_KERNEL, 50,						\
 		&usbd_cdc_uvc_api);
 
