@@ -229,6 +229,15 @@ struct usb_ep_descriptor {
 	uint8_t bInterval;
 } __packed;
 
+/** USB Endpoint Companion Descriptor as used by USB 3. */
+struct usb_ep_companion_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bMaxBurst;
+	uint8_t bmAttributes;
+	uint16_t wBytesPerInterval;
+} __packed;
+
 /** USB Unicode (UTF16LE) String Descriptor defined in spec. Table 9-15 */
 struct usb_string_descriptor {
 	uint8_t bLength;

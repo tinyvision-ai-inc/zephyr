@@ -252,6 +252,18 @@ struct uvc_control_if_descriptor {
 	uint8_t baInterfaceNr_baInterfaceNr[1];
 } __packed;
 
+/** Interface Header Descriptor */
+struct uvc_interface_header_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint16_t bcdUVC;
+	uint16_t wTotalLength;
+	uint32_t dwClockFrequency;
+	uint8_t bInCollection;
+	uint8_t baInterfaceNr;
+} __packed;
+
 /** Input Terminal Descriptor */
 struct uvc_input_terminal_descriptor {
 	uint8_t bLength;
