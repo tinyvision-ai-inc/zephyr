@@ -1525,6 +1525,9 @@ static int usb23_init(const struct device *dev)
 	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, data->caps.mps0, 0);
 	__ASSERT_NO_MSG(err == 0);
 
+	/* Setup a TRB for the automatic endpoint. */
+	usb23_trb_chained(dev, ep_auto_cfg, (void *)ep_auto_addr, ep_auto_size);
+
 	return err;
 }
 
