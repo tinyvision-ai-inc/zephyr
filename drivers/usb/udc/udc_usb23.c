@@ -58,9 +58,7 @@ struct usb23_config {
 	void (*irq_clear_func)(void);
 
 	/* Custom parameters local to this driver */
-	uint32_t auto_enpoint;
-	uintptr_t auto_address;
-	size_t auto_size;
+	uint32_t auto_ep, auto_addr, auto_size;
 };
 
 /*
@@ -602,9 +600,10 @@ static void usb23_trb_chained(const struct device *dev,
 		.addr_lo = LO32((uintptr_t)&trb0),
 		.addr_hi = HI32((uintptr_t)&trb0),
 		.status = sizeof(trb0),
-		.ctrl = USB23_TRB_TRBCTRL_LINK_TRB | USB23_TRB_CTRL_HWO,
+		.ctrl = USB23_TRB_CTRL_TRBCTL_LINK_TRB | USB23_TRB_CTRL_HWO,
 	};
 
+	LOG_DBG("-> TRB ep=0x%02x CHAINED size=%d", ep_cfg->addr, size);
 	usb23_set_trb(dev, ep_cfg, 0, &trb0);
 	usb23_set_trb(dev, ep_cfg, 1, &trb1);
 	usb23_cmd_start_xfer(dev, ep_cfg);
@@ -707,7 +706,6 @@ static int usb23_trb_from_buf(const struct device *dev,
 static void usb23_xfer_process_queue(const struct device *dev,
 		struct udc_ep_config *const ep_cfg)
 {
-	const struct usb23_config *config = dev->config;
 	struct net_buf *buf;
 
 	if (ep_cfg->stat.halted) {
@@ -1394,9 +1392,10 @@ static int usb23_ep_enable(const struct device *dev,
  */
 static int usb23_init(const struct device *dev)
 {
+	const struct usb23_config *config = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_data *data = dev->data;
-	struct udc_ep_config *ep_cfg;
+	struct udc_ep_config *ep_cfg, *ep_auto_cfg;
 	uint32_t reg, core, rel;
 	int err = 0;
 
@@ -1496,7 +1495,8 @@ static int usb23_init(const struct device *dev)
 	__ASSERT_NO_MSG(err == 0);
 
 	/* Setup a TRB for the automatic endpoint. */
-	usb23_trb_chained(dev, ep_auto_cfg, (void *)ep_auto_addr, ep_auto_size);
+	ep_auto_cfg = udc_get_ep_cfg(dev, config->auto_ep);
+//	usb23_trb_chained(dev, ep_auto_cfg, (void *)config->auto_addr, config->auto_size);
 
 	return err;
 }
@@ -1632,8 +1632,9 @@ static const struct udc_api usb23_api = {
 		.speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),	\
 		.irq_enable_func = usb23_irq_enable,				\
 		.irq_clear_func = usb23_irq_clear,				\
-		.auto_enpoint = DT_INST_PROP(n, auto_endpoint),			\
-		.auto_address = DT_INST_PROP(n, auto_address),			\
+		.auto_ep = DT_INST_PROP_BY_IDX(n, auto_endpoint, 0),		\
+		.auto_addr = DT_INST_PROP_BY_IDX(n, auto_endpoint, 1),		\
+		.auto_size = DT_INST_PROP_BY_IDX(n, auto_endpoint, 2),		\
 	};									\
 										\
 	union usb23_evt usb23_dma_evt_buf_##n[USB23_EVT_NUM];			\
