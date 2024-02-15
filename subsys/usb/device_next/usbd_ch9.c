@@ -10,6 +10,7 @@
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/slist.h>
+#include <zephyr/usb/bos.h>
 
 #include "usbd_device.h"
 #include "usbd_desc.h"
@@ -27,6 +28,8 @@ LOG_MODULE_REGISTER(usbd_ch9, CONFIG_USBD_LOG_LEVEL);
 
 #define SF_TEST_MODE_SELECTOR(wIndex)		((uint8_t)((wIndex) >> 8))
 #define SF_TEST_LOWER_BYTE(wIndex)		((uint8_t)(wIndex))
+
+#define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
 
 static bool reqtype_is_to_host(const struct usb_setup_packet *const setup)
 {
@@ -353,8 +356,6 @@ static int sreq_set_feature(struct usbd_contex *const uds_ctx)
 	return ret;
 }
 
-#define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
-
 static int std_request_to_device(struct usbd_contex *const uds_ctx,
 				 struct net_buf *const buf)
 {
@@ -376,6 +377,10 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 		break;
 	CASE(USB_SREQ_SET_FEATURE);
 		ret = sreq_set_feature(uds_ctx);
+		break;
+	CASE(0x30);
+		LOG_ERR("TODO: implement STALL correctly in the driver!");
+		ret = 0;
 		break;
 	CASE(0x31);
 		LOG_ERR("TODO: implement STALL correctly in the driver!");
@@ -480,6 +485,27 @@ static int sreq_get_desc_cfg(struct usbd_contex *const uds_ctx,
 	return 0;
 }
 
+static int sreq_get_desc_bos(struct usbd_contex *const uds_ctx,
+			 struct net_buf *const buf)
+{
+	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+	struct usb_bos_descriptor *bos_desc;
+	size_t len;
+
+	bos_desc = usbd_get_descriptor(uds_ctx, USB_DESC_BOS, 0);
+	if (bos_desc == NULL) {
+		errno = -ENOTSUP;
+		return 0;
+	}
+
+	LOG_DBG("tailroom=%zd wLength=%zd wTotalLength=%zd",
+		net_buf_tailroom(buf), setup->wLength, bos_desc->wTotalLength);
+
+	len = MIN(setup->wLength, net_buf_tailroom(buf));
+	net_buf_add_mem(buf, bos_desc, MIN(len, bos_desc->wTotalLength));
+	return 0;
+}
+
 static int sreq_get_desc(struct usbd_contex *const uds_ctx,
 			 struct net_buf *const buf,
 			 const uint8_t type, const uint8_t idx)
@@ -516,20 +542,26 @@ static int sreq_get_descriptor(struct usbd_contex *const uds_ctx,
 		desc_type, desc_idx);
 
 	switch (desc_type) {
-	case USB_DESC_DEVICE:
+	CASE(USB_DESC_DEVICE);
 		return sreq_get_desc(uds_ctx, buf, USB_DESC_DEVICE, 0);
-	case USB_DESC_CONFIGURATION:
+	CASE(USB_DESC_CONFIGURATION);
 		return sreq_get_desc_cfg(uds_ctx, buf, desc_idx);
-	case USB_DESC_STRING:
+	CASE(USB_DESC_STRING);
 		return sreq_get_desc(uds_ctx, buf, USB_DESC_STRING, desc_idx);
-	case USB_DESC_DEVICE_QUALIFIER:
+	CASE(USB_DESC_DEVICE_QUALIFIER);
 		return sreq_get_desc(uds_ctx, buf, USB_DESC_DEVICE_QUALIFIER, 0);
-	case USB_DESC_BOS:
-		return sreq_get_desc(uds_ctx, buf, USB_DESC_BOS, 0);
-	case USB_DESC_INTERFACE:
-	case USB_DESC_ENDPOINT:
-	case USB_DESC_OTHER_SPEED:
+	CASE(USB_DESC_BOS);
+		return sreq_get_desc_bos(uds_ctx, buf);
+	CASE(USB_DESC_DEBUG);
+		return 0;
+	CASE(USB_DESC_INTERFACE);
+		break;
+	CASE(USB_DESC_ENDPOINT);
+		break;
+	CASE(USB_DESC_OTHER_SPEED);
+		break;
 	default:
+		LOG_ERR("%s: unsupported descriptor", __func__);
 		break;
 	}
 

@@ -120,6 +120,7 @@ static inline bool usb_reqtype_is_to_device(const struct usb_setup_packet *setup
 #define USB_DESC_INTERFACE_ASSOC	11
 #define USB_DESC_BOS			15
 #define USB_DESC_DEVICE_CAPABILITY	16
+#define USB_DESC_ENDPOINT_COMPANION	48
 
 /** Class-Specific Descriptor Types as defined by
  *  USB Common Class Specification
@@ -176,14 +177,6 @@ struct usb_device_qual_descriptor {
 	uint8_t reserved;
 } __packed;
 
-/** USB BOS Descriptor defined in spec. Table 9-12 */
-struct usb_bos_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint16_t wTotalLength;
-	uint8_t bNumDeviceCaps;
-} __packed;
-
 /** USB Standard Configuration Descriptor defined in spec. Table 9-10 */
 struct usb_cfg_descriptor {
 	uint8_t bLength;
@@ -234,6 +227,15 @@ struct usb_ep_descriptor {
 	};
 	uint16_t wMaxPacketSize;
 	uint8_t bInterval;
+} __packed;
+
+/** USB Endpoint Companion Descriptor as used by USB 3. */
+struct usb_ep_companion_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bMaxBurst;
+	uint8_t bmAttributes;
+	uint16_t wBytesPerInterval;
 } __packed;
 
 /** USB Unicode (UTF16LE) String Descriptor defined in spec. Table 9-15 */
