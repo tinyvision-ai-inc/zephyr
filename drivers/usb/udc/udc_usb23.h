@@ -117,7 +117,7 @@ union usb23_evt {
  * use-cases. This value might be good for every use-cases.
  */
 #define USB23_EVT_NUM				8
-#define USB23_TRB_NUM				2
+#define USB23_TRB_NUM				3
 
 /* Device Endpoint Commands and Parameters */
 #define USB23_DEPCMDPAR2(n)			(0xc800 + 16 * (n))
