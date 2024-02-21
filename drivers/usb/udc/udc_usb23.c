@@ -37,7 +37,7 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
 #define GETFIELD(reg, prefix) ((reg & prefix##_MASK) >> prefix##_SHIFT)
 
-#define USB23_XFER_BLOCK_SIZE		(4 * 1024)
+#define USB23_XFER_BLOCK_SIZE		(15 * 1024 * 1024)
 
 /*
  * Structure for holding controller configuration items that can remain in
