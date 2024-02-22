@@ -24,14 +24,15 @@ struct usbd_uvc_desc {
 
 	struct usb_if_descriptor if0;
 	struct uvc_interface_header_descriptor if0_vctl_hdr;
-	struct uvc_input_terminal_descriptor if0_vctl_in;
 	struct uvc_output_terminal_descriptor if0_vctl_out;
-	struct usb_ep_descriptor if0_ctl_ep;
-	struct usb_ep_companion_descriptor if0_ctl_ep_comp;
+	struct uvc_input_terminal_descriptor if0_vctl_in;
 
-	struct usb_ep_descriptor if1;
+	struct usb_if_descriptor if1;
+	struct uvc_stream_input_header_descriptor if1_stream_in;
+	struct uvc_uncompressed_format_descriptor if1_format;
+	struct uvc_uncompressed_frame_descriptor if1_frame0;
 
-	struct usb_ep_descriptor if2;
+	struct usb_if_descriptor if2;
 	struct usb_ep_descriptor if2_in_ep;
 	struct usb_ep_companion_descriptor if2_in_ep_comp;
 
@@ -88,7 +89,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bFirstInterface = 0,						\
 		.bInterfaceCount = 2,						\
 		.bFunctionClass = USB_BCC_VIDEO,				\
-		.bFunctionSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bFunctionSubClass = UVC_SC_VIDEO_INTERFACE_COLLECITON,		\
 		.bFunctionProtocol = UVC_PC_PROTOCOL_UNDEFINED,			\
 		.iFunction = 0,							\
 	},									\
@@ -98,9 +99,9 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
 		.bInterfaceNumber = 0,						\
 		.bAlternateSetting = 0,						\
-		.bNumEndpoints = 1,						\
+		.bNumEndpoints = 0,						\
 		.bInterfaceClass = USB_BCC_VIDEO,				\
-		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceSubClass = UVC_SC_VIDEOCONTROL,			\
 		.bInterfaceProtocol = 0,					\
 		.iInterface = 0,						\
 	},									\
@@ -121,47 +122,110 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 	},									\
 										\
 	.if0_vctl_out = {							\
-		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bLength = sizeof(struct uvc_output_terminal_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VC_OUTPUT_TERMINAL,			\
-		.bTerminalID = 1,						\
-		.wTerminalType = UVC_TT_STREAMING,				\
+		.bTerminalID = 2,						\
+		.wTerminalType = sys_cpu_to_le16(UVC_TT_STREAMING),		\
 		.bAssocTerminal = 0,						\
 		.bSourceID = 2,							\
 		.iTerminal = 0,							\
 	},									\
 										\
 	.if0_vctl_in = {							\
-		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bLength = sizeof(struct uvc_input_terminal_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VC_INPUT_TERMINAL,			\
-		.bTerminalID = 2,						\
-		.wTerminalType = UVC_ITT_CAMERA,				\
+		.bTerminalID = 1,						\
+		.wTerminalType = sys_cpu_to_le16(UVC_ITT_CAMERA),		\
 		.bAssocTerminal = 0,						\
 		.iTerminal = 0,							\
+		.wObjectiveFocalLengthMin = sys_cpu_to_le16(0),			\
+		.wObjectiveFocalLengthMax = sys_cpu_to_le16(0),			\
+		.wOcularFocalLength = sys_cpu_to_le16(0),			\
+		.bControlSize = 3,						\
+		.bmControls = { 0x00, 0x00, 0x00 },				\
 	},									\
 										\
-	.if0_ctl_ep = {								\
-		.bLength = sizeof(struct usb_ep_descriptor),			\
-		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x00,					\
-		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(UVC_DEFAULT_BULK_EP_MPS),	\
-		.bInterval = 0,							\
+	.if1 = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 1,						\
+		.bAlternateSetting = 0,						\
+		.bNumEndpoints = 0,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
 	},									\
 										\
-	.if0_ctl_ep_comp = {							\
-		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
-		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 0,							\
-		.bmAttributes = 0,						\
-		.wBytesPerInterval = 2,						\
+	.if1_stream_in = {							\
+		.bLength = sizeof(struct uvc_stream_input_header_descriptor),	\
+		.bDescriptorType = UVC_CS_INTERFACE,				\
+		.bDescriptorSubtype = UVC_VS_INPUT_HEADER,			\
+		.bNumFormats = 1,						\
+		.wTotalLength = sys_cpu_to_le16(				\
+			sizeof(struct uvc_stream_input_header_descriptor)	\
+			+ sizeof(struct uvc_uncompressed_format_descriptor)	\
+			+ sizeof(struct uvc_uncompressed_frame_descriptor)	\
+		),								\
+		.bEndpointAddress = 0x81,					\
+		.bmInfo = 0,							\
+		.bTerminalLink = 2,						\
+		.bStillCaptureMethod = 0,					\
+		.bTriggerSupport = 0,						\
+		.bTriggerUsage = 0,						\
+		.bControlSize = 1,						\
+		.bmaControls = { 0x00 },					\
+	},									\
+										\
+	.if1_format = {								\
+		.bLength = sizeof(struct uvc_uncompressed_format_descriptor),	\
+		.bDescriptorType = UVC_CS_INTERFACE,				\
+		.bDescriptorSubtype = UVC_VS_FORMAT_UNCOMPRESSED,		\
+		.bFormatIndex = 1,						\
+		.bNumFrameDescriptors = 1,					\
+		.guidFormat = { 0x59,0x55,0x59,0x32, 0x00,0x00, 0x10,0x00,	\
+			0x80,0x00, 0x00,0xAA,0x00,0x38,0x9B,0x71, },		\
+		.bBitsPerPixel = 16,						\
+		.bDefaultFrameIndex = 1,					\
+		.bAspectRatioX = 0,						\
+		.bAspectRatioY = 0,						\
+		.bmInterlaceFlags = 0x00,					\
+		.bCopyProtect = 0,						\
+	},									\
+										\
+	.if1_frame0 = {								\
+		.bLength = sizeof(struct uvc_uncompressed_frame_descriptor),	\
+		.bDescriptorType = UVC_CS_INTERFACE,				\
+		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,		\
+		.bFrameIndex = 1,						\
+		.bmCapabilities = 0x00,						\
+		.wWidth = sys_cpu_to_le16(640),					\
+		.wHeight = sys_cpu_to_le16(480),				\
+		.dwMinBitRate = sys_cpu_to_le32(15360000),			\
+		.dwMaxBitRate = sys_cpu_to_le32(15360000),			\
+		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(614400),		\
+		.dwDefaultFrameInterval = sys_cpu_to_le32(400000),		\
+		.bFrameIntervalType = 0,					\
+	},									\
+										\
+	.if2 = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 1,						\
+		.bAlternateSetting = 1,						\
+		.bNumEndpoints = 1,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
 	},									\
 										\
 	.if2_in_ep = {								\
 		.bLength = sizeof(struct usb_ep_descriptor),			\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x01,					\
+		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
 		.wMaxPacketSize = sys_cpu_to_le16(UVC_DEFAULT_BULK_EP_MPS),	\
 		.bInterval = 0,							\
@@ -172,7 +236,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
-		.wBytesPerInterval = 2,						\
+		.wBytesPerInterval = sys_cpu_to_le16(2),			\
 	},									\
 										\
 	.nil_desc = {								\

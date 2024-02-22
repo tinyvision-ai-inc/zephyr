@@ -273,7 +273,11 @@ struct uvc_input_terminal_descriptor {
 	uint16_t wTerminalType;
 	uint8_t bAssocTerminal;
 	uint8_t iTerminal;
-	uint8_t bExtraFields[1];
+	uint16_t wObjectiveFocalLengthMin;
+	uint16_t wObjectiveFocalLengthMax;
+	uint16_t wOcularFocalLength;
+	uint8_t bControlSize;
+	uint8_t bmControls[3];
 } __packed;
 
 /** Output Terminal Descriptor */
@@ -286,7 +290,6 @@ struct uvc_output_terminal_descriptor {
 	uint8_t bAssocTerminal;
 	uint8_t bSourceID;
 	uint8_t iTerminal;
-	uint8_t bExtraFields[1];
 } __packed;
 
 /** Camera Terminal Descriptor */
@@ -421,22 +424,41 @@ struct uvc_color_matching_descriptor {
 	uint8_t bMatrixCoefficients;
 } __packed;
 
-struct uvc_descriptors {
-	struct uvc_control_status_packet control_status_packet;
-	struct uvc_stream_status_packet stream_status_packet;
-	struct uvc_payload_header payload_header;
-	struct uvc_control_if_descriptor control_if_descriptor;
-	struct uvc_input_terminal_descriptor input_terminal_descriptor;
-	struct uvc_output_terminal_descriptor output_terminal_descriptor;
-	struct uvc_camerma_terminal_descriptor camerma_terminal_descriptor;
-	struct uvc_selector_unit_descriptor selector_unit_descriptor;
-	struct uvc_processing_unit_descriptor processing_unit_descriptor;
-	struct uvc_encoding_unit_descriptor encoding_unit_descriptor;
-	struct uvc_extension_unit_descriptor extension_unit_descriptor;
-	struct uvc_control_interrupt_ep_descriptor control_interrupt_ep_descriptor;
-	struct uvc_stream_input_header_descriptor stream_input_header_descriptor;
-	struct uvc_stream_output_header_descriptor stream_output_header_descriptor;
-	struct uvc_still_image_frame_descriptor still_image_frame_descriptor;
+/*
+ * Header follows the Class Definitions for Video Specification
+ * (USB_Video_Payload_Frame_Based.pdf).
+ */
+
+/** Uncompressed Video Format Descriptor */
+struct uvc_uncompressed_format_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint8_t bFormatIndex;
+	uint8_t bNumFrameDescriptors;
+	uint8_t guidFormat[16];
+	uint8_t bBitsPerPixel;
+	uint8_t bDefaultFrameIndex;
+	uint8_t bAspectRatioX;
+	uint8_t bAspectRatioY;
+	uint8_t bmInterlaceFlags;
+	uint8_t bCopyProtect;
+} __packed;
+
+/** Uncompressed Video Frame Descriptors */
+struct uvc_uncompressed_frame_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint8_t bFrameIndex;
+	uint8_t bmCapabilities;
+	uint16_t wWidth;
+	uint16_t wHeight;
+	uint32_t dwMinBitRate;
+	uint32_t dwMaxBitRate;
+	uint32_t dwMaxVideoFrameBufferSize;
+	uint32_t dwDefaultFrameInterval;
+	uint8_t bFrameIntervalType;
 } __packed;
 
 #endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_ */
