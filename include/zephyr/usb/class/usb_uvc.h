@@ -459,6 +459,33 @@ struct uvc_uncompressed_frame_descriptor {
 	uint32_t dwMaxVideoFrameBufferSize;
 	uint32_t dwDefaultFrameInterval;
 	uint8_t bFrameIntervalType;
+	uint32_t dwFrameInterval[1];
+} __packed;
+
+/** Video Probe and Commit Controls */
+struct uvc_vs_probe_control {
+	uint16_t bmHint;
+	uint8_t bFormatIndex;
+	uint8_t bFrameIndex;
+	uint32_t dwFrameInterval;
+	uint16_t wKeyFrameRate;
+	uint16_t wPFrameRate;
+	uint16_t wCompQuality;
+	uint16_t wCompWindowSize;
+	uint16_t wDelay;
+	uint32_t dwMaxVideoFrameSize;
+	uint32_t dwMaxPayloadTransferSize;
+	uint32_t dwClockFrequency;
+	uint8_t bmFramingInfo;
+	uint8_t bPreferedVersion;
+	uint8_t bMinVersion;
+	uint8_t bMaxVersion;
+	uint8_t bUsage;
+	uint8_t bBitDepthLuma;
+	uint8_t bmSettings;
+	uint8_t bMaxNumberOfRefFramesPlus1;
+	uint16_t bmRateControlModes;
+	uint8_t bmLayoutPerStream[8];
 } __packed;
 
 #endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_ */
