@@ -356,6 +356,38 @@ static int sreq_set_feature(struct usbd_contex *const uds_ctx)
 	return ret;
 }
 
+static int sreq_set_sel(struct usbd_contex *const uds_ctx,
+		struct net_buf *const buf)
+{
+	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+	struct udc_exit_latency el;
+
+	if (setup->wValue != 0 || setup->wIndex != 0 || setup->wLength != 6) {
+		LOG_ERR("invalid command parameters");
+		errno = -ENOTSUP;
+		return 0;
+	}
+
+	if (buf->len != setup->wLength) {
+		LOG_ERR("actual buffer length %d mis-matching wLength %d",
+			buf->len, setup->wLength);
+		errno = -ENOTSUP;
+		return 0;
+	}
+
+	memcpy(&el, buf->data, sizeof(el));
+	el.u2sel = sys_le16_to_cpu(el.u2sel);
+	el.u2pel = sys_le16_to_cpu(el.u2pel);
+
+	return udc_set_exit_latency(uds_ctx->dev, &el);
+}
+
+static int sreq_set_isoch_delay(struct usbd_contex *const uds_ctx)
+{
+	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+	return 0;
+}
+
 static int std_request_to_device(struct usbd_contex *const uds_ctx,
 				 struct net_buf *const buf)
 {
@@ -378,13 +410,11 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 	CASE(USB_SREQ_SET_FEATURE);
 		ret = sreq_set_feature(uds_ctx);
 		break;
-	CASE(0x30);
-		LOG_ERR("TODO: implement STALL correctly in the driver!");
-		ret = 0;
+	CASE(USB_SREQ_SET_SEL);
+		ret = sreq_set_sel(uds_ctx, buf);
 		break;
-	CASE(0x31);
-		LOG_ERR("TODO: implement STALL correctly in the driver!");
-		ret = 0;
+	CASE(USB_SREQ_SET_ISOCH_DELAY);
+		ret = sreq_set_isoch_delay(uds_ctx);
 		break;
 	default:
 		errno = -ENOTSUP;
