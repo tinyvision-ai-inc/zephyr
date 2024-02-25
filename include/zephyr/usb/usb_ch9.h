@@ -104,6 +104,20 @@ static inline bool usb_reqtype_is_to_device(const struct usb_setup_packet *setup
 #define USB_SREQ_GET_INTERFACE		0x0A
 #define USB_SREQ_SET_INTERFACE		0x0B
 #define USB_SREQ_SYNCH_FRAME		0x0C
+/** Additional Descriptor Types defined in USB 3 spec. Table 9-4 */
+#define USB_SREQ_SET_ENCRYPTION		0x0D
+#define USB_SREQ_GET_ENCRYPTION		0x0E
+#define USB_SREQ_SET_HANDSHAKE		0x0F
+#define USB_SREQ_GET_HANDSHAKE		0x10
+#define USB_SREQ_SET_CONNECTION		0x11
+#define USB_SREQ_SET_SECURITY_DATA	0x12
+#define USB_SREQ_GET_SECURITY_DATA	0x13
+#define USB_SREQ_SET_WUSB_DATA		0x14
+#define USB_SREQ_LOOPBACK_DATA_WRITE	0x15
+#define USB_SREQ_LOOPBACK_DATA_READ	0x16
+#define USB_SREQ_SET_INTERFACE_DS	0x17
+#define USB_SREQ_SET_SEL		0x30
+#define USB_SREQ_SET_ISOCH_DELAY	0x31
 
 /** Descriptor Types defined in spec. Table 9-5 */
 #define USB_DESC_DEVICE			1

@@ -64,6 +64,20 @@ enum udc_bus_speed {
 };
 
 /**
+ * @brief USB 3.x link-level latency values for the current session
+ *
+ * These values are communicated from the host to the device, so that the
+ * device can configure the hardware to match what is on the host.
+ * That way, both side of the session have the same properties.
+ */
+struct udc_exit_latency {
+	uint8_t u1sel;
+	uint8_t u1pel;
+	uint16_t u2sel;
+	uint16_t u2pel;
+} __packed;
+
+/**
  * USB device controller endpoint capabilities
  */
 struct udc_ep_caps {
@@ -242,6 +256,8 @@ struct udc_api {
 	int (*host_wakeup)(const struct device *dev);
 	int (*set_address)(const struct device *dev,
 			   const uint8_t addr);
+	int (*set_exit_latency)(const struct device *dev,
+				const struct udc_exit_latency *ll);
 	int (*test_mode)(const struct device *dev,
 			 const uint8_t mode, const bool dryrun);
 	int (*enable)(const struct device *dev);
@@ -479,6 +495,40 @@ static inline int udc_test_mode(const struct device *dev,
 	if (api->test_mode != NULL) {
 		api->lock(dev);
 		ret = api->test_mode(dev, mode, dryrun);
+		api->unlock(dev);
+	} else {
+		ret = -ENOTSUP;
+	}
+
+	return ret;
+}
+
+/**
+ * @brief Set USB3 U1/P1 U2/P2 link latency.
+ *
+ * USB3 defines link latencies values, and the host is expected to configure
+ * these parameters for the device through a SET_SEL command, defined in
+ * USB 3.2 R1 document (section 9.4.12).
+ *
+ * @param[in] dev    Pointer to device struct of the driver instance
+ * @param[in] dev    Pointer to struct with the latency values from the host
+ *
+ * @return 0 on success, all other values should be treated as error.
+ * @retval -EPERM controller is not enabled (or not initialized)
+ */
+static inline int udc_set_exit_latency(const struct device *dev,
+					      const struct udc_exit_latency *ll)
+{
+	const struct udc_api *api = dev->api;
+	int ret;
+
+	if (!udc_is_enabled(dev)) {
+		return -EPERM;
+	}
+
+	if (api->set_exit_latency != NULL) {
+		api->lock(dev);
+		ret = api->set_exit_latency(dev, ll);
 		api->unlock(dev);
 	} else {
 		ret = -ENOTSUP;
