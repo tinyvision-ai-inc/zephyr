@@ -228,4 +228,11 @@ config GPIO_I2C_SWITCH
 	help
 	  Enable GPIO controlled I2C bus switch driver.
 
+config I2C_PCA954X
+	bool "PCA954X I2C addressable switch"
+	default y
+	depends on DT_HAS_NXP_PCA9542A_ENABLED
+	help
+	  Enable PCA954X I2C bus switch
+
 endif # I2C
