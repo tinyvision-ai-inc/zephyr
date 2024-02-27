@@ -404,6 +404,35 @@ void usb23_dump_trbs(const struct device *dev)
 	}
 }
 
+void usb23_dump_fifo_reg(const struct device *dev, int i, uint32_t type,
+		char const *name)
+{
+	uint32_t reg;
+	
+	usb23_io_write(dev, USB23_GDBGFIFOSPACE,
+		type | (i << USB23_GDBGFIFOSPACE_QUEUENUM_SHIFT));
+	reg = usb23_io_read(dev, USB23_GDBGFIFOSPACE);
+	LOG_DBG("FIFO[%d].%s len=%ld", i, name,
+		GETFIELD(reg, USB23_GDBGFIFOSPACE_AVAILABLE));
+}
+
+void usb23_dump_fifo_space(const struct device *dev,
+		struct udc_ep_config *const ep_cfg)
+{
+	int epn = usb23_get_ep_physical_num(ep_cfg);
+
+	LOG_DBG("FIFOSPACE");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_TX, "TX");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RX, "RX");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_TXREQ, "TXREQ");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RXREQ, "RXREQ");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RXINFO, "RXINFO");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, "DESCFETCH");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_WREVENT, "WREVENT");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, "AUXEVENT");
+	usb23_dump_fifo_reg(dev, 2, USB23_GDBGFIFOSPACE_QUEUETYPE_PROTOCOL, "PROTOCOL");
+}
+
 /*------------------------------------------------------------------------------
 --  Commands
 --------------------------------------------------------------------------------
@@ -603,9 +632,11 @@ static void usb23_trb_single_buf(const struct device *dev,
 
 	usb23_set_trb(dev, ep_cfg, &trb);
 	usb23_dump_trb0(dev, ep_cfg);
+	usb23_dump_fifo_space(dev, ep_cfg);
 	usb23_dump_registers(dev);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
 	usb23_dump_trb0(dev, ep_cfg);
+	usb23_dump_fifo_space(dev, ep_cfg);
 	usb23_dump_registers(dev);
 }
 
