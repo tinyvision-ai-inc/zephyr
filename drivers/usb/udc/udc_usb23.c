@@ -476,7 +476,7 @@ static uint32_t usb23_depcmd(const struct device *dev, uint32_t addr, uint32_t c
 		LOG_ERR("Command failed with unknown status: 0x%08x", reg);
 	}
 
-	return GETFIELD(reg, USB23_DEPCMD_XFERRSCIDX);
+	return reg & USB23_DEPCMD_XFERRSCIDX_MASK;
 }
 
 static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
@@ -1177,6 +1177,7 @@ static void usb23_on_event(struct k_work *work)
 	/* Process each pending event from the list */
 	while (usb23_io_read(dev, USB23_GEVNTCOUNT(0)) > 0) {
 		LOG_DBG("");
+		LOG_DBG("EVENT");
 		union usb23_evt evt = usb23_get_next_evt(dev);
 
 		/* We can already release the resource now that we copied it */
@@ -1524,10 +1525,6 @@ static int usb23_init(const struct device *dev)
 	/* Configure the control IN endpoint */
 	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, data->caps.mps0, 0);
 	__ASSERT_NO_MSG(err == 0);
-
-	/* Setup a TRB for the automatic endpoint. */
-	ep_auto_cfg = udc_get_ep_cfg(dev, config->auto_ep);
-//	usb23_trb_chained(dev, ep_auto_cfg, (void *)config->auto_addr, config->auto_size);
 
 	return err;
 }
