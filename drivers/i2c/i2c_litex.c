@@ -129,7 +129,7 @@ static const struct i2c_driver_api i2c_litex_driver_api = {
 			   NULL,					       \
 			   &i2c_bitbang_##n,	                               \
 			   &i2c_litex_cfg_##n,				       \
-			   POST_KERNEL,					       \
+			   PRE_KERNEL_1,				       \
 			   CONFIG_I2C_INIT_PRIORITY,			       \
 			   &i2c_litex_driver_api			       \
 			   );
