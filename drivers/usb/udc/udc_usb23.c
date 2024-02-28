@@ -447,7 +447,7 @@ static uint32_t usb23_cmd(const struct device *dev, uint32_t addr,
 	case USB23_DEPCMD_STATUS_OK:
 		break;
 	case USB23_DEPCMD_STATUS_CMDERR:
-		LOG_ERR("Command failed");
+		LOG_ERR("Command failed cmd=0x%04x addr=%p", cmd, addr);
 		break;
 	default:
 		LOG_ERR("Command failed with unknown status: 0x%08x", reg);
@@ -601,7 +601,7 @@ static void usb23_trb_single(const struct device *dev,
 		.ctrl = ctrl | USB23_TRB_CTRL_HWO | USB23_TRB_CTRL_LST,
 	};
 
-	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
+	LOG_DBG("%s: ep=0x%02x data=0x%x", __func__, ep_cfg->addr, data);
 	usb23_set_trb(dev, ep_cfg, 0, &trb);
 	usb23_cmd_start_xfer(dev, ep_cfg);
 }
@@ -722,9 +722,6 @@ static int usb23_trb_from_buf(const struct device *dev,
 		} else {
 			__ASSERT_NO_MSG(false);
 		}
-	} else if (ep_cfg->addr == config->auto_ep) {
-		usb23_trb_repeated(dev, ep_cfg, ep_data->buf->data);
-		ep_data->repeat = true;
 	} else {
 		usb23_trb_normal(dev, ep_cfg, ep_data->buf->data, n);
 	}
@@ -1136,14 +1133,10 @@ static void usb23_on_xfer_complete(const struct device *dev,
 	}
 
 	__ASSERT_NO_MSG(buf != NULL);
-	__ASSERT_NO_MSG((uintptr_t)buf->data == U64(trb.addr_hi, trb.addr_lo));
 	__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
-//	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK ==
-//			USB23_TRB_STATUS_TRBSTS_OK);
 
 	buf->len = buf->size - GETFIELD(trb.status, USB23_TRB_STATUS_BUFSIZ);
-	LOG_HEXDUMP_DBG(buf->data, buf->len, "BUFFER");
 
 	switch (trb.ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
 	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
