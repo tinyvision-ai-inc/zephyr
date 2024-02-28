@@ -17,7 +17,6 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
-#define UVC_DEFAULT_BULK_EP_MPS 0
 #define CASE(x) case x: LOG_DBG(#x)
 
 struct usbd_uvc_data {
@@ -313,7 +312,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(UVC_DEFAULT_BULK_EP_MPS),	\
+		.wMaxPacketSize = sys_cpu_to_le16(1024),			\
 		.bInterval = 0,							\
 	},									\
 										\
@@ -322,7 +321,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
-		.wBytesPerInterval = sys_cpu_to_le16(2),			\
+		.wBytesPerInterval = sys_cpu_to_le16(0),			\
 	},									\
 										\
 	.nil_desc = {								\

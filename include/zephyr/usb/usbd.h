@@ -286,7 +286,7 @@ struct usbd_class_node {
 	desc_##device_name = {						\
 		.bLength = sizeof(struct usb_device_descriptor),	\
 		.bDescriptorType = USB_DESC_DEVICE,			\
-		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_1),			\
+		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_2),			\
 		.bDeviceClass = USB_BCC_MISCELLANEOUS,			\
 		.bDeviceSubClass = 2,					\
 		.bDeviceProtocol = 1,					\
@@ -310,7 +310,7 @@ struct usbd_class_node {
 	qual_desc_##name = {						\
 		.bLength = sizeof(struct usb_device_qual_descriptor),	\
 		.bDescriptorType = USB_DESC_DEVICE_QUALIFIER,		\
-		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_1),			\
+		.bcdUSB = sys_cpu_to_le16(USB_SRN_3_2),			\
 		.bDeviceClass = USB_BCC_MISCELLANEOUS,			\
 		.bDeviceSubClass = 2,					\
 		.bDeviceProtocol = 1,					\

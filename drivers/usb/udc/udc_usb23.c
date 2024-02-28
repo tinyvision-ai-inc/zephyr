@@ -430,6 +430,7 @@ void usb23_dump_fifo_space(const struct device *dev,
 	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, "DESCFETCH");
 	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_WREVENT, "WREVENT");
 	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, "AUXEVENT");
+	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, "AUXEVENT");
 	usb23_dump_fifo_reg(dev, 2, USB23_GDBGFIFOSPACE_QUEUETYPE_PROTOCOL, "PROTOCOL");
 }
 
@@ -631,13 +632,7 @@ static void usb23_trb_single_buf(const struct device *dev,
 	};
 
 	usb23_set_trb(dev, ep_cfg, &trb);
-	usb23_dump_trb0(dev, ep_cfg);
-	usb23_dump_fifo_space(dev, ep_cfg);
-	usb23_dump_registers(dev);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
-	usb23_dump_trb0(dev, ep_cfg);
-	usb23_dump_fifo_space(dev, ep_cfg);
-	usb23_dump_registers(dev);
 }
 
 static void usb23_trb_normal(const struct device *dev,
@@ -1196,7 +1191,6 @@ static void usb23_on_endpoint_event(const struct device *dev,
 		CASE(USB23_DEPEVT_STATUS_B3_CONTROL_DATA);
 			break;
 		CASE(USB23_DEPEVT_STATUS_B3_CONTROL_STATUS);
-			usb23_dump_registers(dev);
 			break;
 		}
 
@@ -1553,8 +1547,6 @@ static int usb23_init(const struct device *dev)
 	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL,
 		ep_cfg->mps, 0);
 	__ASSERT_NO_MSG(err == 0);
-
-	usb23_dump_registers(dev);
 
 	return err;
 }

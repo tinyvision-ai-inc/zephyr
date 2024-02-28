@@ -294,6 +294,7 @@ struct usb_association_descriptor {
 #define USB_SRN_2_1			0x0210
 #define USB_SRN_3_0			0x0300
 #define USB_SRN_3_1			0x0310
+#define USB_SRN_3_2			0x0320
 
 #define USB_DEC_TO_BCD(dec)	((((dec) / 10) << 4) | ((dec) % 10))
 
