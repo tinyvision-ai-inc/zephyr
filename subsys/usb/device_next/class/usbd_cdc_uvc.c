@@ -88,7 +88,7 @@ void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
 	}
 
 	LOG_DBG("%s buf=%p err=ok", __func__, buf);
-	return;
+
 err:
 	net_buf_unref(buf);
 }
