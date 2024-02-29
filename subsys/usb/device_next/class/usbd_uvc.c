@@ -33,12 +33,10 @@ struct usbd_uvc_desc {
 
 	struct usb_if_descriptor if1;
 	struct uvc_stream_input_header_descriptor if1_stream_in;
+	struct usb_ep_descriptor if1_in_ep;
+	struct usb_ep_companion_descriptor if1_in_ep_comp;
 	struct uvc_uncompressed_format_descriptor if1_format;
 	struct uvc_uncompressed_frame_descriptor if1_frame0;
-
-	struct usb_if_descriptor if2;
-	struct usb_ep_descriptor if2_in_ep;
-	struct usb_ep_companion_descriptor if2_in_ep_comp;
 
 	struct usb_desc_header nil_desc;
 } __packed;
@@ -194,7 +192,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bLength = sizeof(struct uvc_interface_header_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VC_HEADER,				\
-		.bcdUVC = 0x0150,						\
+		.bcdUVC = 0x0110,						\
 		.wTotalLength = sys_cpu_to_le16(				\
 			sizeof(struct uvc_interface_header_descriptor)		\
 			+ sizeof(struct uvc_input_terminal_descriptor)		\
@@ -295,28 +293,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
 	},									\
 										\
-	.if2 = {								\
-		.bLength = sizeof(struct usb_if_descriptor),			\
-		.bDescriptorType = USB_DESC_INTERFACE,				\
-		.bInterfaceNumber = 1,						\
-		.bAlternateSetting = 1,						\
-		.bNumEndpoints = 1,						\
-		.bInterfaceClass = USB_BCC_VIDEO,				\
-		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
-		.bInterfaceProtocol = 0,					\
-		.iInterface = 0,						\
-	},									\
-										\
-	.if2_in_ep = {								\
-		.bLength = sizeof(struct usb_ep_descriptor),			\
-		.bDescriptorType = USB_DESC_ENDPOINT,				\
-		.bEndpointAddress = 0x81,					\
-		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(1024),			\
-		.bInterval = 0,							\
-	},									\
-										\
-	.if2_in_ep_comp = {							\
+	.if1_in_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
@@ -339,7 +316,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 										\
 	UVC_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_uvc_data usbd_uvc_data_##n = {			        \
+	static struct usbd_uvc_data usbd_uvc_data_##n = {		        \
 		.vs_probe_control = {						\
 			.bFormatIndex = 1,					\
 			.bFrameIndex = 1,					\
