@@ -129,7 +129,7 @@ static int pca954x_root_init(const struct device *dev)
 		gpio_pin_set_dt(&config->reset_gpios, 0);
 	}
 
-	i2c_pca954x->selected_chan = 0;
+	i2c_pca954x->selected_chan = (uint8_t) -1;
 
 	return 0;
 }
