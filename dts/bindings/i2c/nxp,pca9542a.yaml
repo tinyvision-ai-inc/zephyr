@@ -1,0 +1,62 @@
+# Binding for NXP PCA9542A
+
+description: NXP PCA9542A binding
+
+compatible: "nxp,pca9542a"
+
+description: |
+  PCA9542 I2C switch
+
+  Each channel is represented by a separate devicetree child node.
+  The channel node can then be used as a standard i2c bus controller
+  like in the following simplified example:
+
+      /* The pca954x node must be a child of an i2c controller */
+      mux: pca9542a@70 {
+          compatible = "nxp,pca9542a";
+          reg = <0x70>;
+          status = "okay";
+          #address-cells = <1>;
+          #size-cells = <0>;
+          reset-gpios = <&gpio5 3 GPIO_ACTIVE_LOW>;
+
+          mux_i2c@0 {
+              compatible: "nxp,pca954x-channel"
+              reg = <0>;
+              #address-cells = <1>;
+              #size-cells = <0>;
+
+              temp_sens_0: tmp116@49 {
+                  compatible = "ti,tmp116";
+                  reg = <0x49>;
+              };
+          };
+
+          mux_i2c@1 {
+              compatible: "nxp,pca954x-channel"
+              reg = <1>;
+              #address-cells = <1>;
+              #size-cells = <0>;
+
+              temp_sens_1: tmp116@49 {
+                  compatible = "ti,tmp116";
+                  reg = <0x49>;
+              };
+          };
+      };
+
+include: [i2c-device.yaml]
+
+properties:
+  reset-gpios:
+    type: phandle-array
+    description: |
+      GPIO connected to the controller RESET pin. This pin is active-low.
+
+child-binding:
+  description: PCA954x I2C switch channel node
+  include: [i2c-controller.yaml]
+  on-bus: i2c
+
+child-binding:
+  compatible: "nxp,pca9542a-channel"
