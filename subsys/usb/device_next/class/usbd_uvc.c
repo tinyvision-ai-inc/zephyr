@@ -26,17 +26,19 @@ struct usbd_uvc_data {
 struct usbd_uvc_desc {
 	struct usb_association_descriptor iad_uvc;
 
-	struct usb_if_descriptor if0;
-	struct uvc_interface_header_descriptor if0_vctl_hdr;
-	struct uvc_output_terminal_descriptor if0_vctl_out;
-	struct uvc_input_terminal_descriptor if0_vctl_in;
+	struct usb_if_descriptor			if0;
+	struct uvc_interface_header_descriptor		if0_vctl_hdr;
+	struct uvc_output_terminal_descriptor		if0_vctl_out;
+	struct uvc_input_terminal_descriptor		if0_vctl_in;
 
-	struct usb_if_descriptor if1;
-	struct uvc_stream_input_header_descriptor if1_stream_in;
-	struct usb_ep_descriptor if1_in_ep;
-	struct usb_ep_companion_descriptor if1_in_ep_comp;
-	struct uvc_uncompressed_format_descriptor if1_format;
-	struct uvc_uncompressed_frame_descriptor if1_frame0;
+	struct usb_if_descriptor			if1_alt0;
+	struct uvc_stream_input_header_descriptor	if1_alt0_stream_in;
+	struct uvc_uncompressed_format_descriptor	if1_alt0_format;
+	struct uvc_uncompressed_frame_descriptor	if1_alt0_frame0;
+
+	struct usb_if_descriptor			if1_alt1;
+	struct usb_ep_descriptor			if1_alt1_in_ep;
+	struct usb_ep_companion_descriptor		if1_alt1_in_ep_comp;
 
 	struct usb_desc_header nil_desc;
 } __packed;
@@ -108,7 +110,7 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 	const struct device *dev = c_nd->data->priv;
 	struct usbd_uvc_data *data = dev->data;
 	void *val;
-	size_t len;
+	size_t size;
 
 	LOG_DBG("%s: bRequest=%d wValue=%d wIndex=%d wLength=%d", __func__,
 		setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
@@ -118,7 +120,7 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 	switch (setup->wValue >> 8) {
 	CASE(UVC_VS_PROBE_CONTROL);
 		val = &data->vs_probe_control;
-		len = sizeof(data->vs_probe_control);
+		size = sizeof(data->vs_probe_control);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
@@ -126,19 +128,19 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 		return 0;
 	}
 
-	if (len != setup->wLength) {
-		LOG_WRN("%s: len=%d wLength=%d partial write not allowed",
-			__func__, len, setup->wLength);
-		errno = -ENOTSUP;
+	if (size != setup->wLength) {
+		LOG_ERR("%s: size=%d wLength=%d partial write not allowed",
+			__func__, size, setup->wLength);
+		//errno = -ENOTSUP;
 		return 0;
 	}
 
 	switch (setup->bRequest) {
 	CASE(UVC_SET_CUR);
-		memcpy(val, buf->data, len);
+		memcpy(val, buf->data, size);
 		break;
         default:
-		LOG_WRN("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
+		LOG_ERR("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
 		errno = -ENOTSUP;
 		return 0;
         }
@@ -187,12 +189,11 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bInterfaceProtocol = 0,					\
 		.iInterface = 0,						\
 	},									\
-										\
 	.if0_vctl_hdr = {							\
 		.bLength = sizeof(struct uvc_interface_header_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VC_HEADER,				\
-		.bcdUVC = 0x0110,						\
+		.bcdUVC = 0x0150,						\
 		.wTotalLength = sys_cpu_to_le16(				\
 			sizeof(struct uvc_interface_header_descriptor)		\
 			+ sizeof(struct uvc_input_terminal_descriptor)		\
@@ -202,7 +203,6 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bInCollection = 1,						\
 		.baInterfaceNr = 1,						\
 	},									\
-										\
 	.if0_vctl_out = {							\
 		.bLength = sizeof(struct uvc_output_terminal_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
@@ -213,7 +213,6 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bSourceID = 1,							\
 		.iTerminal = 0,							\
 	},									\
-										\
 	.if0_vctl_in = {							\
 		.bLength = sizeof(struct uvc_input_terminal_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
@@ -228,8 +227,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bControlSize = 3,						\
 		.bmControls = { 0x00, 0x00, 0x00 },				\
 	},									\
-										\
-	.if1 = {								\
+	.if1_alt0 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
 		.bInterfaceNumber = 1,						\
@@ -240,8 +238,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bInterfaceProtocol = 0,					\
 		.iInterface = 0,						\
 	},									\
-										\
-	.if1_stream_in = {							\
+	.if1_alt0_stream_in = {							\
 		.bLength = sizeof(struct uvc_stream_input_header_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_INPUT_HEADER,			\
@@ -260,8 +257,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bControlSize = 1,						\
 		.bmaControls = { 0x00 },					\
 	},									\
-										\
-	.if1_format = {								\
+	.if1_alt0_format = {							\
 		.bLength = sizeof(struct uvc_uncompressed_format_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_FORMAT_UNCOMPRESSED,		\
@@ -276,8 +272,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bmInterlaceFlags = 0x00,					\
 		.bCopyProtect = 0,						\
 	},									\
-										\
-	.if1_frame0 = {								\
+	.if1_alt0_frame0 = {							\
 		.bLength = sizeof(struct uvc_uncompressed_frame_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,		\
@@ -293,7 +288,26 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
 	},									\
 										\
-	.if1_in_ep_comp = {							\
+	.if1_alt1 = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 1,						\
+		.bAlternateSetting = 0,						\
+		.bNumEndpoints = 0,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
+	},									\
+	.if1_alt1_in_ep = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x81,					\
+		.bmAttributes = USB_EP_TYPE_BULK,				\
+		.wMaxPacketSize = sys_cpu_to_le16(1024),			\
+		.bInterval = 0,							\
+	},									\
+	.if1_alt1_in_ep_comp = {						\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\

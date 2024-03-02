@@ -307,6 +307,8 @@ struct usb23_reg usb23_regs[] = {
 	R(GHWPARAMS0), R(GHWPARAMS1), R(GHWPARAMS2), R(GHWPARAMS3),
 	R(GHWPARAMS4), R(GHWPARAMS5), R(GHWPARAMS6), R(GHWPARAMS7),
 	R(GHWPARAMS8),
+
+#undef R
 };
 
 void usb23_dump_registers(const struct device *dev)
@@ -322,6 +324,15 @@ void usb23_dump_registers(const struct device *dev)
 				ureg->addr, data, ureg->last, ureg->name);
 			ureg->last = data;
 		}
+	}
+}
+
+void usb23_dump_bus_error(const struct device *dev)
+{
+	if (usb23_io_read(dev, USB23_GSTS) & USB23_GSTS_BUSERRADDRVLD) {
+		LOG_ERR("BUS_ERROR addr=0x%08x%08x",
+			usb23_io_read(dev, USB23_GBUSERRADDR_HI),
+			usb23_io_read(dev, USB23_GBUSERRADDR_LO));
 	}
 }
 
@@ -408,32 +419,34 @@ void usb23_dump_trbs(const struct device *dev)
 	}
 }
 
-void usb23_dump_fifo_reg(const struct device *dev, int i, uint32_t type, char const *name)
+void usb23_dump_fifo_space(const struct device *dev)
 {
-	uint32_t reg;
-	
-	usb23_io_write(dev, USB23_GDBGFIFOSPACE,
-		type | (i << USB23_GDBGFIFOSPACE_QUEUENUM_SHIFT));
-	reg = usb23_io_read(dev, USB23_GDBGFIFOSPACE);
-	LOG_DBG("FIFO[%d].%s len=%ld", i, name,
-		GETFIELD(reg, USB23_GDBGFIFOSPACE_AVAILABLE));
-}
+	struct {
+		char *name;
+		uint32_t reg;
+		int num;
+	} fifo[] = {
+#define R(r, n) { .name = #r, .reg = USB23_GDBGFIFOSPACE_QUEUETYPE_##r, .num = n }
+		R(TX, 0), R(RX, 0), R(TXREQ, 0), R(RXREQ, 0), R(RXINFO, 0), R(DESCFETCH, 0),
+		R(TX, 1), R(RX, 1), R(TXREQ, 1), R(RXREQ, 1), R(RXINFO, 1), R(DESCFETCH, 1),
+		R(PROTOCOL,2),
+#undef R
+	};
 
-void usb23_dump_fifo_space(const struct device *dev, struct udc_ep_config *const ep_cfg)
-{
-	int epn = usb23_get_ep_physical_num(ep_cfg);
-
-	LOG_DBG("FIFOSPACE");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_TX, "TX");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RX, "RX");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_TXREQ, "TXREQ");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RXREQ, "RXREQ");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_RXINFO, "RXINFO");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, "DESCFETCH");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_WREVENT, "WREVENT");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, "AUXEVENT");
-	usb23_dump_fifo_reg(dev, epn, USB23_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, "AUXEVENT");
-	usb23_dump_fifo_reg(dev, 2, USB23_GDBGFIFOSPACE_QUEUETYPE_PROTOCOL, "PROTOCOL");
+	for (size_t i = 0; i < sizeof(fifo) / sizeof(*fifo); i++) {
+		usb23_io_write(dev, USB23_GDBGFIFOSPACE,
+			fifo[i].reg | (fifo[i].num << USB23_GDBGFIFOSPACE_QUEUENUM_SHIFT));
+		fifo[i].reg = GETFIELD(usb23_io_read(dev, USB23_GDBGFIFOSPACE),
+			USB23_GDBGFIFOSPACE_AVAILABLE);
+	}
+	LOG_DBG("fifo %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d %s=%d",
+		fifo[0].name, fifo[0].reg, fifo[1].name, fifo[1].reg,
+		fifo[2].name, fifo[2].reg, fifo[3].name, fifo[3].reg,
+		fifo[4].name, fifo[4].reg, fifo[5].name, fifo[5].reg,
+		fifo[6].name, fifo[6].reg, fifo[7].name, fifo[7].reg,
+		fifo[8].name, fifo[8].reg, fifo[9].name, fifo[9].reg,
+		fifo[10].name, fifo[10].reg, fifo[11].name, fifo[11].reg,
+		fifo[12].name, fifo[12].reg);
 }
 
 /*------------------------------------------------------------------------------
@@ -703,22 +716,24 @@ static void usb23_trb_ctrl_data(const struct device *dev, struct udc_ep_config *
 
 static void usb23_trb_ctrl_status_2(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
+	struct usb23_data *priv = udc_get_private(dev);
 	uint32_t ctrl = 0;
 
-	LOG_DBG("-> TRB ep=0x%02x CONTROL_STATUS_2 size=%d", ep_cfg->addr, 0);
+	LOG_DBG("-> TRB ep=0x%02x CONTROL_STATUS_2", ep_cfg->addr);
 	ctrl |= USB23_TRB_CTRL_LST;
 	ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2;
-	usb23_trb_single_buf(dev, ep_cfg, NULL, 0, ctrl);
+	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0, ctrl);
 }
 
 static void usb23_trb_ctrl_status_3(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
+	struct usb23_data *priv = udc_get_private(dev);
 	uint32_t ctrl = 0;
 
-	LOG_DBG("-> TRB ep=0x%02x CONTROL_STATUS_3 size=%d", ep_cfg->addr, 0);
+	LOG_DBG("-> TRB ep=0x%02x CONTROL_STATUS_3", ep_cfg->addr);
 	ctrl |= USB23_TRB_CTRL_LST;
 	ctrl |= USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
-	usb23_trb_single_buf(dev, ep_cfg, NULL, 0, ctrl);
+	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0, ctrl);
 }
 
 /*------------------------------------------------------------------------------
@@ -1140,7 +1155,7 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 		net_buf_add_mem(buf, priv->ctrl_buf, priv->ctrl_size - bufsiz);
 	}
 
-	LOG_DBG("%s: buf=0x%p len=%d size=%d", __func__, buf, buf->len, buf->size);
+	LOG_DBG("%s: buf=0x%p len=%d", __func__, buf, buf->len);
 	__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
 	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK) ==
@@ -1208,7 +1223,6 @@ static void usb23_on_event(struct k_work *work)
 		LOG_DBG("");
 		union usb23_evt evt = usb23_get_next_evt(dev);
 
-
 		/* We can already release the resource now that we copied it */
 		usb23_io_write(dev, USB23_GEVNTCOUNT(0), sizeof(evt));
 
@@ -1219,6 +1233,10 @@ static void usb23_on_event(struct k_work *work)
 		} else {
 			usb23_on_endpoint_event(dev, evt.depevt);
 		}
+
+		usb23_dump_bus_error(dev);
+		usb23_dump_registers(dev);
+		usb23_dump_fifo_space(dev);
 	}
 }
 
@@ -1230,6 +1248,7 @@ void usb23_irq_handler(void *ptr)
 
 	config->irq_clear_func();
 	usb23_on_event(&priv->work);
+	usb23_dump_fifo_space(dev);
 }
 
 /*------------------------------------------------------------------------------
@@ -1524,6 +1543,13 @@ static int usb23_init(const struct device *dev)
 	} else {
 		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED);
 	}
+
+	/* DEBUG */
+	usb23_io_set(dev, USB23_GUCTL, USB23_GUCTL_PSQEXTRRESSP_EN);
+	usb23_io_write(dev, USB23_GTXTHRCFG,
+		USB23_GTXTHRCFG_USBTXPKTCNTSEL
+		| (1 << USB23_GTXTHRCFG_USBTXPKTCNT_SHIFT)
+		| (16 << USB23_GTXTHRCFG_USBMAXTXBURSTSIZE_SHIFT));
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
