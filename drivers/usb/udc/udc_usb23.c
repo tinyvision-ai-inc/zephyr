@@ -75,6 +75,9 @@ struct usb23_ep_data {
 
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
+
+	/* Permit to skip several subsequent XferNotReady events */
+	bool submitted;
 };
 
 /*
@@ -652,6 +655,7 @@ static void usb23_trb_single_buf(const struct device *dev, struct udc_ep_config 
 		.status = status,
 		.ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO,
 	};
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
 	// TOOD handle the situations where BUFSIZ == MPS0, which could happen
 	// in USB2 where the MPS0 is smaller)
@@ -662,6 +666,7 @@ static void usb23_trb_single_buf(const struct device *dev, struct udc_ep_config 
 	usb23_depcmd_ep_get_state(dev, ep_cfg);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
 	usb23_depcmd_ep_get_state(dev, ep_cfg);
+	ep_data->submitted = true;
 }
 
 static void usb23_trb_normal(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
@@ -1042,6 +1047,11 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct net_buf *buf = ep_data->net_buf;
 
+	if (ep_data->submitted) {
+		LOG_DBG("%s ignoring event: TRB already submitted", __func__);
+		return;
+	}
+
 	switch (status & USB23_DEPEVT_STATUS_B3_MASK) {
 	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_SETUP);
 		/* Enqueued directly after XferComplete */
@@ -1102,9 +1112,10 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK) == USB23_TRB_STATUS_TRBSTS_OK);
 	LOG_HEXDUMP_DBG(priv->ctrl_buf, size, ep_cfg->caps.in ? "TX" : "RX");
 
-	/* Mark the TRB and buffer as free for another request */
+	/* Reset the counters */
 	usb23_set_trb(dev, ep_cfg, &(struct usb23_trb){0});
 	ep_data->net_buf = NULL;
+	ep_data->submitted = false;
 
 	if (ep_cfg->addr == USB_CONTROL_EP_OUT) {
 		buf = udc_ctrl_alloc(dev, ep_cfg->addr, size);
