@@ -717,6 +717,7 @@ static void usb23_trb_ctrl_status_2_in(const struct device *dev)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	LOG_DBG("TRB ep=0x%02x CONTROL_STATUS_2", ep_cfg->addr);
+	priv->ctrl_size = 0;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
 }
@@ -726,6 +727,7 @@ static void usb23_trb_ctrl_status_3(const struct device *dev, struct udc_ep_conf
 	struct usb23_data *priv = udc_get_private(dev);
 
 	LOG_DBG("TRB ep=0x%02x CONTROL_STATUS_3", ep_cfg->addr);
+	priv->ctrl_size = 0;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 }
