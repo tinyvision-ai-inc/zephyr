@@ -18,9 +18,14 @@
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define CASE(x) case x: LOG_DBG(#x)
+#define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
+#define UNSUPPORTED			0
+#define UVC_DELAY_MS			10
+#define UVC_MAX_VIDEO_FRAME_SIZE	(100 * 1024)
+#define MAX_PAYLOAD_TRANSFER_SIZE	UVC_MAX_VIDEO_FRAME_SIZE
 
 struct usbd_uvc_data {
-	struct uvc_vs_probe_control vs_probe_control;
+	struct uvc_vs_probe_control probe_cur;
 };
 
 struct usbd_uvc_desc {
@@ -43,6 +48,31 @@ struct usbd_uvc_desc {
 	struct usb_desc_header nil_desc;
 } __packed;
 
+const static struct uvc_vs_probe_control _probe_default = {
+	.bmHint = sys_cpu_to_le16(0),
+	.bFormatIndex = 1,
+	.bFrameIndex = 1,
+	.dwFrameInterval = sys_cpu_to_le32(1000 /*ns*/ / 100),
+	.wKeyFrameRate = UNSUPPORTED,
+	.wPFrameRate = UNSUPPORTED,
+	.wCompQuality = UNSUPPORTED,
+	.wCompWindowSize = UNSUPPORTED,
+	.wDelay = sys_cpu_to_le16(100 /*ms*/),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(100 * 1024),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(100 * 1024),
+	.dwClockFrequency = sys_cpu_to_le32(1000 * 1000 /*Hz*/),
+	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
+	.bPreferedVersion = 1,
+	.bMinVersion = 1,
+	.bMaxVersion = 1,
+	.bUsage = UNSUPPORTED,
+	.bBitDepthLuma = 24 - 8,
+	.bmSettings = UNSUPPORTED,
+	.bMaxNumberOfRefFramesPlus1 = UNSUPPORTED,
+	.bmRateControlModes = UNSUPPORTED,
+	.bmLayoutPerStream = { UNSUPPORTED, UNSUPPORTED, UNSUPPORTED, UNSUPPORTED },
+};
+
 static int usbd_uvc_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
 {
@@ -60,46 +90,38 @@ static int usbd_uvc_cth(struct usbd_class_node *const c_nd,
 			    struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
-	struct usbd_uvc_data *data = dev->data;
-	void *val;
-	size_t len;
-
-	LOG_HEXDUMP_DBG(buf->data, setup->wLength, __func__);
+	size_t size = 0;
 
 	switch (setup->wValue >> 8) {
 	CASE(UVC_VS_PROBE_CONTROL);
-		val = &data->vs_probe_control;
-		len = sizeof(data->vs_probe_control);
+		size = MIN(setup->wLength, sizeof(struct uvc_vs_probe_control));
+
+		switch (setup->bRequest) {
+		CASE(UVC_GET_CUR);
+			net_buf_add_mem(buf, &_probe_default, size);
+			return 0;
+		CASE(UVC_GET_MIN);
+			net_buf_add_mem(buf, &_probe_default, size);
+			return 0;
+		CASE(UVC_GET_MAX);
+			net_buf_add_mem(buf, &_probe_default, size);
+			return 0;
+		CASE(UVC_GET_DEF);
+			net_buf_add_mem(buf, &_probe_default, size);
+			return 0;
+		CASE(UVC_GET_LEN);
+			net_buf_add_mem(buf, &_probe_default, size);
+			return 0;
+		CASE(UVC_GET_INFO);
+			net_buf_add_u8(buf, UVC_INFO_SUPPORTS_GET_SET);
+			return 0;
+		}
 		break;
-	default:
-		LOG_WRN("%s: unknown wValue=0x%02x", __func__, setup->wValue);
-		errno = -ENOTSUP;
-		return 0;
 	}
 
-	switch (setup->bRequest) {
-	CASE(UVC_GET_CUR);
-		net_buf_add_mem(buf, &val, MIN(len, setup->wLength));
-		break;
-	CASE(UVC_GET_MIN);
-		break;
-	CASE(UVC_GET_MAX);
-		break;
-	CASE(UVC_GET_RES);
-		break;
-	CASE(UVC_GET_LEN);
-		break;
-	CASE(UVC_GET_DEF);
-		net_buf_add_mem(buf, &val, MIN(len, setup->wLength));
-		break;
-	CASE(UVC_GET_INFO);
-		break;
-	default:
-		LOG_WRN("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
-		errno = -ENOTSUP;
-		return 0;
-	}
-
+	LOG_WRN("%s: unsupported bRequest=%02x wValue=0x%02x",
+		__func__, setup->bRequest, setup->wValue);
+	errno = -ENOTSUP;
 	return 0;
 }
 
@@ -108,19 +130,14 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 			    const struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
-	struct usbd_uvc_data *data = dev->data;
-	void *val;
-	size_t size;
 
 	LOG_DBG("%s: bRequest=%d wValue=%d wIndex=%d wLength=%d", __func__,
 		setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
 
-	LOG_HEXDUMP_DBG(buf->data, setup->wLength, __func__);
-
 	switch (setup->wValue >> 8) {
 	CASE(UVC_VS_PROBE_CONTROL);
-		val = &data->vs_probe_control;
-		size = sizeof(data->vs_probe_control);
+		break;
+	CASE(UVC_VS_COMMIT_CONTROL);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
@@ -128,16 +145,8 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 		return 0;
 	}
 
-	if (size != setup->wLength) {
-		LOG_ERR("%s: size=%d wLength=%d partial write not allowed",
-			__func__, size, setup->wLength);
-		//errno = -ENOTSUP;
-		return 0;
-	}
-
 	switch (setup->bRequest) {
 	CASE(UVC_SET_CUR);
-		memcpy(val, buf->data, size);
 		break;
         default:
 		LOG_ERR("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
@@ -330,12 +339,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 										\
 	UVC_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_uvc_data usbd_uvc_data_##n = {		        \
-		.vs_probe_control = {						\
-			.bFormatIndex = 1,					\
-			.bFrameIndex = 1,					\
-		},								\
-	};									\
+	static struct usbd_uvc_data usbd_uvc_data_##n;			        \
 										\
 	static struct usbd_class_data usbd_uvc_class_data_##n = {		\
 		.desc = (struct usb_desc_header *)&uvc_desc_##n,		\

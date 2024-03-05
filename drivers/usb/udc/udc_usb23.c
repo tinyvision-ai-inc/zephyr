@@ -35,6 +35,7 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define U64(a, b) (((uint64_t)(a)) << 32 | (((uint64_t)(b)) & 0xffffffff))
 #define MEM32(addr) (*(volatile uint32_t *)(addr))
 #define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
+#define ERR(label) case label: __ASSERT(false, #label); break
 #define GETFIELD(reg, prefix) ((reg & prefix##_MASK) >> prefix##_SHIFT)
 
 /*
@@ -662,10 +663,7 @@ static void usb23_trb_single_buf(const struct device *dev, struct udc_ep_config 
 
 	__ASSERT_NO_MSG(usb23_trb_is_free(dev, ep_cfg));
 	usb23_set_trb(dev, ep_cfg, &trb);
-	usb23_dump_trb0(dev, ep_cfg);
-	usb23_depcmd_ep_get_state(dev, ep_cfg);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
-	usb23_depcmd_ep_get_state(dev, ep_cfg);
 	ep_data->submitted = true;
 }
 
@@ -673,7 +671,7 @@ static void usb23_trb_normal(const struct device *dev, struct udc_ep_config *con
 {
 	struct usb23_data *priv = udc_get_private(dev);
 
-	LOG_DBG("TRB ep=0x%02x NORMAL", ep_cfg->addr);
+	LOG_DBG("TRB_NORMAL");
 	priv->ctrl_size = ep_cfg->caps.in ? buf->size : buf->len;
 	__ASSERT(priv->ctrl_size % ep_cfg->mps == 0,
 		"buffer size must be a multiple of wMaxPacketSize0=%d", ep_cfg->mps);
@@ -686,7 +684,7 @@ static void usb23_trb_ctrl_setup_out(const struct device *dev)
 	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 
-	LOG_DBG("TRB ep=0x%02x CONTROL_SETUP", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_SETUP");
 	priv->ctrl_size = 8;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, priv->ctrl_size,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
@@ -697,7 +695,7 @@ static void usb23_trb_ctrl_data_out(const struct device *dev)
 	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 
-	LOG_DBG("TRB ep=0x%02x CONTROL_DATA_1 (OUT)", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_DATA_1_OUT");
 	priv->ctrl_size = USB23_CTRL_BUF_SIZE;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, priv->ctrl_size,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1);
@@ -708,7 +706,7 @@ static void usb23_trb_ctrl_data_in(const struct device *dev, struct net_buf *buf
 	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
 
-	LOG_DBG("TRB ep=0x%02x CONTROL_DATA_1 (IN)", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_DATA_1_IN");
 	__ASSERT_NO_MSG(buf->len <= USB23_CTRL_BUF_SIZE);
 	memcpy(priv->ctrl_buf, buf->data, buf->len);
 	priv->ctrl_size = buf->len;
@@ -721,7 +719,7 @@ static void usb23_trb_ctrl_status_2_in(const struct device *dev)
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
 	struct usb23_data *priv = udc_get_private(dev);
 
-	LOG_DBG("TRB ep=0x%02x CONTROL_STATUS_2", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_STATUS_2_IN");
 	priv->ctrl_size = 0;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
@@ -731,7 +729,7 @@ static void usb23_trb_ctrl_status_3(const struct device *dev, struct udc_ep_conf
 {
 	struct usb23_data *priv = udc_get_private(dev);
 
-	LOG_DBG("TRB ep=0x%02x CONTROL_STATUS_3", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_STATUS_3");
 	priv->ctrl_size = 0;
 	usb23_trb_single_buf(dev, ep_cfg, priv->ctrl_buf, 0,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
@@ -839,55 +837,33 @@ static void usb23_on_link_state_event(const struct device *dev)
 	switch (reg & USB23_DSTS_CONNECTSPD_MASK) {
 	case USB23_DSTS_CONNECTSPD_SS:
 		switch (reg & USB23_DSTS_USBLNKST_MASK) {
-		CASE(USB23_DSTS_USBLNKST_USB3_U0);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_U1);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_U2);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_U3);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_SS_DIS);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_RX_DET);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_SS_INACT);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_POLL);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_RECOV);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_HRESET);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_CMPLY);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_LPBK);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB3_RESET_RESUME);
-			break;
-		default:
-			LOG_ERR("unknown USB3 link state");
+		CASE(USB23_DSTS_USBLNKST_USB3_U0); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_U1); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_U2); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_U3); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_SS_DIS); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_RX_DET); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_SS_INACT); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_POLL); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_RECOV); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_HRESET); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_CMPLY); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_LPBK); break;
+		CASE(USB23_DSTS_USBLNKST_USB3_RESET_RESUME); break;
+		default: LOG_ERR("unknown USB3 link state");
 		}
 		break;
 	case USB23_DSTS_CONNECTSPD_HS:
 	case USB23_DSTS_CONNECTSPD_FS:
 		switch (reg & USB23_DSTS_USBLNKST_MASK) {
-		CASE(USB23_DSTS_USBLNKST_USB2_ON_STATE);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_SLEEP_STATE);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_DISCONNECTED);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_RESET);
-			break;
-		CASE(USB23_DSTS_USBLNKST_USB2_RESUME);
-			break;
-		default:
-			LOG_ERR("unknown USB2 link state");
+		CASE(USB23_DSTS_USBLNKST_USB2_ON_STATE); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_SLEEP_STATE); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_DISCONNECTED); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_RESET); break;
+		CASE(USB23_DSTS_USBLNKST_USB2_RESUME); break;
+		default: LOG_ERR("unknown USB2 link state");
 		}
 		break;
 	default:
@@ -898,8 +874,7 @@ static void usb23_on_link_state_event(const struct device *dev)
 static void usb23_on_device_event(const struct device *dev, struct usb23_devt devt)
 {
 	switch (devt.type) {
-	CASE(USB23_DEVT_TYPE_DISCONNEVT);
-		break;
+	CASE(USB23_DEVT_TYPE_DISCONNEVT); break;
 	CASE(USB23_DEVT_TYPE_USBRST);
 		usb23_on_usb_reset(dev);
 		break;
@@ -909,22 +884,14 @@ static void usb23_on_device_event(const struct device *dev, struct usb23_devt de
 	CASE(USB23_DEVT_TYPE_ULSTCHNG);
 		usb23_on_link_state_event(dev);
 		break;
-	CASE(USB23_DEVT_TYPE_WKUPEVT);
-		break;
-	CASE(USB23_DEVT_TYPE_SUSPEND);
-		break;
-	CASE(USB23_DEVT_TYPE_SOF);
-		break;
-	CASE(USB23_DEVT_TYPE_ERRTICERR);
-		break;
-	CASE(USB23_DEVT_TYPE_CMDCMPLT);
-		break;
-	CASE(USB23_DEVT_TYPE_EVNTOVERFLOW);
-		break;
-	CASE(USB23_DEVT_TYPE_VNDRDEVTSTRCVED);
-		break;
-	default:
-		LOG_ERR("unknown device event: 0x%08d", *(uint32_t *)&devt);
+	CASE(USB23_DEVT_TYPE_WKUPEVT); break;
+	CASE(USB23_DEVT_TYPE_SUSPEND); break;
+	CASE(USB23_DEVT_TYPE_SOF); break;
+	CASE(USB23_DEVT_TYPE_ERRTICERR); break;
+	CASE(USB23_DEVT_TYPE_CMDCMPLT); break;
+	CASE(USB23_DEVT_TYPE_EVNTOVERFLOW); break;
+	CASE(USB23_DEVT_TYPE_VNDRDEVTSTRCVED); break;
+	default: LOG_ERR("unknown device event: 0x%08d", *(uint32_t *)&devt);
 	}
 }
 
@@ -1101,16 +1068,17 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 	LOG_DBG("%s size=%d", __func__, size);
 
 	switch (trb.status & USB23_TRB_STATUS_TRBSTS_MASK) {
-	CASE(USB23_TRB_STATUS_TRBSTS_OK); break;
-	CASE(USB23_TRB_STATUS_TRBSTS_MISSEDISOC); break;
-	CASE(USB23_TRB_STATUS_TRBSTS_SETUPPENDING); break;
-	CASE(USB23_TRB_STATUS_TRBSTS_XFERINPROGRESS); break;
-	CASE(USB23_TRB_STATUS_TRBSTS_ZLPPENDING); break;
+	case USB23_TRB_STATUS_TRBSTS_OK:
+		break;
+	ERR(USB23_TRB_STATUS_TRBSTS_MISSEDISOC);
+	ERR(USB23_TRB_STATUS_TRBSTS_SETUPPENDING);
+	ERR(USB23_TRB_STATUS_TRBSTS_XFERINPROGRESS);
+	ERR(USB23_TRB_STATUS_TRBSTS_ZLPPENDING);
+	default: __ASSERT_NO_MSG(false);
 	}
 	__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
-	__ASSERT_NO_MSG((trb.status & USB23_TRB_STATUS_TRBSTS_MASK) == USB23_TRB_STATUS_TRBSTS_OK);
-	LOG_HEXDUMP_DBG(priv->ctrl_buf, size, ep_cfg->caps.in ? "TX" : "RX");
+	//LOG_HEXDUMP_DBG(priv->ctrl_buf, size, ep_cfg->caps.in ? "TX" : "RX");
 
 	/* Reset the counters */
 	usb23_set_trb(dev, ep_cfg, &(struct usb23_trb){0});
@@ -1125,20 +1093,15 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 
 	/* Continue to the next step */
 	switch (trb.ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
-	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
-		udc_get_buf_info(buf)->setup = true;
+	case USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP:
+		udc_ep_buf_set_setup(buf);
 		usb23_on_ctrl_setup(dev, ep_cfg, buf);
 		break;
-	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1);
-		udc_get_buf_info(buf)->data = true;
+	case USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1:
 		usb23_on_ctrl_data(dev, ep_cfg, buf);
 		break;
-	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2, "buf=0x%p", buf);
-		udc_get_buf_info(buf)->status = true;
-		usb23_on_ctrl_status(dev, ep_cfg, buf);
-		break;
-	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
-		udc_get_buf_info(buf)->status = true;
+	case USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2:
+	case USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3:
 		usb23_on_ctrl_status(dev, ep_cfg, buf);
 		break;
 	default:
@@ -1154,23 +1117,18 @@ static void usb23_on_endpoint_event(const struct device *dev, struct usb23_depev
 	struct udc_ep_config *const ep_cfg = usb23_get_ep_cfg(dev, epn);
 
 	switch (depevt.type) {
-	CASE(USB23_DEPEVT_TYPE_XFERCOMPLETE, "ep=0x%02x", ep_cfg->addr);
+	CASE(USB23_DEPEVT_TYPE_XFERCOMPLETE);
 		__ASSERT_NO_MSG((depevt.status & USB23_DEPEVT_STATUS_BUSERR) == 0);
 		usb23_on_xfer_complete(dev, ep_cfg);
 		break;
-	CASE(USB23_DEPEVT_TYPE_XFERINPROGRESS, "ep=0x%02x", ep_cfg->addr);
-		break;
-	CASE(USB23_DEPEVT_TYPE_XFERNOTREADY, "ep=0x%02x", ep_cfg->addr);
+	CASE(USB23_DEPEVT_TYPE_XFERNOTREADY);
 		usb23_on_xfer_not_ready(dev, ep_cfg, depevt.status);
 		break;
-	CASE(USB23_DEPEVT_TYPE_RXTXFIFOEVT, "ep=0x%02x", ep_cfg->addr);
-		break;
-	CASE(USB23_DEPEVT_TYPE_STREAMEVT, "ep=0x%02x", ep_cfg->addr);
-		break;
-	CASE(USB23_DEPEVT_TYPE_EPCMDCMPLT, "ep=0x%02x", ep_cfg->addr);
-		break;
-	default:
-		LOG_ERR("unknown endpoint event: 0x%08d", *(uint32_t *)&depevt);
+	CASE(USB23_DEPEVT_TYPE_XFERINPROGRESS); break;
+	CASE(USB23_DEPEVT_TYPE_RXTXFIFOEVT); break;
+	CASE(USB23_DEPEVT_TYPE_STREAMEVT); break;
+	CASE(USB23_DEPEVT_TYPE_EPCMDCMPLT); break;
+	default: LOG_ERR("unknown endpoint event: 0x%x", depevt.type);
 	}
 }
 
@@ -1195,9 +1153,6 @@ static void usb23_on_event(struct k_work *work)
 			usb23_on_endpoint_event(dev, evt.depevt);
 		}
 
-		usb23_dump_bus_error(dev);
-		usb23_dump_registers(dev);
-		usb23_dump_fifo_space(dev);
 	}
 }
 
@@ -1209,7 +1164,6 @@ void usb23_irq_handler(void *ptr)
 
 	config->irq_clear_func();
 	usb23_on_event(&priv->work);
-	usb23_dump_fifo_space(dev);
 }
 
 /*------------------------------------------------------------------------------
@@ -1225,10 +1179,10 @@ static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *cons
 	LOG_DBG("%s: ep=0x%02x buf=0x%p", __func__, ep_cfg->addr, buf);
 
 	switch (ep_cfg->addr) {
-	CASE(USB_CONTROL_EP_IN);
+	case USB_CONTROL_EP_IN:
 		ep_data->net_buf = buf;
 		break;
-	CASE(USB_CONTROL_EP_OUT);
+	case USB_CONTROL_EP_OUT:
 		__ASSERT_NO_MSG(false);
 		break;
 	default:
@@ -1259,7 +1213,7 @@ static int usb23_ep_disable(const struct device *dev, struct udc_ep_config *cons
 {
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 
-	LOG_INF("%s: ep=0x%02x", __func__, ep_cfg->addr);
+	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
 	usb23_io_clear(dev, USB23_DALEPENA, BIT(epn));
 	return 0;
 }
@@ -1309,7 +1263,7 @@ static int usb23_check_address(const struct device *dev, const uint8_t addr)
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr)
 {
-	LOG_INF("ADDR %d", addr);
+	LOG_DBG("ADDR %d", addr);
 
 	/* Configure the new address */
 	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_DEVADDR_MASK,
@@ -1496,15 +1450,6 @@ static int usb23_init(const struct device *dev)
 	} else {
 		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED);
 	}
-
-#if 0
-	/* DEBUG */
-	usb23_io_set(dev, USB23_GUCTL, USB23_GUCTL_PSQEXTRRESSP_EN);
-	usb23_io_write(dev, USB23_GTXTHRCFG,
-		USB23_GTXTHRCFG_USBTXPKTCNTSEL
-		| (1 << USB23_GTXTHRCFG_USBTXPKTCNT_SHIFT)
-		| (16 << USB23_GTXTHRCFG_USBMAXTXBURSTSIZE_SHIFT));
-#endif
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0

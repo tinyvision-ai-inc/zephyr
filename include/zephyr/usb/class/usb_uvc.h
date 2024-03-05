@@ -15,20 +15,20 @@
 #ifndef ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_
 #define ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_
 
-/** Video Interface Class Code */
+/* Video Interface Class Code */
 #define UVC_CC_VIDEO				0x0E
 
-/** Video Interface Subclass Codes */
+/* Video Interface Subclass Codes */
 #define UVC_SC_UNDEFINED			0x00
 #define UVC_SC_VIDEOCONTROL			0x01
 #define UVC_SC_VIDEOSTREAMING			0x02
 #define UVC_SC_VIDEO_INTERFACE_COLLECITON	0x03
 
-/** Video Interface Protocol Codes */
+/* Video Interface Protocol Codes */
 #define UVC_PC_PROTOCOL_UNDEFINED		0x00
 #define UVC_PC_PROTOCOL_15			0x01
 
-/** Video Class-Specific Descriptor Types */
+/* Video Class-Specific Descriptor Types */
 #define UVC_CS_UNDEFINED			0x20
 #define UVC_CS_DEVICE				0x21
 #define UVC_CS_CONFIGURATION			0x22
@@ -36,7 +36,7 @@
 #define UVC_CS_INTERFACE			0x24
 #define UVC_CS_ENDPOINT				0x25
 
-/** Video Class-Specific Video Control Interface Descriptor Subtypes */
+/* Video Class-Specific Video Control Interface Descriptor Subtypes */
 #define UVC_VC_DESCRIPTOR_UNDEFINED		0x00
 #define UVC_VC_HEADER				0x01
 #define UVC_VC_INPUT_TERMINAL			0x02
@@ -46,7 +46,7 @@
 #define UVC_VC_EXTENSION_UNIT			0x06
 #define UVC_VC_ENCODING_UNIT			0x07
 
-/** Video Class-Specific Video Stream Interface Descriptor Subtypes */
+/* Video Class-Specific Video Stream Interface Descriptor Subtypes */
 #define UVC_VS_UNDEFINED			0x00
 #define UVC_VS_INPUT_HEADER			0x01
 #define UVC_VS_OUTPUT_HEADER			0x02
@@ -68,13 +68,13 @@
 #define UVC_VS_FRAME_VP8			0x17
 #define UVC_VS_FORMAT_VP8_SIMULCAST		0x18
 
-/** Video Class-Specific Endpoint Descriptor Subtypes */
+/* Video Class-Specific Endpoint Descriptor Subtypes */
 #define UVC_EP_UNDEFINED			0x00
 #define UVC_EP_GENERAL				0x01
 #define UVC_EP_ENDPOINT				0x02
 #define UVC_EP_INTERRUPT			0x03
 
-/** Video Class-Specific Request Codes */
+/* Video Class-Specific Request Codes */
 #define UVC_RC_UNDEFINED			0x00
 #define UVC_SET_CUR				0x01
 #define UVC_SET_CUR_ALL				0x11
@@ -91,19 +91,19 @@
 #define UVC_GET_RES_ALL				0x94
 #define UVC_GET_DEF_ALL				0x97
 
-/** VideoControl Interface Control Selectors */
+/* VideoControl Interface Control Selectors */
 #define UVC_VC_CONTROL_UNDEFINED		0x00
 #define UVC_VC_VIDEO_POWER_MODE_CONTROL		0x01
 #define UVC_VC_REQUEST_ERROR_CODE_CONTROL	0x02
 
-/** Terminal Control Selectors */
+/* Terminal Control Selectors */
 #define UVC_TE_CONTROL_UNDEFINED		0x00
 
-/** Selector Unit Control Selectors */
+/* Selector Unit Control Selectors */
 #define UVC_SU_CONTROL_UNDEFINED		0x00
 #define UVC_SU_INPUT_SELECT_CONTROL		0x01
 
-/** Camera Terminal Control Selectors */
+/* Camera Terminal Control Selectors */
 #define UVC_CT_CONTROL_UNDEFINED		0x00
 #define UVC_CT_SCANNING_MODE_CONTROL		0x01
 #define UVC_CT_AE_MODE_CONTROL			0x02
@@ -126,7 +126,7 @@
 #define UVC_CT_WINDOW_CONTROL			0x13
 #define UVC_CT_REGION_OF_INTEREST_CONTROL	0x14
 
-/** Processing Unit Control Selectors */
+/* Processing Unit Control Selectors */
 #define UVC_PU_CONTROL_UNDEFINED		0x00
 #define UVC_PU_BACKLIGHT_COMPENSATION_CONTROL	0x01
 #define UVC_PU_BRIGHTNESS_CONTROL		0x02
@@ -148,7 +148,7 @@
 #define UVC_PU_ANALOG_LOCK_STATUS_CONTROL	0x12
 #define UVC_PU_CONTRAST_AUTO_CONTROL		0x13
 
-/** Encoding Unit Control Selectors */
+/* Encoding Unit Control Selectors */
 #define UVC_EU_CONTROL_UNDEFINED		0x00
 #define UVC_EU_SELECT_LAYER_CONTROL		0x01
 #define UVC_EU_PROFILE_TOOLSET_CONTROL		0x02
@@ -171,10 +171,10 @@
 #define UVC_EU_START_OR_STOP_LAYER_CONTROL	0x13
 #define UVC_EU_ERROR_RESILIENCY_CONTROL		0x14
 
-/** Extension Unit Control Selectors */
+/* Extension Unit Control Selectors */
 #define UVC_XU_CONTROL_UNDEFINED		0x00
 
-/** VideoStreaming Interface Control Selectors */
+/* VideoStreaming Interface Control Selectors */
 #define UVC_VS_CONTROL_UNDEFINED		0x00
 #define UVC_VS_PROBE_CONTROL			0x01
 #define UVC_VS_COMMIT_CONTROL			0x02
@@ -186,27 +186,27 @@
 #define UVC_VS_UPDATE_FRAME_SEGMENT_CONTROL	0x08
 #define UVC_VS_SYNCH_DELAY_CONTROL		0x09
 
-/** USB Terminal Types */
+/* USB Terminal Types */
 #define UVC_TT_VENDOR_SPECIFIC			0x0100
 #define UVC_TT_STREAMING			0x0101
 
-/** Input Terminal Types */
+/* Input Terminal Types */
 #define UVC_ITT_VENDOR_SPECIFIC			0x0200
 #define UVC_ITT_CAMERA				0x0201
 #define UVC_ITT_MEDIA_TRANSPORT_INPUT		0x0202
 
-/** Output Terminal Types */
+/* Output Terminal Types */
 #define UVC_OTT_VENDOR_SPECIFIC			0x0300
 #define UVC_OTT_DISPLAY				0x0301
 #define UVC_OTT_MEDIA_TRANSPORT_OUTPUT		0x0302
 
-/** External Terminal Types */
+/* External Terminal Types */
 #define UVC_EXTERNAL_VENDOR_SPECIFIC		0x0400
 #define UVC_COMPOSITE_CONNECTOR			0x0401
 #define UVC_SVIDEO_CONNECTOR			0x0402
 #define UVC_COMPONENT_CONNECTOR			0x0403
 
-/** Video Control Interface Status Packet Format */
+/* Video Control Interface Status Packet Format */
 struct uvc_control_status_packet {
 	uint8_t bStatusType;
 	uint8_t bOriginator;
@@ -216,7 +216,7 @@ struct uvc_control_status_packet {
 	uint8_t bValue;
 } __packed;
 
-/** Video Streaming Interface Status Packet Format */
+/* Video Streaming Interface Status Packet Format */
 struct uvc_stream_status_packet {
 	uint8_t bStatusType;
 	uint8_t bOriginator;
@@ -477,6 +477,9 @@ struct uvc_vs_probe_control {
 	uint32_t dwMaxPayloadTransferSize;
 	uint32_t dwClockFrequency;
 	uint8_t bmFramingInfo;
+#define UVC_BMFRAMING_INFO_FID			(1 << 0)
+#define UVC_BMFRAMING_INFO_EOF			(1 << 1)
+#define UVC_BMFRAMING_INFO_EOS			(1 << 2)
 	uint8_t bPreferedVersion;
 	uint8_t bMinVersion;
 	uint8_t bMaxVersion;
@@ -485,7 +488,7 @@ struct uvc_vs_probe_control {
 	uint8_t bmSettings;
 	uint8_t bMaxNumberOfRefFramesPlus1;
 	uint16_t bmRateControlModes;
-	uint8_t bmLayoutPerStream[8];
+	uint16_t bmLayoutPerStream[4];
 } __packed;
 
 #endif /* ZEPHYR_INCLUDE_USB_CLASS_USB_UVC_H_ */
