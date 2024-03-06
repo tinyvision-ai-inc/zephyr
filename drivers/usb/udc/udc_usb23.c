@@ -99,6 +99,9 @@ struct usb23_data {
 
 	/* Pointers to event buffer fetched by USB23 with DMA */
 	volatile union usb23_evt *evt_buf;
+
+	volatile uint8_t *shared_buffer;
+
 };
 
 struct usb23_reg {
@@ -621,42 +624,6 @@ static void usb23_trb_normal(const struct device *dev,
 	usb23_cmd_start_xfer(dev, ep_cfg);
 }
 
-static void usb23_trb_repeated(const struct device *dev,
-		struct udc_ep_config *const ep_cfg,
-		void *data)
-{
-	volatile struct usb23_trb *trb_buf = usb23_get_trb_buf(dev, ep_cfg);
-	struct usb23_trb trb0 = {
-		.addr_lo = LO32((uintptr_t)data),
-		.addr_hi = HI32((uintptr_t)data),
-		.status = USB23_XFER_BLOCK_SIZE,
-		.ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO,
-	};
-	struct usb23_trb trb1 = {
-		.addr_lo = LO32((uintptr_t)trb_buf),
-		.addr_hi = HI32((uintptr_t)trb_buf),
-		.status = sizeof(trb0),
-		.ctrl = USB23_TRB_CTRL_TRBCTL_LINK_TRB | USB23_TRB_CTRL_HWO,
-	};
-
-	LOG_DBG("-> TRB ep=0x%02x REPEATED addr_hi=0x%08x addr_lo=0x%08x ctrl=0x%08x status=%d", ep_cfg->addr, trb0.addr_hi, trb0.addr_lo, trb0.ctrl, trb0.status);
-	usb23_set_trb(dev, ep_cfg, 0, &trb0);
-	usb23_set_trb(dev, ep_cfg, 1, &trb1);
-	usb23_cmd_start_xfer(dev, ep_cfg);
-}
-
-static void usb23_trb_repeat(const struct device *dev,
-		struct udc_ep_config *const ep_cfg)
-{
-	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, 0);
-
-	trb.ctrl |= USB23_TRB_CTRL_HWO;
-	trb.status = USB23_XFER_BLOCK_SIZE;
-	LOG_DBG("-> TRB ep=0x%02x REPEAT   addr_hi=0x%08x addr_lo=0x%08x ctrl=0x%08x status=%d", ep_cfg->addr, trb.addr_hi, trb.addr_lo, trb.ctrl, trb.status);
-	usb23_set_trb(dev, ep_cfg, 0, &trb);
-	usb23_cmd_update_xfer(dev, ep_cfg);
-}
-
 static void usb23_trb_ctrl_setup(const struct device *dev,
 		struct udc_ep_config *const ep_cfg, void *data, size_t size)
 {
@@ -723,7 +690,9 @@ static int usb23_trb_from_buf(const struct device *dev,
 			__ASSERT_NO_MSG(false);
 		}
 	} else {
-		usb23_trb_normal(dev, ep_cfg, ep_data->buf->data, n);
+		struct usb23_data *priv = udc_get_private(dev);
+		memcpy(priv->shared_buffer, buf->data, n);
+		usb23_trb_normal(dev, ep_cfg, priv->shared_buffer, n);
 	}
 	return 0;
 }
@@ -731,20 +700,6 @@ static int usb23_trb_from_buf(const struct device *dev,
 /*------------------------------------------------------------------------------
 --  Transfers
 ------------------------------------------------------------------------------*/
-
-static void usb23_xfer_repeat(const struct device *dev)
-{
-	const struct usb23_config *config = dev->config;
-	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, config->auto_ep);
-	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
-	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, 0);
-
-	if ((trb.ctrl & USB23_TRB_CTRL_HWO) || !ep_data->repeat) {
-		return;
-	}
-	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
-	usb23_trb_repeat(dev, ep_cfg);
-}
 
 /*
  * In usb23_ep_enqueue(), we only add the buffer to transfer to a list.
@@ -1133,7 +1088,7 @@ static void usb23_on_xfer_complete(const struct device *dev,
 	}
 
 	__ASSERT_NO_MSG(buf != NULL);
-	__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
+	//__ASSERT_NO_MSG(trb.ctrl != 0x00000000);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
 
 	buf->len = buf->size - GETFIELD(trb.status, USB23_TRB_STATUS_BUFSIZ);
@@ -1152,6 +1107,10 @@ static void usb23_on_xfer_complete(const struct device *dev,
 		usb23_on_ctrl_status(dev, ep_cfg, buf);
 		break;
 	default:
+		if (buf->size == 512 && buf->len > 0 ) {
+			struct usb23_data *priv = udc_get_private(dev);
+			memcpy(buf->data, priv->shared_buffer, buf->len);
+		}
 		err = udc_submit_ep_event(dev, buf, 0);
 		__ASSERT_NO_MSG(err == 0);
 		break;
@@ -1235,7 +1194,6 @@ void usb23_irq_handler(void *ptr)
 
 	config->irq_clear_func();
 	usb23_on_event(&priv->work);
-	usb23_xfer_repeat(dev);
 }
 
 /*------------------------------------------------------------------------------
@@ -1682,6 +1640,7 @@ static const struct udc_api usb23_api = {
 		.ep_data = ep_data,						\
 		.evt_buf = usb23_dma_evt_buf_##n,				\
 		.trb_buf = usb23_dma_trb_buf_##n,				\
+		.shared_buffer = DT_INST_PROP(n, shared_buffer)	\
 	};									\
 										\
 	static struct udc_data udc_data_##n = {					\
