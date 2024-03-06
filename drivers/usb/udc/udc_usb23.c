@@ -108,6 +108,9 @@ struct usb23_data {
 
 	/* Pointers to event buffer fetched by USB23 with DMA */
 	volatile union usb23_evt *evt_buf;
+
+	volatile uint8_t *shared_buffer;
+
 };
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
