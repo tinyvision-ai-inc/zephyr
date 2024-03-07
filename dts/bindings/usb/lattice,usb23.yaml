@@ -16,3 +16,6 @@ properties:
   auto-endpoint:
     required: false
     type: array
+  shared-buffer:
+    required: true
+    type: int
