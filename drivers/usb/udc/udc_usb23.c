@@ -1031,8 +1031,6 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 		case USB_CONTROL_EP_OUT:
 			usb23_trb_ctrl_data_out(dev);
 			break;
-		default:
-			__ASSERT(false, "invalid control buffer");
 		}
 		break;
 	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_STATUS);

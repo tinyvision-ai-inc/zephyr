@@ -19,59 +19,142 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define CASE(x) case x: LOG_DBG(#x)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
-#define UNSUPPORTED			0
-#define UVC_DELAY_MS			10
-#define UVC_MAX_VIDEO_FRAME_SIZE	(100 * 1024)
-#define MAX_PAYLOAD_TRANSFER_SIZE	UVC_MAX_VIDEO_FRAME_SIZE
 
 struct usbd_uvc_data {
-	struct uvc_vs_probe_control probe_cur;
+	struct uvc_vs_probe_control probe;
 };
 
 struct usbd_uvc_desc {
 	struct usb_association_descriptor iad_uvc;
 
+	/* VideoControl */
 	struct usb_if_descriptor			if0;
 	struct uvc_interface_header_descriptor		if0_vctl_hdr;
 	struct uvc_output_terminal_descriptor		if0_vctl_out;
 	struct uvc_input_terminal_descriptor		if0_vctl_in;
 
-	struct usb_if_descriptor			if1_alt0;
-	struct uvc_stream_input_header_descriptor	if1_alt0_stream_in;
-	struct uvc_uncompressed_format_descriptor	if1_alt0_format;
-	struct uvc_uncompressed_frame_descriptor	if1_alt0_frame0;
-
-	struct usb_if_descriptor			if1_alt1;
-	struct usb_ep_descriptor			if1_alt1_in_ep;
-	struct usb_ep_companion_descriptor		if1_alt1_in_ep_comp;
+	/* VideoStreaming */
+	struct usb_if_descriptor			if1;
+	struct uvc_stream_input_header_descriptor	if1_stream_in;
+	struct uvc_uncompressed_format_descriptor	if1_format;
+	struct uvc_uncompressed_frame_descriptor	if1_frame0;
+	struct usb_ep_descriptor			if1_in_ep;
+	struct usb_ep_companion_descriptor		if1_in_ep_comp;
 
 	struct usb_desc_header nil_desc;
 } __packed;
 
-const static struct uvc_vs_probe_control _probe_default = {
-	.bmHint = sys_cpu_to_le16(0),
+const static struct uvc_vs_probe_control _probe_def = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
-	.dwFrameInterval = sys_cpu_to_le32(1000 /*ns*/ / 100),
-	.wKeyFrameRate = UNSUPPORTED,
-	.wPFrameRate = UNSUPPORTED,
-	.wCompQuality = UNSUPPORTED,
-	.wCompWindowSize = UNSUPPORTED,
+	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(100 /*ms*/),
-	.dwMaxVideoFrameSize = sys_cpu_to_le32(100 * 1024),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(600 * 1024),
 	.dwMaxPayloadTransferSize = sys_cpu_to_le32(100 * 1024),
-	.dwClockFrequency = sys_cpu_to_le32(1000 * 1000 /*Hz*/),
+	.dwClockFrequency = sys_cpu_to_le32(1000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
 	.bMinVersion = 1,
 	.bMaxVersion = 1,
-	.bUsage = UNSUPPORTED,
-	.bBitDepthLuma = 24 - 8,
-	.bmSettings = UNSUPPORTED,
-	.bMaxNumberOfRefFramesPlus1 = UNSUPPORTED,
-	.bmRateControlModes = UNSUPPORTED,
-	.bmLayoutPerStream = { UNSUPPORTED, UNSUPPORTED, UNSUPPORTED, UNSUPPORTED },
+	.bBitDepthLuma = 16 - 8,
 };
+
+const static struct uvc_vs_probe_control _probe_min = {
+	.bFormatIndex = 1,
+	.bFrameIndex = 1,
+	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
+	.wDelay = sys_cpu_to_le16(1 /*ms*/),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(1 * 1024),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(1 * 1024),
+	.dwClockFrequency = sys_cpu_to_le32(1000 /*Hz*/),
+	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
+	.bPreferedVersion = 1,
+	.bMinVersion = 1,
+	.bMaxVersion = 1,
+	.bBitDepthLuma = 8 - 8,
+};
+
+const static struct uvc_vs_probe_control _probe_max = {
+	.bFormatIndex = 1,
+	.bFrameIndex = 1,
+	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
+	.wDelay = sys_cpu_to_le16(10000 /*ms*/),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(1024 * 1024),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(1024 * 1024),
+	.dwClockFrequency = sys_cpu_to_le32(10000000 /*Hz*/),
+	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
+	.bPreferedVersion = 255,
+	.bMinVersion = 255,
+	.bMaxVersion = 255,
+	.bBitDepthLuma = 24 - 8,
+};
+
+void _dump_probe(const struct uvc_vs_probe_control *pc)
+{
+	LOG_DBG("struct uvc_vs_probe_control");
+	LOG_DBG(".bmHint = 0x%04x", sys_le16_to_cpu(pc->bmHint));
+	LOG_DBG(".bFormatIndex = %d", pc->bFormatIndex);
+	LOG_DBG(".bFrameIndex = %d", pc->bFrameIndex);
+	LOG_DBG(".dwFrameInterval = %d ns", sys_le32_to_cpu(pc->dwFrameInterval) * 100);
+	LOG_DBG(".wKeyFrameRate = %d", sys_le16_to_cpu(pc->wKeyFrameRate));
+	LOG_DBG(".wPFrameRate = %d", pc->wPFrameRate);
+	LOG_DBG(".wCompQuality = %d", pc->wCompQuality);
+	LOG_DBG(".wCompWindowSize = %d", pc->wCompWindowSize);
+	LOG_DBG(".wDelay = %d ms", sys_le16_to_cpu(pc->wDelay));
+	LOG_DBG(".dwMaxVideoFrameSize = %d", sys_le32_to_cpu(pc->dwMaxVideoFrameSize));
+	LOG_DBG(".dwMaxPayloadTransferSize = %d", sys_le32_to_cpu(pc->dwMaxPayloadTransferSize));
+	LOG_DBG(".dwClockFrequency = %d Hz", sys_le32_to_cpu(pc->dwClockFrequency));
+	LOG_DBG(".bmFramingInfo = 0x%02x", pc->bmFramingInfo);
+	LOG_DBG(".bPreferedVersion = %d", pc->bPreferedVersion);
+	LOG_DBG(".bMinVersion = %d", pc->bMinVersion);
+	LOG_DBG(".bMaxVersion = %d", pc->bMaxVersion);
+	LOG_DBG(".bUsage = %d", pc->bUsage);
+	LOG_DBG(".bBitDepthLuma = %d", pc->bBitDepthLuma + 8);
+	LOG_DBG(".bmSettings = %d", pc->bmSettings);
+	LOG_DBG(".bMaxNumberOfRefFramesPlus1 = %d", pc->bMaxNumberOfRefFramesPlus1);
+	LOG_DBG(".bmRateControlModes = %d", pc->bmRateControlModes);
+	LOG_DBG(".bmLayoutPerStream = { %d, %d, %d, %d }",
+		pc->bmLayoutPerStream[0], pc->bmLayoutPerStream[1],
+		pc->bmLayoutPerStream[2], pc->bmLayoutPerStream[3]);
+}
+
+/*
+ * All fields set to 0 are ignored, others are applied
+ * TODO: check if within MIN/MAX range
+ */
+void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
+{
+#define APPLY_PARAM(p)								\
+	if (src->p != 0 && dst->p != src->p) {					\
+		LOG_DBG(".%s = %d -> %d", #p, (int)dst->p, (int)src->p);	\
+		dst->p = src->p;						\
+	}
+	APPLY_PARAM(bFormatIndex);
+	APPLY_PARAM(bFrameIndex);
+	APPLY_PARAM(dwFrameInterval);
+	APPLY_PARAM(wKeyFrameRate);
+	APPLY_PARAM(wPFrameRate);
+	APPLY_PARAM(wCompQuality);
+	APPLY_PARAM(wCompWindowSize);
+	APPLY_PARAM(wDelay);
+	APPLY_PARAM(dwMaxVideoFrameSize);
+	APPLY_PARAM(dwMaxPayloadTransferSize);
+	APPLY_PARAM(dwClockFrequency);
+	APPLY_PARAM(bmFramingInfo);
+	APPLY_PARAM(bPreferedVersion);
+	APPLY_PARAM(bMinVersion);
+	APPLY_PARAM(bMaxVersion);
+	APPLY_PARAM(bUsage);
+	APPLY_PARAM(bBitDepthLuma);
+	APPLY_PARAM(bmSettings);
+	APPLY_PARAM(bMaxNumberOfRefFramesPlus1);
+	APPLY_PARAM(bmRateControlModes);
+	APPLY_PARAM(bmLayoutPerStream[0]);
+	APPLY_PARAM(bmLayoutPerStream[1]);
+	APPLY_PARAM(bmLayoutPerStream[2]);
+	APPLY_PARAM(bmLayoutPerStream[3]);
+#undef APPLY_PARAM
+}
 
 static int usbd_uvc_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
@@ -90,35 +173,44 @@ static int usbd_uvc_cth(struct usbd_class_node *const c_nd,
 			    struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
+	struct usbd_uvc_data *data = (void *)dev->data;
 	size_t size = 0;
 
 	switch (setup->wValue >> 8) {
 	CASE(UVC_VS_PROBE_CONTROL);
-		size = MIN(setup->wLength, sizeof(struct uvc_vs_probe_control));
+		size = MIN(setup->wLength, sizeof(_probe_def));
 
 		switch (setup->bRequest) {
 		CASE(UVC_GET_CUR);
-			net_buf_add_mem(buf, &_probe_default, size);
+			net_buf_add_mem(buf, &data->probe, size);
+			_dump_probe((void *)buf->data);
 			return 0;
 		CASE(UVC_GET_MIN);
-			net_buf_add_mem(buf, &_probe_default, size);
-			return 0;
+			net_buf_add_mem(buf, &_probe_min, size);
+			_dump_probe((void *)buf->data);
+			break;
 		CASE(UVC_GET_MAX);
-			net_buf_add_mem(buf, &_probe_default, size);
-			return 0;
+			net_buf_add_mem(buf, &_probe_max, size);
+			_dump_probe((void *)buf->data);
+			break;
 		CASE(UVC_GET_DEF);
-			net_buf_add_mem(buf, &_probe_default, size);
-			return 0;
+			net_buf_add_mem(buf, &_probe_def, size);
+			_dump_probe((void *)buf->data);
+			break;
 		CASE(UVC_GET_LEN);
-			net_buf_add_mem(buf, &_probe_default, size);
+			net_buf_add_le16(buf, sizeof(_probe_def));
 			return 0;
 		CASE(UVC_GET_INFO);
 			net_buf_add_u8(buf, UVC_INFO_SUPPORTS_GET_SET);
 			return 0;
+		default:
+			goto err_unsupported;
 		}
-		break;
+		_dump_probe((void *)buf->data);
+		return 0;
 	}
 
+err_unsupported:
 	LOG_WRN("%s: unsupported bRequest=%02x wValue=0x%02x",
 		__func__, setup->bRequest, setup->wValue);
 	errno = -ENOTSUP;
@@ -130,6 +222,7 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 			    const struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
+	struct usbd_uvc_data *data = dev->data;
 
 	LOG_DBG("%s: bRequest=%d wValue=%d wIndex=%d wLength=%d", __func__,
 		setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
@@ -147,6 +240,13 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 
 	switch (setup->bRequest) {
 	CASE(UVC_SET_CUR);
+		if (buf->len != sizeof(data->probe)) {
+			LOG_ERR("%s: invalid config buffer size", __func__);
+			errno = -ENOTSUP;
+			return 0;
+		}
+		_load_probe(&data->probe, (void *)buf->data);
+		_dump_probe(&data->probe);
 		break;
         default:
 		LOG_ERR("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
@@ -160,8 +260,11 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 static int usbd_uvc_init(struct usbd_class_node *const c_nd)
 {
 	struct usbd_uvc_desc *desc = c_nd->data->desc;
+	const struct device *dev = c_nd->data->priv;
+	struct usbd_uvc_data *data = (void *)dev->data;
 
 	desc->iad_uvc.bFirstInterface = desc->if0.bInterfaceNumber;
+	memcpy(&data->probe, &_probe_def, sizeof(data->probe));
 	return 0;
 }
 
@@ -186,7 +289,6 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bFunctionProtocol = UVC_PC_PROTOCOL_UNDEFINED,			\
 		.iFunction = 0,							\
 	},									\
-										\
 	.if0 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
@@ -236,18 +338,18 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bControlSize = 3,						\
 		.bmControls = { 0x00, 0x00, 0x00 },				\
 	},									\
-	.if1_alt0 = {								\
+	.if1 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
 		.bInterfaceNumber = 1,						\
 		.bAlternateSetting = 0,						\
-		.bNumEndpoints = 0,						\
+		.bNumEndpoints = 1,						\
 		.bInterfaceClass = USB_BCC_VIDEO,				\
 		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
 		.bInterfaceProtocol = 0,					\
 		.iInterface = 0,						\
 	},									\
-	.if1_alt0_stream_in = {							\
+	.if1_stream_in = {							\
 		.bLength = sizeof(struct uvc_stream_input_header_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_INPUT_HEADER,			\
@@ -266,7 +368,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bControlSize = 1,						\
 		.bmaControls = { 0x00 },					\
 	},									\
-	.if1_alt0_format = {							\
+	.if1_format = {								\
 		.bLength = sizeof(struct uvc_uncompressed_format_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_FORMAT_UNCOMPRESSED,		\
@@ -281,7 +383,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bmInterlaceFlags = 0x00,					\
 		.bCopyProtect = 0,						\
 	},									\
-	.if1_alt0_frame0 = {							\
+	.if1_frame0 = {								\
 		.bLength = sizeof(struct uvc_uncompressed_frame_descriptor),	\
 		.bDescriptorType = UVC_CS_INTERFACE,				\
 		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,		\
@@ -296,19 +398,7 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.bFrameIntervalType = 1,					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
 	},									\
-										\
-	.if1_alt1 = {								\
-		.bLength = sizeof(struct usb_if_descriptor),			\
-		.bDescriptorType = USB_DESC_INTERFACE,				\
-		.bInterfaceNumber = 1,						\
-		.bAlternateSetting = 0,						\
-		.bNumEndpoints = 0,						\
-		.bInterfaceClass = USB_BCC_VIDEO,				\
-		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
-		.bInterfaceProtocol = 0,					\
-		.iInterface = 0,						\
-	},									\
-	.if1_alt1_in_ep = {							\
+	.if1_in_ep = {								\
 		.bLength = sizeof(struct usb_ep_descriptor),			\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
@@ -316,14 +406,13 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.wMaxPacketSize = sys_cpu_to_le16(1024),			\
 		.bInterval = 0,							\
 	},									\
-	.if1_alt1_in_ep_comp = {						\
+	.if1_in_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = sys_cpu_to_le16(0),			\
 	},									\
-										\
 	.nil_desc = {								\
 		.bLength = 0,							\
 		.bDescriptorType = 0,						\
