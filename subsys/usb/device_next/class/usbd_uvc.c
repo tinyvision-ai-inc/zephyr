@@ -17,10 +17,13 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
+#define DT_DRV_COMPAT zephyr_uvc
+
 #define CASE(x) case x: LOG_DBG(#x)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
 
-NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT),
+BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
+NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
 	0, sizeof(struct udc_buf_info), NULL);
 
 struct uvc_data {
@@ -224,7 +227,7 @@ err_unsupported:
 	return 0;
 }
 
-struct udc_ep_config *_get_video_bulk_ep(struct usbd_class_node *const c_nd)
+uint8_t _get_video_bulk_ep(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 
@@ -235,11 +238,16 @@ void _start_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = (void *)dev->data;
-	struct net_buf *buf = net_buf_alloc_with_data(&_buf_pool,
-		(void *)data->video_buf_addr, data->video_buf_size, K_NO_WAIT);
-	struct udc_buf_info *bi = udc_get_buf_info(buf);
+	struct udc_buf_info *bi;
+	struct net_buf *buf;
 	int ret;
 
+	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data->video_buf_addr,
+		data->video_buf_size, K_NO_WAIT);
+	__ASSERT_NO_MSG(buf != NULL);
+
+	bi = udc_get_buf_info(buf);
+	__ASSERT_NO_MSG(bi != NULL);
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = _get_video_bulk_ep(c_nd);
 
@@ -311,7 +319,7 @@ struct usbd_class_api _api = {
 };
 
 #define UVC_DEFINE_DESCRIPTOR(n)						\
-static struct uvc_desc _desc_##n = {					\
+static struct uvc_desc _desc_##n = {						\
 										\
 	.iad_uvc = {								\
 		.bLength = sizeof(struct usb_association_descriptor),		\
@@ -453,12 +461,10 @@ static struct uvc_desc _desc_##n = {					\
 	},									\
 }
 
-#define DT_DRV_COMPAT zephyr_uvc
-
 #define USBD_UVC_DT_DEVICE_DEFINE(n)						\
 	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),					\
-		     "node " DT_NODE_PATH(DT_DRV_INST(n))			\
-		     " is not assigned to a USB device controller");		\
+	     "node " DT_NODE_PATH(DT_DRV_INST(n))				\
+	     " is not assigned to a USB device controller");			\
 										\
 	UVC_DEFINE_DESCRIPTOR(n);						\
 										\
@@ -467,7 +473,7 @@ static struct uvc_desc _desc_##n = {					\
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),			\
 	};									\
 										\
-	USBD_DEFINE_CLASS(_class_##n, &_api, &_class_data_##n);			\
+	USBD_DEFINE_CLASS(uvc_##n, &_api, &_class_data_##n);			\
 										\
 	static struct uvc_data _data_##n = {					\
 		.video_buf_addr = DT_INST_PROP(n, video_buf_addr),		\
