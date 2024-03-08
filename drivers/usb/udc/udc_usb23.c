@@ -1115,17 +1115,17 @@ static void usb23_on_endpoint_event(const struct device *dev, struct usb23_depev
 	struct udc_ep_config *const ep_cfg = usb23_get_ep_cfg(dev, epn);
 
 	switch (depevt.type) {
-	CASE(USB23_DEPEVT_TYPE_XFERCOMPLETE);
+	CASE(USB23_DEPEVT_TYPE_XFERCOMPLETE, "ep=0x%02x", ep_cfg->addr);;
 		__ASSERT_NO_MSG((depevt.status & USB23_DEPEVT_STATUS_BUSERR) == 0);
 		usb23_on_xfer_complete(dev, ep_cfg);
 		break;
-	CASE(USB23_DEPEVT_TYPE_XFERNOTREADY);
+	CASE(USB23_DEPEVT_TYPE_XFERNOTREADY, "ep=0x%02x", ep_cfg->addr);;
 		usb23_on_xfer_not_ready(dev, ep_cfg, depevt.status);
 		break;
-	CASE(USB23_DEPEVT_TYPE_XFERINPROGRESS); break;
-	CASE(USB23_DEPEVT_TYPE_RXTXFIFOEVT); break;
-	CASE(USB23_DEPEVT_TYPE_STREAMEVT); break;
-	CASE(USB23_DEPEVT_TYPE_EPCMDCMPLT); break;
+	CASE(USB23_DEPEVT_TYPE_XFERINPROGRESS, "ep=0x%02x", ep_cfg->addr);; break;
+	CASE(USB23_DEPEVT_TYPE_RXTXFIFOEVT, "ep=0x%02x", ep_cfg->addr);; break;
+	CASE(USB23_DEPEVT_TYPE_STREAMEVT, "ep=0x%02x", ep_cfg->addr);; break;
+	CASE(USB23_DEPEVT_TYPE_EPCMDCMPLT, "ep=0x%02x", ep_cfg->addr);; break;
 	default: LOG_ERR("unknown endpoint event: 0x%x", depevt.type);
 	}
 }
