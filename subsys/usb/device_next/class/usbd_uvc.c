@@ -20,11 +20,18 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define CASE(x) case x: LOG_DBG(#x)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
 
-struct usbd_uvc_data {
+NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT),
+	0, sizeof(struct udc_buf_info), NULL);
+
+struct uvc_data {
 	struct uvc_vs_probe_control probe;
+
+	/* Data buffer continuously sent by the UVC class */
+	uintptr_t video_buf_addr;
+	size_t video_buf_size;
 };
 
-struct usbd_uvc_desc {
+struct uvc_desc {
 	struct usb_association_descriptor iad_uvc;
 
 	/* VideoControl */
@@ -156,24 +163,24 @@ void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_con
 #undef APPLY_PARAM
 }
 
-static int usbd_uvc_request(struct usbd_class_node *const c_nd,
+static int uvc_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
 {
 	return 0;
 }
 
-static void usbd_uvc_update(struct usbd_class_node *const c_nd,
+static void uvc_update(struct usbd_class_node *const c_nd,
 				uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("%s", __func__);
 }
 
-static int usbd_uvc_cth(struct usbd_class_node *const c_nd,
+static int uvc_cth(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
-	struct usbd_uvc_data *data = (void *)dev->data;
+	struct uvc_data *data = (void *)dev->data;
 	size_t size = 0;
 
 	switch (setup->wValue >> 8) {
@@ -217,12 +224,38 @@ err_unsupported:
 	return 0;
 }
 
-static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
+struct udc_ep_config *_get_video_bulk_ep(struct usbd_class_node *const c_nd)
+{
+	struct uvc_desc *desc = c_nd->data->desc;
+
+	return desc->if1_in_ep.bEndpointAddress;
+}
+
+void _start_transfer(struct usbd_class_node *const c_nd)
+{
+	const struct device *dev = c_nd->data->priv;
+	struct uvc_data *data = (void *)dev->data;
+	struct net_buf *buf = net_buf_alloc_with_data(&_buf_pool,
+		(void *)data->video_buf_addr, data->video_buf_size, K_NO_WAIT);
+	struct udc_buf_info *bi = udc_get_buf_info(buf);
+	int ret;
+
+	memset(bi, 0, sizeof(struct udc_buf_info));
+	bi->ep = _get_video_bulk_ep(c_nd);
+
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
+		net_buf_unref(buf);
+	}
+}
+
+static int uvc_ctd(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    const struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
-	struct usbd_uvc_data *data = dev->data;
+	struct uvc_data *data = dev->data;
 
 	LOG_DBG("%s: bRequest=%d wValue=%d wIndex=%d wLength=%d", __func__,
 		setup->bRequest, setup->wValue, setup->wIndex, setup->wLength);
@@ -231,6 +264,7 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 	CASE(UVC_VS_PROBE_CONTROL);
 		break;
 	CASE(UVC_VS_COMMIT_CONTROL);
+		_start_transfer(c_nd);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
@@ -257,27 +291,27 @@ static int usbd_uvc_ctd(struct usbd_class_node *const c_nd,
 	return 0;
 }
 
-static int usbd_uvc_init(struct usbd_class_node *const c_nd)
+static int uvc_init(struct usbd_class_node *const c_nd)
 {
-	struct usbd_uvc_desc *desc = c_nd->data->desc;
+	struct uvc_desc *desc = c_nd->data->desc;
 	const struct device *dev = c_nd->data->priv;
-	struct usbd_uvc_data *data = (void *)dev->data;
+	struct uvc_data *data = (void *)dev->data;
 
 	desc->iad_uvc.bFirstInterface = desc->if0.bInterfaceNumber;
 	memcpy(&data->probe, &_probe_def, sizeof(data->probe));
 	return 0;
 }
 
-struct usbd_class_api usbd_uvc_api = {
-	.request = usbd_uvc_request,
-	.update = usbd_uvc_update,
-	.control_to_host = usbd_uvc_cth,
-	.control_to_dev = usbd_uvc_ctd,
-	.init = usbd_uvc_init,
+struct usbd_class_api _api = {
+	.request = uvc_request,
+	.update = uvc_update,
+	.control_to_host = uvc_cth,
+	.control_to_dev = uvc_ctd,
+	.init = uvc_init,
 };
 
 #define UVC_DEFINE_DESCRIPTOR(n)						\
-static struct usbd_uvc_desc uvc_desc_##n = {					\
+static struct uvc_desc _desc_##n = {					\
 										\
 	.iad_uvc = {								\
 		.bLength = sizeof(struct usb_association_descriptor),		\
@@ -428,19 +462,19 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 										\
 	UVC_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_uvc_data usbd_uvc_data_##n;			        \
-										\
-	static struct usbd_class_data usbd_uvc_class_data_##n = {		\
-		.desc = (struct usb_desc_header *)&uvc_desc_##n,		\
+	static struct usbd_class_data _class_data_##n = {			\
+		.desc = (struct usb_desc_header *)&_desc_##n,			\
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),			\
 	};									\
 										\
-	USBD_DEFINE_CLASS(uvc_##n, &usbd_uvc_api, &usbd_uvc_class_data_##n);	\
-	struct usbd_class_node *const uvc_c_nd = &uvc_##n;			\
+	USBD_DEFINE_CLASS(_class_##n, &_api, &_class_data_##n);			\
 										\
-	DEVICE_DT_INST_DEFINE(n, NULL, NULL,					\
-		&usbd_uvc_data_##n, NULL,					\
-		POST_KERNEL, 50,						\
-		&usbd_uvc_api);
+	static struct uvc_data _data_##n = {					\
+		.video_buf_addr = DT_INST_PROP(n, video_buf_addr),		\
+		.video_buf_size = DT_INST_PROP(n, video_buf_size),		\
+	};									\
+										\
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\
+		POST_KERNEL, 50, &_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_UVC_DT_DEVICE_DEFINE);

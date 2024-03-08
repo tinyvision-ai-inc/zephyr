@@ -45,6 +45,7 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define USB23_EVT_NUM				8
 #define USB23_TRB_NUM				2
 #define USB23_CTRL_BUF_SIZE			512
+#define USB23_XFER_BLOCK_SIZE			(10 * 1024)
 
 /*
  * Structure for holding controller configuration items that can remain in
@@ -65,6 +66,9 @@ struct usb23_config {
 	/* Functions pointers for managing the IRQs from LiteX */
 	void (*irq_enable_func)(void);
 	void (*irq_clear_func)(void);
+
+	/* Number of an endpoint to be automatically enqueued and repeated */
+	uint8_t auto_ep;
 };
 
 /*
@@ -211,22 +215,22 @@ static struct usb23_ep_data *usb23_get_ep_data(const struct device *dev, struct 
 	return &priv->ep_data[epn];
 }
 
-static struct usb23_trb usb23_get_trb(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static struct usb23_trb usb23_get_trb(const struct device *dev, struct udc_ep_config *const ep_cfg, int n)
 {
 	struct usb23_data *priv = udc_get_private(dev);
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 
 	flush_l2_cache();
 	flush_cpu_dcache();
-	return priv->trb_buf[epn][0];
+	return priv->trb_buf[epn][n];
 }
 
-static void usb23_set_trb(const struct device *dev, struct udc_ep_config *const ep_cfg, struct usb23_trb *trb)
+static void usb23_set_trb(const struct device *dev, struct udc_ep_config *const ep_cfg, int n, struct usb23_trb *trb)
 {
 	struct usb23_data *priv = udc_get_private(dev);
 	int epn = usb23_get_ep_physical_num(ep_cfg);
 
-	priv->trb_buf[epn][0] = *trb;
+	priv->trb_buf[epn][n] = *trb;
 	flush_cpu_dcache();
 	flush_l2_cache();
 }
@@ -395,7 +399,7 @@ void usb23_dump_events(const struct device *dev)
 
 void usb23_dump_trb0(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
-	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg);
+	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, 0);
 
 	LOG_DBG("%s: ep=0x%02x addr=0x%08x%08x sts=%ld hwo=%d lst=%d chn=%d csp=%d isp=%d ioc=%d spr=%d pcm1=%ld sof=%ld bufsiz=%ld",
 		__func__, ep_cfg->addr, trb.addr_hi, trb.addr_lo,
@@ -585,6 +589,50 @@ static void usb23_depcmd_start_xfer(const struct device *dev, struct udc_ep_conf
 	ep_data->xferrscidx = idx;
 }
 
+static void usb23_depcmd_update_xfer(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	int epn = usb23_get_ep_physical_num(ep_cfg);
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+
+	LOG_DBG("TRB_REPEAT");
+	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPUPDXFER | ep_data->xferrscidx);
+}
+
+static void usb23_trb_repeated(const struct device *dev, struct udc_ep_config *const ep_cfg, void *data)
+{
+	struct usb23_data *priv = udc_get_private(dev);
+	struct usb23_trb trb0 = {
+		.addr_lo = LO32((uintptr_t)data),
+		.addr_hi = HI32((uintptr_t)data),
+		.status = USB23_XFER_BLOCK_SIZE,
+		.ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO,
+	};
+	struct usb23_trb trb1 = {
+		.addr_lo = LO32((uintptr_t)priv->trb_buf),
+		.addr_hi = HI32((uintptr_t)priv->trb_buf),
+		.status = sizeof(trb0),
+		.ctrl = USB23_TRB_CTRL_TRBCTL_LINK_TRB | USB23_TRB_CTRL_HWO,
+	};
+
+	LOG_DBG("TRB_REPEATED ep=0x%02x addr_hi=0x%08x addr_lo=0x%08x ctrl=0x%08x status=%d",
+		ep_cfg->addr, trb0.addr_hi, trb0.addr_lo, trb0.ctrl, trb0.status);
+	usb23_set_trb(dev, ep_cfg, 0, &trb0);
+	usb23_set_trb(dev, ep_cfg, 1, &trb1);
+	usb23_depcmd_start_xfer(dev, ep_cfg);
+}
+
+static void usb23_trb_repeat(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	struct usb23_trb trb0 = usb23_get_trb(dev, ep_cfg, 0);
+
+	trb0.ctrl |= USB23_TRB_CTRL_HWO;
+	trb0.status = USB23_XFER_BLOCK_SIZE;
+	LOG_DBG("TRB_REPEAT ep=0x%02x addr_hi=0x%08x addr_lo=0x%08x ctrl=0x%08x status=%d",
+		ep_cfg->addr, trb0.addr_hi, trb0.addr_lo, trb0.ctrl, trb0.status);
+	usb23_set_trb(dev, ep_cfg, 0, &trb0);
+	usb23_depcmd_update_xfer(dev, ep_cfg);
+}
+
 static void usb23_depcmd_end_xfer(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
@@ -597,7 +645,7 @@ static void usb23_depcmd_end_xfer(const struct device *dev, struct udc_ep_config
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPENDXFER | reg);
 
 	/* Mark the TRB as free for another request */
-	usb23_set_trb(dev, ep_cfg, &(struct usb23_trb){0});
+	usb23_set_trb(dev, ep_cfg, 0, &(struct usb23_trb){0});
 }
 
 static void usb23_depcmd_start_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
@@ -645,7 +693,12 @@ static void usb23_dgcmd_exit_latency(const struct device *dev, const struct udc_
 
 static bool usb23_trb_is_free(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
-	return usb23_get_trb(dev, ep_cfg).ctrl == 0x00000000;
+	return usb23_get_trb(dev, ep_cfg, 0).ctrl == 0x00000000;
+}
+
+static bool usb23_trb_is_busy(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	return usb23_get_trb(dev, ep_cfg, 0).ctrl & USB23_TRB_CTRL_HWO;
 }
 
 static void usb23_trb_single_buf(const struct device *dev, struct udc_ep_config *const ep_cfg, void *data, uint32_t status, uint32_t ctrl)
@@ -662,7 +715,7 @@ static void usb23_trb_single_buf(const struct device *dev, struct udc_ep_config 
 	// in USB2 where the MPS0 is smaller)
 
 	__ASSERT_NO_MSG(usb23_trb_is_free(dev, ep_cfg));
-	usb23_set_trb(dev, ep_cfg, &trb);
+	usb23_set_trb(dev, ep_cfg, 0, &trb);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
 	ep_data->submitted = true;
 }
@@ -759,11 +812,30 @@ static void usb23_process_queue(const struct device *dev, struct udc_ep_config *
 			break;
 		}
 
-		// TODO submit a normal TRB
+		if (usb23_trb_is_free(dev, ep_cfg)) {
+			usb23_trb_normal(dev, ep_cfg, buf);
 
-		/* Pop from the list, now that it is submitted */
-		udc_buf_get(dev, ep_cfg->addr);
+			/* Pop from the list, now that it is submitted */
+			udc_buf_get(dev, ep_cfg->addr);
+		}
 	}
+}
+
+static void usb23_xfer_repeat(const struct device *dev)
+{
+	const struct usb23_config *config = dev->config;
+	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, config->auto_ep);
+
+	if (ep_cfg->addr == config->auto_ep && !usb23_trb_is_busy(dev, ep_cfg)) {
+		LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
+		usb23_trb_repeat(dev, ep_cfg);
+	}
+}
+
+void usb23_auto_enqueue(const struct device *dev, uint8_t ep_addr, void *data, size_t block_size)
+{
+	__ASSERT_NO_MSG(block_size == USB23_XFER_BLOCK_SIZE);
+	usb23_trb_repeated(dev, udc_get_ep_cfg(dev, ep_addr), data);
 }
 
 /*------------------------------------------------------------------------------
@@ -1031,6 +1103,8 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 		case USB_CONTROL_EP_OUT:
 			usb23_trb_ctrl_data_out(dev);
 			break;
+		default:
+			usb23_process_queue(dev, ep_cfg);
 		}
 		break;
 	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_STATUS);
@@ -1048,7 +1122,7 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct usb23_data *priv = udc_get_private(dev);
-	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg);
+	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, 0);
 	struct net_buf *buf = ep_data->net_buf;
 	uint32_t size;
 	int err;
@@ -1079,7 +1153,7 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 	//LOG_HEXDUMP_DBG(priv->ctrl_buf, size, ep_cfg->caps.in ? "TX" : "RX");
 
 	/* Reset the counters */
-	usb23_set_trb(dev, ep_cfg, &(struct usb23_trb){0});
+	usb23_set_trb(dev, ep_cfg, 0, &(struct usb23_trb){0});
 	ep_data->net_buf = NULL;
 	ep_data->submitted = false;
 
@@ -1162,6 +1236,7 @@ void usb23_irq_handler(void *ptr)
 
 	config->irq_clear_func();
 	usb23_on_event(&priv->work);
+	usb23_xfer_repeat(dev);
 }
 
 /*------------------------------------------------------------------------------
@@ -1261,7 +1336,7 @@ static int usb23_check_address(const struct device *dev, const uint8_t addr)
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr)
 {
-	LOG_DBG("ADDR %d", addr);
+	LOG_INF("ADDR %d", addr);
 
 	/* Configure the new address */
 	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_DEVADDR_MASK,
@@ -1516,7 +1591,7 @@ static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *cons
 	}
 
 	/* Mark the active TRB as vacant */
-	usb23_set_trb(dev, ep_cfg, &(struct usb23_trb){0});
+	usb23_set_trb(dev, ep_cfg, 0, &(struct usb23_trb){0});
 
 	return 0;
 }
@@ -1613,6 +1688,7 @@ static const struct udc_api usb23_api = {
 		.speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),	\
 		.irq_enable_func = usb23_irq_enable,				\
 		.irq_clear_func = usb23_irq_clear,				\
+		.auto_ep = DT_INST_PROP_BY_IDX(n, auto_endpoint, 0),		\
 	};									\
 										\
 	union usb23_evt usb23_dma_evt_buf_##n[USB23_EVT_NUM];			\

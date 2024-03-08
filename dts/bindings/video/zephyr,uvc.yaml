@@ -6,3 +6,14 @@ description: USB UVC
 compatible: "zephyr,uvc"
 
 on-bus: usb
+
+properties:
+  video-buf-addr:
+    type: int
+    description: |
+      Address of a video memory buffer.
+
+  video-buf-size:
+    type: int
+    description: |
+      Size of the video memory buffer.

@@ -13,3 +13,6 @@ properties:
     required: true
   interrupts:
     required: true
+  auto-endpoint:
+    required: false
+    type: array
