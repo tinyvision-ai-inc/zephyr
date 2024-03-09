@@ -445,7 +445,7 @@ static struct uvc_desc _desc_##n = {						\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(1024),			\
+		.wMaxPacketSize = sys_cpu_to_le16(64),			\
 		.bInterval = 0,							\
 	},									\
 	.if1_in_ep_comp = {							\
