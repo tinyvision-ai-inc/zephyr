@@ -604,6 +604,7 @@ static void usb23_depcmd_update_xfer(const struct device *dev, struct udc_ep_con
 static void usb23_trb_repeated(const struct device *dev, struct udc_ep_config *const ep_cfg, void *data)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+	int epn = usb23_get_ep_physical_num(ep_cfg);
 	struct usb23_data *priv = udc_get_private(dev);
 	struct usb23_trb trb0 = {
 		.addr_lo = LO32((uintptr_t)data),
@@ -612,8 +613,8 @@ static void usb23_trb_repeated(const struct device *dev, struct udc_ep_config *c
 		.ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO,
 	};
 	struct usb23_trb trb1 = {
-		.addr_lo = LO32((uintptr_t)priv->trb_buf),
-		.addr_hi = HI32((uintptr_t)priv->trb_buf),
+		.addr_lo = LO32((uintptr_t)priv->trb_buf[epn]),
+		.addr_hi = HI32((uintptr_t)priv->trb_buf[epn]),
 		.status = sizeof(trb0),
 		.ctrl = USB23_TRB_CTRL_TRBCTL_LINK_TRB | USB23_TRB_CTRL_HWO,
 	};
