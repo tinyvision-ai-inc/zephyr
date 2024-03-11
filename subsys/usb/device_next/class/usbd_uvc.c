@@ -166,10 +166,63 @@ void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_con
 #undef APPLY_PARAM
 }
 
+uint8_t _get_video_bulk_ep(struct usbd_class_node *const c_nd)
+{
+	struct uvc_desc *desc = c_nd->data->desc;
+
+	return desc->if1_in_ep.bEndpointAddress;
+}
+
+void _new_transfer(struct usbd_class_node *const c_nd)
+{
+	const struct device *dev = c_nd->data->priv;
+	struct uvc_data *data = (void *)dev->data;
+	struct udc_buf_info *bi;
+	struct net_buf *buf;
+	int ret;
+
+	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data->video_buf_addr,
+		data->video_buf_size, K_NO_WAIT);
+	__ASSERT_NO_MSG(buf != NULL);
+
+	bi = udc_get_buf_info(buf);
+	__ASSERT_NO_MSG(bi != NULL);
+	memset(bi, 0, sizeof(struct udc_buf_info));
+	bi->ep = _get_video_bulk_ep(c_nd);
+
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
+		net_buf_unref(buf);
+	}
+}
+
 static int uvc_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
 {
-	return 0;
+	struct usbd_contex *uds_ctx = c_nd->data->uds_ctx;
+	struct udc_buf_info *bi;
+
+	LOG_DBG("%s buf=%p err=%d", __func__, buf, err);
+
+	bi = udc_get_buf_info(buf);
+	if (err) {
+		if (err == -ECONNABORTED) {
+			LOG_WRN("request ep 0x%02x, len %u cancelled",
+				bi->ep, buf->len);
+		} else {
+			LOG_ERR("request ep 0x%02x, len %u failed",
+				bi->ep, buf->len);
+		}
+		goto err;
+	}
+
+	if (bi->ep == _get_video_bulk_ep(c_nd)) {
+		LOG_DBG("%s: transfer completed", __func__);
+		_new_transfer(c_nd);
+	}
+err:
+	return usbd_ep_buf_free(uds_ctx, buf);
 }
 
 static void uvc_update(struct usbd_class_node *const c_nd,
@@ -227,37 +280,6 @@ err_unsupported:
 	return 0;
 }
 
-uint8_t _get_video_bulk_ep(struct usbd_class_node *const c_nd)
-{
-	struct uvc_desc *desc = c_nd->data->desc;
-
-	return desc->if1_in_ep.bEndpointAddress;
-}
-
-void _start_transfer(struct usbd_class_node *const c_nd)
-{
-	const struct device *dev = c_nd->data->priv;
-	struct uvc_data *data = (void *)dev->data;
-	struct udc_buf_info *bi;
-	struct net_buf *buf;
-	int ret;
-
-	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data->video_buf_addr,
-		data->video_buf_size, K_NO_WAIT);
-	__ASSERT_NO_MSG(buf != NULL);
-
-	bi = udc_get_buf_info(buf);
-	__ASSERT_NO_MSG(bi != NULL);
-	memset(bi, 0, sizeof(struct udc_buf_info));
-	bi->ep = _get_video_bulk_ep(c_nd);
-
-	ret = usbd_ep_enqueue(c_nd, buf);
-	if (ret) {
-		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
-		net_buf_unref(buf);
-	}
-}
-
 static int uvc_ctd(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    const struct net_buf *const buf)
@@ -272,7 +294,7 @@ static int uvc_ctd(struct usbd_class_node *const c_nd,
 	CASE(UVC_VS_PROBE_CONTROL);
 		break;
 	CASE(UVC_VS_COMMIT_CONTROL);
-		_start_transfer(c_nd);
+		_new_transfer(c_nd);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
