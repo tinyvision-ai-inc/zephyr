@@ -8,12 +8,12 @@ compatible: "zephyr,uvc"
 on-bus: usb
 
 properties:
-  video-buf-addr:
+  payload-addr:
     type: int
     description: |
       Address of a video memory buffer.
 
-  video-buf-size:
+  payload-size:
     type: int
     description: |
       Size of the video memory buffer.

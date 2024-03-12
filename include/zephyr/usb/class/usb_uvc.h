@@ -236,8 +236,9 @@ struct uvc_payload_header {
 #define UVC_BMHEADERINFO_STILL_IMAGE		(1 << 5)
 #define UVC_BMHEADERINFO_ERROR			(1 << 6)
 #define UVC_BMHEADERINFO_END_OF_HEADER		(1 << 7)
-	/* uint32_t dwPresentationTime; (optional) */
-	/* uint64_t scrSourceClock; (optional) */
+	//uint32_t dwPresentationTime; /* optional */
+	//uint64_t scrSourceClock; /* optional */
+	uint8_t padding[16 - 2];
 } __packed;
 
 /** Class-Specific Video Control Interface Descriptor */
