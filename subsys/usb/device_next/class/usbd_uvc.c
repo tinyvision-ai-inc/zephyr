@@ -257,6 +257,8 @@ static int uvc_request(struct usbd_class_node *const c_nd,
 		usbd_ep_buf_free(uds_ctx, buf);
 		_start_transfer(c_nd);
 	}
+
+	return err;
 }
 
 static void uvc_update(struct usbd_class_node *const c_nd,
