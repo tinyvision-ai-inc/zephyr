@@ -625,9 +625,11 @@ static void usb23_set_trb_data_in(const struct device *dev, struct udc_ep_config
 	if (size > config->block_size) {
 		/* More repetition needed after this one, crop the size */
 		size = config->block_size;
+		ep_data->completed_size += size;
 	} else {
 		/* Switch to the next buffer */
 		ep_data->current_buf = ep_data->current_buf->frags;
+		ep_data->completed_size = 0;
 
 		if (ep_data->current_buf == NULL) {
 			/* Last of all repetitions, mark the end of the chain,
@@ -642,7 +644,6 @@ static void usb23_set_trb_data_in(const struct device *dev, struct udc_ep_config
 
 	LOG_DBG("%s: size=%d", __func__, size);
 	trb.status = size;
-	ep_data->completed_size += size;
 	usb23_set_trb(dev, ep_cfg, 0, &trb);
 }
 

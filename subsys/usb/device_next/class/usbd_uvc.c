@@ -22,10 +22,11 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define CASE(x) case x: LOG_DBG(#x)
 #define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
-#define FRAME_WIDTH			160
-#define FRAME_HEIGHT			120
-#define FRAME_BIT_PER_PIXEL		16
-#define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * FRAME_BIT_PER_PIXEL / 8)
+#define FRAME_WIDTH			10
+#define FRAME_HEIGHT			10
+#define BITS_PER_PIXEL			16
+#define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
+#define PAYLOAD_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
@@ -36,7 +37,6 @@ struct uvc_data {
 
 	/* Data buffer continuously sent by the UVC class */
 	uintptr_t payload_addr;
-	size_t payload_size;
 
 	/* Pointer to a header structure that can be passed to DMA */
 	struct uvc_payload_header *payload_header;
@@ -71,13 +71,13 @@ static const struct uvc_vs_probe_control _probe_def = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(100 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
 	.bMinVersion = 1,
 	.bMaxVersion = 1,
-	.bBitDepthLuma = 16 - 8,
+	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
 static const struct uvc_vs_probe_control _probe_min = {
@@ -86,13 +86,13 @@ static const struct uvc_vs_probe_control _probe_min = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(1 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
 	.bMinVersion = 1,
 	.bMaxVersion = 1,
-	.bBitDepthLuma = 8 - 8,
+	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
 static const struct uvc_vs_probe_control _probe_max = {
@@ -101,13 +101,13 @@ static const struct uvc_vs_probe_control _probe_max = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(10000 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(10000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 255,
 	.bMinVersion = 255,
 	.bMaxVersion = 255,
-	.bBitDepthLuma = 24 - 8,
+	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
 static void _dump_probe(const struct uvc_vs_probe_control *pc)
@@ -222,7 +222,7 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 	INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
 
 	buf = _alloc_net_buf(c_nd, data->payload_header, sizeof(struct uvc_payload_header));
-	buf->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, data->payload_size);
+	buf->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, data->probe.dwMaxVideoFrameSize);
 
 	ret = usbd_ep_enqueue(c_nd, buf);
 	if (ret) {
@@ -501,8 +501,8 @@ static struct uvc_desc _desc_##n = {						\
 		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,		\
 		.bFrameIndex = 1,						\
 		.bmCapabilities = 0x00,						\
-		.wWidth = sys_cpu_to_le16(160),					\
-		.wHeight = sys_cpu_to_le16(120),				\
+		.wWidth = sys_cpu_to_le16(FRAME_WIDTH),				\
+		.wHeight = sys_cpu_to_le16(FRAME_HEIGHT),			\
 		.dwMinBitRate = sys_cpu_to_le32(15360000),			\
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),			\
 		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(FRAME_SIZE),	\
@@ -550,7 +550,6 @@ static struct uvc_desc _desc_##n = {						\
 	static struct uvc_data _data_##n = {					\
 		.payload_header = &uvc_payload_header_##n,			\
 		.payload_addr = DT_INST_PROP(n, payload_addr),			\
-		.payload_size = DT_INST_PROP(n, payload_size),			\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\

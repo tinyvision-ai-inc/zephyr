@@ -12,8 +12,3 @@ properties:
     type: int
     description: |
       Address of a video memory buffer.
-
-  payload-size:
-    type: int
-    description: |
-      Size of the video memory buffer.
