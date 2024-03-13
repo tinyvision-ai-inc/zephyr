@@ -20,7 +20,12 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define DT_DRV_COMPAT zephyr_uvc
 
 #define CASE(x) case x: LOG_DBG(#x)
+#define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
+#define FRAME_WIDTH			160
+#define FRAME_HEIGHT			120
+#define FRAME_BIT_PER_PIXEL		16
+#define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * FRAME_BIT_PER_PIXEL / 8)
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
@@ -63,10 +68,10 @@ struct uvc_desc {
 static const struct uvc_vs_probe_control _probe_def = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
-	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
+	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(100 /*ms*/),
-	.dwMaxVideoFrameSize = sys_cpu_to_le32(600 * 1024),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(100 * 1024),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
@@ -78,10 +83,10 @@ static const struct uvc_vs_probe_control _probe_def = {
 static const struct uvc_vs_probe_control _probe_min = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
-	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
+	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(1 /*ms*/),
-	.dwMaxVideoFrameSize = sys_cpu_to_le32(1 * 1024),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(1 * 1024),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
@@ -93,10 +98,10 @@ static const struct uvc_vs_probe_control _probe_min = {
 static const struct uvc_vs_probe_control _probe_max = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
-	.dwFrameInterval = sys_cpu_to_le32(40000000 /*ns*/ / 100),
+	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(10000 /*ms*/),
-	.dwMaxVideoFrameSize = sys_cpu_to_le32(1024 * 1024),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(1024 * 1024),
+	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(FRAME_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(10000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 255,
@@ -105,7 +110,7 @@ static const struct uvc_vs_probe_control _probe_max = {
 	.bBitDepthLuma = 24 - 8,
 };
 
-void _dump_probe(const struct uvc_vs_probe_control *pc)
+static void _dump_probe(const struct uvc_vs_probe_control *pc)
 {
 	LOG_DBG("struct uvc_vs_probe_control");
 	LOG_DBG(".bmHint = 0x%04x", sys_le16_to_cpu(pc->bmHint));
@@ -138,7 +143,7 @@ void _dump_probe(const struct uvc_vs_probe_control *pc)
  * All fields set to 0 are ignored, others are applied
  * TODO: check if within MIN/MAX range
  */
-void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
+static void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
 {
 #define APPLY_PARAM(p)								\
 	if (src->p != 0 && dst->p != src->p) {					\
@@ -172,14 +177,14 @@ void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_con
 #undef APPLY_PARAM
 }
 
-uint8_t _get_bulk_ep(struct usbd_class_node *const c_nd)
+static uint8_t _get_bulk_ep(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 
 	return desc->if1_in_ep.bEndpointAddress;
 }
 
-struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *data, size_t size)
+static struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *data, size_t size)
 {
 	struct net_buf *buf;
 	struct udc_buf_info *bi;
@@ -196,7 +201,7 @@ struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *data, s
 	return buf;
 }
 
-void _start_transfer(struct usbd_class_node *const c_nd)
+static void _start_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
@@ -212,6 +217,9 @@ void _start_transfer(struct usbd_class_node *const c_nd)
 	/* Toggle the FrameId bit for every new frame. */
 	// TODO only do this once per frame, not once per transfer header
 	data->payload_header->bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
+	INC_LE(32, data->payload_header->dwPresentationTime, 1);
+	INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
+	INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
 
 	buf = _alloc_net_buf(c_nd, data->payload_header, sizeof(struct uvc_payload_header));
 	buf->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, data->payload_size);
@@ -223,7 +231,7 @@ void _start_transfer(struct usbd_class_node *const c_nd)
 	}
 }
 
-void _complete_transfer(struct usbd_class_node *const c_nd)
+static void _complete_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
@@ -231,7 +239,7 @@ void _complete_transfer(struct usbd_class_node *const c_nd)
 	data->transferring = false;
 }
 
-static int uvc_request(struct usbd_class_node *const c_nd,
+static int _api_request(struct usbd_class_node *const c_nd,
 				struct net_buf *buf, int err)
 {
 	struct usbd_contex *uds_ctx = c_nd->data->uds_ctx;
@@ -261,13 +269,13 @@ static int uvc_request(struct usbd_class_node *const c_nd,
 	return err;
 }
 
-static void uvc_update(struct usbd_class_node *const c_nd,
+static void _api_update(struct usbd_class_node *const c_nd,
 				uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("%s", __func__);
 }
 
-static int uvc_cth(struct usbd_class_node *const c_nd,
+static int _api_cth(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    struct net_buf *const buf)
 {
@@ -316,7 +324,7 @@ err_unsupported:
 	return 0;
 }
 
-static int uvc_ctd(struct usbd_class_node *const c_nd,
+static int _api_ctd(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    const struct net_buf *const buf)
 {
@@ -357,24 +365,27 @@ static int uvc_ctd(struct usbd_class_node *const c_nd,
 	return 0;
 }
 
-static int uvc_init(struct usbd_class_node *const c_nd)
+static int _api_init(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = (void *)dev->data;
 
 	data->payload_header->bHeaderLength = sizeof(struct uvc_payload_header);
+	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_PRESENTATIONTIME;
+	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
+	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
 	desc->iad_uvc.bFirstInterface = desc->if0.bInterfaceNumber;
 	memcpy(&data->probe, &_probe_def, sizeof(data->probe));
 	return 0;
 }
 
 struct usbd_class_api _api = {
-	.request = uvc_request,
-	.update = uvc_update,
-	.control_to_host = uvc_cth,
-	.control_to_dev = uvc_ctd,
-	.init = uvc_init,
+	.request = _api_request,
+	.update = _api_update,
+	.control_to_host = _api_cth,
+	.control_to_dev = _api_ctd,
+	.init = _api_init,
 };
 
 #define UVC_DEFINE_DESCRIPTOR(n)						\
@@ -494,8 +505,8 @@ static struct uvc_desc _desc_##n = {						\
 		.wHeight = sys_cpu_to_le16(120),				\
 		.dwMinBitRate = sys_cpu_to_le32(15360000),			\
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),			\
-		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(614400),		\
-		.dwDefaultFrameInterval = sys_cpu_to_le32(400000),		\
+		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(FRAME_SIZE),	\
+		.dwDefaultFrameInterval = sys_cpu_to_le32(300*1000*1000 / 100), \
 		.bFrameIntervalType = 1,					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
 	},									\
