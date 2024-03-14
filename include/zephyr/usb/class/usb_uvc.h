@@ -239,7 +239,7 @@ struct uvc_payload_header {
 	uint32_t dwPresentationTime; /* optional */
 	uint32_t scrSourceClockSTC; /* optional */
 	uint16_t scrSourceClockSOF; /* optional */
-	uint8_t padding[4];
+	uint8_t padding[64 - 12];
 } __packed;
 
 /** Class-Specific Video Control Interface Descriptor */

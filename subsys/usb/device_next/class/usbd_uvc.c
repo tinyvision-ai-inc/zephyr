@@ -23,10 +23,10 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
 #define FRAME_WIDTH			10
-#define FRAME_HEIGHT			10
+#define FRAME_HEIGHT			3
 #define BITS_PER_PIXEL			16
 #define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
-#define PAYLOAD_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
+#define TRANSFER_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
@@ -71,7 +71,7 @@ static const struct uvc_vs_probe_control _probe_def = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(100 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(TRANSFER_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
@@ -86,7 +86,7 @@ static const struct uvc_vs_probe_control _probe_min = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(1 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(TRANSFER_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(1000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 1,
@@ -101,7 +101,7 @@ static const struct uvc_vs_probe_control _probe_max = {
 	.dwFrameInterval = sys_cpu_to_le32(300*1000*1000 /*ns*/ / 100),
 	.wDelay = sys_cpu_to_le16(10000 /*ms*/),
 	.dwMaxVideoFrameSize = sys_cpu_to_le32(FRAME_SIZE),
-	.dwMaxPayloadTransferSize = sys_cpu_to_le32(PAYLOAD_SIZE),
+	.dwMaxPayloadTransferSize = sys_cpu_to_le32(TRANSFER_SIZE),
 	.dwClockFrequency = sys_cpu_to_le32(10000000 /*Hz*/),
 	.bmFramingInfo = UVC_BMFRAMING_INFO_FID,
 	.bPreferedVersion = 255,
@@ -505,7 +505,7 @@ static struct uvc_desc _desc_##n = {						\
 		.wHeight = sys_cpu_to_le16(FRAME_HEIGHT),			\
 		.dwMinBitRate = sys_cpu_to_le32(15360000),			\
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),			\
-		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(FRAME_SIZE),	\
+		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(TRANSFER_SIZE),	\
 		.dwDefaultFrameInterval = sys_cpu_to_le32(300*1000*1000 / 100), \
 		.bFrameIntervalType = 1,					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
@@ -515,7 +515,7 @@ static struct uvc_desc _desc_##n = {						\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(8),				\
+		.wMaxPacketSize = sys_cpu_to_le16(64),				\
 		.bInterval = 0,							\
 	},									\
 	.if1_in_ep_comp = {							\

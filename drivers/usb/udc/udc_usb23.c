@@ -1253,6 +1253,7 @@ static void usb23_on_event(struct k_work *work)
 
 		if (evt.raw == 0x00000000) {
 			LOG_ERR("empty event received");
+			usb23_dump_bus_error(dev);
 		} else if (evt.devt.category) {
 			usb23_on_device_event(dev, evt.devt);
 		} else {
