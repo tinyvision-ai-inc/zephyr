@@ -22,8 +22,9 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define CASE(x) case x: LOG_DBG(#x)
 #define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
-#define FRAME_WIDTH			10
-#define FRAME_HEIGHT			3
+#define FRAME_WIDTH			160
+#define FRAME_HEIGHT			20
+
 #define BITS_PER_PIXEL			16
 #define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
 #define TRANSFER_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
@@ -505,7 +506,7 @@ static struct uvc_desc _desc_##n = {						\
 		.wHeight = sys_cpu_to_le16(FRAME_HEIGHT),			\
 		.dwMinBitRate = sys_cpu_to_le32(15360000),			\
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),			\
-		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(TRANSFER_SIZE),	\
+		.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(FRAME_SIZE),	\
 		.dwDefaultFrameInterval = sys_cpu_to_le32(300*1000*1000 / 100), \
 		.bFrameIntervalType = 1,					\
 		.dwFrameInterval = { sys_cpu_to_le32(400000), },		\
@@ -515,7 +516,7 @@ static struct uvc_desc _desc_##n = {						\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(64),				\
+		.wMaxPacketSize = sys_cpu_to_le16(512),				\
 		.bInterval = 0,							\
 	},									\
 	.if1_in_ep_comp = {							\
