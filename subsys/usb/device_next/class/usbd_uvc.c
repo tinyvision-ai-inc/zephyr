@@ -22,15 +22,16 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define CASE(x) case x: LOG_DBG(#x)
 #define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
-#define FRAME_WIDTH			160
-#define FRAME_HEIGHT			3
+#define FRAME_WIDTH			320
+#define FRAME_HEIGHT			240
+#define BLOCK_SIZE			8192
 
 #define BITS_PER_PIXEL			16
 #define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
 #define TRANSFER_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
-NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
+NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 1000,
 	0, sizeof(struct udc_buf_info), NULL);
 
 struct uvc_data {
@@ -206,7 +207,8 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
-	struct net_buf *buf;
+	struct net_buf *head;
+	struct net_buf *tail;
 	int ret;
 
 	if (data->transferring) {
@@ -222,13 +224,22 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 	INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
 	INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
 
-	buf = _alloc_net_buf(c_nd, data->payload_header, sizeof(struct uvc_payload_header));
-	buf->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, data->probe.dwMaxVideoFrameSize);
+	tail = head = _alloc_net_buf(c_nd, data->payload_header, sizeof(struct uvc_payload_header));
+	__ASSERT_NO_MSG(tail != NULL);
 
-	ret = usbd_ep_enqueue(c_nd, buf);
+	for (size_t i = 0; i < data->probe.dwMaxVideoFrameSize; i += BLOCK_SIZE) {
+		const size_t size_left = data->probe.dwMaxVideoFrameSize - i;
+		const size_t size_sent = MIN(size_left, BLOCK_SIZE);
+
+		tail->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, size_sent);
+		tail = tail->frags;
+		__ASSERT_NO_MSG(tail != NULL);
+	}
+
+	ret = usbd_ep_enqueue(c_nd, head);
 	if (ret) {
-		LOG_DBG("%s buf=%p err=usbd", __func__, buf);
-		net_buf_unref(buf);
+		LOG_DBG("%s buf=%p err=usbd", __func__, head);
+		net_buf_unref(head);
 	}
 }
 
@@ -257,13 +268,13 @@ static int _api_request(struct usbd_class_node *const c_nd,
 			LOG_ERR("request ep 0x%02x, len %u failed",
 				bi->ep, buf->len);
 		}
-		usbd_ep_buf_free(uds_ctx, buf);
 	}
+
+	net_buf_unref(buf);
 
 	if (bi->ep == _get_bulk_ep(c_nd)) {
 		LOG_DBG("%s: transfer completed", __func__);
 		_complete_transfer(c_nd);
-		usbd_ep_buf_free(uds_ctx, buf);
 		_start_transfer(c_nd);
 	}
 
@@ -554,6 +565,6 @@ static struct uvc_desc _desc_##n = {						\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\
-		POST_KERNEL, 50, &_api);
+		APPLICATION, 50, &_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_UVC_DT_DEVICE_DEFINE);
