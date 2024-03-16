@@ -398,7 +398,7 @@ void usb23_dump_trbs(const struct device *dev, struct udc_ep_config *const ep_cf
 	for (int i = 0; i < ep_data->num_of_trbs; i++) {
 		struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, i);
 
-		LOG_INF("%s: ep=0x%02x n=%d addr=0x%08x%08x sts=%ld hwo=%d lst=%d chn=%d csp=%d isp=%d ioc=%d spr=%d pcm1=%ld sof=%ld bufsiz=%ld",
+		LOG_DBG("%s: ep=0x%02x n=%d addr=0x%08x%08x sts=%ld hwo=%d lst=%d chn=%d csp=%d isp=%d ioc=%d spr=%d pcm1=%ld sof=%ld bufsiz=%ld",
 			__func__, ep_cfg->addr, i, trb.addr_hi, trb.addr_lo,
 			GETFIELD(trb.status, USB23_TRB_STATUS_TRBSTS),
 			!!(trb.ctrl & USB23_TRB_CTRL_HWO),

@@ -236,6 +236,8 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 		__ASSERT_NO_MSG(tail != NULL);
 	}
 
+	LOG_INF("Submitting a %dx%d frame with %d bits per pixel (%zd bytes)",
+		FRAME_WIDTH, FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 	ret = usbd_ep_enqueue(c_nd, head);
 	if (ret) {
 		LOG_DBG("%s buf=%p err=usbd", __func__, head);
