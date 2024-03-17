@@ -325,6 +325,9 @@ union usb23_evt {
 
 /* Endpoint Global Event Buffer Count (of valid event) */
 #define USB23_GEVNTCOUNT(n)			(0xc40c + 16 * (n))
+#define USB23_GEVNTCOUNT_EVNTCOUNT_MASK		GENMASK(15, 0)
+#define USB23_GEVNTCOUNT_EVNTCOUNT_SHIFT	0
+#define USB23_GEVNTCOUNT_EVNT_HANDLER_BUSY	BIT(31)
 
 /* USB Device Active USB Endpoint Enable */
 #define USB23_DALEPENA				0xC720

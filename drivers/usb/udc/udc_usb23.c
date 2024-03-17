@@ -742,7 +742,7 @@ static void usb23_trb_ctrl_data_in(const struct device *dev, struct net_buf *buf
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
-	LOG_DBG("TRB_CONTROL_DATA_1_IN ep=0x%02x", ep_cfg->addr);
+	LOG_DBG("TRB_CONTROL_DATA_1_IN ep=0x%02x buf=%p", ep_cfg->addr, buf);
 	__ASSERT_NO_MSG(buf->len <= USB23_CTRL_BUF_SIZE);
 	memcpy(config->ctrl_buf, buf->data, buf->len);
 	ep_data->enqueued_size = buf->len;
@@ -1185,8 +1185,11 @@ static void usb23_on_event(struct k_work *work)
 		} else {
 			usb23_on_endpoint_event(dev, evt.depevt);
 		}
-
 	}
+
+	/* Let the core know we are done processing events. */
+	usb23_io_write(dev, USB23_GEVNTCOUNT(0),
+		USB23_GEVNTCOUNT_EVNT_HANDLER_BUSY);
 }
 
 void usb23_irq_handler(void *ptr)
@@ -1196,7 +1199,7 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	config->irq_clear_func();
-	usb23_on_event(&priv->work);
+	k_work_submit(&priv->work);
 }
 
 /*------------------------------------------------------------------------------
