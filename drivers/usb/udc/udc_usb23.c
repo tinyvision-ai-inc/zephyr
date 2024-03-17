@@ -1683,7 +1683,7 @@ static const struct udc_api usb23_api = {
 										\
 	DEVICE_DT_INST_DEFINE(n, usb23_driver_preinit, NULL,			\
 		&udc_data_##n, &usb23_config_##n,				\
-		APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,		\
+		POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,		\
 		&usb23_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USB23_DEVICE_DEFINE)
