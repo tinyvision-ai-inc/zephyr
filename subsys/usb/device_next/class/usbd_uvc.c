@@ -576,6 +576,6 @@ static struct uvc_desc _desc_##n = {						\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\
-		APPLICATION, 50, &_api);
+		POST_KERNEL, 50, &_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_UVC_DT_DEVICE_DEFINE);

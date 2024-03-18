@@ -382,12 +382,6 @@ static int sreq_set_sel(struct usbd_contex *const uds_ctx,
 	return udc_set_exit_latency(uds_ctx->dev, &el);
 }
 
-static int sreq_set_isoch_delay(struct usbd_contex *const uds_ctx)
-{
-	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
-	return 0;
-}
-
 static int std_request_to_device(struct usbd_contex *const uds_ctx,
 				 struct net_buf *const buf)
 {
@@ -412,9 +406,6 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 		break;
 	CASE(USB_SREQ_SET_SEL);
 		ret = sreq_set_sel(uds_ctx, buf);
-		break;
-	CASE(USB_SREQ_SET_ISOCH_DELAY);
-		ret = sreq_set_isoch_delay(uds_ctx);
 		break;
 	default:
 		errno = -ENOTSUP;
