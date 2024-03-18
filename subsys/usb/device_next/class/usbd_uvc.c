@@ -23,15 +23,14 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define INC_LE(sz, x, i) x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET	((1 << 0) | (1 << 1))
 #define FRAME_WIDTH			320
-#define FRAME_HEIGHT			240
-#define BLOCK_SIZE			(8192 * 2)
-
+#define FRAME_HEIGHT			24
+#define BLOCK_SIZE			8192
 #define BITS_PER_PIXEL			16
 #define FRAME_SIZE			(FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
 #define TRANSFER_SIZE			(FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
-NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 1000,
+NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100,
 	0, sizeof(struct udc_buf_info), NULL);
 
 struct uvc_data {
@@ -179,7 +178,7 @@ static void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_pr
 #undef APPLY_PARAM
 }
 
-static uint8_t _get_bulk_ep(struct usbd_class_node *const c_nd)
+static uint8_t _get_bulk_ep_num(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 
@@ -198,17 +197,40 @@ static struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *
 	__ASSERT_NO_MSG(bi != NULL);
 
 	memset(bi, 0, sizeof(struct udc_buf_info));
-	bi->ep = _get_bulk_ep(c_nd);
+	bi->ep = _get_bulk_ep_num(c_nd);
 
 	return buf;
+}
+
+static int _try_enqueue(struct usbd_class_node *const c_nd, void *data, size_t size, bool last_of_transfer)
+{
+	struct net_buf *buf;
+	struct udc_buf_info *bi;
+	int ret;
+
+	LOG_DBG("%s: Enqueueing data=%p size=%d zlp=%d", __func__, data, size, last_of_transfer);
+
+	buf = _alloc_net_buf(c_nd, data, size);
+	if (buf == NULL) {
+		LOG_WRN("%s: Not enough buffers", __func__);
+		return -ENOMEM;
+	}
+
+	bi = udc_get_buf_info(buf);
+	bi->zlp = last_of_transfer;
+
+	ret = usbd_ep_enqueue(c_nd, buf);
+	if (ret) {
+		LOG_WRN("%s: Could not enqueue buf=%p", __func__, buf);
+		net_buf_unref(buf);
+	}
+	return ret;
 }
 
 static void _start_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
-	struct net_buf *head;
-	struct net_buf *tail;
 	int ret;
 
 	if (data->transferring) {
@@ -224,24 +246,19 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 	INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
 	INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
 
-	tail = head = _alloc_net_buf(c_nd, data->payload_header, sizeof(struct uvc_payload_header));
-	__ASSERT_NO_MSG(tail != NULL);
+	LOG_INF("Submitting a %dx%d frame with %d bits per pixel (%zd bytes)",
+		FRAME_WIDTH, FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
+
+	ret = _try_enqueue(c_nd, data->payload_header, sizeof(struct uvc_payload_header), false);
+	__ASSERT_NO_MSG(ret == 0);
 
 	for (size_t i = 0; i < data->probe.dwMaxVideoFrameSize; i += BLOCK_SIZE) {
 		const size_t size_left = data->probe.dwMaxVideoFrameSize - i;
 		const size_t size_sent = MIN(size_left, BLOCK_SIZE);
 
-		tail->frags = _alloc_net_buf(c_nd, (void *)data->payload_addr, size_sent);
-		tail = tail->frags;
-		__ASSERT_NO_MSG(tail != NULL);
-	}
-
-	LOG_INF("Submitting a %dx%d frame with %d bits per pixel (%zd bytes)",
-		FRAME_WIDTH, FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
-	ret = usbd_ep_enqueue(c_nd, head);
-	if (ret) {
-		LOG_DBG("%s buf=%p err=usbd", __func__, head);
-		net_buf_unref(head);
+		ret = _try_enqueue(c_nd, (void *)data->payload_addr, size_sent,
+			size_left <= BLOCK_SIZE);
+		__ASSERT_NO_MSG(ret == 0);
 	}
 }
 
@@ -253,38 +270,30 @@ static void _complete_transfer(struct usbd_class_node *const c_nd)
 	data->transferring = false;
 }
 
-static int _api_request(struct usbd_class_node *const c_nd,
-				struct net_buf *buf, int err)
+static int _api_request(struct usbd_class_node *const c_nd, struct net_buf *buf, int err)
 {
-	struct usbd_contex *uds_ctx = c_nd->data->uds_ctx;
-	struct udc_buf_info *bi;
+	struct udc_buf_info bi;
 
-	LOG_DBG("%s buf=%p err=%d", __func__, buf, err);
+	LOG_DBG("%s: buf=%p len=%d err=%d", __func__, buf, buf->len, err);
 
-	bi = udc_get_buf_info(buf);
-	if (err) {
-		if (err == -ECONNABORTED) {
-			LOG_WRN("request ep 0x%02x, len %u cancelled",
-				bi->ep, buf->len);
-		} else {
-			LOG_ERR("request ep 0x%02x, len %u failed",
-				bi->ep, buf->len);
-		}
-	}
-
+	/* Local copy so that we can free buf */
+	memcpy(&bi, udc_get_buf_info(buf), sizeof(bi));
 	net_buf_unref(buf);
 
-	if (bi->ep == _get_bulk_ep(c_nd)) {
-		LOG_DBG("%s: transfer completed", __func__);
+	if (bi.ep == _get_bulk_ep_num(c_nd)) {
+		LOG_DBG("%s: transfer completed zlp=%d", __func__, bi.zlp);
 		_complete_transfer(c_nd);
-		_start_transfer(c_nd);
+		if (bi.zlp) {
+			_start_transfer(c_nd);
+		}
+	} else {
+		__ASSERT(false, "transfer completion for unknown enpoint");
 	}
 
 	return err;
 }
 
-static void _api_update(struct usbd_class_node *const c_nd,
-				uint8_t iface, uint8_t alternate)
+static void _api_update(struct usbd_class_node *const c_nd, uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("%s", __func__);
 }
