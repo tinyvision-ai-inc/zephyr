@@ -16,9 +16,6 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(intc_vexriscv, LOG_LEVEL_DBG);
 
-#include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(intc_vexriscv, LOG_LEVEL_DBG);
-
 #define IRQ_MASK		DT_INST_REG_ADDR_BY_NAME(0, irq_mask)
 #define IRQ_PENDING		DT_INST_REG_ADDR_BY_NAME(0, irq_pending)
 

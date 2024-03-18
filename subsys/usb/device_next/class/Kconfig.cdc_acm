@@ -21,6 +21,12 @@ config USBD_CDC_ACM_STACK_SIZE
 	help
 	  USB CDC ACM workqueue stack size.
 
+config USBD_CDC_ACM_MEM_POOL_IN_BSS
+	bool "BSS USB CDC ACM memory pool"
+	default n
+	help
+	  Locate USB CDC ACM memory pool in .bss setion
+
 module = USBD_CDC_ACM
 module-str = usbd cdc_acm
 default-count = 1
