@@ -38,7 +38,7 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define CASE_ERR(label) case label: __ASSERT(false, #label); break
 #define GETFIELD(reg, prefix) ((reg & prefix##_MASK) >> prefix##_SHIFT)
 
-#define CONFIG_USB23_EVT_NUM			21
+#define CONFIG_USB23_EVT_NUM			64
 #define USB23_CTRL_BUF_SIZE			512
 
 /*
