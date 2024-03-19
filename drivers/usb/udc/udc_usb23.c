@@ -1171,8 +1171,6 @@ static void usb23_on_xfer_done(const struct device *dev, struct udc_ep_config *c
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, ep_data->tail);
 
-	usb23_dump_trbs(dev, ep_cfg);
-
 	__ASSERT_NO_MSG(trb.ctrl);
 	__ASSERT_NO_MSG((trb.ctrl & USB23_TRB_CTRL_HWO) == 0);
 	usb23_on_trb_done(dev, ep_cfg, &trb);

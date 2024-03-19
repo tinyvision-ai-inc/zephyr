@@ -32,8 +32,8 @@ zephyr_library_sources_ifdef(
 )
 
 zephyr_library_sources_ifdef(
-	CONFIG_USBD_CDC_UVC_CLASS
-	class/usbd_cdc_uvc.c
+	CONFIG_USBD_CDC_RAW_CLASS
+	class/usbd_cdc_raw.c
 )
 
 zephyr_include_directories_ifdef(

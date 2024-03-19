@@ -17,16 +17,17 @@
 #include <zephyr/drivers/usb/udc.h>
 
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(usbd_cdc_uvc, CONFIG_USBD_CDC_UVC_LOG_LEVEL);
+LOG_MODULE_REGISTER(usbd_cdc_raw, CONFIG_USBD_CDC_RAW_LOG_LEVEL);
 
-NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
+NET_BUF_POOL_DEFINE(cdc_raw_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
 
-#define CDC_UVC_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
-#define CDC_UVC_DEFAULT_BULK_EP_MPS	0
-#define CDC_UVC_DEFAULT_INT_EP_MPS	16
-#define CDC_UVC_DEFAULT_INT_INTERVAL	0x0A
+#define CDC_RAW_DEFAULT_BULK_EP_MPS	0
+#define CDC_RAW_DEFAULT_INT_EP_MPS	16
+#define CDC_RAW_DEFAULT_INT_INTERVAL	0x0A
 
-struct usbd_cdc_uvc_desc {
+bool usbd_cdc_raw_data_terminal_ready;
+
+struct usbd_cdc_raw_desc {
 	struct usb_association_descriptor iad_cdc;
 	struct usb_if_descriptor if0;
 	struct cdc_header_descriptor if0_header;
@@ -45,31 +46,30 @@ struct usbd_cdc_uvc_desc {
 	struct usb_desc_header nil_desc;
 } __packed;
 
-struct usbd_class_node *const cdc_uvc_c_nd;
+struct usbd_class_node *const cdc_raw_c_nd;
 
-static uint8_t cdc_uvc_get_bulk_in(struct usbd_class_node *const c_nd)
+static uint8_t cdc_raw_get_bulk_in(struct usbd_class_node *const c_nd)
 {
-	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
+	struct usbd_cdc_raw_desc *desc = c_nd->data->desc;
 
 	return desc->if1_in_ep.bEndpointAddress;
 }
 
-static uint8_t cdc_uvc_get_bulk_out(struct usbd_class_node *const c_nd)
+static uint8_t cdc_raw_get_bulk_out(struct usbd_class_node *const c_nd)
 {
-	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
+	struct usbd_cdc_raw_desc *desc = c_nd->data->desc;
 
 	return desc->if1_out_ep.bEndpointAddress;
 }
 
-void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
+int cdc_raw_enqueue_in(char const *data_buf, size_t data_len)
 {
-	struct usbd_class_node *c_nd = cdc_uvc_c_nd;
+	struct usbd_class_node *c_nd = cdc_raw_c_nd;
 	struct net_buf *buf;
 	struct udc_buf_info *bi;
 	int ret;
 
-	buf = net_buf_alloc_with_data(&cdc_uvc_ep_pool,
-		data_buf, data_len, K_NO_WAIT);
+	buf = net_buf_alloc_with_data(&cdc_raw_ep_pool, data_buf, data_len, K_NO_WAIT);
 	if (buf == NULL) {
 		LOG_DBG("%s buf=NULL err=alloc", __func__);
 		return;
@@ -77,7 +77,7 @@ void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
 
 	bi = udc_get_buf_info(buf);
 	memset(bi, 0, sizeof(struct udc_buf_info));
-	bi->ep = cdc_uvc_get_bulk_in(c_nd);
+	bi->ep = cdc_raw_get_bulk_in(c_nd);
 
 	ret = usbd_ep_enqueue(c_nd, buf);
 	if (ret) {
@@ -86,13 +86,13 @@ void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
 	}
 
 	LOG_DBG("%s buf=%p err=ok", __func__, buf);
-	return;
+	return 0;
 err:
 	net_buf_unref(buf);
+	return ret;
 }
 
-static int usbd_cdc_uvc_request(struct usbd_class_node *const c_nd,
-				struct net_buf *buf, int err)
+static int usbd_cdc_raw_request(struct usbd_class_node *const c_nd, struct net_buf *buf, int err)
 {
 	struct usbd_contex *uds_ctx = c_nd->data->uds_ctx;
 	struct udc_buf_info *bi;
@@ -111,41 +111,40 @@ static int usbd_cdc_uvc_request(struct usbd_class_node *const c_nd,
 		goto err;
 	}
 
-	if (bi->ep == cdc_uvc_get_bulk_out(c_nd)) {
+	if (bi->ep == cdc_raw_get_bulk_out(c_nd)) {
 		/* RX transfer completion */
 	}
 
-	if (bi->ep == cdc_uvc_get_bulk_in(c_nd)) {
+	if (bi->ep == cdc_raw_get_bulk_in(c_nd)) {
 		/* TX transfer completion */
 	}
 err:
 	return usbd_ep_buf_free(uds_ctx, buf);
 }
 
-static void usbd_cdc_uvc_update(struct usbd_class_node *const c_nd,
-				uint8_t iface, uint8_t alternate)
+static void usbd_cdc_raw_update(struct usbd_class_node *const c_nd, uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("New configuration, interface %u alternate %u",
 		iface, alternate);
 }
 
-static int usbd_cdc_uvc_cth(struct usbd_class_node *const c_nd,
-			    const struct usb_setup_packet *const setup,
-			    struct net_buf *const buf)
+static int usbd_cdc_raw_cth(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup, struct net_buf *const buf)
 {
 	return 0;
 }
 
-static int usbd_cdc_uvc_ctd(struct usbd_class_node *const c_nd,
-			    const struct usb_setup_packet *const setup,
-			    const struct net_buf *const buf)
+static int usbd_cdc_raw_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup, const struct net_buf *const buf)
 {
+	if (setup->bRequest == SET_CONTROL_LINE_STATE &&
+			(setup->wValue & SET_CONTROL_LINE_STATE_DTR)) {
+		usbd_cdc_raw_data_terminal_ready = true;
+	}
 	return 0;
 }
 
-static int usbd_cdc_uvc_init(struct usbd_class_node *const c_nd)
+static int usbd_cdc_raw_init(struct usbd_class_node *const c_nd)
 {
-	struct usbd_cdc_uvc_desc *desc = c_nd->data->desc;
+	struct usbd_cdc_raw_desc *desc = c_nd->data->desc;
 
 	desc->iad_cdc.bFirstInterface = desc->if0.bInterfaceNumber;
 	desc->if0_union.bControlInterface = desc->if0.bInterfaceNumber;
@@ -154,16 +153,17 @@ static int usbd_cdc_uvc_init(struct usbd_class_node *const c_nd)
 	return 0;
 }
 
-struct usbd_class_api usbd_cdc_uvc_api = {
-	.request = usbd_cdc_uvc_request,
-	.update = usbd_cdc_uvc_update,
-	.control_to_host = usbd_cdc_uvc_cth,
-	.control_to_dev = usbd_cdc_uvc_ctd,
-	.init = usbd_cdc_uvc_init,
+struct usbd_class_api usbd_cdc_raw_api = {
+	.request = usbd_cdc_raw_request,
+	.update = usbd_cdc_raw_update,
+	.control_to_host = usbd_cdc_raw_cth,
+	.control_to_dev = usbd_cdc_raw_ctd,
+	.init = usbd_cdc_raw_init,
 };
 
-#define CDC_UVC_DEFINE_DESCRIPTOR(n)						\
-static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
+#define CDC_RAW_DEFINE_DESCRIPTOR(n)						\
+static struct usbd_cdc_raw_desc cdc_raw_desc_##n = {				\
+										\
 	.iad_cdc = {								\
 		.bLength = sizeof(struct usb_association_descriptor),		\
 		.bDescriptorType = USB_DESC_INTERFACE_ASSOC,			\
@@ -223,8 +223,8 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_INTERRUPT,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_UVC_DEFAULT_INT_EP_MPS),	\
-		.bInterval = CDC_UVC_DEFAULT_INT_INTERVAL,			\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_INT_EP_MPS),	\
+		.bInterval = CDC_RAW_DEFAULT_INT_INTERVAL,			\
 	},									\
 										\
 	.if0_int_ep_comp = {							\
@@ -252,7 +252,7 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x82,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_UVC_DEFAULT_BULK_EP_MPS),	\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_BULK_EP_MPS),	\
 		.bInterval = 0,							\
 	},									\
 										\
@@ -269,7 +269,7 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x01,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_UVC_DEFAULT_BULK_EP_MPS),	\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_BULK_EP_MPS),	\
 		.bInterval = 0,							\
 	},									\
 										\
@@ -287,28 +287,26 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 	},									\
 }
 
-#define DT_DRV_COMPAT zephyr_cdc_uvc
+#define DT_DRV_COMPAT zephyr_cdc_raw
 
-#define USBD_CDC_UVC_DT_DEVICE_DEFINE(n)					\
+#define USBD_CDC_RAW_DT_DEVICE_DEFINE(n)					\
+										\
 	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),					\
 		     "node " DT_NODE_PATH(DT_DRV_INST(n))			\
 		     " is not assigned to a USB device controller");		\
 										\
-	CDC_UVC_DEFINE_DESCRIPTOR(n);						\
+	CDC_RAW_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_class_data usbd_cdc_uvc_data_##n;			\
-	USBD_DEFINE_CLASS(cdc_uvc_##n, &usbd_cdc_uvc_api,			\
-		&usbd_cdc_uvc_data_##n);\
-	struct usbd_class_node *const cdc_uvc_c_nd = &cdc_uvc_##n;		\
-										\
-	static struct usbd_class_data usbd_cdc_uvc_data_##n = {			\
-		.desc = (struct usb_desc_header *)&cdc_uvc_desc_##n,		\
+	static struct usbd_class_data usbd_cdc_raw_data_##n = {			\
+		.desc = (struct usb_desc_header *)&cdc_raw_desc_##n,		\
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),			\
 	};									\
 										\
-	DEVICE_DT_INST_DEFINE(n, NULL, NULL,					\
-		&usbd_cdc_uvc_data_##n, NULL,					\
-		POST_KERNEL, 50,						\
-		&usbd_cdc_uvc_api);
+	USBD_DEFINE_CLASS(cdc_raw_##n, &usbd_cdc_raw_api,			\
+		&usbd_cdc_raw_data_##n);					\
+	struct usbd_class_node *const cdc_raw_c_nd = &cdc_raw_##n;		\
+										\
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL, NULL, NULL,			\
+		POST_KERNEL, 50, &usbd_cdc_raw_api);
 
-DT_INST_FOREACH_STATUS_OKAY(USBD_CDC_UVC_DT_DEVICE_DEFINE);
+DT_INST_FOREACH_STATUS_OKAY(USBD_CDC_RAW_DT_DEVICE_DEFINE);
