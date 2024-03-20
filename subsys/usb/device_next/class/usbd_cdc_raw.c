@@ -75,6 +75,8 @@ int cdc_raw_read(const struct device *dev, struct net_buf *buf)
 	struct cdc_raw_data *data = dev->data;
 	struct udc_buf_info *bi = udc_get_buf_info(buf);
 
+	LOG_DBG("%s: buf=%p size=%d data=%p", __func__, buf, buf->size, buf->data);
+
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = _get_bulk_out(data->c_nd);
 	return usbd_ep_enqueue(data->c_nd, buf);
@@ -87,6 +89,7 @@ int cdc_raw_write(const struct device *dev, struct net_buf *buf)
 
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = _get_bulk_in(data->c_nd);
+	bi->zlp = true; /* Flush the transfer immediately after this buffer */
 	return usbd_ep_enqueue(data->c_nd, buf);
 }
 

@@ -518,6 +518,7 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 		break;
 	case USB_EP_TYPE_BULK:
 		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_BULK;
+		reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // TODO debug
 		break;
 	case USB_EP_TYPE_INTERRUPT:
 		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_INT;
@@ -658,7 +659,11 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 	} else {
 		/* Mark the next TRB as being part of the same USB transfer */
 		ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL;
-		ctrl |= USB23_TRB_CTRL_CHN;
+		if (ep_cfg->caps.in) {
+			ctrl |= USB23_TRB_CTRL_CHN;
+		} else {
+			ctrl |= USB23_TRB_CTRL_CSP;
+		}
 		ctrl |= USB23_TRB_CTRL_IOC;
 		ctrl |= USB23_TRB_CTRL_HWO;
 	}
@@ -1096,7 +1101,7 @@ static void usb23_on_xfer_done_norm(const struct device *dev, struct udc_ep_conf
 
 	/* For buffers coming from the host, update the size actually received */
 	if (ep_cfg->caps.out) {
-		//buf->len = buf->size - GETFIELD(trb->status, USB23_TRB_STATUS_BUFSIZ);
+		buf->len = buf->size - GETFIELD(trb->status, USB23_TRB_STATUS_BUFSIZ);
 	}
 
 	err = udc_submit_ep_event(dev, buf, 0);
