@@ -24,6 +24,21 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_core, CONFIG_USBD_LOG_LEVEL);
 
+static ALWAYS_INLINE int usbd_event_handler(struct usbd_contex *const uds_ctx,
+					    struct udc_event *const event);
+
+static inline void usbd_do_event(struct udc_event *event)
+{
+	STRUCT_SECTION_FOREACH(usbd_contex, uds_ctx) {
+		if (uds_ctx->dev == event->dev &&
+		    usbd_is_initialized(uds_ctx)) {
+			usbd_event_handler(uds_ctx, event);
+		}
+	}
+}
+
+#if IS_ENABLED(CONFIG_USBD_THREAD)
+
 static K_KERNEL_STACK_DEFINE(usbd_stack, CONFIG_USBD_THREAD_STACK_SIZE);
 static struct k_thread usbd_thread_data;
 
@@ -35,6 +50,17 @@ static int usbd_event_carrier(const struct device *dev,
 {
 	return k_msgq_put(&usbd_msgq, event, K_NO_WAIT);
 }
+
+#else
+
+static int usbd_event_carrier(const struct device *dev,
+			      const struct udc_event *const event)
+{
+	usbd_do_event((struct udc_event *)event);
+	return 0;
+}
+
+#endif
 
 static int event_handler_ep_request(struct usbd_contex *const uds_ctx,
 				    const struct udc_event *const event)
@@ -166,6 +192,7 @@ static ALWAYS_INLINE int usbd_event_handler(struct usbd_contex *const uds_ctx,
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_USBD_THREAD)
 static void usbd_thread(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -176,15 +203,10 @@ static void usbd_thread(void *p1, void *p2, void *p3)
 
 	while (true) {
 		k_msgq_get(&usbd_msgq, &event, K_FOREVER);
-
-		STRUCT_SECTION_FOREACH(usbd_contex, uds_ctx) {
-			if (uds_ctx->dev == event.dev &&
-			    usbd_is_initialized(uds_ctx)) {
-				usbd_event_handler(uds_ctx, &event);
-			}
-		}
+		usbd_do_event();
 	}
 }
+#endif
 
 int usbd_device_init_core(struct usbd_contex *const uds_ctx)
 {
@@ -231,6 +253,7 @@ int usbd_device_shutdown_core(struct usbd_contex *const uds_ctx)
 
 static int usbd_pre_init(void)
 {
+#if IS_ENABLED(CONFIG_USBD_THREAD)
 	k_thread_create(&usbd_thread_data, usbd_stack,
 			K_KERNEL_STACK_SIZEOF(usbd_stack),
 			usbd_thread,
@@ -238,6 +261,7 @@ static int usbd_pre_init(void)
 			K_PRIO_COOP(8), 0, K_NO_WAIT);
 
 	k_thread_name_set(&usbd_thread_data, "usbd");
+#endif
 
 	LOG_DBG("Available USB class nodes:");
 	STRUCT_SECTION_FOREACH(usbd_class_node, node) {

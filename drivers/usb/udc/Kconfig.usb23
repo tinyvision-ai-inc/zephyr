@@ -8,3 +8,7 @@ config UDC_USB23
 	depends on DT_HAS_LATTICE_USB23_ENABLED
 	help
 	  Lattice USB23 USB device controller driver.
+
+module = UDC_USB23
+module-str = usb23 drv
+source "subsys/logging/Kconfig.template.log_config"

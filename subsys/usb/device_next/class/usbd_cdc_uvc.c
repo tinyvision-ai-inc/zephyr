@@ -26,6 +26,8 @@ NET_BUF_POOL_DEFINE(cdc_uvc_ep_pool, 2, 0, sizeof(struct udc_buf_info), NULL);
 #define CDC_UVC_DEFAULT_INT_EP_MPS	16
 #define CDC_UVC_DEFAULT_INT_INTERVAL	0x0A
 
+bool usbd_cdc_uvc_data_terminal_ready;
+
 struct usbd_cdc_uvc_desc {
 	struct usb_association_descriptor iad_cdc;
 	struct usb_if_descriptor if0;
@@ -86,7 +88,7 @@ void cdc_uvc_enqueue_in(char const *data_buf, size_t data_len)
 	}
 
 	LOG_DBG("%s buf=%p err=ok", __func__, buf);
-	return;
+
 err:
 	net_buf_unref(buf);
 }
@@ -140,6 +142,10 @@ static int usbd_cdc_uvc_ctd(struct usbd_class_node *const c_nd,
 			    const struct usb_setup_packet *const setup,
 			    const struct net_buf *const buf)
 {
+	if (setup->bRequest == SET_CONTROL_LINE_STATE &&
+			(setup->wValue & SET_CONTROL_LINE_STATE_DTR)) {
+		usbd_cdc_uvc_data_terminal_ready = true;
+	}
 	return 0;
 }
 
@@ -164,6 +170,7 @@ struct usbd_class_api usbd_cdc_uvc_api = {
 
 #define CDC_UVC_DEFINE_DESCRIPTOR(n)						\
 static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
+										\
 	.iad_cdc = {								\
 		.bLength = sizeof(struct usb_association_descriptor),		\
 		.bDescriptorType = USB_DESC_INTERFACE_ASSOC,			\
@@ -296,18 +303,17 @@ static struct usbd_cdc_uvc_desc cdc_uvc_desc_##n = {				\
 										\
 	CDC_UVC_DEFINE_DESCRIPTOR(n);						\
 										\
-	static struct usbd_class_data usbd_cdc_uvc_data_##n;			\
-	USBD_DEFINE_CLASS(cdc_uvc_##n, &usbd_cdc_uvc_api,			\
-		&usbd_cdc_uvc_data_##n);\
-	struct usbd_class_node *const cdc_uvc_c_nd = &cdc_uvc_##n;		\
-										\
 	static struct usbd_class_data usbd_cdc_uvc_data_##n = {			\
 		.desc = (struct usb_desc_header *)&cdc_uvc_desc_##n,		\
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),			\
 	};									\
 										\
+	USBD_DEFINE_CLASS(cdc_uvc_##n, &usbd_cdc_uvc_api,			\
+		&usbd_cdc_uvc_data_##n);					\
+	struct usbd_class_node *const cdc_uvc_c_nd = &cdc_uvc_##n;		\
+										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL,					\
-		&usbd_cdc_uvc_data_##n, NULL,					\
+		NULL, NULL,							\
 		POST_KERNEL, 50,						\
 		&usbd_cdc_uvc_api);
 

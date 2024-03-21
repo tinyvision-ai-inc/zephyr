@@ -22,6 +22,10 @@ config USBD_SHELL
 	help
 	  Enable USB device shell.
 
+config USBD_THREAD
+	bool "USB device thread"
+	default y
+
 config USBD_THREAD_INIT_PRIO
 	int
 	default 90

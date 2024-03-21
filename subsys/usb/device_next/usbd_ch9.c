@@ -384,7 +384,7 @@ static int sreq_set_sel(struct usbd_contex *const uds_ctx,
 
 static int sreq_set_isoch_delay(struct usbd_contex *const uds_ctx)
 {
-	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+//	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	return 0;
 }
 
