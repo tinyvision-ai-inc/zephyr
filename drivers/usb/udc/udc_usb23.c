@@ -111,7 +111,6 @@ struct usb23_data {
 };
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
-static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf);
 
 /*------------------------------------------------------------------------------
 --  Input/Output
@@ -500,53 +499,53 @@ static uint32_t usb23_depcmd(const struct device *dev, uint32_t addr, uint32_t c
 static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
-	uint32_t reg0 = 0, reg1 = 0;
+	uint32_t param0 = 0, param1 = 0;
 
 	LOG_INF("Configuring endpoint 0x%02x with wMaxPacketSize=%d",
 		ep_cfg->addr, ep_cfg->mps);
 
 	if (ep_cfg->stat.enabled) {
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_ACTION_MODIFY;
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_ACTION_MODIFY;
 	} else {
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_ACTION_INIT;
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_ACTION_INIT;
 	}
 
 	switch (ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) {
 	case USB_EP_TYPE_CONTROL:
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_CTRL;
-		reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_CTRL;
+		param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
 		break;
 	case USB_EP_TYPE_BULK:
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_BULK;
-		reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // TODO debug
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_BULK;
+		param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // TODO debug
 		break;
 	case USB_EP_TYPE_INTERRUPT:
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_INT;
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_INT;
 		break;
 	case USB_EP_TYPE_ISO:
-		reg0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_ISOC;
+		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_ISOC;
 		break;
 	default:
 		__ASSERT_NO_MSG(false);
 	}
 
 	/* Max Packet Size according to the USB descriptor configuration */
-	reg0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
+	param0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
 
 	/* One-to-one mapping between FIFO numbers and endpoints numbers */
-	reg0 |= usb23_get_ep_fifo_num(ep_cfg)
+	param0 |= usb23_get_ep_fifo_num(ep_cfg)
 			<< USB23_DEPCMDPAR0_DEPCFG_FIFONUM_SHIFT;
 
 	/* Per-endpoint events */
-	reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
-	reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
+	param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
 
 	/* This is the usb protocol endpoint number, but the data encoding
 	 * we chose for physical endpoint number is the same as this register */
-	reg1 |= epn << USB23_DEPCMDPAR1_DEPCFG_EPNUMBER_SHIFT;
+	param1 |= epn << USB23_DEPCMDPAR1_DEPCFG_EPNUMBER_SHIFT;
 
-	usb23_io_write(dev, USB23_DEPCMDPAR0(epn), reg0);
-	usb23_io_write(dev, USB23_DEPCMDPAR1(epn), reg1);
+	usb23_io_write(dev, USB23_DEPCMDPAR0(epn), param0);
+	usb23_io_write(dev, USB23_DEPCMDPAR1(epn), param1);
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPCFG);
 }
 
@@ -562,13 +561,12 @@ static void usb23_depcmd_ep_xfer_config(const struct device *dev, struct udc_ep_
 
 static uint32_t usb23_depcmd_ep_get_state(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
-	uint32_t reg;
 	int epn = usb23_get_epn(ep_cfg->addr);
 
+	LOG_DBG("DepGetState: ep=0x%02x", ep_cfg->addr);
+
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPGETSTATE);
-	reg = usb23_io_read(dev, USB23_DEPCMDPAR2(epn));
-	LOG_DBG("DepGetState: ep=0x%02x state=0x%08x", ep_cfg->addr, reg);
-	return reg;
+	return usb23_io_read(dev, USB23_DEPCMDPAR2(epn));
 }
 
 static void usb23_depcmd_set_stall(const struct device *dev, struct udc_ep_config *const ep_cfg)
@@ -576,6 +574,7 @@ static void usb23_depcmd_set_stall(const struct device *dev, struct udc_ep_confi
 	int epn = usb23_get_epn(ep_cfg->addr);
 
 	LOG_WRN("DepSetStall: ep=0x%02x", ep_cfg->addr);
+
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPSETSTALL);
 }
 
@@ -583,7 +582,8 @@ static void usb23_depcmd_clear_stall(const struct device *dev, struct udc_ep_con
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 
-	LOG_DBG("DepClearStall ep=0x%02x", ep_cfg->addr);
+	LOG_INF("DepClearStall ep=0x%02x", ep_cfg->addr);
+
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPCSTALL);
 }
 
@@ -591,7 +591,6 @@ static void usb23_depcmd_start_xfer(const struct device *dev, struct udc_ep_conf
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
-	uint32_t idx;
 
 	LOG_DBG("DepStartXfer ep=0x%02x", ep_cfg->addr);
 	usb23_dump_trbs(dev, ep_cfg);
@@ -602,8 +601,9 @@ static void usb23_depcmd_start_xfer(const struct device *dev, struct udc_ep_conf
 
 	usb23_io_write(dev, USB23_DEPCMDPAR0(epn), HI32((uintptr_t)ep_data->trb_buf));
 	usb23_io_write(dev, USB23_DEPCMDPAR1(epn), LO32((uintptr_t)ep_data->trb_buf));
-	idx = usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPSTRTXFER);
-	ep_data->xferrscidx = idx;
+	
+	ep_data->xferrscidx = 
+		usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPSTRTXFER);
 	ep_data->running = true;
 }
 
@@ -611,11 +611,12 @@ static void usb23_depcmd_update_xfer(const struct device *dev, struct udc_ep_con
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
-	uint32_t idx = ep_data->xferrscidx << USB23_DEPCMD_XFERRSCIDX_SHIFT;
+	uint32_t flags;
 
 	LOG_DBG("DepUpdateXfer ep=0x%02x", ep_cfg->addr);
-	usb23_dump_trbs(dev, ep_cfg);
-	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPUPDXFER | idx);
+
+	flags = ep_data->xferrscidx << USB23_DEPCMD_XFERRSCIDX_SHIFT;
+	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPUPDXFER | flags);
 }
 
 /*
@@ -672,17 +673,15 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 	return usb23_send_trb(dev, ep_cfg, buf, ctrl);
 }
 
-static void usb23_depcmd_end_xfer(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static void usb23_depcmd_end_xfer(const struct device *dev, struct udc_ep_config *const ep_cfg, uint32_t flags)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	int epn = usb23_get_epn(ep_cfg->addr);
-	uint32_t reg;
 
 	LOG_DBG("DepEndXfer: ep=0x%02x", ep_cfg->addr);
 
-	reg = ep_data->xferrscidx << USB23_DEPCMD_XFERRSCIDX_SHIFT;
-	reg |= USB23_DEPCMD_HIPRI_FORCERM;
-	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPENDXFER | reg);
+	flags |= ep_data->xferrscidx << USB23_DEPCMD_XFERRSCIDX_SHIFT;
+	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPENDXFER | flags);
 
 	// TODO mark the TRB as free for another request
 	//usb23_set_trb(dev, ep_cfg, 0, &(struct usb23_trb){0});
@@ -691,10 +690,12 @@ static void usb23_depcmd_end_xfer(const struct device *dev, struct udc_ep_config
 static void usb23_depcmd_start_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
-	uint32_t reg = 0;
+	uint32_t flags;
 
-	reg = (ep_cfg->caps.control ? 0 : 2) << USB23_DEPCMD_XFERRSCIDX_SHIFT;
-	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPSTARTCFG | reg);
+	LOG_DBG("DepStartConfig: ep=0x%02x", ep_cfg->addr);
+
+	flags = (ep_cfg->caps.control ? 0 : 2) << USB23_DEPCMD_XFERRSCIDX_SHIFT;
+	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPSTARTCFG | flags);
 }
 
 static void usb23_dgcmd(const struct device *dev, uint32_t cmd)
@@ -773,11 +774,12 @@ static void usb23_trb_ctrl_data_out(const struct device *dev)
 		USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1);
 }
 
-static void usb23_trb_ctrl_data_in(const struct device *dev, struct net_buf *buf)
+static void usb23_trb_ctrl_data_in(const struct device *dev)
 {
 	const struct usb23_config *config = dev->config;
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_IN);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+	struct net_buf *buf = ep_data->net_buf[ep_data->head];
 
 	LOG_DBG("TRB_CONTROL_DATA_1_IN ep=0x%02x", ep_cfg->addr);
 	__ASSERT_NO_MSG(buf->len <= USB23_CTRL_BUF_SIZE);
@@ -810,6 +812,16 @@ static void usb23_trb_ctrl_status_3(const struct device *dev, struct udc_ep_conf
 		USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 }
 
+static void usb23_trb_ctrl_status_3_in(const struct device *dev)
+{
+	usb23_trb_ctrl_status_3(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
+}
+
+static void usb23_trb_ctrl_status_3_out(const struct device *dev)
+{
+	usb23_trb_ctrl_status_3(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
+}
+
 /*------------------------------------------------------------------------------
 --  Events
 --------------------------------------------------------------------------------
@@ -825,7 +837,7 @@ static void usb23_on_usb_reset(const struct device *dev)
 	/* Reset all ongoing transfers on non-0 endpoints */
 	for (int epn = 1; epn < config->num_of_eps / 2; epn++) {
 		continue; // TODO
-		//usb23_depcmd_end_xfer(dev, usb23_get_ep_cfg(dev, epn));
+		//usb23_depcmd_end_xfer(dev, usb23_get_ep_cfg(dev, epn), 0);
 		usb23_depcmd_clear_stall(dev, usb23_get_ep_cfg(dev, epn));
 	}
 
@@ -976,6 +988,7 @@ static void usb23_on_ctrl_read_data(const struct device *dev, struct udc_ep_conf
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
 	udc_ctrl_update_stage(dev, buf);
+	usb23_trb_ctrl_status_3_out(dev);
 }
 
 /* OUT (status) */
@@ -1054,6 +1067,13 @@ static void usb23_on_ctrl_status(const struct device *dev, struct udc_ep_config 
 
 static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_config *const ep_cfg, uint32_t status)
 {
+	switch (status & USB23_DEPEVT_STATUS_B3_MASK) {
+	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_SETUP); break;
+	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_DATA); break;
+	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_STATUS); break;
+	}
+	return;
+
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
 	if (ep_data->running || !ep_cfg->caps.control) {
@@ -1068,8 +1088,7 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 	CASE(USB23_DEPEVT_STATUS_B3_CONTROL_DATA);
 		switch (ep_cfg->addr) {
 		case USB_CONTROL_EP_IN:
-			__ASSERT_NO_MSG(ep_data->net_buf[ep_data->head] != NULL);
-			usb23_trb_ctrl_data_in(dev, ep_data->net_buf[ep_data->head]);
+			usb23_trb_ctrl_data_in(dev);
 			break;
 		case USB_CONTROL_EP_OUT:
 			usb23_trb_ctrl_data_out(dev);
@@ -1122,15 +1141,17 @@ static void usb23_on_xfer_done_ctrl(const struct device *dev, struct udc_ep_conf
 
 	/* Continue to the next step */
 	switch (trb->ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
-	case USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP:
+	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 		udc_ep_buf_set_setup(buf);
 		usb23_on_ctrl_setup(dev, ep_cfg, buf);
 		break;
-	case USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1:
+	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_DATA_1);
 		usb23_on_ctrl_data(dev, ep_cfg, buf);
 		break;
-	case USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2:
-	case USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3:
+	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
+		usb23_on_ctrl_status(dev, ep_cfg, buf);
+		break;
+	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 		usb23_on_ctrl_status(dev, ep_cfg, buf);
 		break;
 	default:
@@ -1247,6 +1268,7 @@ void usb23_irq_handler(void *ptr)
 static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+	struct udc_buf_info *bi = udc_get_buf_info(buf);
 	int ret = 0;
 
 	LOG_DBG("%s: ep=0x%02x buf=0x%p", __func__, ep_cfg->addr, buf);
@@ -1256,7 +1278,15 @@ static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *cons
 
 	switch (ep_cfg->addr) {
 	case USB_CONTROL_EP_IN:
-		/* Handled in XferNotReady event */
+		if (bi->data) {
+			usb23_trb_ctrl_data_in(dev);
+		} else if (bi->status && udc_ctrl_stage_is_no_data(dev)) {
+			usb23_trb_ctrl_status_2_in(dev);
+		} else if (bi->status) {
+			usb23_trb_ctrl_status_3_in(dev);
+		} else {
+			__ASSERT(false, "unknown control buffer type");
+		}
 		break;
 	case USB_CONTROL_EP_OUT:
 		__ASSERT(false, "expected to be handled by the driver directly");
@@ -1301,16 +1331,27 @@ static int usb23_ep_disable(const struct device *dev, struct udc_ep_config *cons
  */
 static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg)
 {
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+
 	LOG_WRN("Setting stall state on endpoint ep=0x%02x", ep_cfg->addr);
 
 	switch (ep_cfg->addr) {
 	case USB_CONTROL_EP_IN:
+		/* Remove the TRBs transfer for the cancelled sequence */
+		usb23_depcmd_end_xfer(dev, ep_cfg, USB23_DEPCMD_HIPRI_FORCERM);
+		usb23_set_trb(dev, ep_cfg, 0, &(struct usb23_trb){0});
+
 		/* The datasheet says to only set stall for the OUT direction */
 		ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 		/* fallthrough */
 	case USB_CONTROL_EP_OUT:
-		usb23_depcmd_end_xfer(dev, ep_cfg);
+		usb23_depcmd_end_xfer(dev, ep_cfg, 0);
 		usb23_depcmd_set_stall(dev, ep_cfg);
+		ep_data->running = false;
+
+		/* The hardware will automatically clear the halt state upon
+		 * the next setup packet received. */
+		usb23_trb_ctrl_setup_out(dev);
 		break;
 	default:
 		usb23_depcmd_set_stall(dev, ep_cfg);
@@ -1703,7 +1744,7 @@ static const struct udc_api usb23_api = {
 										\
 	union usb23_evt usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];		\
 	uint8_t usb23_dma_ctrl_data_##n[USB23_CTRL_BUF_SIZE];			\
-	struct udc_ep_config usb23_ep_cfg_##n[NUM_OF_EPS(n)];		\
+	struct udc_ep_config usb23_ep_cfg_##n[NUM_OF_EPS(n)];			\
 										\
 	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_TRB_BUF_DEFINE);\
 	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_NET_BUF_DEFINE);\
