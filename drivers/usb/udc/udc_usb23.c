@@ -1556,14 +1556,14 @@ static int usb23_ep_enable(const struct device *dev, struct udc_ep_config *const
 	usb23_depcmd_ep_config(dev, ep_cfg);
 	usb23_depcmd_ep_xfer_config(dev, ep_cfg);
 
-	/* Starting from here, the endpoint can be used */
-	usb23_io_set(dev, USB23_DALEPENA, USB23_DALEPENA_USBACTEP(epn));
-
 	/* No active TRB for now, DepUpdateXfer will add some later */
 	if (!ep_cfg->caps.control) {
 		usb23_set_link_trb(dev, ep_cfg);
 		usb23_depcmd_start_xfer(dev, ep_cfg);
 	}
+
+	/* Starting from here, the endpoint can be used */
+	usb23_io_set(dev, USB23_DALEPENA, USB23_DALEPENA_USBACTEP(epn));
 
 	return 0;
 }
