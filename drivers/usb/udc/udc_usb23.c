@@ -840,25 +840,37 @@ static void usb23_on_soft_reset(const struct device *dev)
 	struct udc_data *data = dev->data;
 	uint32_t reg;
 
+	/* Configure and reset the Device Controller */
+	usb23_io_write(dev, USB23_DCTL, USB23_DCTL_CSFTRST |
+		// TODO confirm that DWC_USB3_EN_LPM_ERRATA == 1
+		(15 << USB23_DCTL_LPM_NYET_THRES_SHIFT));
+	usb23_io_wait_go_low(dev, USB23_DCTL, USB23_DCTL_CSFTRST);
+
+	/* Letting GSBUSCFG0 and GSBUSCFG1 unchanged */
+	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
+
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
 	LOG_INF("coreid=0x%04lx rel=0x%04lx", GETFIELD(reg, USB23_GCOREID_CORE),
 		GETFIELD(reg, USB23_GCOREID_REL));
 	__ASSERT_NO_MSG(GETFIELD(reg, USB23_GCOREID_CORE) == 0x5533);
 
+	/* Letting GUID unchanged */
+	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
+
 	/* Setting fifo size for both TX and RX */
 	usb23_io_write(dev, USB23_GTXFIFOSIZ(0), 512);
 	usb23_io_write(dev, USB23_GRXFIFOSIZ(0), 512);
 
 	/* Setup the event buffer address, size and start event reception */
-	for (int i = 0; i < CONFIG_USB23_EVT_NUM; i++) {
-		config->evt_buf[i] = (union usb23_evt){0};
-	}
+	memset((void *)config->evt_buf, 0, CONFIG_USB23_EVT_NUM * sizeof(union usb23_evt));
 	usb23_flush_mem_write();
 	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)config->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)config->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTSIZ(0), CONFIG_USB23_EVT_NUM * sizeof(*config->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTCOUNT(0), 0);
+
+	/* Letting GCTL unchanged */
 
 	/* Set the USB device configuration, including max supported speed */
 	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_PERFRINT_90);
@@ -885,7 +897,7 @@ static void usb23_on_soft_reset(const struct device *dev)
 		| USB23_DEVTEN_DISCONNEVTEN
 	);
 
-	/* Only to be done for endpoint 0 and 1 at this stage */
+	/* Configure endpoint 0 and 1 only for now */
 	usb23_depcmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
 	usb23_depcmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_IN));
 }
@@ -1563,9 +1575,7 @@ static int usb23_ep_enable(const struct device *dev, struct udc_ep_config *const
  */
 static int usb23_init(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
 	struct udc_data *data = dev->data;
-	uint32_t reg;
 	int err = 0;
 
 	/* Issue a soft reset to the core and USB2 and USB3 PHY */
@@ -1589,19 +1599,8 @@ static int usb23_init(const struct device *dev)
 	usb23_io_set(dev, USB23_U3PHYCTRL1, BIT(22));
 	usb23_io_clear(dev, USB23_U3PHYCTRL4, USB23_U3PHYCTRL4_INT_CLOCK);
 
-	/* Configure and reset the Device Controller */
-	usb23_io_write(dev, USB23_DCTL, 0x40f00000); // TODO decode
-	usb23_io_wait_go_low(dev, USB23_DCTL, USB23_DCTL_CSFTRST);
-
-	/* Letting GSBUSCFG0 and GSBUSCFG1 unchanged */
-	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
-
 	/* The USB core was reset, configure it as documented */
 	usb23_on_soft_reset(dev);
-
-	/* Issue a soft reset to USB2 PHY */
-	usb23_io_set(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
-	usb23_io_clear(dev, USB23_GUSB2PHYCFG, USB23_GUSB2PHYCFG_PHYSOFTRST);
 
 	/* Configure the control OUT endpoint */
 	LOG_DBG("%s: ep=%p ctrl=%d", __func__, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT), udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT)->caps.control);
