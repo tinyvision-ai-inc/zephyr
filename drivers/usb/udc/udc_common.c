@@ -44,8 +44,6 @@ struct udc_ep_config *udc_get_ep_cfg(const struct device *dev, const uint8_t ep)
 {
 	struct udc_data *data = dev->data;
 
-	LOG_DBG("%s: ep=%p USB_EP_LUT_IDX=%ld ep=0x%02x", __func__,
-		data->ep_lut[USB_EP_LUT_IDX(ep)], USB_EP_LUT_IDX(ep), ep);
 	return data->ep_lut[USB_EP_LUT_IDX(ep)];
 }
 
@@ -72,8 +70,6 @@ int udc_register_ep(const struct device *dev, struct udc_ep_config *const cfg)
 {
 	struct udc_data *data = dev->data;
 	uint8_t idx;
-
-	LOG_DBG("%s: ep=0x%02x", __func__, cfg->addr);
 
 	if (udc_is_initialized(dev)) {
 		return -EACCES;
@@ -222,7 +218,6 @@ static bool ep_check_config(const struct device *dev,
 	bool dir_is_in = USB_EP_DIR_IS_IN(ep);
 	bool dir_is_out = USB_EP_DIR_IS_OUT(ep);
 
-	LOG_DBG("%s: ep=%p", __func__, cfg);
 	LOG_DBG("cfg d:%c|%c t:%c|%c|%c|%c, mps %u",
 		cfg->caps.in ? 'I' : '-',
 		cfg->caps.out ? 'O' : '-',
@@ -349,7 +344,6 @@ int udc_ep_enable_internal(const struct device *dev,
 		return -EALREADY;
 	}
 
-	LOG_DBG("%s: ep=0x%02x", __func__, cfg->addr);
 	if (!ep_check_config(dev, cfg, ep, attributes, mps, interval)) {
 		LOG_ERR("Endpoint 0x%02x validation failed", cfg->addr);
 		return -ENODEV;
