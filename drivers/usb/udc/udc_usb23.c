@@ -584,7 +584,6 @@ static void usb23_depcmd_start_xfer(const struct device *dev, struct udc_ep_conf
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
 	LOG_DBG("DepStartXfer ep=0x%02x", ep_cfg->addr);
-	usb23_dump_trbs(dev, ep_cfg);
 
 	/* Make sure the device is in U0 state, assuming TX FIFO is empty */
 	usb23_io_field(dev, USB23_DCTL, USB23_DCTL_ULSTCHNGREQ_MASK,

@@ -20,9 +20,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(cdc_raw, CONFIG_USBD_CDC_RAW_LOG_LEVEL);
 
-#define CDC_RAW_DEFAULT_BULK_EP_MPS	0
-#define CDC_RAW_DEFAULT_INT_EP_MPS	16
-#define CDC_RAW_DEFAULT_INT_INTERVAL	0x0A
+#define CDC_RAW_BULK_EP_MPS		1024
+#define CDC_RAW_INT_EP_MPS		16
+#define CDC_RAW_INT_INTERVAL		0x0A
 
 struct cdc_raw_desc {
 	struct usb_association_descriptor iad_cdc;
@@ -239,8 +239,8 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x81,					\
 		.bmAttributes = USB_EP_TYPE_INTERRUPT,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_INT_EP_MPS),	\
-		.bInterval = CDC_RAW_DEFAULT_INT_INTERVAL,			\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_INT_EP_MPS),		\
+		.bInterval = CDC_RAW_INT_INTERVAL,				\
 	},									\
 										\
 	.if0_int_ep_comp = {							\
@@ -248,7 +248,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
-		.wBytesPerInterval = 2,						\
+		.wBytesPerInterval = 0,						\
 	},									\
 										\
 	.if1 = {								\
@@ -268,7 +268,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x82,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_BULK_EP_MPS),	\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_BULK_EP_MPS),		\
 		.bInterval = 0,							\
 	},									\
 										\
@@ -277,7 +277,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
-		.wBytesPerInterval = 2,						\
+		.wBytesPerInterval = 0,						\
 	},									\
 										\
 	.if1_out_ep = {								\
@@ -285,7 +285,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
 		.bEndpointAddress = 0x01,					\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
-		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_DEFAULT_BULK_EP_MPS),	\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_RAW_BULK_EP_MPS),		\
 		.bInterval = 0,							\
 	},									\
 										\
@@ -294,7 +294,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
 		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
-		.wBytesPerInterval = 2,						\
+		.wBytesPerInterval = 0,						\
 	},									\
 										\
 	.nil_desc = {								\
