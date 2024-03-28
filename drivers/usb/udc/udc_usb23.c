@@ -707,7 +707,7 @@ static void usb23_trb_ctrl_data_out(const struct device *dev)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	LOG_DBG("TRB_CONTROL_DATA_OUT ep=0x%02x", ep_cfg->addr);
-	ep_data->enqueued_size = MIN(priv->data_stage_length, USB23_CTRL_BUF_SIZE);
+	ep_data->enqueued_size = USB23_CTRL_BUF_SIZE;
 	usb23_trb_ctrl(dev, ep_cfg, config->ctrl_data, ep_data->enqueued_size,
 		USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
