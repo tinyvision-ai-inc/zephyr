@@ -769,7 +769,7 @@ static int usb23_push_trb(const struct device *dev, struct udc_ep_config *const 
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available. */
-	if ((usb23_get_trb(dev, ep_cfg, ep_data->head).ctrl & USB23_TRB_CTRL_HWO)) {
+	if ((usb23_get_trb(dev, ep_cfg, ep_data->head).ctrl != 0x00000000)) {
 		return -EBUSY;
 	}
 
