@@ -110,8 +110,6 @@ struct usb23_data {
 
 	/* Back-reference to parent */
 	const struct device *dev;
-
-	size_t data_stage_length;
 };
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
@@ -757,7 +755,7 @@ static void usb23_trb_ctrl_status_3_out(const struct device *dev)
 /*
  * Push the TRB at the end and move one step, skipping the Link TRB
  */
-static int usb23_push_trb(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, uint32_t ctrl)
+static int usb23_send_trb(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, uint32_t ctrl)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct usb23_trb trb = {
@@ -774,13 +772,16 @@ static int usb23_push_trb(const struct device *dev, struct udc_ep_config *const 
 	}
 
 	usb23_set_trb(dev, ep_cfg, ep_data->head, &trb);
+
+	/* Update the transfer with the new transfer descriptor */
+	usb23_depcmd_update_xfer(dev, ep_cfg);
+
 	return 0;
 }
 
 static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	uint32_t ctrl;
-	int ret;
 
 	LOG_DBG("TRB_BULK_IN ep=0x%02x buf=%p", ep_cfg->addr, buf);
 
@@ -803,13 +804,7 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 	}
 
 	/* Try to submit the TRB if some is available */
-	ret = usb23_push_trb(dev, ep_cfg, buf, ctrl);
-	if (ret < 0) {
-		return ret;
-	}
-
-	usb23_depcmd_update_xfer(dev, ep_cfg);
-	return 0;
+	return usb23_send_trb(dev, ep_cfg, buf, ctrl);
 }
 
 /*------------------------------------------------------------------------------
@@ -1081,10 +1076,6 @@ static void usb23_on_ctrl_nodata_status(const struct device *dev, struct udc_ep_
 
 static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	struct usb23_data *priv = udc_get_private(dev);
-
-	priv->data_stage_length = udc_data_stage_length(buf);
-
 	/* Move to the next state to be able to differentiate in/out/no-data */
 	udc_ctrl_update_stage(dev, buf);
 
