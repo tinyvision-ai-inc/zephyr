@@ -114,6 +114,7 @@ struct usb23_data {
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
 static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
+static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg);
 
 /*------------------------------------------------------------------------------
 --  Input/Output
@@ -783,7 +784,7 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 {
 	uint32_t ctrl;
 
-	LOG_DBG("TRB_BULK_IN ep=0x%02x buf=%p", ep_cfg->addr, buf);
+	LOG_DBG("TRB_BULK ep=0x%02x buf=%p", ep_cfg->addr, buf);
 
 	/* Make sure the transfer is terminated */
 	if (udc_ep_buf_has_zlp(buf)) {
@@ -1153,6 +1154,9 @@ static void usb23_on_xfer_done_norm(const struct device *dev, struct udc_ep_conf
 
 	err = udc_submit_ep_event(dev, buf, 0);
 	__ASSERT_NO_MSG(err == 0);
+
+	/* Now that there is a free slot, enqueue the next buffer if any */
+	usb23_ep_enqueue_pending(dev, ep_cfg);
 }
 
 static void usb23_on_xfer_done_ctrl(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, struct usb23_trb *trb)
@@ -1292,19 +1296,32 @@ void usb23_irq_handler(void *ptr)
 --  Interface called by Zehpyr from the upper levels of abstractions.
 */
 
+static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	struct net_buf *buf;
+	int err;
+
+	/* See if there is another buffer to be processed */
+	buf = net_buf_get(&ep_cfg->fifo, K_NO_WAIT);
+	if (buf) {
+		/* There is more room for one buffer to be submitted */
+		err = usb23_trb_bulk(dev, ep_cfg, next_buf);
+		__ASSERT_NO_MSG(err == 0);
+	}
+}
+
 static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct udc_buf_info *bi = udc_get_buf_info(buf);
-	int ret = 0;
 
 	LOG_DBG("%s: ep=0x%02x buf=0x%p", __func__, ep_cfg->addr, buf);
 
-	/* Associate a buffer and a TRB together */
-	ep_data->net_buf[ep_data->head] = buf;
-
 	switch (ep_cfg->addr) {
 	case USB_CONTROL_EP_IN:
+		/* Save the buffer to fetch it back later */
+		ep_data->net_buf[0] = buf;
+
 		if (bi->data) {
 			usb23_trb_ctrl_data_in(dev);
 		} else if (bi->status && udc_ctrl_stage_is_no_data(dev)) {
@@ -1319,14 +1336,18 @@ static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *cons
 		__ASSERT(false, "expected to be handled by the driver directly");
 		break;
 	default:
-		/* Submit the transaction */
-		ret = usb23_trb_bulk(dev, ep_cfg, buf);
-
-		/*  Update the transaction by one step */
-		ep_data->head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
+		/* Try to submit the buffer directly to the hardware */
+		if (usb23_trb_bulk(dev, ep_cfg, buf) == 0) {
+			/* Associate a buffer and a TRB together */
+			ep_data->net_buf[ep_data->head] = buf;
+			ep_data->head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
+		} else {
+			/* Fallback to submit it to a queue for later */
+			udc_buf_put(ep_cfg, buf);
+		}
 	}
 
-	return ret;
+	return 0;
 }
 
 static int usb23_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg)
