@@ -212,8 +212,6 @@ static struct usb23_trb usb23_get_trb(const struct device *dev, struct udc_ep_co
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
 	__ASSERT_NO_MSG(n < ep_data->num_of_trbs);
-	flush_l2_cache();
-	flush_cpu_dcache();
 	return ep_data->trb_buf[n];
 }
 
@@ -223,8 +221,6 @@ static void usb23_set_trb(const struct device *dev, struct udc_ep_config *const 
 
 	__ASSERT_NO_MSG(n < ep_data->num_of_trbs);
 	ep_data->trb_buf[n] = *trb;
-	flush_cpu_dcache();
-	flush_l2_cache();
 }
 
 static union usb23_evt usb23_get_next_evt(const struct device *dev)
@@ -234,14 +230,10 @@ static union usb23_evt usb23_get_next_evt(const struct device *dev)
 	volatile union usb23_evt evt;
 
 	/* Cache the current event */
-	flush_l2_cache();
-	flush_cpu_dcache();
 	evt = config->evt_buf[priv->evt_next];
 
 	/* Clear it on the event buffer */
 	config->evt_buf[priv->evt_next].raw = 0x00000000;
-	flush_l2_cache();
-	flush_cpu_dcache();
 
 	/* This is a ring buffer, wrap around */
 	priv->evt_next++;
@@ -1567,8 +1559,6 @@ static int usb23_init(const struct device *dev)
 	for (int i = 0; i < CONFIG_USB23_EVT_NUM; i++) {
 		config->evt_buf[i] = (union usb23_evt){0};
 	}
-	flush_l2_cache();
-	flush_cpu_dcache();
 	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)config->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)config->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTSIZ(0), CONFIG_USB23_EVT_NUM * sizeof(*config->evt_buf));
