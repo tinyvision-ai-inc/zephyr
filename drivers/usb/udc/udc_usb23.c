@@ -772,7 +772,10 @@ static int usb23_send_trb(const struct device *dev, struct udc_ep_config *const 
 		return -EBUSY;
 	}
 
+	/* Associate an active buffer and a TRB together */
 	usb23_set_trb(dev, ep_cfg, ep_data->head, &trb);
+	ep_data->net_buf[ep_data->head] = buf;
+	ep_data->head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
 
 	/* Update the transfer with the new transfer descriptor */
 	usb23_depcmd_update_xfer(dev, ep_cfg);
@@ -1287,7 +1290,8 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	config->irq_clear_func();
-	k_work_submit(&priv->work);
+	//k_work_submit(&priv->work);
+	usb23_on_event(&priv->work);
 }
 
 /*------------------------------------------------------------------------------
@@ -1305,7 +1309,7 @@ static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_con
 	buf = net_buf_get(&ep_cfg->fifo, K_NO_WAIT);
 	if (buf) {
 		/* There is more room for one buffer to be submitted */
-		err = usb23_trb_bulk(dev, ep_cfg, next_buf);
+		err = usb23_trb_bulk(dev, ep_cfg, buf);
 		__ASSERT_NO_MSG(err == 0);
 	}
 }
@@ -1337,11 +1341,7 @@ static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *cons
 		break;
 	default:
 		/* Try to submit the buffer directly to the hardware */
-		if (usb23_trb_bulk(dev, ep_cfg, buf) == 0) {
-			/* Associate a buffer and a TRB together */
-			ep_data->net_buf[ep_data->head] = buf;
-			ep_data->head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
-		} else {
+		if (usb23_trb_bulk(dev, ep_cfg, buf) != 0) {
 			/* Fallback to submit it to a queue for later */
 			udc_buf_put(ep_cfg, buf);
 		}
