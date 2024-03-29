@@ -496,11 +496,11 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	switch (ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) {
 	case USB_EP_TYPE_CONTROL:
 		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_CTRL;
-		param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		//param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // for debug
 		break;
 	case USB_EP_TYPE_BULK:
 		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_BULK;
-		param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // debug, ok to remove
+		//param1 |= USB23_DEPCMDPAR1_DEPCFG_XFERNRDYEN; // for debug
 		break;
 	case USB_EP_TYPE_INTERRUPT:
 		param0 |= USB23_DEPCMDPAR0_DEPCFG_EPTYPE_INT;
@@ -1026,8 +1026,8 @@ static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_con
 static void usb23_on_ctrl_write_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_status(dev, buf);
 	udc_ctrl_update_stage(dev, buf);
+	udc_ctrl_submit_status(dev, buf);
 }
 
 /*-- Control Read --*/
@@ -1273,7 +1273,6 @@ static void usb23_on_event(struct k_work *work)
 		} else {
 			usb23_on_endpoint_event(dev, evt.depevt);
 		}
-
 	}
 }
 
@@ -1284,7 +1283,7 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	config->irq_clear_func();
-	usb23_on_event(&priv->work);
+	k_work_submit(&priv->work);
 }
 
 /*------------------------------------------------------------------------------
