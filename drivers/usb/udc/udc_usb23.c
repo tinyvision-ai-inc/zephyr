@@ -760,18 +760,21 @@ static int usb23_send_trb(const struct device *dev, struct udc_ep_config *const 
 		.ctrl = ctrl,
 		.status = ep_cfg->caps.in ? buf->len : buf->size,
 	};
-	size_t next_trb_head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
+	size_t next_head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available. */
-	if (next_trb_head == ep_data->tail) {
+	if (next_head == ep_data->tail) {
+		LOG_DBG("%s: busy head=%d next_head=%d tail=%d num_of_trbs=%d",
+			__func__, ep_data->head, next_head, ep_data->tail,
+			ep_data->num_of_trbs);
 		return -EBUSY;
 	}
 
 	/* Associate an active buffer and a TRB together */
 	usb23_set_trb(dev, ep_cfg, ep_data->head, &trb);
 	ep_data->net_buf[ep_data->head] = buf;
-	ep_data->head = next_trb_head;
+	ep_data->head = next_head;
 
 	/* Update the transfer with the new transfer descriptor */
 	usb23_depcmd_update_xfer(dev, ep_cfg);
@@ -1143,12 +1146,16 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 static void usb23_on_xfer_done_norm(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, struct usb23_trb *trb)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+	size_t next_tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
 	int err;
+
+	LOG_DBG("%s: head=%d tail=%d next_tail=%d", __func__,
+		ep_data->head, ep_data->tail, next_tail);
 
 	/* Clear the current TRB and switch to the next */
 	usb23_set_trb(dev, ep_cfg, ep_data->tail, &(struct usb23_trb){0});
 	ep_data->net_buf[ep_data->tail] = NULL;
-	ep_data->tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
+	ep_data->tail = next_tail;
 
 	__ASSERT_NO_MSG(buf != NULL);
 	__ASSERT_NO_MSG(!ep_cfg->caps.control);
