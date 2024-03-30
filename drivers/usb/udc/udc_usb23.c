@@ -760,17 +760,18 @@ static int usb23_send_trb(const struct device *dev, struct udc_ep_config *const 
 		.ctrl = ctrl,
 		.status = ep_cfg->caps.in ? buf->len : buf->size,
 	};
+	size_t next_trb_head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available. */
-	if ((usb23_get_trb(dev, ep_cfg, ep_data->head).ctrl != 0x00000000)) {
+	if (next_trb_head == ep_data->tail) {
 		return -EBUSY;
 	}
 
 	/* Associate an active buffer and a TRB together */
 	usb23_set_trb(dev, ep_cfg, ep_data->head, &trb);
 	ep_data->net_buf[ep_data->head] = buf;
-	ep_data->head = (ep_data->head + 1) % (ep_data->num_of_trbs - 1);
+	ep_data->head = next_trb_head;
 
 	/* Update the transfer with the new transfer descriptor */
 	usb23_depcmd_update_xfer(dev, ep_cfg);
