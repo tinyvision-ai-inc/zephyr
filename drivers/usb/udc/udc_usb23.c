@@ -91,9 +91,6 @@ struct usb23_ep_data {
 
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
-
-	/* Size passed to BUFSIZ= parameter */
-	size_t enqueued_size;
 };
 
 /*
@@ -678,8 +675,6 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 		.ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO,
 	};
 
-	ep_data->enqueued_size = trb0.status;
-
 	__ASSERT_NO_MSG(usb23_get_trb(dev, ep_cfg, 0).ctrl == 0x00000000);
 	usb23_set_trb(dev, ep_cfg, 0, &trb0);
 	usb23_depcmd_start_xfer(dev, ep_cfg);
@@ -697,12 +692,11 @@ static void usb23_trb_ctrl_out(const struct device *dev, uint32_t ctrl, size_t s
 	struct usb23_trb trb1 = {
 		.addr_lo = LO32(config->discard),
 		.addr_hi = HI32(config->discard),
-		.status = ep_cfg->mps - ep_data->enqueued_size,
+		.status = ep_cfg->mps - size,
 		.ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO,
 	};
 
 	ep_data->net_buf[0] = udc_ctrl_alloc(dev, ep_cfg->addr, size);
-	ep_data->enqueued_size = trb0.status;
 	__ASSERT_NO_MSG(ep_data->net_buf[0] != NULL);
 
 	trb0.addr_lo = LO32((uintptr_t)ep_data->net_buf[0]->data);
