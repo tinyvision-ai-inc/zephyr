@@ -681,28 +681,28 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 	usb23_depcmd_start_xfer(dev, ep_cfg);
 }
 
-static void usb23_trb_ctrl_out(const struct device *dev, uint32_t ctrl, size_t size)
+static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, uint32_t ctrl)
 {
 	const struct usb23_config *config = dev->config;
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct usb23_trb trb0 = {
-		.status = size,
+		.status = buf->size,
 		.ctrl = ctrl | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO,
 	};
 	struct usb23_trb trb1 = {
 		.addr_lo = LO32(config->discard),
 		.addr_hi = HI32(config->discard),
-		.status = ep_cfg->mps - size,
+		.status = ep_cfg->mps - buf->size,
 		.ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO,
 	};
 
-	ep_data->net_buf[0] = udc_ctrl_alloc(dev, ep_cfg->addr, size);
+	ep_data->net_buf[0] = buf;
 	__ASSERT_NO_MSG(ep_data->net_buf[0] != NULL);
 
 	trb0.addr_lo = LO32((uintptr_t)ep_data->net_buf[0]->data);
 	trb0.addr_hi = HI32((uintptr_t)ep_data->net_buf[0]->data);
-	LOG_DBG("%s: buf=%p data=0x%p", __func__, ep_data->net_buf[0], ep_data->net_buf[0]->data);
+	LOG_DBG("%s: buf=%p data=%p", __func__, ep_data->net_buf[0], ep_data->net_buf[0]->data);
 
 	__ASSERT_NO_MSG(usb23_get_trb(dev, ep_cfg, 0).ctrl == 0x00000000);
 	__ASSERT_NO_MSG(usb23_get_trb(dev, ep_cfg, 1).ctrl == 0x00000000);
@@ -713,17 +713,19 @@ static void usb23_trb_ctrl_out(const struct device *dev, uint32_t ctrl, size_t s
 
 static void usb23_trb_ctrl_setup_out(const struct device *dev)
 {
+	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 8);
+
 	LOG_DBG("TRB_CONTROL_SETUP ep=0x%02x", USB_CONTROL_EP_OUT);
-	usb23_trb_ctrl_out(dev, USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP, 8);
+	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 }
 
 static void usb23_trb_ctrl_data_out(const struct device *dev)
 {
 	struct usb23_data *priv = udc_get_private(dev);
-	size_t len = priv->data_stage_length;
+	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, priv->data_stage_length);
 
 	LOG_DBG("TRB_CONTROL_DATA_OUT ep=0x%02x", USB_CONTROL_EP_OUT);
-	usb23_trb_ctrl_out(dev, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA, len);
+	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 
 static void usb23_trb_ctrl_data_in(const struct device *dev)
@@ -746,8 +748,10 @@ static void usb23_trb_ctrl_status_3_in(const struct device *dev)
 
 static void usb23_trb_ctrl_status_3_out(const struct device *dev)
 {
+	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 0);
+
 	LOG_DBG("TRB_CONTROL_STATUS_3_OUT ep=0x%02x", USB_CONTROL_EP_OUT);
-	usb23_trb_ctrl_out(dev, USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3, 0);
+	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 }
 
 /*
@@ -1010,92 +1014,88 @@ static void usb23_on_device_event(const struct device *dev, struct usb23_devt de
 	}
 }
 
-/*
- * Control Write
- */
+/* Control Write */
 
-/*
- * Control Write OUT (setup)
- */
+/* OUT */
 static void usb23_on_ctrl_write_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
+	LOG_DBG("%s: buf=%p", __func__, buf);
 	usb23_trb_ctrl_data_out(dev);
 }
 
-/*
- * OUT (data)
- */
+/* OUT */
 static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
 	udc_ctrl_update_stage(dev, buf);
-	udc_ctrl_submit_s_out_status(dev, buf);
+	err = udc_ctrl_submit_s_out_status(dev, buf);
+	__ASSERT_NO_MSG(err == 0);
 }
 
-/*
- * IN (status)
- */
+/* IN */
 static void usb23_on_ctrl_write_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_status(dev, buf);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(err == 0);
 	udc_ctrl_update_stage(dev, buf);
 }
 
-/*
- * Control Read
- */
+/* Control Read */
 
-/*
- * OUT (setup)
- */
+/* OUT */
 static void usb23_on_ctrl_read_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_s_in_status(dev);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
+	err = udc_ctrl_submit_s_in_status(dev);
+	__ASSERT_NO_MSG(err == 0);
 }
 
-/*
- * IN (data)
- */
+/* IN */
 static void usb23_on_ctrl_read_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_update_stage(dev, buf);
+	LOG_DBG("%s: buf=%p", __func__, buf);
 	usb23_trb_ctrl_status_3_out(dev);
+	udc_ctrl_update_stage(dev, buf);
 }
 
-/*
- * OUT (status)
- */
+/* OUT */
 static void usb23_on_ctrl_read_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_status(dev, buf);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(err == 0);
 	udc_ctrl_update_stage(dev, buf);
 }
 
-/*
- * No-Data Control
- */
+/* No-Data Control */
 
-/*
- * OUT (setup)
- */
+/* OUT */
 static void usb23_on_ctrl_nodata_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_s_status(dev);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
+	err = udc_ctrl_submit_s_status(dev);
+	__ASSERT_NO_MSG(err == 0);
 }
 
-/*
- * IN (status)
- */
+/* IN */
 static void usb23_on_ctrl_nodata_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_submit_status(dev, buf);
+	int err;
+
+	LOG_DBG("%s: buf=%p", __func__, buf);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(err == 0);
 	udc_ctrl_update_stage(dev, buf);
 }
 
@@ -1106,11 +1106,12 @@ static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *
 	/* Only moment where this information is accessible */
 	priv->data_stage_length = udc_data_stage_length(buf);
 
-	/* Move to the next state to be able to differentiate in/out/no-data */
-	udc_ctrl_update_stage(dev, buf);
-
 	LOG_DBG("%s: buf=%p data=%p", __func__, buf, buf->data);
 	LOG_HEXDUMP_DBG(buf->data, buf->size, "HEXDUMP");
+
+	/* To be able to differentiate the next stage*/
+	udc_ep_buf_set_setup(buf);
+	udc_ctrl_update_stage(dev, buf);
 
 	if (udc_ctrl_stage_is_data_out(dev)) {
 		usb23_on_ctrl_write_setup(dev, ep_cfg, buf);
@@ -1126,15 +1127,17 @@ static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *
 static void usb23_on_ctrl_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	if (udc_ctrl_stage_is_data_out(dev)) {
+		__ASSERT_NO_MSG(ep_cfg->addr == USB_CONTROL_EP_OUT);
 		usb23_on_ctrl_write_data(dev, ep_cfg, buf);
 	} else if (udc_ctrl_stage_is_data_in(dev)) {
+		__ASSERT_NO_MSG(ep_cfg->addr == USB_CONTROL_EP_IN);
 		usb23_on_ctrl_read_data(dev, ep_cfg, buf);
+		net_buf_unref(buf);
 	} else {
 		LOG_ERR("unknown data stage");
 	}
 
-	// TODO: if this is needed, add to udc_skeleton.c too?
-	net_buf_unref(buf);
+	//net_buf_unref(buf);
 }
 
 static void usb23_on_ctrl_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
@@ -1204,7 +1207,6 @@ static void usb23_on_xfer_done_ctrl(const struct device *dev, struct udc_ep_conf
 	/* Continue to the next step */
 	switch (trb->ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
 	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
-		udc_ep_buf_set_setup(buf);
 		usb23_on_ctrl_setup(dev, ep_cfg, buf);
 		break;
 	CASE(USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
@@ -1345,7 +1347,7 @@ static int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct udc_buf_info *bi = udc_get_buf_info(buf);
 
-	LOG_DBG("%s: ep=0x%02x buf=0x%p", __func__, ep_cfg->addr, buf);
+	LOG_DBG("%s: ep=0x%02x buf=%p", __func__, ep_cfg->addr, buf);
 
 	switch (ep_cfg->addr) {
 	case USB_CONTROL_EP_IN:

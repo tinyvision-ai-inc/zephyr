@@ -404,9 +404,11 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 	CASE(USB_SREQ_SET_FEATURE);
 		ret = sreq_set_feature(uds_ctx);
 		break;
+#if 0
 	CASE(USB_SREQ_SET_SEL);
 		ret = sreq_set_sel(uds_ctx, buf);
 		break;
+#endif
 	default:
 		errno = -ENOTSUP;
 		ret = 0;
@@ -917,6 +919,8 @@ int usbd_handle_ctrl_xfer(struct usbd_contex *const uds_ctx,
 			/* Enqueue DATA (IN) or STATUS (OUT) buffer */
 			ret = usbd_ep_ctrl_enqueue(uds_ctx, next_buf);
 		}
+
+		net_buf_unref(buf);
 
 		return ret;
 	}
