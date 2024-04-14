@@ -112,16 +112,15 @@ struct usb23_data {
 };
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
-static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
 static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg);
 
-/*------------------------------------------------------------------------------
---  Input/Output
---------------------------------------------------------------------------------
---  Communication with the USB23 register interface through memory addresses
---  The USB23 core has a register interface and a DMA interface memory.
---  These helpers are the only places where I/O is done with it.
-*/
+/*
+ * Input/Output
+ *
+ * Communication with the USB23 register interface through memory addresses
+ * The USB23 core has a register interface and a DMA interface memory.
+ * These helpers are the only places where I/O is done with it.
+ */
 
 static uint32_t usb23_io_read(const struct device *dev, uint32_t addr)
 {
@@ -157,12 +156,12 @@ static void usb23_io_field(const struct device *dev, uint32_t addr, uint32_t mas
 	usb23_io_write(dev, addr, (usb23_io_read(dev, addr) & ~mask) | val);
 }
 
-/*------------------------------------------------------------------------------
---  Setters/Getters
---------------------------------------------------------------------------------
---  Helpers to convert between various numbers formats or accessing one struct
---  from another. No action on the hardware.
-*/
+/*
+ * Setters/Getters
+ *
+ * Helpers to convert between various numbers formats or accessing one struct
+ * from another. No action on the hardware.
+ */
 
 /*
  * This is a mapping between logical and physical resources we decoreed.
@@ -246,12 +245,12 @@ static union usb23_evt usb23_get_next_evt(const struct device *dev)
 	return evt;
 }
 
-/*------------------------------------------------------------------------------
---  Debug
---------------------------------------------------------------------------------
---  Temporary functions used for debugging, meant to be removed once the
---  implementation is complete.
-*/
+/*
+ * Debug
+ *
+ * Temporary functions used for debugging, meant to be removed once the
+ * implementation is complete.
+ */
 
 struct usb23_reg {
 	uint32_t addr;
@@ -449,13 +448,13 @@ void usb23_dump_fifo_space(const struct device *dev)
 		fifo[12].name, fifo[12].reg);
 }
 
-/*------------------------------------------------------------------------------
---  Commands
---------------------------------------------------------------------------------
---  The DEPCMD register acts as a command interface, where a command number is
---  written along with parameters, an action is performed and a CMDACT bit is
---  reset whenever the command completes.
-*/
+/*
+ * Commands
+ *
+ * The DEPCMD register acts as a command interface, where a command number is
+ * written along with parameters, an action is performed and a CMDACT bit is
+ * reset whenever the command completes.
+ */
 
 static uint32_t usb23_depcmd(const struct device *dev, uint32_t addr, uint32_t cmd)
 {
@@ -545,6 +544,7 @@ static void usb23_depcmd_ep_xfer_config(const struct device *dev, struct udc_ep_
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPXFERCFG);
 }
 
+#if 0
 static uint32_t usb23_depcmd_ep_get_state(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
@@ -554,6 +554,7 @@ static uint32_t usb23_depcmd_ep_get_state(const struct device *dev, struct udc_e
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPGETSTATE);
 	return usb23_io_read(dev, USB23_DEPCMDPAR2(epn));
 }
+#endif
 
 static void usb23_depcmd_set_stall(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
@@ -655,13 +656,13 @@ static void usb23_dgcmd_exit_latency(const struct device *dev, const struct udc_
 	usb23_dgcmd(dev, USB23_DGCMD_EXITLATENCY);
 }
 
-/*------------------------------------------------------------------------------
---  Transfer Requests (TRB)
---------------------------------------------------------------------------------
---  USB23 receives transfer requests from this driver through a shared memory
---  buffer, resubmitted upon every new transfer (through either Start or Update
---  command).
-*/
+/*
+ * Transfer Requests (TRB)
+ *
+ * USB23 receives transfer requests from this driver through a shared memory
+ * buffer, resubmitted upon every new transfer (through either Start or Update
+ * command).
+ */
 
 static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 {
@@ -701,6 +702,7 @@ static void usb23_trb_ctrl_out(const struct device *dev, uint32_t ctrl, size_t s
 
 	trb0.addr_lo = LO32((uintptr_t)ep_data->net_buf[0]->data);
 	trb0.addr_hi = HI32((uintptr_t)ep_data->net_buf[0]->data);
+	LOG_DBG("%s: buf=%p data=0x%p", __func__, ep_data->net_buf[0], ep_data->net_buf[0]->data);
 
 	__ASSERT_NO_MSG(usb23_get_trb(dev, ep_cfg, 0).ctrl == 0x00000000);
 	__ASSERT_NO_MSG(usb23_get_trb(dev, ep_cfg, 1).ctrl == 0x00000000);
@@ -810,13 +812,13 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 	return usb23_send_trb(dev, ep_cfg, buf, ctrl);
 }
 
-/*------------------------------------------------------------------------------
---  Events
---------------------------------------------------------------------------------
---  Process the events from the event ring buffer. Interrupts gives us a hint
---  that an event is available, which we fetch from a ring buffer shared with
---  the hardware.
-*/
+/*
+ *  Events
+ *
+ *  Process the events from the event ring buffer. Interrupts gives us a hint
+ *  that an event is available, which we fetch from a ring buffer shared with
+ *  the hardware.
+ */
 
 static void usb23_on_soft_reset(const struct device *dev)
 {
@@ -1008,16 +1010,22 @@ static void usb23_on_device_event(const struct device *dev, struct usb23_devt de
 	}
 }
 
-/*-- Control Write --*/
+/*
+ * Control Write
+ */
 
-/* OUT (setup) */
+/*
+ * Control Write OUT (setup)
+ */
 static void usb23_on_ctrl_write_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
 	usb23_trb_ctrl_data_out(dev);
 }
 
-/* OUT (data) */
+/*
+ * OUT (data)
+ */
 static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
@@ -1025,24 +1033,32 @@ static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_con
 	udc_ctrl_submit_s_out_status(dev, buf);
 }
 
-/* IN (status) */
+/*
+ * IN (status)
+ */
 static void usb23_on_ctrl_write_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
-	udc_ctrl_update_stage(dev, buf);
 	udc_ctrl_submit_status(dev, buf);
+	udc_ctrl_update_stage(dev, buf);
 }
 
-/*-- Control Read --*/
+/*
+ * Control Read
+ */
 
-/* OUT (setup) */
+/*
+ * OUT (setup)
+ */
 static void usb23_on_ctrl_read_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
 	udc_ctrl_submit_s_in_status(dev);
 }
 
-/* IN (data) */
+/*
+ * IN (data)
+ */
 static void usb23_on_ctrl_read_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
@@ -1050,7 +1066,9 @@ static void usb23_on_ctrl_read_data(const struct device *dev, struct udc_ep_conf
 	usb23_trb_ctrl_status_3_out(dev);
 }
 
-/* OUT (status) */
+/*
+ * OUT (status)
+ */
 static void usb23_on_ctrl_read_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
@@ -1058,24 +1076,28 @@ static void usb23_on_ctrl_read_status(const struct device *dev, struct udc_ep_co
 	udc_ctrl_update_stage(dev, buf);
 }
 
-/*-- No-Data Control --*/
+/*
+ * No-Data Control
+ */
 
-/* OUT (setup) */
+/*
+ * OUT (setup)
+ */
 static void usb23_on_ctrl_nodata_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
 	udc_ctrl_submit_s_status(dev);
 }
 
-/* IN (status) */
+/*
+ * IN (status)
+ */
 static void usb23_on_ctrl_nodata_status(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s buf=%p", __func__, buf);
 	udc_ctrl_submit_status(dev, buf);
 	udc_ctrl_update_stage(dev, buf);
 }
-
-/*--*/
 
 static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
@@ -1087,6 +1109,7 @@ static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *
 	/* Move to the next state to be able to differentiate in/out/no-data */
 	udc_ctrl_update_stage(dev, buf);
 
+	LOG_DBG("%s: buf=%p data=%p", __func__, buf, buf->data);
 	LOG_HEXDUMP_DBG(buf->data, buf->size, "HEXDUMP");
 
 	if (udc_ctrl_stage_is_data_out(dev)) {
@@ -1293,15 +1316,15 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	config->irq_clear_func();
-	//k_work_submit(&priv->work);
-	usb23_on_event(&priv->work);
+	k_work_submit(&priv->work);
+	//usb23_on_event(&priv->work);
 }
 
-/*------------------------------------------------------------------------------
---  UDC API
---------------------------------------------------------------------------------
---  Interface called by Zehpyr from the upper levels of abstractions.
-*/
+/*
+ * UDC API
+ *
+ * Interface called by Zehpyr from the upper levels of abstractions.
+ */
 
 static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
@@ -1317,7 +1340,7 @@ static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_con
 	}
 }
 
-static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
+static int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct udc_buf_info *bi = udc_get_buf_info(buf);
@@ -1353,7 +1376,7 @@ static int usb23_ep_enqueue(const struct device *dev, struct udc_ep_config *cons
 	return 0;
 }
 
-static int usb23_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static int usb23_api_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	unsigned int lock_key;
 	struct net_buf *buf;
@@ -1368,7 +1391,7 @@ static int usb23_ep_dequeue(const struct device *dev, struct udc_ep_config *cons
 	return 0;
 }
 
-static int usb23_ep_disable(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static int usb23_api_ep_disable(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 
@@ -1380,7 +1403,7 @@ static int usb23_ep_disable(const struct device *dev, struct udc_ep_config *cons
 /*
  * Halt endpoint. Halted endpoint should respond with a STALL handshake.
  */
-static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg)
+static int usb23_api_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg)
 {
 	LOG_WRN("Setting stall state on endpoint ep=0x%02x", ep_cfg->addr);
 
@@ -1409,7 +1432,7 @@ static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_
 	return 0;
 }
 
-static int usb23_ep_clear_halt(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static int usb23_api_ep_clear_halt(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	LOG_WRN("Clearing stall state on endpoint ep=0x%02x", ep_cfg->addr);
 	__ASSERT_NO_MSG(ep_cfg->addr != USB_CONTROL_EP_OUT);
@@ -1420,7 +1443,7 @@ static int usb23_ep_clear_halt(const struct device *dev, struct udc_ep_config *c
 	return 0;
 }
 
-static int usb23_check_address(const struct device *dev, const uint8_t addr)
+static int usb23_api_set_address(const struct device *dev, const uint8_t addr)
 {
 	/* The address is set in the code earlier to improve latency, only
 	 * checking that it is still the value done for consistency. */
@@ -1444,7 +1467,7 @@ static int usb23_set_address(const struct device *dev, const uint8_t addr)
 	return 0;
 }
 
-static int usb23_set_exit_latency(const struct device *dev, const struct udc_exit_latency *el)
+static int usb23_api_set_exit_latency(const struct device *dev, const struct udc_exit_latency *el)
 {
 	LOG_DBG("%s u1sel=%d u1pel=%d u2sel=%d u2pel=%d", __func__,
 		el->u1sel, el->u1pel, el->u2sel, el->u2pel);
@@ -1452,12 +1475,12 @@ static int usb23_set_exit_latency(const struct device *dev, const struct udc_exi
 	return 0;
 }
 
-static int usb23_host_wakeup(const struct device *dev)
+static int usb23_api_host_wakeup(const struct device *dev)
 {
 	return 0;
 }
 
-static enum udc_bus_speed usb23_device_speed(const struct device *dev)
+static enum udc_bus_speed usb23_api_device_speed(const struct device *dev)
 {
 	switch (usb23_io_read(dev, USB23_DSTS) & USB23_DSTS_CONNECTSPD_MASK) {
 	case USB23_DSTS_CONNECTSPD_HS:
@@ -1471,7 +1494,7 @@ static enum udc_bus_speed usb23_device_speed(const struct device *dev)
 	return 0;
 }
 
-static int usb23_enable(const struct device *dev)
+static int usb23_api_enable(const struct device *dev)
 {
 	const struct usb23_config *config = dev->config;
 
@@ -1485,7 +1508,7 @@ static int usb23_enable(const struct device *dev)
 	return 0;
 }
 
-static int usb23_disable(const struct device *dev)
+static int usb23_api_disable(const struct device *dev)
 {
 	LOG_INF("%s", __func__);
 	return 0;
@@ -1494,7 +1517,7 @@ static int usb23_disable(const struct device *dev)
 /*
  * Shut down the controller completely
  */
-static int usb23_shutdown(const struct device *dev)
+static int usb23_api_shutdown(const struct device *dev)
 {
 	LOG_INF("%s", __func__);
 	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_OUT)) {
@@ -1508,24 +1531,24 @@ static int usb23_shutdown(const struct device *dev)
 	return 0;
 }
 
-static int usb23_lock(const struct device *dev)
+static int usb23_api_lock(const struct device *dev)
 {
 	return udc_lock_internal(dev, K_FOREVER);
 }
 
-static int usb23_unlock(const struct device *dev)
+static int usb23_api_unlock(const struct device *dev)
 {
 	return udc_unlock_internal(dev);
 }
 
-/*------------------------------------------------------------------------------
---  Hardware Init
---------------------------------------------------------------------------------
---  Prepare the driver and the hardware to being used.
---  This goes through register configuration and register commands.
-*/
+/*
+ * Hardware Init
+ *
+ * Prepare the driver and the hardware to being used.
+ * This goes through register configuration and register commands.
+ */
 
-static int usb23_ep_enable(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 
@@ -1551,7 +1574,7 @@ static int usb23_ep_enable(const struct device *dev, struct udc_ep_config *const
  * of detecting VBUS activity it should be enabled here.
  * Only usb23_enable() makes device visible to the host.
  */
-static int usb23_init(const struct device *dev)
+static int usb23_api_init(const struct device *dev)
 {
 	struct udc_data *data = dev->data;
 	int err = 0;
@@ -1592,18 +1615,21 @@ static int usb23_init(const struct device *dev)
 	return err;
 }
 
-/*------------------------------------------------------------------------------
---  Software Init
---------------------------------------------------------------------------------
---  Setup the default values and configure software variables and structs.
---  No effect on hardware.
-*/
+/*
+ * Software Init
+ *
+ * Setup the default values and configure software variables and structs.
+ * No effect on hardware.
+ */
 
+/*
+ * The real init function is triggered by the application with .
+ */
 static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *const ep_cfg, uint8_t addr, int mps)
 {
 	int err;
 
-	LOG_DBG("%s: .---. ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg, ep_cfg->caps.control);
+	LOG_DBG("%s: ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg, ep_cfg->caps.control);
 
 	/* Generic properties for Zephyr */
 	ep_cfg->addr = addr;
@@ -1623,15 +1649,11 @@ static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *cons
 	}
 	ep_cfg->caps.mps = mps;
 
-	LOG_DBG("%s: |   | ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg, ep_cfg->caps.control);
-
 	err = udc_register_ep(dev, ep_cfg);
 	if (err != 0) {
 		LOG_ERR("Failed to register endpoint");
 		return err;
 	}
-
-	LOG_DBG("%s: '---' ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg, ep_cfg->caps.control);
 
 	return 0;
 }
@@ -1680,22 +1702,22 @@ static int usb23_driver_preinit(const struct device *dev)
 }
 
 static const struct udc_api usb23_api = {
-	.lock = usb23_lock,
-	.unlock = usb23_unlock,
-	.device_speed = usb23_device_speed,
-	.init = usb23_init,
-	.enable = usb23_enable,
-	.disable = usb23_disable,
-	.shutdown = usb23_shutdown,
-	.set_address = usb23_check_address,
-	.set_exit_latency = usb23_set_exit_latency,
-	.host_wakeup = usb23_host_wakeup,
-	.ep_enable = usb23_ep_enable,
-	.ep_disable = usb23_ep_disable,
-	.ep_set_halt = usb23_ep_set_halt,
-	.ep_clear_halt = usb23_ep_clear_halt,
-	.ep_enqueue = usb23_ep_enqueue,
-	.ep_dequeue = usb23_ep_dequeue,
+	.lock = usb23_api_lock,
+	.unlock = usb23_api_unlock,
+	.device_speed = usb23_api_device_speed,
+	.init = usb23_api_init,
+	.enable = usb23_api_enable,
+	.disable = usb23_api_disable,
+	.shutdown = usb23_api_shutdown,
+	.set_address = usb23_api_set_address,
+	.set_exit_latency = usb23_api_set_exit_latency,
+	.host_wakeup = usb23_api_host_wakeup,
+	.ep_enable = usb23_api_ep_enable,
+	.ep_disable = usb23_api_ep_disable,
+	.ep_set_halt = usb23_api_ep_set_halt,
+	.ep_clear_halt = usb23_api_ep_clear_halt,
+	.ep_enqueue = usb23_api_ep_enqueue,
+	.ep_dequeue = usb23_api_ep_dequeue,
 };
 
 #define NUM_OF_EPS(n) (DT_INST_PROP(n, num_bidir_endpoints) * 2)

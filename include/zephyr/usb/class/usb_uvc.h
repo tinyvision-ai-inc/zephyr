@@ -464,6 +464,42 @@ struct uvc_uncompressed_frame_descriptor {
 	uint32_t dwFrameInterval[1];
 } __packed;
 
+/** Motion-JPEG Video Format Descriptor */
+struct uvc_mjpeg_format_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint8_t bFormatIndex;
+	uint8_t bNumFrameDescriptors;
+	uint8_t bmFlags;
+#define UVC_MJPEG_FLAGS_FIXEDSIZESAMPLES	(1 << 0)
+	uint8_t bDefaultFrameIndex;
+	uint8_t bAspectRatioX;
+	uint8_t bAspectRatioY;
+	uint8_t bmInterlaceFlags;
+	uint8_t bCopyProtect;
+} __packed;
+
+/** Motion-JPEG Video Frame Descriptor */
+struct uvc_mjpeg_frame_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint8_t bFrameIndex;
+	uint8_t bmCapabilities;
+	uint16_t wWidth;
+	uint16_t wHeight;
+	uint32_t dwMinBitRate;
+	uint32_t dwMaxBitRate;
+	uint32_t dwMaxVideoFrameBufferSize;
+	uint32_t dwDefaultFrameInterval;
+	/* Only continuous frame interval supported here */
+	uint8_t bFrameIntervalType;
+	uint32_t dwMinFrameInterval;
+	uint32_t dwMaxFrameInterval;
+	uint32_t dwFrameIntervalStep;
+} __packed;
+
 /** Video Probe and Commit Controls */
 struct uvc_vs_probe_control {
 	uint16_t bmHint;
