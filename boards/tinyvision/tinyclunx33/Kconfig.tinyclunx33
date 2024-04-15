@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_TINYCLUNX33
+	select SOC_LITEX_VEXRISCV
