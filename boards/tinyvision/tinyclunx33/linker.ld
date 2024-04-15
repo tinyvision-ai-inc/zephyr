@@ -1,5 +1,11 @@
-#include <zephyr/devicetree.h>
 #include <zephyr/linker/linker-tool.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/linker/devicetree_regions.h>
+
+MEMORY
+{
+	LINKER_DT_REGIONS()
+}
 
 SECTIONS
 {

@@ -25,7 +25,7 @@
 		ram0: memory@40000000 {
 			compatible = "zephyr,memory-region";
 			device_type = "memory";
-			reg = <0x40000000 0x100000>;
+			reg = <0x40000000 0x1000>;
 			zephyr,memory-region = "RAM";
 		};
 
