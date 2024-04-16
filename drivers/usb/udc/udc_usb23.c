@@ -1319,7 +1319,6 @@ void usb23_irq_handler(void *ptr)
 
 	config->irq_clear_func();
 	k_work_submit(&priv->work);
-	//usb23_on_event(&priv->work);
 }
 
 /*

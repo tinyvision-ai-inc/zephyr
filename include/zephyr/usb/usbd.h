@@ -338,6 +338,44 @@ struct usbd_class_node {
 		.desc = &cfg_desc_##name,				\
 	}
 
+#define USBD_BOS_DEFINE(d_name)						\
+	struct usb_bos_descriptor_##d_name {				\
+		struct usb_bos_descriptor bos;				\
+		struct usb_bos_capability_lpm lpm;			\
+		struct usb_bos_capability_superspeed_usb superspeed_usb;\
+	} __packed;							\
+	struct usb_bos_descriptor_##d_name				\
+	bos_desc_##d_name = {						\
+		.bos = {						\
+			.bLength = sizeof(struct usb_bos_descriptor),	\
+			.bDescriptorType = USB_DESC_BOS,		\
+			.wTotalLength = sys_cpu_to_le16(sizeof(struct usb_bos_descriptor_##d_name)),\
+			.bNumDeviceCaps = 2,				\
+		},							\
+		.lpm = {						\
+			.bLength = sizeof(struct usb_bos_capability_lpm),\
+			.bDescriptorType = USB_DESC_DEVICE_CAPABILITY,	\
+			.bDevCapabilityType = USB_BOS_CAPABILITY_EXTENSION,\
+			.bmAttributes = USB_BOS_ATTRIBUTES_LPM,		\
+		},							\
+		.superspeed_usb = {					\
+			.bLength = sizeof(struct usb_bos_capability_superspeed_usb),\
+			.bDescriptorType = USB_DESC_DEVICE_CAPABILITY,	\
+			.bDevCapabilityType = USB_BOS_CAPABILITY_SUPERSPEED_USB,\
+			.bmAttributes = USB_BOS_ATTRIBUTES_LPM,		\
+			.wSpeedsSupported = sys_cpu_to_le16(		\
+				USB_BOS_SPEED_SUPERSPEED_GEN1 |		\
+				USB_BOS_SPEED_HIGHSPEED |		\
+				USB_BOS_SPEED_FULLSPEED),		\
+			.bFunctionnalSupport = 1,			\
+			.bU1DevExitLat = 10,				\
+			.wU2DevExitLat = sys_cpu_to_le16(1023),		\
+		},							\
+	};								\
+	static struct usbd_desc_node d_name = {				\
+		.desc = &bos_desc_##d_name,				\
+	};
+
 /**
  * @brief Create a string descriptor node and language string descriptor
  *
