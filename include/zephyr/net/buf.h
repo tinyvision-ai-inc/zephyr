@@ -93,10 +93,10 @@ struct net_buf_simple {
 	 *
 	 * To determine the max length, use net_buf_simple_max_len(), not #size!
 	 */
-	uint16_t len;
+	uint32_t len;
 
 	/** Amount of data that net_buf_simple#__buf can store. */
-	uint16_t size;
+	uint32_t size;
 
 	/** Start of the data storage. Not to be accessed directly
 	 *  (the data pointer should be used instead).
@@ -853,9 +853,9 @@ uint16_t net_buf_simple_max_len(struct net_buf_simple *buf);
  */
 struct net_buf_simple_state {
 	/** Offset of the data pointer from the beginning of the storage */
-	uint16_t offset;
+	uint32_t offset;
 	/** Length of data */
-	uint16_t len;
+	uint32_t len;
 };
 
 /**
@@ -936,10 +936,10 @@ struct net_buf {
 			uint8_t *data;
 
 			/** Length of the data behind the data pointer. */
-			uint16_t len;
+			uint32_t len;
 
 			/** Amount of data that this buffer can store. */
-			uint16_t size;
+			uint32_t size;
 
 			/** Start of the data storage. Not to be accessed
 			 *  directly (the data pointer should be used
@@ -994,7 +994,7 @@ struct net_buf_pool {
 	atomic_t avail_count;
 
 	/** Total size of the pool. */
-	const uint16_t pool_size;
+	const uint32_t pool_size;
 
 	/** Name of the pool. Used when printing pool information. */
 	const char *name;

@@ -1561,8 +1561,12 @@ static int usb23_api_unlock(const struct device *dev)
 static int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 
 	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
+
+	/* Initialize the TRB buffer */
+	memset((void *)ep_data->trb_buf, 0, ep_data->num_of_trbs * sizeof(struct usb23_trb));
 
 	usb23_depcmd_ep_config(dev, ep_cfg);
 	usb23_depcmd_ep_xfer_config(dev, ep_cfg);

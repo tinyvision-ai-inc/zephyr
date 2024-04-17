@@ -246,7 +246,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 	.if0_int_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 0,							\
+		.bMaxBurst = 15,							\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = 0,						\
 	},									\
@@ -275,7 +275,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 	.if1_in_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 0,							\
+		.bMaxBurst = 15,						\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = 0,						\
 	},									\
@@ -292,7 +292,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 	.if1_out_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 0,							\
+		.bMaxBurst = 15,						\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = 0,						\
 	},									\
