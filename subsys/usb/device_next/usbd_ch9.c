@@ -379,7 +379,8 @@ static int sreq_set_sel(struct usbd_contex *const uds_ctx,
 	el.u2sel = sys_le16_to_cpu(el.u2sel);
 	el.u2pel = sys_le16_to_cpu(el.u2pel);
 
-	return udc_set_exit_latency(uds_ctx->dev, &el);
+	errno = udc_set_exit_latency(uds_ctx->dev, &el);
+	return 0;
 }
 
 static int std_request_to_device(struct usbd_contex *const uds_ctx,
@@ -404,11 +405,9 @@ static int std_request_to_device(struct usbd_contex *const uds_ctx,
 	CASE(USB_SREQ_SET_FEATURE);
 		ret = sreq_set_feature(uds_ctx);
 		break;
-#if 0
 	CASE(USB_SREQ_SET_SEL);
 		ret = sreq_set_sel(uds_ctx, buf);
 		break;
-#endif
 	default:
 		errno = -ENOTSUP;
 		ret = 0;

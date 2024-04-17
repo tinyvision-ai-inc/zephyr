@@ -1026,7 +1026,16 @@ static void usb23_on_ctrl_write_setup(const struct device *dev, struct udc_ep_co
 /* OUT */
 static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
+	struct udc_data *data = dev->data;
 	int err;
+
+	if (data->caps.ss) {
+		LOG_ERR("%s: not supported on USB3 for now", __func__);
+		/* Control Write on USB3 does not currently work */
+		usb23_depcmd_set_stall(dev, ep_cfg);
+		usb23_trb_ctrl_setup_out(dev);
+		return;
+	}
 
 	LOG_DBG("%s: buf=%p", __func__, buf);
 	udc_ctrl_update_stage(dev, buf);
