@@ -835,7 +835,12 @@ static void usb23_on_soft_reset(const struct device *dev)
 		(15 << USB23_DCTL_LPM_NYET_THRES_SHIFT));
 	usb23_io_wait_go_low(dev, USB23_DCTL, USB23_DCTL_CSFTRST);
 
-	/* Letting GSBUSCFG0 and GSBUSCFG1 unchanged */
+	/* Enable AXI64 bursts for various sizes expected */
+	usb23_io_set(dev, USB23_GSBUSCFG0, USB23_GSBUSCFG0_INCR256BRSTENA |
+		USB23_GSBUSCFG0_INCR128BRSTENA | USB23_GSBUSCFG0_INCR64BRSTENA |
+		USB23_GSBUSCFG0_INCR32BRSTENA | USB23_GSBUSCFG0_INCR16BRSTENA |
+		USB23_GSBUSCFG0_INCR8BRSTENA | USB23_GSBUSCFG0_INCR4BRSTENA);
+
 	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
 
 	/* Read the chip identification */
