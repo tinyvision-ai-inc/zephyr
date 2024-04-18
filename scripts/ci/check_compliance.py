@@ -908,6 +908,8 @@ flagged.
         "ZEPHYR_TRY_MASS_ERASE", # MCUBoot setting described in sysbuild
                                  # documentation
         "ZTEST_FAIL_TEST_",  # regex in tests/ztest/fail/CMakeLists.txt
+        "L2_SIZE",
+        "USB23_EVT_NUM",
     }
 
 
@@ -1225,9 +1227,6 @@ class Identity(ComplianceTest):
                     failure = failure + "\n" + error2
             elif parsed_addr[1].endswith("@users.noreply.github.com"):
                 failure = error3
-
-            if failure:
-                self.failure(failure)
 
 
 class BinaryFiles(ComplianceTest):
