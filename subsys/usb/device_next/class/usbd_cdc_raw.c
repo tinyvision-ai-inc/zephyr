@@ -21,7 +21,7 @@
 LOG_MODULE_REGISTER(cdc_raw, CONFIG_USBD_CDC_RAW_LOG_LEVEL);
 
 #define CDC_RAW_BULK_EP_MPS		1024
-#define CDC_RAW_INT_EP_MPS		16
+#define CDC_RAW_INT_EP_MPS		64
 #define CDC_RAW_INT_INTERVAL		0x0A
 
 struct cdc_raw_desc {
@@ -246,7 +246,7 @@ static struct cdc_raw_desc _desc_##n = {					\
 	.if0_int_ep_comp = {							\
 		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,							\
+		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = 0,						\
 	},									\
