@@ -575,6 +575,7 @@ enum {
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
 static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg);
+uint8_t usb23_discard_buf[512];
 
 /*
  * Input/Output
@@ -977,7 +978,7 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	param0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
 
 	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
-	param0 |= 0 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
+	param0 |= 1 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	param0 |= (ep_cfg->caps.out ? 0 : (ep_cfg->addr & 0b01111111))
@@ -1145,7 +1146,6 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 
 static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, uint32_t ctrl)
 {
-	const struct usb23_config *config = dev->config;
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
 	struct usb23_trb trb0 = {
@@ -1153,8 +1153,8 @@ static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, ui
 		.ctrl = ctrl | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO,
 	};
 	struct usb23_trb trb1 = {
-		.addr_lo = LO32(config->discard),
-		.addr_hi = HI32(config->discard),
+		.addr_lo = LO32((uintptr_t)usb23_discard_buf),
+		.addr_hi = HI32((uintptr_t)usb23_discard_buf),
 		.status = ep_cfg->mps - buf->size,
 		.ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO,
 	};
@@ -1177,6 +1177,7 @@ static void usb23_trb_ctrl_setup_out(const struct device *dev)
 {
 	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 8);
 
+	memset(buf->data, 0xff, buf->size);
 	LOG_DBG("TRB_CONTROL_SETUP ep=0x%02x", USB_CONTROL_EP_OUT);
 	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 }
@@ -1184,7 +1185,7 @@ static void usb23_trb_ctrl_setup_out(const struct device *dev)
 static void usb23_trb_ctrl_data_out(const struct device *dev)
 {
 	struct usb23_data *priv = udc_get_private(dev);
-	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, priv->data_stage_length);
+	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 8); // priv->data_stage_length
 
 	LOG_DBG("TRB_CONTROL_DATA_OUT ep=0x%02x", USB_CONTROL_EP_OUT);
 	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
@@ -1314,7 +1315,8 @@ static void usb23_on_soft_reset(const struct device *dev)
 	/* Letting GUID unchanged */
 	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
 
-	/* Setting fifo size for both TX and RX, completely arbitrary values */
+	/* Setting fifo size for both TX and RX, experimental values
+	 * GRXFIFOSIZ too far below or above  512 * 3 leads to errors */
 	usb23_io_write(dev, USB23_GTXFIFOSIZ(0), 512 * 3);
 	usb23_io_write(dev, USB23_GRXFIFOSIZ(0), 512 * 3);
 
@@ -1342,6 +1344,8 @@ static void usb23_on_soft_reset(const struct device *dev)
 	default:
 		__ASSERT_NO_MSG(false);
 	}
+	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK,
+		1 << USB23_DCFG_NUMP_SHIFT);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
@@ -1487,7 +1491,16 @@ static void usb23_on_device_event(const struct device *dev, struct usb23_devt de
 static void usb23_on_ctrl_write_setup(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
 	LOG_DBG("%s: buf=%p", __func__, buf);
+	LOG_HEXDUMP_DBG(buf->data, buf->size, "DATA");
+	LOG_HEXDUMP_DBG(usb23_discard_buf, sizeof(usb23_discard_buf), "DISCARD");
 	usb23_trb_ctrl_data_out(dev);
+#if 0
+		LOG_ERR("%s: not supported on USB3 for now", __func__);
+		/* Control Write on USB3 does not currently work */
+		usb23_depcmd_set_stall(dev, ep_cfg);
+		usb23_trb_ctrl_setup_out(dev);
+		return;
+#endif
 }
 
 /* OUT */
@@ -1497,17 +1510,15 @@ static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_con
 	int err;
 
 	if (data->caps.ss) {
-		LOG_ERR("%s: not supported on USB3 for now", __func__);
-		/* Control Write on USB3 does not currently work */
-		usb23_depcmd_set_stall(dev, ep_cfg);
-		usb23_trb_ctrl_setup_out(dev);
-		return;
+		LOG_HEXDUMP_DBG(buf->data, buf->size, "DATA");
+		LOG_HEXDUMP_DBG(usb23_discard_buf, sizeof(usb23_discard_buf), "DISCARD");
 	}
 
 	LOG_DBG("%s: buf=%p", __func__, buf);
 	udc_ctrl_update_stage(dev, buf);
 	err = udc_ctrl_submit_s_out_status(dev, buf);
 	__ASSERT_NO_MSG(err == 0);
+	k_sleep(K_MSEC(1));
 }
 
 /* IN */
