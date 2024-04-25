@@ -977,7 +977,7 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	param0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
 
 	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
-	param0 |= 1 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
+	param0 |= 15 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	param0 |= (ep_cfg->caps.out ? 0 : (ep_cfg->addr & 0b01111111))
@@ -1345,7 +1345,7 @@ static void usb23_on_soft_reset(const struct device *dev)
 		__ASSERT_NO_MSG(false);
 	}
 	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK,
-		1 << USB23_DCFG_NUMP_SHIFT);
+		15 << USB23_DCFG_NUMP_SHIFT);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
