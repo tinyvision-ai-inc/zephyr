@@ -85,6 +85,8 @@ extern "C" {
 #define USB_MAX_FS_INT_MPS	64   /**< full speed MPS for interrupt EP */
 #define USB_MAX_FS_ISO_MPS	1023 /**< full speed MPS for isochronous EP */
 
+#define USB_MAX_SS_MPS		9   /**< maximum packet size (MPS) for SS devices */
+
 /*************************************************************************
  *  USB application interface
  **************************************************************************/

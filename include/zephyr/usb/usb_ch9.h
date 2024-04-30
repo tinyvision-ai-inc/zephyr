@@ -309,7 +309,7 @@ struct usb_association_descriptor {
 #define USB_GET_DESCRIPTOR_INDEX(wValue)	((uint8_t)(wValue))
 
 /** USB Control Endpoints maximum packet size (MPS) */
-#define USB_CONTROL_EP_MPS		64U
+#define USB_CONTROL_EP_MPS		9U
 
 /** USB endpoint direction mask */
 #define USB_EP_DIR_MASK			(uint8_t)BIT(7)

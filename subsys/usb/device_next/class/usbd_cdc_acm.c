@@ -32,8 +32,8 @@ NET_BUF_POOL_FIXED_DEFINE(cdc_acm_ep_pool,
 #endif
 
 #define CDC_ACM_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
-#define CDC_ACM_DEFAULT_BULK_EP_MPS	0
-#define CDC_ACM_DEFAULT_INT_EP_MPS	16
+#define CDC_ACM_DEFAULT_BULK_EP_MPS	1024
+#define CDC_ACM_DEFAULT_INT_EP_MPS	512
 #define CDC_ACM_DEFAULT_INT_INTERVAL	0x0A
 
 #define CDC_ACM_CLASS_ENABLED		0
@@ -92,10 +92,13 @@ struct usbd_cdc_acm_desc {
 	struct cdc_acm_descriptor if0_acm;
 	struct cdc_union_descriptor if0_union;
 	struct usb_ep_descriptor if0_int_ep;
+	struct usb_ep_companion_descriptor if0_int_ep_ssp;
 
 	struct usb_if_descriptor if1;
 	struct usb_ep_descriptor if1_in_ep;
+	struct usb_ep_companion_descriptor if1_in_ep_ssp;
 	struct usb_ep_descriptor if1_out_ep;
+	struct usb_ep_companion_descriptor if1_out_ep_ssp;
 
 	struct usb_desc_header nil_desc;
 } __packed;
@@ -1064,6 +1067,14 @@ static struct usbd_cdc_acm_desc cdc_acm_desc_##n = {				\
 		.bInterval = CDC_ACM_DEFAULT_INT_INTERVAL,			\
 	},									\
 										\
+	.if0_int_ep_ssp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 0,						\
+	},									\
+										\
 	.if1 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
@@ -1085,6 +1096,14 @@ static struct usbd_cdc_acm_desc cdc_acm_desc_##n = {				\
 		.bInterval = 0,							\
 	},									\
 										\
+	.if1_in_ep_ssp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 15,						\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 0,						\
+	},									\
+										\
 	.if1_out_ep = {								\
 		.bLength = sizeof(struct usb_ep_descriptor),			\
 		.bDescriptorType = USB_DESC_ENDPOINT,				\
@@ -1092,6 +1111,14 @@ static struct usbd_cdc_acm_desc cdc_acm_desc_##n = {				\
 		.bmAttributes = USB_EP_TYPE_BULK,				\
 		.wMaxPacketSize = sys_cpu_to_le16(CDC_ACM_DEFAULT_BULK_EP_MPS),	\
 		.bInterval = 0,							\
+	},									\
+										\
+	.if1_out_ep_ssp = {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 15,						\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 0,						\
 	},									\
 										\
 	.nil_desc = {								\

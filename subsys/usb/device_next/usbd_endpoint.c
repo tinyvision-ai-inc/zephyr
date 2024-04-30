@@ -70,7 +70,7 @@ static void usbd_ep_ctrl_set_zlp(struct usbd_contex *const uds_ctx,
 	 * last chunk is wMaxPacketSize long, to indicate the last
 	 * packet.
 	 */
-	if (setup->wLength > min_len && !(min_len % USB_CONTROL_EP_MPS)) {
+	if (setup->wLength > min_len && !(min_len % (1 << USB_CONTROL_EP_MPS))) {
 		/*
 		 * Transfer length is less as requested by wLength and
 		 * is multiple of wMaxPacketSize.
