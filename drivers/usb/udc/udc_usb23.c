@@ -504,6 +504,9 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	/* Max Packet Size according to the USB descriptor configuration */
 	reg0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
 
+	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
+	reg0 |= 1 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
+
 	/* One-to-one mapping between FIFO numbers and endpoints numbers */
 	reg0 |= usb23_get_ep_fifo_num(ep_cfg)
 			<< USB23_DEPCMDPAR0_DEPCFG_FIFONUM_SHIFT;
@@ -1586,6 +1589,9 @@ static int usb23_init(const struct device *dev)
 	} else {
 		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED);
 	}
+
+	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK,
+			1 << USB23_DCFG_NUMP_SHIFT);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
