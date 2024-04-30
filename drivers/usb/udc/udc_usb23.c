@@ -1122,6 +1122,7 @@ static void usb23_on_xfer_complete_normal_ep(const struct device *dev, struct ud
 	__ASSERT_NO_MSG(err == 0);
 }
 
+static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
 static void usb23_on_xfer_complete_ctrl_ep(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, struct usb23_trb *trb)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
@@ -1136,6 +1137,18 @@ static void usb23_on_xfer_complete_ctrl_ep(const struct device *dev, struct udc_
 		net_buf_add_mem(buf, config->ctrl_buf, size);
 	}
 	__ASSERT_NO_MSG(buf != NULL);
+
+	if ((trb->status & USB23_TRB_STATUS_TRBSTS_MASK) ==
+			USB23_TRB_STATUS_TRBSTS_SETUPPENDING) {
+		LOG_DBG("%s: setup pending received, resetting current"
+				"transaction", __func__);
+		struct udc_data *data = dev->data;
+		usb23_ep_set_halt(dev, ep_cfg);
+		usb23_trb_ctrl_setup_out(dev);
+		data->stage = CTRL_PIPE_STAGE_SETUP;
+
+		return;
+	}
 
 	/* Continue to the next step */
 	switch (trb->ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
@@ -1181,9 +1194,9 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 	/* Sanity checks */
 	switch (trb.status & USB23_TRB_STATUS_TRBSTS_MASK) {
 	case USB23_TRB_STATUS_TRBSTS_OK:
+	case USB23_TRB_STATUS_TRBSTS_SETUPPENDING:
 		break;
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_MISSEDISOC);
-	CASE_ERR(USB23_TRB_STATUS_TRBSTS_SETUPPENDING);
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_XFERINPROGRESS);
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_ZLPPENDING);
 	default: __ASSERT_NO_MSG(false);
