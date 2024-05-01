@@ -69,7 +69,7 @@ USBD_DEVICE_DESCR_DEFINE(primary) struct common_descriptor common_desc = {
 		.bDeviceSubClass = 0,
 		.bDeviceProtocol = 0,
 #endif
-		.bMaxPacketSize0 = USB_MAX_CTRL_MPS,
+		.bMaxPacketSize0 = USB_MAX_SS_MPS,
 		.idVendor = sys_cpu_to_le16((uint16_t)CONFIG_USB_DEVICE_VID),
 		.idProduct = sys_cpu_to_le16((uint16_t)CONFIG_USB_DEVICE_PID),
 		.bcdDevice = sys_cpu_to_le16(USB_BCD_DRN),
@@ -359,7 +359,7 @@ static void usb_desc_update_mps0(struct usb_device_descriptor *const desc)
 {
 	struct usb_dc_ep_cfg_data ep_cfg = {
 		.ep_addr = 0,
-		.ep_mps = USB_MAX_CTRL_MPS,
+		.ep_mps = USB_MAX_SS_MPS,
 		.ep_type = USB_DC_EP_CONTROL,
 	};
 	int ret;

@@ -504,6 +504,9 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	/* Max Packet Size according to the USB descriptor configuration */
 	reg0 |= ep_cfg->mps << USB23_DEPCMDPAR0_DEPCFG_MPS_SHIFT;
 
+	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
+	reg0 |= 1 << USB23_DEPCMDPAR0_DEPCFG_BRSTSIZ_SHIFT;
+
 	/* One-to-one mapping between FIFO numbers and endpoints numbers */
 	reg0 |= usb23_get_ep_fifo_num(ep_cfg)
 			<< USB23_DEPCMDPAR0_DEPCFG_FIFONUM_SHIFT;
@@ -1122,6 +1125,7 @@ static void usb23_on_xfer_complete_normal_ep(const struct device *dev, struct ud
 	__ASSERT_NO_MSG(err == 0);
 }
 
+static int usb23_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
 static void usb23_on_xfer_complete_ctrl_ep(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, struct usb23_trb *trb)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
@@ -1136,6 +1140,18 @@ static void usb23_on_xfer_complete_ctrl_ep(const struct device *dev, struct udc_
 		net_buf_add_mem(buf, config->ctrl_buf, size);
 	}
 	__ASSERT_NO_MSG(buf != NULL);
+
+	if ((trb->status & USB23_TRB_STATUS_TRBSTS_MASK) ==
+			USB23_TRB_STATUS_TRBSTS_SETUPPENDING) {
+		LOG_DBG("%s: setup pending received, resetting current"
+				"transaction", __func__);
+		struct udc_data *data = dev->data;
+		usb23_ep_set_halt(dev, ep_cfg);
+		usb23_trb_ctrl_setup_out(dev);
+		data->stage = CTRL_PIPE_STAGE_SETUP;
+
+		return;
+	}
 
 	/* Continue to the next step */
 	switch (trb->ctrl & USB23_TRB_CTRL_TRBCTL_MASK) {
@@ -1181,9 +1197,9 @@ static void usb23_on_xfer_complete(const struct device *dev, struct udc_ep_confi
 	/* Sanity checks */
 	switch (trb.status & USB23_TRB_STATUS_TRBSTS_MASK) {
 	case USB23_TRB_STATUS_TRBSTS_OK:
+	case USB23_TRB_STATUS_TRBSTS_SETUPPENDING:
 		break;
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_MISSEDISOC);
-	CASE_ERR(USB23_TRB_STATUS_TRBSTS_SETUPPENDING);
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_XFERINPROGRESS);
 	CASE_ERR(USB23_TRB_STATUS_TRBSTS_ZLPPENDING);
 	default: __ASSERT_NO_MSG(false);
@@ -1573,6 +1589,9 @@ static int usb23_init(const struct device *dev)
 	} else {
 		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_FULL_SPEED);
 	}
+
+	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK,
+			1 << USB23_DCFG_NUMP_SHIFT);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0
