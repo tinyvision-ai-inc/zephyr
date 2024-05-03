@@ -1145,6 +1145,22 @@
 		.bInterval = HID_IN_EP_INTERVAL(n, hs),				\
 	}
 
+
+#define HID_IN_EP_SSP_DEFINE(n, hs, alt) {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 1,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 0,						\
+	}
+
+#define HID_OUT_EP_SSP_DEFINE(n, hs, alt) {							\
+		.bLength = sizeof(struct usb_ep_companion_descriptor),		\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 1,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = 0,						\
+	}
 /*
  * Both the optional OUT endpoint and the associated pool are only defined if
  * there is an out-report-size property.

@@ -52,9 +52,9 @@ struct usbd_hid_descriptor {
 	struct usb_if_descriptor if0;
 	struct hid_descriptor hid;
 	struct usb_ep_descriptor in_ep;
-	struct usb_ep_descriptor hs_in_ep;
+	struct usb_ep_companion_descriptor in_ep_ssp;
 	struct usb_ep_descriptor out_ep;
-	struct usb_ep_descriptor hs_out_ep;
+	struct usb_ep_companion_descriptor out_ep_ssp;
 
 	struct usb_if_descriptor if0_1;
 	struct usb_ep_descriptor alt_hs_in_ep;
@@ -106,8 +106,6 @@ static int usbd_hid_request(struct usbd_class_node *const c_nd,
 	struct hid_device_data *ddata = dev->data;
 	const struct hid_device_ops *ops = ddata->ops;
 	struct udc_buf_info *bi;
-
-	LOG_DBG("%s %p", __func__, c_nd);
 
 	bi = udc_get_buf_info(buf);
 
@@ -648,26 +646,18 @@ static const struct hid_device_driver_api hid_device_api = {
 #define USBD_HID_INTERFACE_SIMPLE_DEFINE(n)					\
 	static struct usbd_hid_descriptor hid_desc_##n = {			\
 		.if0 = HID_INTERFACE_DEFINE(n, 0),				\
+		.in_ep_ssp = HID_IN_EP_SSP_DEFINE(n, false, false),	\
 		.hid = HID_DESCRIPTOR_DEFINE(n),				\
-		.in_ep = HID_IN_EP_DEFINE(n, false, true),			\
-		.hs_in_ep = HID_IN_EP_DEFINE(n, true, true),			\
-		.out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, false, true),		\
-		.hs_out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, true, true),		\
-	};									\
-										\
-	const static struct usb_desc_header *hid_fs_desc_##n[] = {		\
-		(struct usb_desc_header *) &hid_desc_##n.if0,			\
-		(struct usb_desc_header *) &hid_desc_##n.hid,			\
-		(struct usb_desc_header *) &hid_desc_##n.in_ep,			\
-		(struct usb_desc_header *) &hid_desc_##n.out_ep,		\
-		NULL,								\
+		.in_ep = HID_IN_EP_DEFINE(n, true, true),			\
+		.out_ep_ssp = HID_OUT_EP_SSP_DEFINE(n, false, false),	\
+		.out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, true, true),		\
 	};									\
 										\
 	const static struct usb_desc_header *hid_hs_desc_##n[] = {		\
 		(struct usb_desc_header *) &hid_desc_##n.if0,			\
 		(struct usb_desc_header *) &hid_desc_##n.hid,			\
-		(struct usb_desc_header *) &hid_desc_##n.hs_in_ep,		\
-		(struct usb_desc_header *) &hid_desc_##n.hs_out_ep,		\
+		(struct usb_desc_header *) &hid_desc_##n.in_ep,		\
+		(struct usb_desc_header *) &hid_desc_##n.out_ep,		\
 		NULL,								\
 	}
 
@@ -675,10 +665,10 @@ static const struct hid_device_driver_api hid_device_api = {
 	static struct usbd_hid_descriptor hid_desc_##n = {			\
 		.if0 = HID_INTERFACE_DEFINE(n, 0),				\
 		.hid = HID_DESCRIPTOR_DEFINE(n),				\
-		.in_ep = HID_IN_EP_DEFINE(n, false, false),			\
-		.hs_in_ep = HID_IN_EP_DEFINE(n, true, false),			\
-		.out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, false, false),		\
-		.hs_out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, true, false),		\
+		.in_ep_ssp = HID_IN_EP_SSP_DEFINE(n, false, false),	\
+		.in_ep = HID_IN_EP_DEFINE(n, true, false),			\
+		.out_ep_ssp = HID_OUT_EP_SSP_DEFINE(n, false, false),	\
+		.out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, true, false),		\
 		.if0_1 = HID_INTERFACE_DEFINE(n, 1),				\
 		.alt_hs_in_ep = HID_IN_EP_DEFINE(n, true, true),		\
 		.alt_hs_out_ep = HID_OUT_EP_DEFINE_OR_ZERO(n, true, true),	\
@@ -706,12 +696,6 @@ static const struct hid_device_driver_api hid_device_api = {
 		NULL,								\
 	}
 
-#if 0
-#define USBD_HID_INTERFACE_DEFINE(n)						\
-	COND_CODE_1(HID_ALL_MPS_LESS_65(n),					\
-		    (USBD_HID_INTERFACE_SIMPLE_DEFINE(n)),			\
-		    (USBD_HID_INTERFACE_ALTERNATE_DEFINE(n)))
-#endif
 
 #define USBD_HID_INTERFACE_DEFINE(n)						\
 	USBD_HID_INTERFACE_SIMPLE_DEFINE(n)
@@ -747,7 +731,3 @@ static const struct hid_device_driver_api hid_device_api = {
 		&hid_device_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_HID_INSTANCE_DEFINE);
-
-#if 0
-			  
-#endif
