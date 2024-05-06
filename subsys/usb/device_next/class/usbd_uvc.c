@@ -142,7 +142,7 @@ static void _dump_probe(const struct uvc_vs_probe_control *pc)
 
 /*
  * All fields set to 0 are ignored, others are applied
- * TODO: check if within MIN/MAX range
+ * TODO check if within MIN/MAX range
  */
 static void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
 {
@@ -572,7 +572,7 @@ static struct uvc_desc _desc_##n = {						\
 										\
 	static struct uvc_data _data_##n = {					\
 		.payload_header = &uvc_payload_header_##n,			\
-		.payload_addr = DT_INST_PROP(n, payload_addr),			\
+		.payload_addr = 0xb1000000, /* TODO temporary */		\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\
