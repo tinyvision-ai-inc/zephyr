@@ -5,4 +5,4 @@ description: IMX219 CMOS video sensor
 
 compatible: "sony,imx219"
 
-include: i2c-device.yaml
+include: [i2c-device.yaml, video-device.yaml]

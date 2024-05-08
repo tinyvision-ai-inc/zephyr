@@ -97,12 +97,7 @@ static const struct video_driver_api tinygen_driver_api = {
 #define DT_DRV_COMPAT tinyvision_tinygen
 
 #define TINYGEN_DEVICE_DEFINE(n)						\
-										\
-	const struct tinygen_conf tinygen_conf_##n = {				\
-		.spec = I2C_DT_SPEC_INST_GET(n),				\
-	};									\
-										\
-	DEVICE_DT_INST_DEFINE(n, tinygen_init, NULL, NULL, &tinygen_conf_##n,	\
+	DEVICE_DT_INST_DEFINE(n, tinygen_init, NULL, NULL, NULL,		\
 			      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,	\
 			      &tinygen_driver_api);
 

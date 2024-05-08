@@ -6,10 +6,6 @@ description: |
   This follows some of V4L2 conventions:
   https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/devicetree/bindings/media/video-interfaces.yaml
 
-description: |
-  USB Video Class Input Terminal entity
-  Port element as described by the video driver API.
-
 child-binding:
   description: |
     A port entity of a device

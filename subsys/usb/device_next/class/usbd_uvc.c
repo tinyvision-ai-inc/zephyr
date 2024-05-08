@@ -37,9 +37,6 @@ NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10
 struct uvc_data {
 	struct uvc_vs_probe_control probe;
 
-	/* Data buffer continuously sent by the UVC class */
-	uintptr_t payload_addr;
-
 	/* Pointer to a header structure that can be passed to DMA */
 	struct uvc_payload_header *payload_header;
 
@@ -266,7 +263,7 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 		const size_t size_left = data->probe.dwMaxVideoFrameSize - i;
 		const size_t size_sent = MIN(size_left, BLOCK_SIZE);
 
-		ret = _try_enqueue(c_nd, (void *)data->payload_addr, size_sent,
+		ret = _try_enqueue(c_nd, (void *)0xb1100000, size_sent,
 			size_left <= BLOCK_SIZE);
 		__ASSERT_NO_MSG(ret == 0);
 	}

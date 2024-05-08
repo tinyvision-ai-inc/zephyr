@@ -3,7 +3,6 @@
 
 config VIDEO_TINYGEN
 	bool "tinyGEN ad-hoc pattern generator"
-	select I2C
 	depends on DT_HAS_TINYVISION_TINYGEN_ENABLED
 	default y
 	help
