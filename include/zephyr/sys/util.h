@@ -810,6 +810,18 @@ static inline void mem_xor_128(uint8_t dst[16], const uint8_t src1[16], const ui
 	})
 
 /**
+ * @brief encode a GUID into an uint8_t array according to the specification:
+ * first three groups in little endian, last two in big endian:
+ * GUID(0x00112233, 0x4455, 0x6677, 0x8899, 0xaabbccddeeff) becomes:
+ * 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+ */
+#define GUID(a, b, c, d, e)                                                                        \
+	((a) >> 0) & 0xff, ((a) >> 8) & 0xff, ((a) >> 16) & 0xff, ((a) >> 24) & 0xff,              \
+	((b) >> 0) & 0xff, ((b) >> 8) & 0xff, ((c) >> 0) & 0xff, ((c) >> 8) & 0xff,                \
+	((d) >> 8) & 0xff, ((d) >> 0) & 0xff, ((e) >> 40) & 0xff, ((e) >> 32) & 0xff,              \
+	((e) >> 24) & 0xff, ((e) >> 16) & 0xff, ((e) >> 8) & 0xff, ((e) >> 0) & 0xff
+
+/**
  * @}
  */
 
