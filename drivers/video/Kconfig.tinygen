@@ -1,0 +1,10 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+config VIDEO_TINYGEN
+	bool "tinyGEN ad-hoc pattern generator"
+	select I2C
+	depends on DT_HAS_TINYVISION_TINYGEN_ENABLED
+	default y
+	help
+	  Enable driver for tinyGEN pattern generator

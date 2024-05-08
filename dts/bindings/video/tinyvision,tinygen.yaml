@@ -1,0 +1,8 @@
+# Copyright (c) 2024, tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: IMX219 CMOS video sensor
+
+compatible: "sony,imx219"
+
+include: i2c-device.yaml

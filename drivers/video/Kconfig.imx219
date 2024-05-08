@@ -1,6 +1,4 @@
-# IMX219
-
-# Copyright (c) 2024 tinyVision.ai INC.
+# Copyright (c) 2024 tinyVision.ai Inc.
 # SPDX-License-Identifier: Apache-2.0
 
 config VIDEO_IMX219

@@ -31,24 +31,98 @@
 extern "C" {
 #endif
 
-#define VIDEO_DT_REMOTE(n, port, endpoint)					\
-	DT_PROP(DT_CHILD(DT_CHILD(n, port), endpoint), remote_endpoint)
+/**
+ * @brief Get a node identifier of a node's remote-endpoint connection.
+ *
+ * This will follow the phandle pointed to by the remote-endpoint property.
+ * This requires a port child with an endoint child, and the endpoint holding
+ * the remote-endpoint property.
+ *
+ * @param node_id node identifier
+ * @param port name of the port to follow, port_0 for port@0
+ * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ * @return node ID of the endpoint linked to the given port and endpoint
+ */
+#define VIDEO_DT_REMOTE(node_id, port, endpoint)				\
+	DT_PROP(DT_CHILD(DT_CHILD(node_id, port), endpoint), remote_endpoint)
 
-#define VIDEO_DT_REMOTE_DEVICE(n, port, endpoint)				\
-	DEVICE_DT_GET(DT_GPARENT(VIDEO_DT_REMOTE(n, port, endpoint)))
+/**
+ * @brief Get a device reference of a node's remote-endpoint connection.
+ *
+ * This will follow the phandle pointed to by the remote-endpoint property.
+ *
+ * @param node_id node identifier
+ * @param port name of the port to follow, port_0 for port@0
+ * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ *
+ * @see VIDEO_DT_REMOTE()
+ */
+#define VIDEO_DT_REMOTE_DEVICE(node_id, port, endpoint)				\
+	DEVICE_DT_GET(DT_GPARENT(VIDEO_DT_REMOTE(node_id, port, endpoint)))
 
-#define VIDEO_DT_REMOTE_PORT(n, port, endpoint)					\
-	DT_PROP_OR(DT_PARENT(VIDEO_DT_REMOTE(n, port, endpoint)), reg, 0)
+/**
+ * @brief Get the port address of a node's remote-endpoint connection.
+ *
+ * This will follow the phandle pointed to by the remote-endpoint property.
+ * This then fetches the parent endpoint then port, and gives its address.
+ *
+ * @param node_id node identifier
+ * @param port name of the port to follow, port_0 for port@0
+ * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ *
+ * @see VIDEO_DT_REMOTE()
+ */
+#define VIDEO_DT_REMOTE_PORT(node_id, port, endpoint)				\
+	DT_PROP_OR(DT_PARENT(VIDEO_DT_REMOTE(node_id, port, endpoint)), reg, 0)
 
-#define VIDEO_DT_REMOTE_ENDPOINT(n, port, endpoint)				\
-	DT_PROP_OR(VIDEO_DT_REMOTE(n, port, endpoint), reg, 0)
+/**
+ * @brief Get the endpoint address of a node's remote-endpoint connection.
+ *
+ * This will follow the phandle pointed to by the remote-endpoint property.
+ * This then fetches the parent endpoint and gives its address.
+ *
+ * @param node_id node identifier
+ * @param port name of the port to follow, port_0 for port@0
+ * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ *
+ * @see VIDEO_DT_REMOTE()
+ */
+#define VIDEO_DT_REMOTE_ENDPOINT(node_id, port, endpoint)			\
+	DT_PROP_OR(VIDEO_DT_REMOTE(node_id, port, endpoint), reg, 0)
 
-#define VIDEO_DT_SPEC_GET(n, port, endpoint)					\
+/**
+ * @brief Get a device reference for the node identifier's remote endpoint
+ *
+ * This will follow the phandle pointed to by the remote-endpoint property.
+ *
+ * @param node_id node identifier
+ * @param port name of the port to follow, port_0 for port@0
+ * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ *
+ * @see VIDEO_DT_REMOTE()
+ */
+#define VIDEO_DT_SPEC_GET(node_id, port, endpoint)				\
 	{									\
-		.dev = VIDEO_DT_REMOTE_DEVICE(n, port, endpoint),		\
-		.port = VIDEO_DT_REMOTE_PORT(n, port, endpoint),		\
-		.endpoint = VIDEO_DT_REMOTE_ENDPOINT(n, port, endpoint),	\
+		.dev = VIDEO_DT_REMOTE_DEVICE(node_id, port, endpoint),		\
+		.port = VIDEO_DT_REMOTE_PORT(node_id, port, endpoint),		\
+		.endpoint = VIDEO_DT_REMOTE_ENDPOINT(node_id, port, endpoint),	\
 	}
+
+/**
+ * @brief Video Device Tree endpoint identifier
+ *
+ * Identify a particular port and particular endpoint of a video device,
+ * providing all the context necessary to act upon a video device, via one of
+ * its endpoint.
+ */
+struct video_dt_spec {
+	/** Device instance of the remote video device to communicate with. */
+	const struct device *dev;
+	/** Port Device Tree address, the reg property of the port. */
+	uint16_t port;
+	/** Endpoint Device Tree address, the reg property of the endpoint. */
+	uint16_t endpoint;
+};
 
 /**
  * @struct video_format
@@ -132,22 +206,6 @@ struct video_buffer {
 	 * endpoints.
 	 */
 	uint32_t timestamp;
-};
-
-/**
- * @brief Video Device Tree endpoint identifier
- *
- * Identify a particular port and particular endpoint of a video device,
- * providing all the context necessary to act upon a video device, via one of
- * its endpoint.
- */
-struct video_dt_spec {
-	/** Device instance of the remote video device to communicate with. */
-	const struct device *dev;
-	/** Port Device Tree address, the reg property of the port. */
-	uint16_t port;
-	/** Endpoint Device Tree address, the reg property of the endpoint. */
-	uint16_t endpoint;
 };
 
 /**

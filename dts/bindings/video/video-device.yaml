@@ -1,0 +1,33 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Video device common definitions
+  This follows some of V4L2 conventions:
+  https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/devicetree/bindings/media/video-interfaces.yaml
+
+description: |
+  USB Video Class Input Terminal entity
+  Port element as described by the video driver API.
+
+child-binding:
+  description: |
+    A port entity of a device
+    Allowing devices with multiple input and output connection, such as an
+    HDMI stream selector with many input ports and one output.
+
+  child-binding:
+    description: |
+      An endpoint entity of a port
+      Allowing devices with multiple channels per port, such as MIPI virtual
+      channels.
+
+    properties:
+      remote-endpoint:
+        type: phandle
+        required: true
+        description: |
+          Reference to a Video endpoint
+          This Video endpoint should implement the "video" driver API, and will
+          provide data either directly, or through an associated video device.
+          For instance, an image sensor providing data over a MIPI peripheral.

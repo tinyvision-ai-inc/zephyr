@@ -247,7 +247,7 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 	data->transferring = true;
 
 	// TODO handle situations with multiple inputs
-	//video_stream_start(&input[0]);
+	video_stream_start(&input[0]);
 
 	/* Toggle the FrameId bit for every new frame. */
 	// TODO only do this once per frame, not once per transfer header
