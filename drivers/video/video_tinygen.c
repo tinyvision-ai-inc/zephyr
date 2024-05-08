@@ -5,10 +5,10 @@
  */
 
 #include <stdint.h>
-
-#include <zephyr/kernel.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(tinygen, CONFIG_VIDEO_LOG_LEVEL);
@@ -18,9 +18,16 @@ struct tinygen_conf {
 	size_t buf_size;
 };
 
+struct tinygen_data {
+	struct k_fifo fifo;
+};
+
 static int tinygen_init(const struct device *dev)
 {
+	struct tinygen_data *data = dev->data;
+
 	LOG_DBG("%s", __func__);
+	k_fifo_init(&data->fifo);
 	return 0;
 }
 
@@ -76,20 +83,34 @@ static int tinygen_get_format(const struct video_dt_spec *spec, struct video_for
 	return -ENOTSUP;
 }
 
-static int tinygen_enqueue(const struct video_dt_spec *spec, struct video_buffer *buf)
+static int tinygen_enqueue(const struct video_dt_spec *spec, struct video_buffer *vbuf)
 {
 	const struct tinygen_conf *conf = spec->dev->config;
+	struct tinygen_data *data = spec->dev->data;
 
-	if (buf->size > conf->buf_size) {
-		return -EINVAL;
-	}
+	LOG_DBG("%s", __func__);
 
-	buf->buffer = (uint8_t *)conf->buf_addr;
+	/* No data transfer: the data is memory mapped by the hardware and immediately ready */
+	vbuf->buffer = (uint8_t *)conf->buf_addr;
+	vbuf->bytesused = MIN(vbuf->size, conf->buf_size);
+
+	k_fifo_put(&data->fifo, vbuf);
 	return 0;
 }
 
-static int tinygen_dequeue(const struct video_dt_spec *spec, struct video_buffer *buf)
+static int tinygen_dequeue(const struct video_dt_spec *spec, struct video_buffer **vbufp, k_timeout_t timeout)
 {
+	const struct tinygen_conf *conf = spec->dev->config;
+	struct tinygen_data *data = spec->dev->data;
+
+	LOG_DBG("%s", __func__);
+
+	*vbufp = k_fifo_get(&data->fifo, timeout);
+	if (*vbufp == NULL) {
+		LOG_ERR("cannot dequeue a buffer");
+		return -EIO;
+	}
+
 	return 0;
 }
 
@@ -114,7 +135,9 @@ static const struct video_driver_api tinygen_driver_api = {
 		.buf_size = DT_INST_REG_SIZE(n),                                                   \
 	};                                                                                         \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(n, tinygen_init, NULL, NULL, &tinygen_conf_##n, POST_KERNEL,         \
-			      CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &tinygen_driver_api);
+	struct tinygen_data tinygen_data_##n;                                                      \
+                                                                                                   \
+	DEVICE_DT_INST_DEFINE(n, tinygen_init, NULL, &tinygen_data_##n, &tinygen_conf_##n,         \
+			      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &tinygen_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(TINYGEN_DEVICE_DEFINE)

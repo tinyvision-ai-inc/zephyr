@@ -43,69 +43,23 @@ extern "C" {
  * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
  * @return node ID of the endpoint linked to the given port and endpoint
  */
-#define VIDEO_DT_REMOTE(node_id, port, endpoint)				\
+#define VIDEO_DT_REMOTE_ENDPOINT(node_id, port, endpoint)                                          \
 	DT_PROP(DT_CHILD(DT_CHILD(node_id, port), endpoint), remote_endpoint)
-
-/**
- * @brief Get a device reference of a node's remote-endpoint connection.
- *
- * This will follow the phandle pointed to by the remote-endpoint property.
- *
- * @param node_id node identifier
- * @param port name of the port to follow, port_0 for port@0
- * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
- *
- * @see VIDEO_DT_REMOTE()
- */
-#define VIDEO_DT_REMOTE_DEVICE(node_id, port, endpoint)				\
-	DEVICE_DT_GET(DT_GPARENT(VIDEO_DT_REMOTE(node_id, port, endpoint)))
-
-/**
- * @brief Get the port address of a node's remote-endpoint connection.
- *
- * This will follow the phandle pointed to by the remote-endpoint property.
- * This then fetches the parent endpoint then port, and gives its address.
- *
- * @param node_id node identifier
- * @param port name of the port to follow, port_0 for port@0
- * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
- *
- * @see VIDEO_DT_REMOTE()
- */
-#define VIDEO_DT_REMOTE_PORT(node_id, port, endpoint)				\
-	DT_PROP_OR(DT_PARENT(VIDEO_DT_REMOTE(node_id, port, endpoint)), reg, 0)
-
-/**
- * @brief Get the endpoint address of a node's remote-endpoint connection.
- *
- * This will follow the phandle pointed to by the remote-endpoint property.
- * This then fetches the parent endpoint and gives its address.
- *
- * @param node_id node identifier
- * @param port name of the port to follow, port_0 for port@0
- * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
- *
- * @see VIDEO_DT_REMOTE()
- */
-#define VIDEO_DT_REMOTE_ENDPOINT(node_id, port, endpoint)			\
-	DT_PROP_OR(VIDEO_DT_REMOTE(node_id, port, endpoint), reg, 0)
 
 /**
  * @brief Get a device reference for the node identifier's remote endpoint
  *
  * This will follow the phandle pointed to by the remote-endpoint property.
  *
- * @param node_id node identifier
- * @param port name of the port to follow, port_0 for port@0
- * @param endpoint name of the endpoint to follow, endpoint_0 for endpoint@0
+ * @param node_id node identifier of a remote-endpoint phandle property
  *
- * @see VIDEO_DT_REMOTE()
+ * @see VIDEO_DT_REMOTE_ENDPOINT()
  */
-#define VIDEO_DT_SPEC_GET(node_id, port, endpoint)				\
-	{									\
-		.dev = VIDEO_DT_REMOTE_DEVICE(node_id, port, endpoint),		\
-		.port = VIDEO_DT_REMOTE_PORT(node_id, port, endpoint),		\
-		.endpoint = VIDEO_DT_REMOTE_ENDPOINT(node_id, port, endpoint),	\
+#define VIDEO_DT_SPEC_GET(node_id)                                                                 \
+	{                                                                                          \
+		.dev = 	DEVICE_DT_GET(DT_GPARENT(node_id)),                                        \
+		.port = DT_PROP_OR(DT_PARENT(node_id), reg, 0),                                    \
+		.endpoint = DT_PROP_OR(node_id, reg, 0)                                            \
 	}
 
 /**

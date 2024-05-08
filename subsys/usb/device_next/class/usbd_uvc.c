@@ -24,13 +24,12 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define UVC_INFO_SUPPORTS_GET_SET ((1 << 0) | (1 << 1))
 #define FRAME_WIDTH               320
 #define FRAME_HEIGHT              240
-#define BLOCK_SIZE                0xffff
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
 #define TRANSFER_SIZE             (FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
-NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100, 0,
+NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
 			  sizeof(struct udc_buf_info), NULL);
 
 struct uvc_data {
@@ -43,7 +42,7 @@ struct uvc_data {
 	bool transferring;
 
 	/* Array of remote-port specifications */
-	const struct video_dt_spec *input_dt_spec;
+	const struct video_dt_spec *video_dt_spec;
 
 	/* Size of this array */
 	size_t num_of_inputs;
@@ -116,6 +115,7 @@ static const struct uvc_vs_probe_control _probe_max = {
 
 static void _dump_probe(const struct uvc_vs_probe_control *pc)
 {
+	return;
 	LOG_DBG("struct uvc_vs_probe_control");
 	LOG_DBG(".bmHint = 0x%04x", sys_le16_to_cpu(pc->bmHint));
 	LOG_DBG(".bFormatIndex = %d", pc->bFormatIndex);
@@ -187,12 +187,16 @@ static uint8_t _get_bulk_ep_num(struct usbd_class_node *const c_nd)
 	return desc->if1_in_ep.bEndpointAddress;
 }
 
-static struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *data, size_t size)
+static int _usb_enqueue(struct usbd_class_node *const c_nd, void *data, size_t size,
+			bool last_of_transfer)
 {
 	struct net_buf *buf;
 	struct udc_buf_info *bi;
+	int err;
 
-	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data, size, K_NO_WAIT);
+	LOG_DBG("%s: Enqueueing data=%p size=%d zlp=%d", __func__, data, size, last_of_transfer);
+
+	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data, size, K_FOREVER);
 	__ASSERT_NO_MSG(buf != NULL);
 
 	bi = udc_get_buf_info(buf);
@@ -200,50 +204,32 @@ static struct net_buf *_alloc_net_buf(struct usbd_class_node *const c_nd, void *
 
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = _get_bulk_ep_num(c_nd);
-
-	return buf;
-}
-
-static int _try_enqueue(struct usbd_class_node *const c_nd, void *data, size_t size,
-			bool last_of_transfer)
-{
-	struct net_buf *buf;
-	struct udc_buf_info *bi;
-	int ret;
-
-	LOG_DBG("%s: Enqueueing data=%p size=%d zlp=%d", __func__, data, size, last_of_transfer);
-
-	buf = _alloc_net_buf(c_nd, data, size);
-	if (buf == NULL) {
-		LOG_WRN("%s: Not enough buffers", __func__);
-		return -ENOMEM;
-	}
-
-	bi = udc_get_buf_info(buf);
 	bi->zlp = last_of_transfer;
 
-	ret = usbd_ep_enqueue(c_nd, buf);
-	if (ret) {
+	err = usbd_ep_enqueue(c_nd, buf);
+	if (err != 0) {
 		LOG_WRN("%s: Could not enqueue buf=%p", __func__, buf);
 		net_buf_unref(buf);
 	}
-	return ret;
+	return err;
 }
 
-static void _start_transfer(struct usbd_class_node *const c_nd)
+static int _enqueue_new_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
-	const struct video_dt_spec *input = data->input_dt_spec;
-	int ret;
+	const struct video_dt_spec *video = data->video_dt_spec;
+	struct video_buffer vbuf = { 0 };
+	struct video_buffer *vbufp = NULL;
+	int err;
 
 	if (data->transferring) {
-		return;
+		return 0;
 	}
 	data->transferring = true;
 
 	// TODO handle situations with multiple inputs
-	video_stream_start(&input[0]);
+	video_stream_start(video);
 
 	/* Toggle the FrameId bit for every new frame. */
 	// TODO only do this once per frame, not once per transfer header
@@ -255,19 +241,37 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 	LOG_INF("Submitting a %dx%d frame with %d bits per pixel (%zd bytes)", FRAME_WIDTH,
 		FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 
-	ret = _try_enqueue(c_nd, data->payload_header, sizeof(struct uvc_payload_header), false);
-	__ASSERT_NO_MSG(ret == 0);
-
-	for (size_t i = 0; i < data->probe.dwMaxVideoFrameSize; i += BLOCK_SIZE) {
-		const size_t size_left = data->probe.dwMaxVideoFrameSize - i;
-		const size_t size_sent = MIN(size_left, BLOCK_SIZE);
-
-		ret = _try_enqueue(c_nd, (void *)0xb1100000, size_sent, size_left <= BLOCK_SIZE);
-		__ASSERT_NO_MSG(ret == 0);
+	err = _usb_enqueue(c_nd, data->payload_header, sizeof(struct uvc_payload_header), false);
+	if (err != 0) {
+		return err;
 	}
+
+	for (size_t n = data->probe.dwMaxVideoFrameSize; n > 0; n -= vbufp->bytesused) {
+		// TODO how to handle memory-mapped data sources on the video API?
+		vbuf.size = n;
+
+		err = video_enqueue(video, &vbuf);
+		if (err != 0) {
+			LOG_ERR("failed to submit the buffer to the video system");
+			return err;
+		}
+
+		err = video_dequeue(video, &vbufp, K_FOREVER);
+		if (err != 0) {
+			LOG_ERR("failed to fetch the filled buffer from the video system");
+			return err;
+		}
+
+		err = _usb_enqueue(c_nd, vbufp->buffer, vbufp->bytesused, vbufp->bytesused == n);
+		if (err != 0) {
+			return err;
+		}
+	}
+
+	return err;
 }
 
-static void _complete_transfer(struct usbd_class_node *const c_nd)
+static void _on_transfer_complete(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
@@ -287,9 +291,9 @@ static int _api_request(struct usbd_class_node *const c_nd, struct net_buf *buf,
 
 	if (bi.ep == _get_bulk_ep_num(c_nd)) {
 		LOG_DBG("%s: transfer completed zlp=%d", __func__, bi.zlp);
-		_complete_transfer(c_nd);
+		_on_transfer_complete(c_nd);
 		if (bi.zlp) {
-			_start_transfer(c_nd);
+			err = _enqueue_new_transfer(c_nd);
 		}
 	} else {
 		__ASSERT(false, "transfer completion for unknown enpoint");
@@ -364,7 +368,7 @@ static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_p
 	case UVC_VS_PROBE_CONTROL:
 		break;
 	case UVC_VS_COMMIT_CONTROL:
-		_start_transfer(c_nd);
+		_enqueue_new_transfer(c_nd);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
@@ -415,7 +419,7 @@ struct usbd_class_api _api = {
 };
 
 #define DEFINE_UVC_DESCRIPTOR(n)                                                                   \
-	static struct uvc_desc _desc_##n = {                                                       \
+	static const struct uvc_desc _desc_##n = {                                                 \
                                                                                                    \
 		.iad_uvc =                                                                         \
 			{                                                                          \
@@ -543,7 +547,7 @@ struct usbd_class_api _api = {
 				.bFrameIntervalType = 1,                                           \
 				.dwFrameInterval =                                                 \
 					{                                                          \
-						sys_cpu_to_le32(400000),                           \
+						sys_cpu_to_le32(1000000),                          \
 					},                                                         \
 			},                                                                         \
 		.if1_in_ep =                                                                       \
@@ -572,14 +576,13 @@ struct usbd_class_api _api = {
 
 #define REMOTE_DT_SPEC(n)                                                                          \
 	IF_ENABLED(DT_NODE_HAS_COMPAT(n, zephyr_uvc_input_terminal),                               \
-		   (VIDEO_DT_SPEC_GET(n, port, endpoint), ))
+		   (VIDEO_DT_SPEC_GET(VIDEO_DT_REMOTE_ENDPOINT(n, port, endpoint))))
 
 #define DEFINE_UVC_DEVICE(n)                                                                       \
-	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),                                                       \
-		     "node " DT_NODE_PATH(                                                         \
-			     DT_DRV_INST(n)) " is not assigned to a USB device controller");       \
+	BUILD_ASSERT(DT_INST_ON_BUS(n, usb), "node " DT_NODE_PATH(DT_DRV_INST(n)) " is not"        \
+		     " assigned to a USB device controller");                                      \
                                                                                                    \
-	DEFINE_UVC_DESCRIPTOR(n);                                                                  \
+	DEFINE_UVC_DESCRIPTOR(n);                                                                   \
                                                                                                    \
 	static struct usbd_class_data _class_data_##n = {                                          \
 		.desc = (struct usb_desc_header *)&_desc_##n,                                      \
@@ -590,13 +593,13 @@ struct usbd_class_api _api = {
                                                                                                    \
 	struct uvc_payload_header uvc_payload_header_##n;                                          \
                                                                                                    \
-	const struct video_dt_spec input_dt_spec_##n[] = {                                         \
-		DT_INST_FOREACH_CHILD_STATUS_OKAY(n, REMOTE_DT_SPEC)};                             \
+	const struct video_dt_spec video_dt_spec_##n[] = {                                         \
+		DT_INST_FOREACH_CHILD_STATUS_OKAY_SEP(n, REMOTE_DT_SPEC, (,))};                    \
                                                                                                    \
 	static struct uvc_data _data_##n = {                                                       \
 		.payload_header = &uvc_payload_header_##n,                                         \
-		.input_dt_spec = input_dt_spec_##n,                                                \
-		.num_of_inputs = ARRAY_SIZE(input_dt_spec_##n),                                    \
+		.video_dt_spec = video_dt_spec_##n,                                                \
+		.num_of_inputs = ARRAY_SIZE(video_dt_spec_##n),                                    \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL, POST_KERNEL, 50, &_api);
