@@ -1,0 +1,20 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: USB Video Class Input Terminal entity
+  Port element as described by the video driver API.
+  An UVC input terminal node only contains a single port, and a single
+  endpoint per port. If multiple endpoints are required, multiple Input
+  Terminals nodes should be declared instead.
+
+compatible: "zephyr,uvc-input-terminal"
+
+child-binding:
+  child-binding:
+    properties:
+      remote-endpoint:
+        type: phandle
+        required: true
+        description: Reference to a Video endpoint
+          This Video endpoint should implement the "video" driver API, and will
+          provide data to this UVC input terminal.

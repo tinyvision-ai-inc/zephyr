@@ -487,23 +487,24 @@ static int imx219_init(const struct device *dev)
 	return err ? -EIO : 0;
 }
 
-static int imx219_stream_start(const struct device *dev)
+static int imx219_stream_start(const struct video_dt_spec *spec)
 {
 	LOG_DBG("%s", __func__);
-	return imx219_write_u8(dev, IMX219_MODE_SEL, 1);
+	return imx219_write_u8(spec->dev, IMX219_MODE_SEL, 1);
 }
 
-static int imx219_stream_stop(const struct device *dev)
+static int imx219_stream_stop(const struct video_dt_spec *spec)
 {
-	return imx219_write_u8(dev, IMX219_MODE_SEL, 0);
+	return imx219_write_u8(spec->dev, IMX219_MODE_SEL, 0);
 }
 
-static int imx219_set_ctrl(const struct device *dev, unsigned int cid, void *p)
+static int imx219_set_ctrl(const struct video_dt_spec *spec, unsigned int cid, void *p)
 {
+	const struct device *dev = spec->dev;
 	int32_t i32 = *(int32_t *)p;
 	int err = 0;
 
-	imx219_stream_stop(dev);
+	imx219_stream_stop(spec);
 
 	switch (cid) {
 	case VIDEO_CID_CAMERA_EXPOSURE:
@@ -523,13 +524,14 @@ static int imx219_set_ctrl(const struct device *dev, unsigned int cid, void *p)
 		return -ENOTSUP;
 	}
 
-	imx219_stream_start(dev);
+	imx219_stream_start(spec);
 
 	return err ? -EIO : 0;
 }
 
-static int imx219_get_ctrl(const struct device *dev, unsigned int cid, void *p)
+static int imx219_get_ctrl(const struct video_dt_spec *spec, unsigned int cid, void *p)
 {
+	const struct device *dev = spec->dev;
 	int32_t *i32p = p;
 	uint16_t u16;
 	uint8_t u8;
@@ -573,22 +575,20 @@ static const struct video_format_cap fmts[] = {
 	{ 0 }
 };
 
-static int imx219_get_caps(const struct device *dev, enum video_endpoint_id ep,
+static int imx219_get_caps(const struct video_dt_spec *spec,
 			   struct video_caps *caps)
 {
 	caps->format_caps = fmts;
 	return -ENOTSUP;
 }
 
-static int imx219_set_format(const struct device *dev,
-			     enum video_endpoint_id ep,
+static int imx219_set_format(const struct video_dt_spec *spec,
 			     struct video_format *format)
 {
 	return -ENOTSUP;
 }
 
-static int imx219_get_format(const struct device *dev,
-			     enum video_endpoint_id ep,
+static int imx219_get_format(const struct video_dt_spec *spec,
 			     struct video_format *format)
 {
 	return -ENOTSUP;

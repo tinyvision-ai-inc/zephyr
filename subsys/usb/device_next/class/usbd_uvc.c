@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022 Nordic Semiconductor ASA
+ * Copyright (c) 2024 tinyVision.ai Inc.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -13,6 +13,7 @@
 #include <zephyr/usb/class/usb_uvc.h>
 
 #include <zephyr/drivers/usb/udc.h>
+#include <zephyr/drivers/video.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
@@ -44,6 +45,12 @@ struct uvc_data {
 
 	/* Current state of the transfer to avoid enqueue it twice */
 	bool transferring;
+
+	/* Array of remote-port specifications */
+	const struct video_dt_spec *input_dt_spec;
+
+	/* Size of this array */
+	size_t num_of_inputs;
 };
 
 struct uvc_desc {
@@ -231,13 +238,16 @@ static void _start_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
+	const struct video_dt_spec *input = data->input_dt_spec;
 	int ret;
 
 	if (data->transferring) {
 		return;
 	}
-
 	data->transferring = true;
+
+	// TODO handle situations with multiple inputs
+	//video_stream_start(&input[0]);
 
 	/* Toggle the FrameId bit for every new frame. */
 	// TODO only do this once per frame, not once per transfer header
@@ -411,7 +421,7 @@ struct usbd_class_api _api = {
 	.init = _api_init,
 };
 
-#define UVC_DEFINE_DESCRIPTOR(n)						\
+#define DEFINE_UVC_DESCRIPTOR(n)						\
 static struct uvc_desc _desc_##n = {						\
 										\
 	.iad_uvc = {								\
@@ -554,12 +564,17 @@ static struct uvc_desc _desc_##n = {						\
 	},									\
 }
 
-#define USBD_UVC_DT_DEVICE_DEFINE(n)						\
+#define REMOTE_DT_SPEC(n)							\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(n, zephyr_uvc_input_terminal), (		\
+		VIDEO_DT_SPEC_GET(n, port, endpoint),				\
+	))
+
+#define DEFINE_UVC_DEVICE(n)							\
 	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),					\
 	     "node " DT_NODE_PATH(DT_DRV_INST(n))				\
 	     " is not assigned to a USB device controller");			\
 										\
-	UVC_DEFINE_DESCRIPTOR(n);						\
+	DEFINE_UVC_DESCRIPTOR(n);						\
 										\
 	static struct usbd_class_data _class_data_##n = {			\
 		.desc = (struct usb_desc_header *)&_desc_##n,			\
@@ -570,12 +585,17 @@ static struct uvc_desc _desc_##n = {						\
 										\
 	struct uvc_payload_header uvc_payload_header_##n;			\
 										\
+	const struct video_dt_spec input_dt_spec_##n[] = {			\
+		DT_INST_FOREACH_CHILD_STATUS_OKAY(n, REMOTE_DT_SPEC)	\
+	};									\
+										\
 	static struct uvc_data _data_##n = {					\
 		.payload_header = &uvc_payload_header_##n,			\
-		.payload_addr = 0xb1000000, /* TODO temporary */		\
+		.input_dt_spec = input_dt_spec_##n,				\
+		.num_of_inputs = ARRAY_SIZE(input_dt_spec_##n),			\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL,			\
 		POST_KERNEL, 50, &_api);
 
-DT_INST_FOREACH_STATUS_OKAY(USBD_UVC_DT_DEVICE_DEFINE);
+DT_INST_FOREACH_STATUS_OKAY(DEFINE_UVC_DEVICE)
