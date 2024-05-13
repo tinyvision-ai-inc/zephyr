@@ -485,7 +485,7 @@ static int sreq_get_desc_cfg(struct usbd_contex *const uds_ctx,
 	struct usbd_class_node *c_nd;
 	uint16_t len;
 
-	cfg_nd = usbd_config_get(uds_ctx, 1); // TODO should be idx + 1
+	cfg_nd = usbd_config_get(uds_ctx, idx + 1);
 	if (cfg_nd == NULL) {
 		LOG_ERR("Configuration descriptor %u not found", idx + 1);
 		errno = -ENOTSUP;

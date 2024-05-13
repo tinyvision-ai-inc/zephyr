@@ -1305,6 +1305,9 @@ static void usb23_on_soft_reset(const struct device *dev)
 		USB23_GSBUSCFG0_INCR8BRSTENA | USB23_GSBUSCFG0_INCR4BRSTENA);
 
 	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
+	usb23_io_write(dev, USB23_GTXTHRCFG, USB23_GTXTHRCFG_USBTXPKTCNTSEL |
+		(1 << USB23_GTXTHRCFG_USBTXPKTCNT_SHIFT) |
+		(2 << USB23_GTXTHRCFG_USBMAXTXBURSTSIZE_SHIFT));
 
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
@@ -1497,10 +1500,9 @@ static void usb23_on_ctrl_write_setup(const struct device *dev, struct udc_ep_co
 /* OUT */
 static void usb23_on_ctrl_write_data(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf)
 {
-	struct udc_data *data = dev->data;
 	int err;
 
-	LOG_HEXDUMP_DBG(buf->data, buf->size, "DATA");
+	LOG_HEXDUMP_DBG(buf->data, buf->size, __func__);
 	LOG_DBG("%s: buf=%p", __func__, buf);
 	udc_ctrl_update_stage(dev, buf);
 	err = udc_ctrl_submit_s_out_status(dev, buf);
@@ -1581,7 +1583,7 @@ static void usb23_on_ctrl_setup(const struct device *dev, struct udc_ep_config *
 	priv->data_stage_length = udc_data_stage_length(buf);
 
 	LOG_DBG("%s: buf=%p data=%p", __func__, buf, buf->data);
-	LOG_HEXDUMP_DBG(buf->data, buf->size, "HEXDUMP");
+	LOG_HEXDUMP_DBG(buf->data, buf->size, __func__);
 
 	/* To be able to differentiate the next stage*/
 	udc_ep_buf_set_setup(buf);
@@ -1659,6 +1661,8 @@ static void usb23_on_xfer_done_norm(const struct device *dev, struct udc_ep_conf
 
 	__ASSERT_NO_MSG(buf != NULL);
 	__ASSERT_NO_MSG(!ep_cfg->caps.control);
+
+	LOG_HEXDUMP_DBG(buf->data, buf->len, __func__);
 
 	err = udc_submit_ep_event(dev, buf, 0);
 	__ASSERT_NO_MSG(err == 0);
