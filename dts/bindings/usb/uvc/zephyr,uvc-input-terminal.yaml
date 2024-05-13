@@ -9,12 +9,4 @@ description: USB Video Class Input Terminal entity
 
 compatible: "zephyr,uvc-input-terminal"
 
-child-binding:
-  child-binding:
-    properties:
-      remote-endpoint:
-        type: phandle
-        required: true
-        description: Reference to a Video endpoint
-          This Video endpoint should implement the "video" driver API, and will
-          provide data to this UVC input terminal.
+include: video-device.yaml

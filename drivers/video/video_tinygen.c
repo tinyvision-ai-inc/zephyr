@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, tinyVision.ai Inc.
+ * Copyright (c) 2024 tinyVision.ai Inc.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -100,7 +100,6 @@ static int tinygen_enqueue(const struct video_dt_spec *spec, struct video_buffer
 
 static int tinygen_dequeue(const struct video_dt_spec *spec, struct video_buffer **vbufp, k_timeout_t timeout)
 {
-	const struct tinygen_conf *conf = spec->dev->config;
 	struct tinygen_data *data = spec->dev->data;
 
 	LOG_DBG("%s", __func__);

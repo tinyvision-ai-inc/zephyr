@@ -1,9 +1,9 @@
 # Copyright (c) 2024 tinyVision.ai Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-description: Small pattern generator with an incrementing address
+description: MIPI-CSI controller core for FPGA architectures
 
-compatible: "tinyvision,tinygen"
+compatible: "tinyvision,pixelpump"
 
 # TODO generates an _ORD set to -1 when this is included on both side
 #include: video-device.yaml

@@ -368,6 +368,7 @@ static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_p
 	case UVC_VS_PROBE_CONTROL:
 		break;
 	case UVC_VS_COMMIT_CONTROL:
+		// TODO answer to the query first and defer performing the transfer to later
 		_enqueue_new_transfer(c_nd);
 		break;
 	default:
@@ -556,7 +557,7 @@ struct usbd_class_api _api = {
 				.bDescriptorType = USB_DESC_ENDPOINT,                              \
 				.bEndpointAddress = 0x81,                                          \
 				.bmAttributes = USB_EP_TYPE_BULK,                                  \
-				.wMaxPacketSize = sys_cpu_to_le16(512),                            \
+				.wMaxPacketSize = sys_cpu_to_le16(1024),                           \
 				.bInterval = 0,                                                    \
 			},                                                                         \
 		.if1_in_ep_comp =                                                                  \
@@ -582,7 +583,7 @@ struct usbd_class_api _api = {
 	BUILD_ASSERT(DT_INST_ON_BUS(n, usb), "node " DT_NODE_PATH(DT_DRV_INST(n)) " is not"        \
 		     " assigned to a USB device controller");                                      \
                                                                                                    \
-	DEFINE_UVC_DESCRIPTOR(n);                                                                   \
+	DEFINE_UVC_DESCRIPTOR(n);                                                                  \
                                                                                                    \
 	static struct usbd_class_data _class_data_##n = {                                          \
 		.desc = (struct usb_desc_header *)&_desc_##n,                                      \
