@@ -559,13 +559,13 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define USB23_GHWPARAMS7			0xc15c
 #define USB23_GHWPARAMS8			0xc600
 
-#define LO32(n) ((uint32_t)((uint64_t)(n) & 0xffffffff))
-#define HI32(n) ((uint32_t)((uint64_t)(n) >> 32))
-#define U64(a, b) (((uint64_t)(a)) << 32 | (((uint64_t)(b)) & 0xffffffff))
-#define MEM32(addr) (*(volatile uint32_t *)(addr))
-#define CASE(label, ...) case label: LOG_DBG(#label ": " __VA_ARGS__)
-#define CASE_ERR(label) case label: __ASSERT(false, #label); break
-#define GETFIELD(reg, prefix) ((reg & prefix##_MASK) >> prefix##_SHIFT)
+#define LO32(n)			((uint32_t)((uint64_t)(n) & 0xffffffff))
+#define HI32(n)			((uint32_t)((uint64_t)(n) >> 32))
+#define U64(a, b)		(((uint64_t)(a)) << 32 | (((uint64_t)(b)) & 0xffffffff))
+#define MEM32(addr)		(*(volatile uint32_t *)(addr))
+#define CASE(label, ...)	case label: LOG_DBG(#label ": " __VA_ARGS__)
+#define CASE_ERR(label)		case label: __ASSERT(false, #label); break
+#define GETFIELD(reg, prefix)	((reg & prefix##_MASK) >> prefix##_SHIFT)
 
 enum {
 	USB23_SPEED_IDX_SUPER_SPEED = 3,
@@ -575,6 +575,7 @@ enum {
 
 static int usb23_set_address(const struct device *dev, const uint8_t addr);
 static void usb23_ep_enqueue_pending(const struct device *dev, struct udc_ep_config *const ep_cfg);
+void usb23_dump_trbs(const struct device *dev, struct udc_ep_config *const ep_cfg);
 
 /*
  * Input/Output
@@ -686,6 +687,16 @@ static void usb23_set_link_trb(const struct device *dev, struct udc_ep_config *c
 
 	__ASSERT_NO_MSG(ep_data->num_of_trbs > 0);
 	usb23_set_trb(dev, ep_cfg, ep_data->num_of_trbs - 1, &link_trb);
+}
+
+static void usb23_clear_tail_trb(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+
+	__ASSERT_NO_MSG((ep_data->trb_buf[ep_data->tail].ctrl & USB23_TRB_CTRL_HWO) == 0);
+	usb23_set_trb(dev, ep_cfg, ep_data->tail, &(struct usb23_trb){0});
+	ep_data->net_buf[ep_data->tail] = NULL; // TODO free net_buf here
+	ep_data->tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
 }
 
 static union usb23_evt usb23_get_next_evt(const struct device *dev)
@@ -1006,7 +1017,7 @@ static void usb23_depcmd_ep_xfer_config(const struct device *dev, struct udc_ep_
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPXFERCFG);
 }
 
-#if 0
+#if 0 /* useful for hibernating */
 static uint32_t usb23_depcmd_ep_get_state(const struct device *dev, struct udc_ep_config *const ep_cfg)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
@@ -1648,19 +1659,15 @@ static void usb23_on_xfer_not_ready(const struct device *dev, struct udc_ep_conf
 static void usb23_on_xfer_done_norm(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf, struct usb23_trb *trb)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
-	size_t next_tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
 	int err;
 
-	LOG_DBG("%s: head=%d tail=%d next_tail=%d", __func__,
-		ep_data->head, ep_data->tail, next_tail);
+	LOG_DBG("%s: head=%d tail=%d", __func__, ep_data->head, ep_data->tail);
 
-	/* Clear the current TRB and switch to the next */
-	usb23_set_trb(dev, ep_cfg, ep_data->tail, &(struct usb23_trb){0});
-	ep_data->net_buf[ep_data->tail] = NULL;
-	ep_data->tail = next_tail;
-
-	__ASSERT_NO_MSG(buf != NULL);
 	__ASSERT_NO_MSG(!ep_cfg->caps.control);
+	__ASSERT_NO_MSG(buf != NULL);
+
+	/* Clear the TRB that triggered the event */
+	usb23_clear_tail_trb(dev, ep_cfg);
 
 	LOG_HEXDUMP_DBG(buf->data, buf->len, __func__);
 

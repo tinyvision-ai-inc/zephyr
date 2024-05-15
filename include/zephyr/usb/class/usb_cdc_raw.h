@@ -64,9 +64,10 @@ int cdc_raw_read(const struct device *dev, struct net_buf *buf);
  *
  * @param dev Pointer to the USB CDC RAW DeviceTree instance.
  * @param buf Pointer to a net_buf structure, that can be freed from the callback.
+ * @param zlp Whether to flush the transfer or not.
  * @return 0 on success
  */
-int cdc_raw_write(const struct device *dev, struct net_buf *buf);
+int cdc_raw_write(const struct device *dev, struct net_buf *buf, bool zlp);
 
 /**
  * @brief Checks that the CDC ACM "DTR" control command was set by the host.

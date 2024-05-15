@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#define DT_DRV_COMPAT zephyr_cdc_raw
+
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/uart.h>
@@ -82,14 +84,14 @@ int cdc_raw_read(const struct device *dev, struct net_buf *buf)
 	return usbd_ep_enqueue(data->c_nd, buf);
 }
 
-int cdc_raw_write(const struct device *dev, struct net_buf *buf)
+int cdc_raw_write(const struct device *dev, struct net_buf *buf, bool zlp)
 {
 	struct cdc_raw_data *data = dev->data;
 	struct udc_buf_info *bi = udc_get_buf_info(buf);
 
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = _get_bulk_in(data->c_nd);
-	bi->zlp = true; /* Flush the transfer immediately after this buffer */
+	bi->zlp = zlp; /* Flush the transfer or not */
 	return usbd_ep_enqueue(data->c_nd, buf);
 }
 
@@ -302,8 +304,6 @@ static struct cdc_raw_desc _desc_##n = {					\
 		.bDescriptorType = 0,						\
 	},									\
 }
-
-#define DT_DRV_COMPAT zephyr_cdc_raw
 
 #define cdc_raw_DT_DEVICE_DEFINE(n)						\
 										\
