@@ -1358,8 +1358,7 @@ static void usb23_on_soft_reset(const struct device *dev)
 	default:
 		__ASSERT_NO_MSG(false);
 	}
-	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK,
-		15 << USB23_DCFG_NUMP_SHIFT);
+	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK, 15 << USB23_DCFG_NUMP_SHIFT);
 
 	/* Enable reception of USB events */
 	usb23_io_write(dev, USB23_DEVTEN, 0

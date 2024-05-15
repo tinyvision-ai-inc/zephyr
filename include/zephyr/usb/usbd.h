@@ -344,7 +344,7 @@ struct usbd_class_node {
 		struct usb_bos_capability_lpm lpm;			\
 		struct usb_bos_capability_superspeed_usb superspeed_usb;\
 	} __packed;							\
-	struct usb_bos_descriptor_##d_name				\
+	static struct usb_bos_descriptor_##d_name			\
 	bos_desc_##d_name = {						\
 		.bos = {						\
 			.bLength = sizeof(struct usb_bos_descriptor),	\
