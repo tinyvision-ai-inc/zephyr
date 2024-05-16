@@ -1,0 +1,23 @@
+# Copyright (c) 2023 tinyVision.ai
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    Lattice USB23 Controller in device mode
+
+compatible: "lattice,usb23-auto-ep"
+
+include: [base.yaml]
+
+properties:
+  ep-num:
+      type: int
+      required: true
+  trbs:
+      type: int
+      required: true
+  num-trbs:
+      type: int
+      required: true
+  events:
+      type: int
+      required: true
