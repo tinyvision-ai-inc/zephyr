@@ -21,9 +21,10 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_cdc_acm, CONFIG_USBD_CDC_ACM_LOG_LEVEL);
 
-NET_BUF_POOL_FIXED_DEFINE(cdc_acm_ep_pool,
-			  DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
-			  512, sizeof(struct udc_buf_info), NULL);
+NET_BUF_POOL_VAR_DEFINE(cdc_acm_ep_pool,
+			DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 4,
+			DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 4 * 1024,
+			sizeof(struct udc_buf_info), NULL);
 
 #define CDC_ACM_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
 #define CDC_ACM_DEFAULT_BULK_EP_MPS	1024
@@ -104,7 +105,7 @@ struct net_buf *cdc_acm_buf_alloc(const uint8_t ep)
 	struct net_buf *buf = NULL;
 	struct udc_buf_info *bi;
 
-	buf = net_buf_alloc(&cdc_acm_ep_pool, K_NO_WAIT);
+	buf = net_buf_alloc_len(&cdc_acm_ep_pool, 1024, K_NO_WAIT);
 	if (!buf) {
 		return NULL;
 	}
@@ -454,6 +455,7 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	struct cdc_acm_uart_data *data;
 	struct usbd_class_node *c_nd;
 	struct net_buf *buf;
+	struct udc_buf_info *bi;
 	size_t len;
 	int ret;
 
@@ -483,6 +485,10 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 
 	len = ring_buf_get(data->tx_fifo.rb, buf->data, buf->size);
 	net_buf_add(buf, len);
+
+	/* Flush the buffer immediately. */
+	bi = udc_get_buf_info(buf);
+	bi->zlp = true;
 
 	ret = usbd_ep_enqueue(c_nd, buf);
 	if (ret) {
@@ -1134,7 +1140,7 @@ static struct usbd_cdc_acm_desc cdc_acm_desc_##n = {				\
 			  &usbd_cdc_acm_api,					\
 			  &usbd_cdc_acm_data_##n);				\
 										\
-	RING_BUF_DECLARE(cdc_acm_rb_rx_##n, DT_INST_PROP(n, tx_fifo_size));	\
+	RING_BUF_DECLARE(cdc_acm_rb_rx_##n, DT_INST_PROP(n, rx_fifo_size));	\
 	RING_BUF_DECLARE(cdc_acm_rb_tx_##n, DT_INST_PROP(n, tx_fifo_size));	\
 										\
 	static struct cdc_acm_uart_data uart_data_##n = {			\

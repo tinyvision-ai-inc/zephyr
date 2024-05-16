@@ -1266,7 +1266,7 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 {
 	uint32_t ctrl;
 
-	LOG_DBG("TRB_BULK ep=0x%02x buf=%p", ep_cfg->addr, buf);
+	LOG_DBG("TRB_BULK ep=0x%02x buf=%p data=%p size=%d len=%d", ep_cfg->addr, buf, buf->data, buf->size, buf->len);
 
 	/* Make sure the transfer is terminated */
 	if (udc_ep_buf_has_zlp(buf)) {
