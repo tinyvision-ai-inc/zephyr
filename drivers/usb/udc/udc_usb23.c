@@ -26,6 +26,7 @@
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/util.h>
 #include <app_version.h>
+#include <zephyr/drivers/usb/udc_auto_ep.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usb23, CONFIG_UDC_USB23_LOG_LEVEL);
@@ -260,6 +261,8 @@ struct usb23_reg {
 	R(GCTL),
 	R(DCTL),
 	R(DCFG),
+	R(GSBUSCFG0),
+	R(GSBUSCFG1),
 	R(DEVTEN),
 	R(DALEPENA),
 	R(GCOREID),
@@ -393,9 +396,10 @@ void usb23_dump_trbs(const struct device *dev, struct udc_ep_config *const ep_cf
 	for (int i = 0; i < ep_data->num_of_trbs; i++) {
 		struct usb23_trb trb = usb23_get_trb(dev, ep_cfg, i);
 
-		LOG_DBG("%s: ep=0x%02x n=%d addr=0x%08x%08x sts=%ld hwo=%d lst=%d chn=%d csp=%d isp=%d ioc=%d spr=%d pcm1=%ld sof=%ld bufsiz=%ld",
+		LOG_DBG("%s: ep=0x%02x n=%d addr=0x%08x%08x sts=%ld typ=%ld hwo=%d lst=%d chn=%d csp=%d isp=%d ioc=%d spr=%d pcm1=%ld sof=%ld bufsiz=%ld",
 			__func__, ep_cfg->addr, i, trb.addr_hi, trb.addr_lo,
 			GETFIELD(trb.status, USB23_TRB_STATUS_TRBSTS),
+			GETFIELD(trb.ctrl, USB23_TRB_CTRL_TRBCTL),
 			!!(trb.ctrl & USB23_TRB_CTRL_HWO),
 			!!(trb.ctrl & USB23_TRB_CTRL_LST),
 			!!(trb.ctrl & USB23_TRB_CTRL_CHN),
@@ -469,7 +473,8 @@ static uint32_t usb23_depcmd(const struct device *dev, uint32_t addr, uint32_t c
 	return GETFIELD(reg, USB23_DEPCMD_XFERRSCIDX);
 }
 
-static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
+static void usb23_depcmd_ep_config_internal(const struct device *dev, struct udc_ep_config *const ep_cfg,
+		unsigned short evmask)
 {
 	int epn = usb23_get_epn(ep_cfg->addr);
 	uint32_t reg0 = 0, reg1 = 0;
@@ -512,8 +517,7 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 			<< USB23_DEPCMDPAR0_DEPCFG_FIFONUM_SHIFT;
 
 	/* Per-endpoint events */
-	reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
-	reg1 |= USB23_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	reg1 |= evmask;
 
 	/* This is the usb protocol endpoint number, but the data encoding
 	 * we chose for physical endpoint number is the same as this register */
@@ -522,6 +526,13 @@ static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_confi
 	usb23_io_write(dev, USB23_DEPCMDPAR0(epn), reg0);
 	usb23_io_write(dev, USB23_DEPCMDPAR1(epn), reg1);
 	usb23_depcmd(dev, USB23_DEPCMD(epn), USB23_DEPCMD_DEPCFG);
+}
+
+static void usb23_depcmd_ep_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	usb23_depcmd_ep_config_internal(dev, ep_cfg,
+			USB23_DEPCMDPAR1_DEPCFG_XFERINPROGEN |
+			USB23_DEPCMDPAR1_DEPCFG_XFERCMPLEN);
 }
 
 static void usb23_depcmd_ep_xfer_config(const struct device *dev, struct udc_ep_config *const ep_cfg)
@@ -1527,8 +1538,6 @@ static int usb23_init(const struct device *dev)
 	uint32_t reg;
 	int err = 0;
 
-	usb23_dump_registers(dev);
-
 	/* Read the chip identification */
 	reg = usb23_io_read(dev, USB23_GCOREID);
 	LOG_INF("coreid=0x%04lx rel=0x%04lx", GETFIELD(reg, USB23_GCOREID_CORE),
@@ -1560,7 +1569,12 @@ static int usb23_init(const struct device *dev)
 	usb23_io_write(dev, USB23_DCTL, 0x40f00000); // TODO decode
 	usb23_io_wait_go_low(dev, USB23_DCTL, USB23_DCTL_CSFTRST);
 
-	/* Letting GSBUSCFG0 and GSBUSCFG1 unchanged */
+	/* Enable AXI64 bursts for various sizes expected */
+	usb23_io_set(dev, USB23_GSBUSCFG0, USB23_GSBUSCFG0_INCR256BRSTENA |
+		USB23_GSBUSCFG0_INCR128BRSTENA | USB23_GSBUSCFG0_INCR64BRSTENA |
+		USB23_GSBUSCFG0_INCR32BRSTENA | USB23_GSBUSCFG0_INCR16BRSTENA |
+		USB23_GSBUSCFG0_INCR8BRSTENA | USB23_GSBUSCFG0_INCR4BRSTENA);
+
 	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
 
 	/* Issue a soft reset to USB2 PHY */
@@ -1620,6 +1634,8 @@ static int usb23_init(const struct device *dev)
 	/* Configure the control IN endpoint */
 	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, data->caps.mps0, 0);
 	__ASSERT_NO_MSG(err == 0);
+
+	usb23_dump_registers(dev);
 
 	return err;
 }
@@ -1793,3 +1809,75 @@ static const struct udc_api usb23_api = {
 		&usb23_api);
 
 DT_INST_FOREACH_STATUS_OKAY(USB23_DEVICE_DEFINE)
+
+
+static int usb23_auto_ep_start(const struct device *dev)
+{
+	struct udc_auto_ep_data *d = dev->data;
+	LOG_INF("epaddr=%x epn=%d", d->epaddr, usb23_get_epn(d->epaddr));
+	struct udc_ep_config *ep_cfg = usb23_get_ep_cfg(d->udc, usb23_get_epn(d->epaddr));
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(d->udc, ep_cfg);
+
+//	if (ep_data->running)
+//		return -EALREADY;
+
+	ep_data->trb_buf = d->trbs;
+	ep_data->num_of_trbs = d->num_trbs;
+
+#define	R(reg)	{ .addr = USB23_##reg, .name = #reg, .last = 0 }
+	struct usb23_reg cfg0 = R(GSBUSCFG0);
+	struct usb23_reg cfg1 = R(GSBUSCFG1);
+
+	LOG_DBG("reg 0x%08x == 0x%08x // %s", cfg0.addr, usb23_io_read(d->udc, cfg0.addr), cfg0.name);
+	LOG_DBG("reg 0x%08x == 0x%08x // %s", cfg1.addr, usb23_io_read(d->udc, cfg1.addr), cfg1.name);
+
+	usb23_depcmd_ep_config_internal(d->udc, ep_cfg, 0);
+	usb23_depcmd_start_xfer(d->udc, ep_cfg);
+
+	return ep_data->xferrscidx;
+}
+
+static void usb23_auto_ep_stop(const struct device *dev)
+{
+	struct udc_auto_ep_data *d = dev->data;
+	LOG_INF("epaddr=%x epn=%d", d->epaddr, usb23_get_epn(d->epaddr));
+	struct udc_ep_config *ep_cfg = usb23_get_ep_cfg(d->udc, usb23_get_epn(d->epaddr));
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(d->udc, ep_cfg);
+
+	if (!ep_data->running)
+		return;
+
+	usb23_depcmd_end_xfer(d->udc, ep_cfg);
+
+	ep_data->running = 0;
+}
+
+static void* usb23_auto_ep_base(const struct device *dev)
+{
+	struct udc_auto_ep_data *d = dev->data;
+	const struct usb23_config *config = d->udc->config;
+	return (void *)(config->base + USB23_DEPCMDPAR2(usb23_get_epn(d->epaddr)));
+}
+
+static const struct udc_auto_ep_api usb23_auto_ep_api = {
+	.start = usb23_auto_ep_start,
+	.stop = usb23_auto_ep_stop,
+	.ep_base = usb23_auto_ep_base
+};
+
+#define USB23_AUTO_EP_DEFINE(n)						\
+	static struct udc_auto_ep_data usb23_auto_ep_##n = {	\
+		.udc = DEVICE_DT_GET(DT_INST_PARENT(n)),		\
+		.epaddr = DT_INST_PROP(n, ep_num),			\
+		.trbs = (void*) DT_INST_PROP(n, trbs),			\
+		.num_trbs = DT_INST_PROP(n, num_trbs),			\
+		.events = DT_INST_PROP(n, events),			\
+	};								\
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL,				\
+		&usb23_auto_ep_##n, NULL,				\
+		POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,	\
+		&usb23_auto_ep_api);
+
+#undef DT_DRV_COMPAT
+#define DT_DRV_COMPAT lattice_usb23_auto_ep
+DT_INST_FOREACH_STATUS_OKAY(USB23_AUTO_EP_DEFINE)
