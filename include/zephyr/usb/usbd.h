@@ -362,7 +362,7 @@ struct usbd_class_node {
 			.bLength = sizeof(struct usb_bos_capability_superspeed_usb),\
 			.bDescriptorType = USB_DESC_DEVICE_CAPABILITY,	\
 			.bDevCapabilityType = USB_BOS_CAPABILITY_SUPERSPEED_USB,\
-			.bmAttributes = USB_BOS_ATTRIBUTES_LPM,		\
+			.bmAttributes = 0,				\
 			.wSpeedsSupported = sys_cpu_to_le16(		\
 				USB_BOS_SPEED_SUPERSPEED_GEN1 |		\
 				USB_BOS_SPEED_HIGHSPEED |		\

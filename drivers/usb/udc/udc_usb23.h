@@ -166,8 +166,7 @@ static inline struct usb23_ep_data *usb23_get_ep_data(const struct device *dev,
 
 void usb23_on_event(const struct device *dev);
 enum udc_bus_speed usb23_api_device_speed(const struct device *dev);
-int usb23_api_disable(const struct device *dev);
-int usb23_api_enable(const struct device *dev);
+void usb23_enable(const struct device *dev);
 int usb23_api_ep_clear_halt(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_disable(const struct device *dev, struct udc_ep_config *const ep_cfg);
@@ -175,14 +174,9 @@ int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep
 int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg,
 			 struct net_buf *buf);
 int usb23_api_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
-int usb23_api_host_wakeup(const struct device *dev);
 int usb23_api_init(const struct device *dev);
-int usb23_api_lock(const struct device *dev);
 int usb23_api_set_address(const struct device *dev, const uint8_t addr);
 int usb23_api_set_exit_latency(const struct device *dev, const struct udc_exit_latency *el);
-int usb23_api_shutdown(const struct device *dev);
-int usb23_api_unlock(const struct device *dev);
-int usb23_driver_preinit(const struct device *dev);
 void usb23_irq_handler(void *ptr);
 
 #endif // ZEPHYR_DRIVERS_USB_UDC_USB23_H

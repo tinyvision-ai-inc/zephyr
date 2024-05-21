@@ -20,6 +20,70 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #include "udc_common.h"
 #include "udc_usb23.h"
 
+static int usb23_api_enable(const struct device *dev)
+{
+	LOG_INF("%s", __func__);
+	usb23_enable(dev);
+	return 0;
+}
+
+static int usb23_api_disable(const struct device *dev)
+{
+	LOG_INF("%s", __func__);
+	return 0;
+}
+
+static int usb23_api_host_wakeup(const struct device *dev)
+{
+	return 0;
+}
+
+/*
+ * Shut down the controller completely
+ */
+static int usb23_api_shutdown(const struct device *dev)
+{
+	LOG_INF("%s", __func__);
+	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_OUT)) {
+		LOG_ERR("Failed to disable control endpoint");
+		return -EIO;
+	}
+	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_IN)) {
+		LOG_ERR("Failed to disable control endpoint");
+		return -EIO;
+	}
+	return 0;
+}
+
+static int usb23_api_lock(const struct device *dev)
+{
+	return udc_lock_internal(dev, K_FOREVER);
+}
+
+static int usb23_api_unlock(const struct device *dev)
+{
+	return udc_unlock_internal(dev);
+}
+
+static const struct udc_api usb23_api = {
+	.lock = usb23_api_lock,
+	.unlock = usb23_api_unlock,
+	.device_speed = usb23_api_device_speed,
+	.init = usb23_api_init,
+	.enable = usb23_api_enable,
+	.disable = usb23_api_disable,
+	.shutdown = usb23_api_shutdown,
+	.set_address = usb23_api_set_address,
+	.set_exit_latency = usb23_api_set_exit_latency,
+	.host_wakeup = usb23_api_host_wakeup,
+	.ep_enable = usb23_api_ep_enable,
+	.ep_disable = usb23_api_ep_disable,
+	.ep_set_halt = usb23_api_ep_set_halt,
+	.ep_clear_halt = usb23_api_ep_clear_halt,
+	.ep_enqueue = usb23_api_ep_enqueue,
+	.ep_dequeue = usb23_api_ep_dequeue,
+};
+
 static void usb23_event_worker(struct k_work *work)
 {
 	const struct usb23_data *priv = CONTAINER_OF(work, struct usb23_data, work);
@@ -107,25 +171,6 @@ int usb23_driver_preinit(const struct device *dev)
 
 	return 0;
 }
-
-static const struct udc_api usb23_api = {
-	.lock = usb23_api_lock,
-	.unlock = usb23_api_unlock,
-	.device_speed = usb23_api_device_speed,
-	.init = usb23_api_init,
-	.enable = usb23_api_enable,
-	.disable = usb23_api_disable,
-	.shutdown = usb23_api_shutdown,
-	.set_address = usb23_api_set_address,
-	.set_exit_latency = usb23_api_set_exit_latency,
-	.host_wakeup = usb23_api_host_wakeup,
-	.ep_enable = usb23_api_ep_enable,
-	.ep_disable = usb23_api_ep_disable,
-	.ep_set_halt = usb23_api_ep_set_halt,
-	.ep_clear_halt = usb23_api_ep_clear_halt,
-	.ep_enqueue = usb23_api_ep_enqueue,
-	.ep_dequeue = usb23_api_ep_dequeue,
-};
 
 #define NUM_BIDIR_EPS(n)       DT_INST_PROP(n, num_bidir_endpoints)
 #define NUM_OF_TRBS(inst, epn) DT_PROP_BY_IDX(inst, num_endpoint_trb, epn)

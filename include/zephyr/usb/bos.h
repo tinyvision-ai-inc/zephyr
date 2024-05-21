@@ -33,6 +33,7 @@ enum usb_bos_capability_types {
 
 enum usb_bos_attributes {
 	USB_BOS_ATTRIBUTES_LPM = BIT(1),
+	USB_BOS_ATTRIBUTES_LTM = BIT(1),
 	USB_BOS_ATTRIBUTES_BESL = BIT(2)
 };
 

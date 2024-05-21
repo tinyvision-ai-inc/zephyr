@@ -2069,11 +2069,6 @@ int usb23_api_set_exit_latency(const struct device *dev, const struct udc_exit_l
 	return 0;
 }
 
-int usb23_api_host_wakeup(const struct device *dev)
-{
-	return 0;
-}
-
 enum udc_bus_speed usb23_api_device_speed(const struct device *dev)
 {
 	switch (usb23_io_read(dev, USB23_DSTS) & USB23_DSTS_CONNECTSPD_MASK) {
@@ -2088,51 +2083,15 @@ enum udc_bus_speed usb23_api_device_speed(const struct device *dev)
 	return 0;
 }
 
-int usb23_api_enable(const struct device *dev)
+void usb23_enable(const struct device *dev)
 {
 	const struct usb23_config *config = dev->config;
-
-	LOG_INF("%s", __func__);
 
 	/* Bootstrap: prepare reception of the initial Setup packet */
 	usb23_trb_ctrl_setup_out(dev);
 
 	usb23_io_set(dev, USB23_DCTL, USB23_DCTL_RUNSTOP);
 	config->irq_enable_func();
-	return 0;
-}
-
-int usb23_api_disable(const struct device *dev)
-{
-	LOG_INF("%s", __func__);
-	return 0;
-}
-
-/*
- * Shut down the controller completely
- */
-int usb23_api_shutdown(const struct device *dev)
-{
-	LOG_INF("%s", __func__);
-	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_OUT)) {
-		LOG_ERR("Failed to disable control endpoint");
-		return -EIO;
-	}
-	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_IN)) {
-		LOG_ERR("Failed to disable control endpoint");
-		return -EIO;
-	}
-	return 0;
-}
-
-int usb23_api_lock(const struct device *dev)
-{
-	return udc_lock_internal(dev, K_FOREVER);
-}
-
-int usb23_api_unlock(const struct device *dev)
-{
-	return udc_unlock_internal(dev);
 }
 
 /*
