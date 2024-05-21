@@ -11,11 +11,22 @@
 
 #define DT_DRV_COMPAT lattice_usb23
 
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
+
 /*
  * USB device controller (UDC) for Lattice USB2 and USB3 hardened FPGA core.
  */
 #include "udc_common.h"
 #include "udc_usb23.h"
+
+static void usb23_event_worker(struct k_work *work)
+{
+	const struct usb23_data *priv = CONTAINER_OF(work, struct usb23_data, work);
+	const struct device *dev = priv->dev;
+
+	usb23_on_event(dev);
+}
 
 /*
  * The real init function is triggered by the application with .
@@ -47,7 +58,7 @@ static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *cons
 	ep_cfg->caps.mps = mps;
 
 	ret = udc_register_ep(dev, ep_cfg);
-	if (err != 0) {
+	if (ret != 0) {
 		LOG_ERR("Failed to register endpoint");
 		return ret;
 	}
@@ -67,7 +78,7 @@ int usb23_driver_preinit(const struct device *dev)
 	uint16_t mps = 0;
 
 	k_mutex_init(&data->mutex);
-	k_work_init(&priv->work, &usb23_on_event);
+	k_work_init(&priv->work, &usb23_event_worker);
 
 	data->caps.rwup = true;
 	switch (config->speed_idx) {
@@ -90,8 +101,8 @@ int usb23_driver_preinit(const struct device *dev)
 		LOG_ERR("Not implemented");
 	}
 
-	for (int epn = 0; epn < config->num_of_eps; epn++) {
-		usb23_ep_preinit(dev, usb23_get_ep_cfg(dev, epn), usb23_get_ep_addr(epn), mps);
+	for (int epn = 0; epn < config->num_bidir_eps * 2; epn++) {
+		usb23_ep_preinit(dev, usb23_get_ep_cfg(dev, epn), usb23_get_addr(epn), mps);
 	}
 
 	return 0;
@@ -116,7 +127,7 @@ static const struct udc_api usb23_api = {
 	.ep_dequeue = usb23_api_ep_dequeue,
 };
 
-#define NUM_OF_EPS(n)          (DT_INST_PROP(n, num_bidir_endpoints) * 2)
+#define NUM_BIDIR_EPS(n)       DT_INST_PROP(n, num_bidir_endpoints)
 #define NUM_OF_TRBS(inst, epn) DT_PROP_BY_IDX(inst, num_endpoint_trb, epn)
 
 #define USB23_EP_TRB_BUF_DEFINE(n, m, epn)                                                         \
@@ -148,18 +159,18 @@ static const struct udc_api usb23_api = {
 	}                                                                                          \
                                                                                                    \
 	union usb23_evt usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                               \
-	struct udc_ep_config usb23_ep_cfg_##n[NUM_OF_EPS(n)];                                      \
+	struct udc_ep_config usb23_ep_cfg_##n[NUM_BIDIR_EPS(n) * 2];                               \
                                                                                                    \
 	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_TRB_BUF_DEFINE);                   \
 	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_NET_BUF_DEFINE);                   \
                                                                                                    \
-	static struct usb23_ep_data usb23_ep_data_##n[NUM_OF_EPS(n)] = {                           \
+	static struct usb23_ep_data usb23_ep_data_##n[NUM_BIDIR_EPS(n) * 2] = {                    \
 		DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_DATA_ENTRY)};              \
                                                                                                    \
 	static const struct usb23_config usb23_config_##n = {                                      \
 		.base = DT_INST_REG_ADDR_BY_NAME(n, base),                                         \
 		.discard = DT_INST_REG_ADDR_BY_NAME(n, discard),                                   \
-		.num_of_eps = NUM_OF_EPS(n),                                                       \
+		.num_bidir_eps = NUM_BIDIR_EPS(n),                                                 \
 		.ep_cfg = usb23_ep_cfg_##n,                                                        \
 		.ep_data = usb23_ep_data_##n,                                                      \
 		.speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),                           \

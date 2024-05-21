@@ -16,7 +16,7 @@
  */
 struct usb23_config {
 	/* USB endpoints configuration and data */
-	size_t num_of_eps;
+	size_t num_bidir_eps;
 	struct usb23_ep_data *ep_data;
 	struct udc_ep_config *ep_cfg;
 
@@ -120,6 +120,51 @@ struct usb23_trb {
 	uint32_t ctrl;
 } __packed;
 
+/*
+ * Enum matching the device-speed devicetree property elements.
+ */
+enum {
+	USB23_SPEED_IDX_SUPER_SPEED = 3,
+	USB23_SPEED_IDX_HIGH_SPEED = 2,
+	USB23_SPEED_IDX_FULL_SPEED = 1,
+};
+
+/*
+ * This is a mapping between logical and physical resources we decoreed.
+ * Convert from USB standard endpoint number to physical resource number.
+ * It alternates between OUT endpoints (0x00) and IN endpoints (0x80).
+ * From: 0x00, 0x80, 0x01, 0x81, 0x02, 0x82, 0x03, 0x83, ...
+ * To:   0,    1,    2,    3,    4,    5,    6,    7,    ...
+ */
+static inline int usb23_get_epn(uint8_t addr)
+{
+	return ((addr & 0x7f) << 1) | ((addr & 0x80) >> 7);
+}
+
+static inline uint8_t usb23_get_addr(int epn)
+{
+	return (((epn & 0xfe) >> 1) | (epn & 0x01) << 7);
+}
+
+
+static inline struct udc_ep_config *usb23_get_ep_cfg(const struct device *dev, int epn)
+{
+	const struct usb23_config *config = dev->config;
+
+	return &config->ep_cfg[epn];
+}
+
+static inline struct usb23_ep_data *usb23_get_ep_data(const struct device *dev,
+					       struct udc_ep_config *const ep_cfg)
+{
+	const struct usb23_config *config = dev->config;
+	int epn = usb23_get_epn(ep_cfg->addr);
+
+	__ASSERT_NO_MSG(epn < config->num_bidir_eps * 2);
+	return &config->ep_data[epn];
+}
+
+void usb23_on_event(const struct device *dev);
 enum udc_bus_speed usb23_api_device_speed(const struct device *dev);
 int usb23_api_disable(const struct device *dev);
 int usb23_api_enable(const struct device *dev);
