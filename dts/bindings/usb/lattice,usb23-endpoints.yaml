@@ -1,0 +1,16 @@
+# Copyright (c) 2023 tinyVision.ai
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    Lattice USB23 Controller endpoint description block
+
+compatible: "lattice,usb23-endpoints"
+
+child-binding:
+  properties:
+    reg:
+      type: int
+      required: true
+    num-trbs:
+      type: int
+      required: true

@@ -13,6 +13,3 @@ properties:
     required: true
   interrupts:
     required: true
-  num-endpoint-trb:
-    type: array
-    required: true

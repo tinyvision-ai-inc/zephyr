@@ -172,20 +172,17 @@ int usb23_driver_preinit(const struct device *dev)
 	return 0;
 }
 
-#define NUM_BIDIR_EPS(n)       DT_INST_PROP(n, num_bidir_endpoints)
-#define NUM_OF_TRBS(inst, epn) DT_PROP_BY_IDX(inst, num_endpoint_trb, epn)
+#define USB23_EP_TRB_BUF_DEFINE(n)                                                                 \
+	static struct usb23_trb usb23_dma_trb_buf_##n[DT_PROP(n, num_trbs)];
 
-#define USB23_EP_TRB_BUF_DEFINE(n, m, epn)                                                         \
-	static struct usb23_trb usb23_dma_trb_buf_##n##_##epn[NUM_OF_TRBS(n, epn)];
+#define USB23_EP_NET_BUF_DEFINE(n)                                                                 \
+	static struct net_buf *usb23_net_buf_##n[DT_PROP(n, num_trbs)];
 
-#define USB23_EP_NET_BUF_DEFINE(n, m, epn)                                                         \
-	static struct net_buf *usb23_net_buf_##n##_##epn[NUM_OF_TRBS(n, epn)];
-
-#define USB23_EP_DATA_ENTRY(n, m, epn)                                                             \
+#define USB23_EP_DATA_ENTRY(n)                                                                     \
 	{                                                                                          \
-		.num_of_trbs = NUM_OF_TRBS(n, epn),                                                \
-		.trb_buf = usb23_dma_trb_buf_##n##_##epn,                                          \
-		.net_buf = usb23_net_buf_##n##_##epn,                                              \
+		.num_of_trbs = DT_PROP(n, num_trbs),                                               \
+		.trb_buf = usb23_dma_trb_buf_##n,                                                  \
+		.net_buf = usb23_net_buf_##n,                                                      \
 	},
 
 #define USB23_DEVICE_DEFINE(n)                                                                     \
@@ -204,18 +201,18 @@ int usb23_driver_preinit(const struct device *dev)
 	}                                                                                          \
                                                                                                    \
 	union usb23_evt usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                               \
-	struct udc_ep_config usb23_ep_cfg_##n[NUM_BIDIR_EPS(n) * 2];                               \
+	struct udc_ep_config usb23_ep_cfg_##n[DT_INST_PROP(n, num_bidir_endpoints) * 2];           \
                                                                                                    \
-	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_TRB_BUF_DEFINE);                   \
-	DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_NET_BUF_DEFINE);                   \
+	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_TRB_BUF_DEFINE);                    \
+	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_NET_BUF_DEFINE);                    \
                                                                                                    \
-	static struct usb23_ep_data usb23_ep_data_##n[NUM_BIDIR_EPS(n) * 2] = {                    \
-		DT_INST_FOREACH_PROP_ELEM(n, num_endpoint_trb, USB23_EP_DATA_ENTRY)};              \
+	static struct usb23_ep_data usb23_ep_data_##n[] = {                                        \
+		DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_DATA_ENTRY)};               \
                                                                                                    \
 	static const struct usb23_config usb23_config_##n = {                                      \
 		.base = DT_INST_REG_ADDR_BY_NAME(n, base),                                         \
 		.discard = DT_INST_REG_ADDR_BY_NAME(n, discard),                                   \
-		.num_bidir_eps = NUM_BIDIR_EPS(n),                                                 \
+		.num_bidir_eps = DT_INST_PROP(n, num_bidir_endpoints),                             \
 		.ep_cfg = usb23_ep_cfg_##n,                                                        \
 		.ep_data = usb23_ep_data_##n,                                                      \
 		.speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),                           \
