@@ -1,10 +1,5 @@
-# Copyright (c) 2023 tinyVision.ai
-# SPDX-License-Identifier: Apache-2.0
+#Copyright(c) 2023 tinyVision.ai
+#SPDX - License - Identifier : Apache - 2.0
 
-config UDC_USB23
-	bool "Lattice USB device controller driver"
-	imply UDC_WORKQUEUE
-	default y
-	depends on DT_HAS_LATTICE_USB23_ENABLED
-	help
-	  Lattice USB23 USB device controller driver.
+config UDC_USB23 bool "Lattice USB device controller driver" imply UDC_WORKQUEUE default y depends
+	on DT_HAS_LATTICE_USB23_ENABLED help Lattice USB23 USB device controller driver.

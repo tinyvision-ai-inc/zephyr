@@ -8,7 +8,7 @@
 #ifndef ZEPHYR_DRIVERS_USB_UDC_USB23_H
 #define ZEPHYR_DRIVERS_USB_UDC_USB23_H
 
-#define CONFIG_USB23_EVT_NUM			64
+#define CONFIG_USB23_EVT_NUM 64
 
 /*
  * Structure for holding controller configuration items that can remain in
@@ -80,24 +80,24 @@ struct usb23_data {
  * Format for an endpoint-specific event.
  */
 struct usb23_depevt {
-	uint32_t category:1;
-	uint32_t ep_num:5;
-	uint32_t type:4;
-	uint32_t reserved_11_10:2;
-	uint32_t status:4;
-	uint32_t parameters:16;
+	uint32_t category: 1;
+	uint32_t ep_num: 5;
+	uint32_t type: 4;
+	uint32_t reserved_11_10: 2;
+	uint32_t status: 4;
+	uint32_t parameters: 16;
 } __packed;
 
 /*
  * Format for a device event unrelated to any endpoint.
  */
 struct usb23_devt {
-	uint32_t category:1;
-	uint32_t event:7;
-	uint32_t type:4;
-	uint32_t reserved_15_12:4;
-	uint32_t evtinfo:9;
-	uint32_t reserved_31_25:7;
+	uint32_t category: 1;
+	uint32_t event: 7;
+	uint32_t type: 4;
+	uint32_t reserved_15_12: 4;
+	uint32_t evtinfo: 9;
+	uint32_t reserved_31_25: 7;
 } __packed;
 
 /*
@@ -127,7 +127,8 @@ int usb23_api_ep_clear_halt(const struct device *dev, struct udc_ep_config *cons
 int usb23_api_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_disable(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep_cfg);
-int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg, struct net_buf *buf);
+int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *const ep_cfg,
+			 struct net_buf *buf);
 int usb23_api_ep_set_halt(const struct device *dev, struct udc_ep_config *ep_cfg);
 int usb23_api_host_wakeup(const struct device *dev);
 int usb23_api_init(const struct device *dev);
