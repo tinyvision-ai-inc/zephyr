@@ -41,6 +41,10 @@ struct usb23_config {
  * All data specific to one endpoint
  */
 struct usb23_ep_data {
+	/* Whether the trb_buf refers to an instance of the USB Manager
+	 * which will poll an endpoint instead of memory. */
+	bool is_usb_manager;
+
 	/* Pointer to the DMA-accessible buffer of TRBs and its size */
 	struct usb23_trb *trb_buf;
 

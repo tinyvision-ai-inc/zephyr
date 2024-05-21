@@ -1292,7 +1292,10 @@ static int usb23_send_trb(const struct device *dev, struct udc_ep_config *const 
 static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const ep_cfg,
 			  struct net_buf *buf)
 {
-	uint32_t ctrl;
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+	/* If the endpoint is managed by the USB manager, then do not enable interrupts:
+	 * the USB Manager will poll the endpoint */
+	uint32_t ctrl = ep_data->is_usb_manager ? USB23_TRB_CTRL_IOC : 0;
 
 	LOG_DBG("TRB_BULK ep=0x%02x buf=%p data=%p size=%d len=%d", ep_cfg->addr, buf, buf->data,
 		buf->size, buf->len);
@@ -1300,12 +1303,12 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 	/* Make sure the transfer is terminated */
 	if (udc_ep_buf_has_zlp(buf)) {
 		/* Mark the TRB as end of a chain: CHN=0 */
-		ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL_ZLP;
+		ctrl |= USB23_TRB_CTRL_TRBCTL_NORMAL_ZLP;
 		ctrl |= USB23_TRB_CTRL_IOC;
 		ctrl |= USB23_TRB_CTRL_HWO;
 	} else {
 		/* Mark the next TRB as being part of the same USB transfer */
-		ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL;
+		ctrl |= USB23_TRB_CTRL_TRBCTL_NORMAL;
 		if (ep_cfg->caps.in) {
 			ctrl |= USB23_TRB_CTRL_CHN;
 		} else {
@@ -2095,6 +2098,17 @@ void usb23_enable(const struct device *dev)
 }
 
 /*
+ * Configure the USB Manager: a custom FPGA core that polls the HWO flag of a TRB to send a new TRB
+ * whenever the previous one is completed.
+ */
+void usb23_enable_usb_manager(const struct device *dev, struct udc_ep_config *const ep_cfg)
+{
+	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_cfg);
+
+	LOG_DBG("USB Manager: TRB_ADDRESS=%p", ep_data->trb_buf);
+}
+
+/*
  * Hardware Init
  *
  * Prepare the driver and the hardware to being used.
@@ -2109,6 +2123,7 @@ int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep
 	LOG_DBG("%s: ep=0x%02x", __func__, ep_cfg->addr);
 
 	/* Initialize the TRB buffer */
+	LOG_DBG("%s: trb_buf=%p", __func__, ep_data->trb_buf);
 	memset((void *)ep_data->trb_buf, 0, ep_data->num_of_trbs * sizeof(struct usb23_trb));
 
 	usb23_depcmd_ep_config(dev, ep_cfg);
@@ -2122,6 +2137,11 @@ int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep
 
 	/* Starting from here, the endpoint can be used */
 	usb23_io_set(dev, USB23_DALEPENA, USB23_DALEPENA_USBACTEP(epn));
+
+	/* For enabled endpoint, use the USB Manager to automatically reload the TRBs */
+	if (ep_data->is_usb_manager) {
+		usb23_enable_usb_manager(dev, ep_cfg);
+	}
 
 	return 0;
 }

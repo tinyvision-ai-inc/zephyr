@@ -22,14 +22,14 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define INC_LE(sz, x, i)          x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET ((1 << 0) | (1 << 1))
-#define FRAME_WIDTH               320
-#define FRAME_HEIGHT              240
+#define FRAME_WIDTH               20
+#define FRAME_HEIGHT              10
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * (BITS_PER_PIXEL / 8))
 #define TRANSFER_SIZE             (FRAME_SIZE + sizeof(struct uvc_payload_header))
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
-NET_BUF_POOL_FIXED_DEFINE(_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
+NET_BUF_POOL_FIXED_DEFINE(uvc_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
 			  sizeof(struct udc_buf_info), NULL);
 
 struct uvc_data {
@@ -68,7 +68,7 @@ struct uvc_desc {
 	struct usb_desc_header nil_desc;
 } __packed;
 
-static const struct uvc_vs_probe_control _probe_def = {
+static const struct uvc_vs_probe_control uvc_probe_def = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
 	.dwFrameInterval = sys_cpu_to_le32(300 * 1000 * 1000 /*ns*/ / 100),
@@ -83,7 +83,7 @@ static const struct uvc_vs_probe_control _probe_def = {
 	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
-static const struct uvc_vs_probe_control _probe_min = {
+static const struct uvc_vs_probe_control uvc_probe_min = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
 	.dwFrameInterval = sys_cpu_to_le32(300 * 1000 * 1000 /*ns*/ / 100),
@@ -98,7 +98,7 @@ static const struct uvc_vs_probe_control _probe_min = {
 	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
-static const struct uvc_vs_probe_control _probe_max = {
+static const struct uvc_vs_probe_control uvc_probe_max = {
 	.bFormatIndex = 1,
 	.bFrameIndex = 1,
 	.dwFrameInterval = sys_cpu_to_le32(300 * 1000 * 1000 /*ns*/ / 100),
@@ -113,7 +113,7 @@ static const struct uvc_vs_probe_control _probe_max = {
 	.bBitDepthLuma = BITS_PER_PIXEL - 8,
 };
 
-static void _dump_probe(const struct uvc_vs_probe_control *pc)
+static void uvc_dump_probe(const struct uvc_vs_probe_control *pc)
 {
 	return;
 	LOG_DBG("struct uvc_vs_probe_control");
@@ -146,7 +146,7 @@ static void _dump_probe(const struct uvc_vs_probe_control *pc)
  * All fields set to 0 are ignored, others are applied
  * TODO check if within MIN/MAX range
  */
-static void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
+static void uvc_load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_probe_control *src)
 {
 #define APPLY_PARAM(p)                                                                             \
 	if (src->p != 0 && dst->p != src->p) {                                                     \
@@ -180,14 +180,14 @@ static void _load_probe(struct uvc_vs_probe_control *dst, const struct uvc_vs_pr
 #undef APPLY_PARAM
 }
 
-static uint8_t _get_bulk_ep_num(struct usbd_class_node *const c_nd)
+static uint8_t uvc_get_bulk_ep_num(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 
 	return desc->if1_in_ep.bEndpointAddress;
 }
 
-static int _usb_enqueue(struct usbd_class_node *const c_nd, void *data, size_t size,
+static int uvc_usb_enqueue(struct usbd_class_node *const c_nd, void *data, size_t size,
 			bool last_of_transfer)
 {
 	struct net_buf *buf;
@@ -196,14 +196,14 @@ static int _usb_enqueue(struct usbd_class_node *const c_nd, void *data, size_t s
 
 	LOG_DBG("%s: Enqueueing data=%p size=%d zlp=%d", __func__, data, size, last_of_transfer);
 
-	buf = net_buf_alloc_with_data(&_buf_pool, (void *)data, size, K_FOREVER);
+	buf = net_buf_alloc_with_data(&uvc_buf_pool, (void *)data, size, K_FOREVER);
 	__ASSERT_NO_MSG(buf != NULL);
 
 	bi = udc_get_buf_info(buf);
 	__ASSERT_NO_MSG(bi != NULL);
 
 	memset(bi, 0, sizeof(struct udc_buf_info));
-	bi->ep = _get_bulk_ep_num(c_nd);
+	bi->ep = uvc_get_bulk_ep_num(c_nd);
 	bi->zlp = last_of_transfer;
 
 	err = usbd_ep_enqueue(c_nd, buf);
@@ -214,7 +214,7 @@ static int _usb_enqueue(struct usbd_class_node *const c_nd, void *data, size_t s
 	return err;
 }
 
-static int _enqueue_new_transfer(struct usbd_class_node *const c_nd)
+static int uvc_enqueue_new_transfer(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
@@ -241,7 +241,7 @@ static int _enqueue_new_transfer(struct usbd_class_node *const c_nd)
 	LOG_INF("Submitting a %dx%d frame with %d bits per pixel (%zd bytes)", FRAME_WIDTH,
 		FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 
-	err = _usb_enqueue(c_nd, data->payload_header, sizeof(struct uvc_payload_header), false);
+	err = uvc_usb_enqueue(c_nd, data->payload_header, sizeof(struct uvc_payload_header), false);
 	if (err != 0) {
 		return err;
 	}
@@ -262,7 +262,7 @@ static int _enqueue_new_transfer(struct usbd_class_node *const c_nd)
 			return err;
 		}
 
-		err = _usb_enqueue(c_nd, vbufp->buffer, vbufp->bytesused, vbufp->bytesused == n);
+		err = uvc_usb_enqueue(c_nd, vbufp->buffer, vbufp->bytesused, vbufp->bytesused == n);
 		if (err != 0) {
 			return err;
 		}
@@ -271,7 +271,7 @@ static int _enqueue_new_transfer(struct usbd_class_node *const c_nd)
 	return err;
 }
 
-static void _on_transfer_complete(struct usbd_class_node *const c_nd)
+static void uvc_on_transfer_complete(struct usbd_class_node *const c_nd)
 {
 	const struct device *dev = c_nd->data->priv;
 	struct uvc_data *data = dev->data;
@@ -279,7 +279,7 @@ static void _on_transfer_complete(struct usbd_class_node *const c_nd)
 	data->transferring = false;
 }
 
-static int _api_request(struct usbd_class_node *const c_nd, struct net_buf *buf, int err)
+static int uvc_api_request(struct usbd_class_node *const c_nd, struct net_buf *buf, int err)
 {
 	struct udc_buf_info bi;
 
@@ -289,11 +289,11 @@ static int _api_request(struct usbd_class_node *const c_nd, struct net_buf *buf,
 	memcpy(&bi, udc_get_buf_info(buf), sizeof(bi));
 	net_buf_unref(buf);
 
-	if (bi.ep == _get_bulk_ep_num(c_nd)) {
+	if (bi.ep == uvc_get_bulk_ep_num(c_nd)) {
 		LOG_DBG("%s: transfer completed zlp=%d", __func__, bi.zlp);
-		_on_transfer_complete(c_nd);
+		uvc_on_transfer_complete(c_nd);
 		if (bi.zlp) {
-			err = _enqueue_new_transfer(c_nd);
+			err = uvc_enqueue_new_transfer(c_nd);
 		}
 	} else {
 		__ASSERT(false, "transfer completion for unknown enpoint");
@@ -302,12 +302,12 @@ static int _api_request(struct usbd_class_node *const c_nd, struct net_buf *buf,
 	return err;
 }
 
-static void _api_update(struct usbd_class_node *const c_nd, uint8_t iface, uint8_t alternate)
+static void uvc_api_update(struct usbd_class_node *const c_nd, uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("%s", __func__);
 }
 
-static int _api_cth(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup,
+static int uvc_api_cth(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup,
 		    struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
@@ -316,27 +316,27 @@ static int _api_cth(struct usbd_class_node *const c_nd, const struct usb_setup_p
 
 	switch (setup->wValue >> 8) {
 	case UVC_VS_PROBE_CONTROL:
-		size = MIN(setup->wLength, sizeof(_probe_def));
+		size = MIN(setup->wLength, sizeof(uvc_probe_def));
 
 		switch (setup->bRequest) {
 		case UVC_GET_CUR:
 			net_buf_add_mem(buf, &data->probe, size);
-			_dump_probe((void *)buf->data);
+			uvc_dump_probe((void *)buf->data);
 			return 0;
 		case UVC_GET_MIN:
-			net_buf_add_mem(buf, &_probe_min, size);
-			_dump_probe((void *)buf->data);
+			net_buf_add_mem(buf, &uvc_probe_min, size);
+			uvc_dump_probe((void *)buf->data);
 			break;
 		case UVC_GET_MAX:
-			net_buf_add_mem(buf, &_probe_max, size);
-			_dump_probe((void *)buf->data);
+			net_buf_add_mem(buf, &uvc_probe_max, size);
+			uvc_dump_probe((void *)buf->data);
 			break;
 		case UVC_GET_DEF:
-			net_buf_add_mem(buf, &_probe_def, size);
-			_dump_probe((void *)buf->data);
+			net_buf_add_mem(buf, &uvc_probe_def, size);
+			uvc_dump_probe((void *)buf->data);
 			break;
 		case UVC_GET_LEN:
-			net_buf_add_le16(buf, sizeof(_probe_def));
+			net_buf_add_le16(buf, sizeof(uvc_probe_def));
 			return 0;
 		case UVC_GET_INFO:
 			net_buf_add_u8(buf, UVC_INFO_SUPPORTS_GET_SET);
@@ -344,7 +344,7 @@ static int _api_cth(struct usbd_class_node *const c_nd, const struct usb_setup_p
 		default:
 			goto err_unsupported;
 		}
-		_dump_probe((void *)buf->data);
+		uvc_dump_probe((void *)buf->data);
 		return 0;
 	}
 
@@ -355,7 +355,7 @@ err_unsupported:
 	return 0;
 }
 
-static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup,
+static int uvc_api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_packet *const setup,
 		    const struct net_buf *const buf)
 {
 	const struct device *dev = c_nd->data->priv;
@@ -369,7 +369,7 @@ static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_p
 		break;
 	case UVC_VS_COMMIT_CONTROL:
 		// TODO answer to the query first and defer performing the transfer to later
-		_enqueue_new_transfer(c_nd);
+		uvc_enqueue_new_transfer(c_nd);
 		break;
 	default:
 		LOG_WRN("%s: unknown wValue=%d", __func__, setup->wValue);
@@ -384,8 +384,8 @@ static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_p
 			errno = -ENOTSUP;
 			return 0;
 		}
-		_load_probe(&data->probe, (void *)buf->data);
-		_dump_probe(&data->probe);
+		uvc_load_probe(&data->probe, (void *)buf->data);
+		uvc_dump_probe(&data->probe);
 		break;
 	default:
 		LOG_ERR("%s: unknown bRequest=0x%02x", __func__, setup->bRequest);
@@ -396,7 +396,7 @@ static int _api_ctd(struct usbd_class_node *const c_nd, const struct usb_setup_p
 	return 0;
 }
 
-static int _api_init(struct usbd_class_node *const c_nd)
+static int uvc_api_init(struct usbd_class_node *const c_nd)
 {
 	struct uvc_desc *desc = c_nd->data->desc;
 	const struct device *dev = c_nd->data->priv;
@@ -407,20 +407,20 @@ static int _api_init(struct usbd_class_node *const c_nd)
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
 	desc->iad_uvc.bFirstInterface = desc->if0.bInterfaceNumber;
-	memcpy(&data->probe, &_probe_def, sizeof(data->probe));
+	memcpy(&data->probe, &uvc_probe_def, sizeof(data->probe));
 	return 0;
 }
 
-struct usbd_class_api _api = {
-	.request = _api_request,
-	.update = _api_update,
-	.control_to_host = _api_cth,
-	.control_to_dev = _api_ctd,
-	.init = _api_init,
+struct usbd_class_api uvc_api = {
+	.request = uvc_api_request,
+	.update = uvc_api_update,
+	.control_to_host = uvc_api_cth,
+	.control_to_dev = uvc_api_ctd,
+	.init = uvc_api_init,
 };
 
 #define DEFINE_UVC_DESCRIPTOR(n)                                                                   \
-	static const struct uvc_desc _desc_##n = {                                                 \
+	static const struct uvc_desc uvc_desc_##n = {                                              \
                                                                                                    \
 		.iad_uvc =                                                                         \
 			{                                                                          \
@@ -585,24 +585,24 @@ struct usbd_class_api _api = {
                                                                                                    \
 	DEFINE_UVC_DESCRIPTOR(n);                                                                  \
                                                                                                    \
-	static struct usbd_class_data _class_data_##n = {                                          \
-		.desc = (struct usb_desc_header *)&_desc_##n,                                      \
+	static struct usbd_class_data uvc_class_data_##n = {                                       \
+		.desc = (struct usb_desc_header *)&uvc_desc_##n,                                   \
 		.priv = (void *)DEVICE_DT_GET(DT_DRV_INST(n)),                                     \
 	};                                                                                         \
                                                                                                    \
-	USBD_DEFINE_CLASS(uvc_##n, &_api, &_class_data_##n);                                       \
+	USBD_DEFINE_CLASS(uvc_##n, &uvc_api, &uvc_class_data_##n);                                 \
                                                                                                    \
 	struct uvc_payload_header uvc_payload_header_##n;                                          \
                                                                                                    \
 	const struct video_dt_spec video_dt_spec_##n[] = {                                         \
 		DT_INST_FOREACH_CHILD_STATUS_OKAY_SEP(n, REMOTE_DT_SPEC, (,))};                    \
                                                                                                    \
-	static struct uvc_data _data_##n = {                                                       \
+	static struct uvc_data uvc_data_##n = {                                                    \
 		.payload_header = &uvc_payload_header_##n,                                         \
 		.video_dt_spec = video_dt_spec_##n,                                                \
 		.num_of_inputs = ARRAY_SIZE(video_dt_spec_##n),                                    \
 	};                                                                                         \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &_data_##n, NULL, POST_KERNEL, 50, &_api);
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &uvc_data_##n, NULL, POST_KERNEL, 50, &uvc_api);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_UVC_DEVICE)

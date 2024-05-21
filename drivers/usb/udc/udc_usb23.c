@@ -175,11 +175,11 @@ int usb23_driver_preinit(const struct device *dev)
 #define USB23_EP_TRB_BUF_DEFINE(n)                                                                 \
 	static struct usb23_trb usb23_dma_trb_buf_##n[DT_PROP(n, num_trbs)];
 
-#define USB23_EP_NET_BUF_DEFINE(n)                                                                 \
-	static struct net_buf *usb23_net_buf_##n[DT_PROP(n, num_trbs)];
+#define USB23_EP_NET_BUF_DEFINE(n) static struct net_buf *usb23_net_buf_##n[DT_PROP(n, num_trbs)];
 
 #define USB23_EP_DATA_ENTRY(n)                                                                     \
 	{                                                                                          \
+		.is_usb_manager = DT_NODE_HAS_PROP(n, usb_manager),                                \
 		.num_of_trbs = DT_PROP(n, num_trbs),                                               \
 		.trb_buf = usb23_dma_trb_buf_##n,                                                  \
 		.net_buf = usb23_net_buf_##n,                                                      \
@@ -203,8 +203,8 @@ int usb23_driver_preinit(const struct device *dev)
 	union usb23_evt usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                               \
 	struct udc_ep_config usb23_ep_cfg_##n[DT_INST_PROP(n, num_bidir_endpoints) * 2];           \
                                                                                                    \
-	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_TRB_BUF_DEFINE);                    \
-	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_NET_BUF_DEFINE);                    \
+	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_TRB_BUF_DEFINE)                     \
+	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_NET_BUF_DEFINE)                     \
                                                                                                    \
 	static struct usb23_ep_data usb23_ep_data_##n[] = {                                        \
 		DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_DATA_ENTRY)};               \

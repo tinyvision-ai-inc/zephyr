@@ -14,3 +14,5 @@ child-binding:
     num-trbs:
       type: int
       required: true
+    usb-manager:
+      type: boolean
