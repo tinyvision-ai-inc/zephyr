@@ -17,6 +17,86 @@
 #include "udc_common.h"
 #include "udc_usb23.h"
 
+/*
+ * The real init function is triggered by the application with .
+ */
+static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *const ep_cfg,
+			    uint8_t addr, int mps)
+{
+	int ret;
+
+	LOG_DBG("%s: ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg,
+		ep_cfg->caps.control);
+
+	/* Generic properties for Zephyr */
+	ep_cfg->addr = addr;
+	if (ep_cfg->addr & USB_EP_DIR_IN) {
+		ep_cfg->caps.in = 1;
+	} else {
+		ep_cfg->caps.out = 1;
+	}
+	if (ep_cfg->addr == USB_CONTROL_EP_OUT || ep_cfg->addr == USB_CONTROL_EP_IN) {
+		LOG_DBG("%s: control", __func__);
+		ep_cfg->caps.control = 1;
+	} else {
+		LOG_DBG("%s: normal", __func__);
+		ep_cfg->caps.bulk = 1;
+		ep_cfg->caps.interrupt = 1;
+		ep_cfg->caps.iso = 1;
+	}
+	ep_cfg->caps.mps = mps;
+
+	ret = udc_register_ep(dev, ep_cfg);
+	if (err != 0) {
+		LOG_ERR("Failed to register endpoint");
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Initialize the controller and endpoints capabilities,
+ * register endpoint structures, no hardware I/O yet.
+ */
+int usb23_driver_preinit(const struct device *dev)
+{
+	const struct usb23_config *config = dev->config;
+	struct udc_data *data = dev->data;
+	struct usb23_data *priv = udc_get_private(dev);
+	uint16_t mps = 0;
+
+	k_mutex_init(&data->mutex);
+	k_work_init(&priv->work, &usb23_on_event);
+
+	data->caps.rwup = true;
+	switch (config->speed_idx) {
+	case USB23_SPEED_IDX_SUPER_SPEED:
+		data->caps.mps0 = UDC_MPS0_512;
+		data->caps.ss = true;
+		data->caps.hs = true;
+		mps = 1024;
+		break;
+	case USB23_SPEED_IDX_HIGH_SPEED:
+		data->caps.mps0 = UDC_MPS0_64;
+		data->caps.hs = true;
+		mps = 1024;
+		break;
+	case USB23_SPEED_IDX_FULL_SPEED:
+		data->caps.mps0 = UDC_MPS0_64; // TODO: adjust
+		mps = 64;                      // TODO: adjust
+		break;
+	default:
+		LOG_ERR("Not implemented");
+	}
+
+	for (int epn = 0; epn < config->num_of_eps; epn++) {
+		usb23_ep_preinit(dev, usb23_get_ep_cfg(dev, epn), usb23_get_ep_addr(epn), mps);
+	}
+
+	return 0;
+}
+
 static const struct udc_api usb23_api = {
 	.lock = usb23_api_lock,
 	.unlock = usb23_api_unlock,

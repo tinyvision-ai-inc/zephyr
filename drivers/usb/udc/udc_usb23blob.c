@@ -1343,8 +1343,7 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 		ctrl |= USB23_TRB_CTRL_IOC;
 		ctrl |= USB23_TRB_CTRL_HWO;
 	} else {
-		/* Mark the next TRB as being part of the same USB transfer
-		 */
+		/* Mark the next TRB as being part of the same USB transfer */
 		ctrl = USB23_TRB_CTRL_TRBCTL_NORMAL;
 		if (ep_cfg->caps.in) {
 			ctrl |= USB23_TRB_CTRL_CHN;
@@ -1360,9 +1359,9 @@ static int usb23_trb_bulk(const struct device *dev, struct udc_ep_config *const 
 }
 
 /*
- *  Events
+ * Events
  *
- *  Process the events from the event ring buffer. Interrupts gives us a
+ * Process the events from the event ring buffer. Interrupts gives us a
  * hint that an event is available, which we fetch from a ring buffer shared
  * with the hardware.
  */
@@ -1414,8 +1413,7 @@ static void usb23_on_soft_reset(const struct device *dev)
 
 	/* Letting GCTL unchanged */
 
-	/* Set the USB device configuration, including max supported speed
-	 */
+	/* Set the USB device configuration, including max supported speed */
 	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_PERFRINT_90);
 	switch (config->speed_idx) {
 	case USB23_SPEED_IDX_SUPER_SPEED:
@@ -1432,15 +1430,13 @@ static void usb23_on_soft_reset(const struct device *dev)
 	}
 	usb23_io_field(dev, USB23_DCFG, USB23_DCFG_NUMP_MASK, 15 << USB23_DCFG_NUMP_SHIFT);
 
-	/* Enable reception of USB events */
+	/* Enable reception of all USB events except USB23_DEVTEN_ULSTCNGEN */
 	usb23_io_write(dev, USB23_DEVTEN,
-		       0 | USB23_DEVTEN_INACTTIMEOUTRCVEDEN | USB23_DEVTEN_VNDRDEVTSTRCVEDEN |
+		       USB23_DEVTEN_INACTTIMEOUTRCVEDEN | USB23_DEVTEN_VNDRDEVTSTRCVEDEN |
 			       USB23_DEVTEN_EVNTOVERFLOWEN | USB23_DEVTEN_CMDCMPLTEN |
 			       USB23_DEVTEN_ERRTICERREN | USB23_DEVTEN_HIBERNATIONREQEVTEN |
-			       USB23_DEVTEN_WKUPEVTEN
-			       //	| USB23_DEVTEN_ULSTCNGEN
-			       | USB23_DEVTEN_CONNECTDONEEN | USB23_DEVTEN_USBRSTEN |
-			       USB23_DEVTEN_DISCONNEVTEN);
+			       USB23_DEVTEN_WKUPEVTEN | USB23_DEVTEN_CONNECTDONEEN |
+			       USB23_DEVTEN_USBRSTEN | USB23_DEVTEN_DISCONNEVTEN);
 
 	/* Configure endpoint 0 and 1 only for now */
 	usb23_depcmd_start_config(dev, udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT));
@@ -2225,91 +2221,4 @@ int usb23_api_init(const struct device *dev)
 	__ASSERT_NO_MSG(ret == 0);
 
 	return ret;
-}
-
-/*
- * Software Init
- *
- * Setup the default values and configure software variables and structs.
- * No effect on hardware.
- */
-
-/*
- * The real init function is triggered by the application with .
- */
-static int usb23_ep_preinit(const struct device *dev, struct udc_ep_config *const ep_cfg,
-			    uint8_t addr, int mps)
-{
-	int ret;
-
-	LOG_DBG("%s: ep=0x%02x ep=%p ctrl=%d", __func__, ep_cfg->addr, ep_cfg,
-		ep_cfg->caps.control);
-
-	/* Generic properties for Zephyr */
-	ep_cfg->addr = addr;
-	if (ep_cfg->addr & USB_EP_DIR_IN) {
-		ep_cfg->caps.in = 1;
-	} else {
-		ep_cfg->caps.out = 1;
-	}
-	if (ep_cfg->addr == USB_CONTROL_EP_OUT || ep_cfg->addr == USB_CONTROL_EP_IN) {
-		LOG_DBG("%s: control", __func__);
-		ep_cfg->caps.control = 1;
-	} else {
-		LOG_DBG("%s: normal", __func__);
-		ep_cfg->caps.bulk = 1;
-		ep_cfg->caps.interrupt = 1;
-		ep_cfg->caps.iso = 1;
-	}
-	ep_cfg->caps.mps = mps;
-
-	ret = udc_register_ep(dev, ep_cfg);
-	if (err != 0) {
-		LOG_ERR("Failed to register endpoint");
-		return ret;
-	}
-
-	return 0;
-}
-
-/*
- * Initialize the controller and endpoints capabilities,
- * register endpoint structures, no hardware I/O yet.
- */
-int usb23_driver_preinit(const struct device *dev)
-{
-	const struct usb23_config *config = dev->config;
-	struct udc_data *data = dev->data;
-	struct usb23_data *priv = udc_get_private(dev);
-	uint16_t mps = 0;
-
-	k_mutex_init(&data->mutex);
-	k_work_init(&priv->work, &usb23_on_event);
-
-	data->caps.rwup = true;
-	switch (config->speed_idx) {
-	case USB23_SPEED_IDX_SUPER_SPEED:
-		data->caps.mps0 = UDC_MPS0_512;
-		data->caps.ss = true;
-		data->caps.hs = true;
-		mps = 1024;
-		break;
-	case USB23_SPEED_IDX_HIGH_SPEED:
-		data->caps.mps0 = UDC_MPS0_64;
-		data->caps.hs = true;
-		mps = 1024;
-		break;
-	case USB23_SPEED_IDX_FULL_SPEED:
-		data->caps.mps0 = UDC_MPS0_64; // TODO: adjust
-		mps = 64;                      // TODO: adjust
-		break;
-	default:
-		LOG_ERR("Not implemented");
-	}
-
-	for (int epn = 0; epn < config->num_of_eps; epn++) {
-		usb23_ep_preinit(dev, usb23_get_ep_cfg(dev, epn), usb23_get_ep_addr(epn), mps);
-	}
-
-	return 0;
 }
