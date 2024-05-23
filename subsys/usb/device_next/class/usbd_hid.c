@@ -413,10 +413,9 @@ static void usbd_hid_enable(struct usbd_class_node *const c_nd)
 	const struct hid_device_ops *const ops = ddata->ops;
 	struct usbd_hid_descriptor *const desc = ddata->desc;
 
-	LOG_DBG("%s %p", __func__, c_nd);
 	atomic_set_bit(&ddata->state, HID_DEV_CLASS_ENABLED);
 	ddata->protocol = HID_PROTOCOL_REPORT;
-	if (ops->iface_ready) {
+	if (ops->iface_ready && -1 != ops->iface_ready) {
 		ops->iface_ready(dev, true);
 	}
 
