@@ -1,0 +1,11 @@
+board:
+  name: tinyclunx33
+  vendor: tinyvision
+  revision:
+    format: number
+    default: "2"
+    revisions:
+      - name: "2"
+      - name: "3"
+  socs:
+  - name: litex_vexriscv

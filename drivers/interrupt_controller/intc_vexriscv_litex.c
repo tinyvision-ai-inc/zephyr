@@ -26,6 +26,8 @@
 
 #define GPIO_IRQ		DT_IRQN(DT_NODELABEL(gpio_in))
 
+#define UDC0_IRQ		DT_IRQN(DT_NODELABEL(zephyr_udc0))
+
 static inline void vexriscv_litex_irq_setmask(uint32_t mask)
 {
 	__asm__ volatile ("csrw %0, %1" :: "i"(IRQ_MASK), "r"(mask));
@@ -103,6 +105,13 @@ static void vexriscv_litex_irq_handler(const void *device)
 		ite = &_sw_isr_table[GPIO_IRQ];
 		ite->isr(ite->arg);
 	}
+
+#ifdef CONFIG_UDC_USB23
+	if (irqs & (1 << UDC0_IRQ)) {
+		ite = &_sw_isr_table[UDC0_IRQ];
+		ite->isr(ite->arg);
+	}
+#endif
 }
 
 void arch_irq_enable(unsigned int irq)
