@@ -208,20 +208,31 @@ usbd_class_get_by_req(struct usbd_context *const uds_ctx,
 static struct usbd_class_node *
 usbd_class_node_get(const char *name, const enum usbd_speed speed)
 {
-	if (speed == USBD_SPEED_FS) {
+	switch (speed) {
+	case USBD_SPEED_FS:
 		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs,
 						 usbd_class_node, c_nd) {
 			if (strcmp(name, c_nd->c_data->name) == 0) {
 				return c_nd;
 			}
 		}
-	} else if (speed == USBD_SPEED_HS) {
+		break;
+	case USBD_SPEED_HS:
 		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs,
 						 usbd_class_node, c_nd) {
 			if (strcmp(name, c_nd->c_data->name) == 0) {
 				return c_nd;
 			}
 		}
+		break;
+	case USBD_SPEED_SS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss,
+						 usbd_class_node, c_nd) {
+			if (strcmp(name, c_nd->c_data->name) == 0) {
+				return c_nd;
+			}
+		}
+		break;
 	}
 
 	LOG_ERR("USB device class %s not found", name);
@@ -345,21 +356,8 @@ int usbd_register_all_classes(struct usbd_context *const uds_ctx,
 {
 	int ret;
 
-	if (speed == USBD_SPEED_HS) {
-		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, c_nd) {
-			ret = usbd_register_class(uds_ctx, c_nd->c_data->name,
-						  speed, cfg);
-			if (ret) {
-				LOG_ERR("Failed to register %s to HS configuration %u",
-					c_nd->c_data->name, cfg);
-				return ret;
-			}
-		}
-
-		return 0;
-	}
-
-	if (speed == USBD_SPEED_FS) {
+	switch (speed) {
+	case USBD_SPEED_FS:
 		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs, usbd_class_node, c_nd) {
 			ret = usbd_register_class(uds_ctx, c_nd->c_data->name,
 						  speed, cfg);
@@ -369,10 +367,30 @@ int usbd_register_all_classes(struct usbd_context *const uds_ctx,
 				return ret;
 			}
 		}
-
+		return 0;
+	case USBD_SPEED_HS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, c_nd) {
+			ret = usbd_register_class(uds_ctx, c_nd->c_data->name,
+						  speed, cfg);
+			if (ret) {
+				LOG_ERR("Failed to register %s to HS configuration %u",
+					c_nd->c_data->name, cfg);
+				return ret;
+			}
+		}
+		return 0;
+	case USBD_SPEED_SS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss, usbd_class_node, c_nd) {
+			ret = usbd_register_class(uds_ctx, c_nd->c_data->name,
+						  speed, cfg);
+			if (ret) {
+				LOG_ERR("Failed to register %s to SS configuration %u",
+					c_nd->c_data->name, cfg);
+				return ret;
+			}
+		}
 		return 0;
 	}
-
 	return -ENOTSUP;
 }
 
@@ -409,24 +427,55 @@ int usbd_unregister_class(struct usbd_context *const uds_ctx,
 	/* TODO: The use of atomic here does not make this code thread safe.
 	 * The atomic should be changed to something else.
 	 */
-	if (speed == USBD_SPEED_HS) {
-		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs,
-						 usbd_class_node, i) {
+	switch (speed) {
+	case USBD_SPEED_FS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, i) {
 			if ((i->c_data == c_nd->c_data) &&
 			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
 				can_release_data = false;
 				break;
 			}
 		}
-	} else {
-		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs,
-						 usbd_class_node, i) {
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss, usbd_class_node, i) {
 			if ((i->c_data == c_nd->c_data) &&
 			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
 				can_release_data = false;
 				break;
 			}
 		}
+		break;
+	case USBD_SPEED_HS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs, usbd_class_node, i) {
+			if ((i->c_data == c_nd->c_data) &&
+			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
+				can_release_data = false;
+				break;
+			}
+		}
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss, usbd_class_node, i) {
+			if ((i->c_data == c_nd->c_data) &&
+			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
+				can_release_data = false;
+				break;
+			}
+		}
+		break;
+	case USBD_SPEED_SS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs, usbd_class_node, i) {
+			if ((i->c_data == c_nd->c_data) &&
+			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
+				can_release_data = false;
+				break;
+			}
+		}
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, i) {
+			if ((i->c_data == c_nd->c_data) &&
+			    atomic_test_bit(&i->state, USBD_CCTX_REGISTERED)) {
+				can_release_data = false;
+				break;
+			}
+		}
+		break;
 	}
 
 	ret = usbd_class_remove(uds_ctx, c_nd, speed, cfg);
@@ -449,21 +498,8 @@ int usbd_unregister_all_classes(struct usbd_context *const uds_ctx,
 {
 	int ret;
 
-	if (speed == USBD_SPEED_HS) {
-		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, c_nd) {
-			ret = usbd_unregister_class(uds_ctx, c_nd->c_data->name,
-						    speed, cfg);
-			if (ret) {
-				LOG_ERR("Failed to unregister %s to HS configuration %u",
-					c_nd->c_data->name, cfg);
-				return ret;
-			}
-		}
-
-		return 0;
-	}
-
-	if (speed == USBD_SPEED_FS) {
+	switch (speed) {
+	case USBD_SPEED_FS:
 		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_fs, usbd_class_node, c_nd) {
 			ret = usbd_unregister_class(uds_ctx, c_nd->c_data->name,
 						    speed, cfg);
@@ -473,7 +509,28 @@ int usbd_unregister_all_classes(struct usbd_context *const uds_ctx,
 				return ret;
 			}
 		}
-
+		return 0;
+	case USBD_SPEED_HS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_hs, usbd_class_node, c_nd) {
+			ret = usbd_unregister_class(uds_ctx, c_nd->c_data->name,
+						    speed, cfg);
+			if (ret) {
+				LOG_ERR("Failed to unregister %s to HS configuration %u",
+					c_nd->c_data->name, cfg);
+				return ret;
+			}
+		}
+		return 0;
+	case USBD_SPEED_SS:
+		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss, usbd_class_node, c_nd) {
+			ret = usbd_unregister_class(uds_ctx, c_nd->c_data->name,
+						    speed, cfg);
+			if (ret) {
+				LOG_ERR("Failed to unregister %s to SS configuration %u",
+					c_nd->c_data->name, cfg);
+				return ret;
+			}
+		}
 		return 0;
 	}
 

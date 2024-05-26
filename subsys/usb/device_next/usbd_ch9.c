@@ -358,6 +358,32 @@ static int sreq_set_feature(struct usbd_context *const uds_ctx)
 	return ret;
 }
 
+static int sreq_set_sel(struct usbd_context *const uds_ctx, struct net_buf *const buf)
+{
+	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+	struct udc_exit_latency el;
+
+	if (setup->wValue != 0 || setup->wIndex != 0 || setup->wLength != 6) {
+		LOG_ERR("invalid command parameters");
+		errno = -ENOTSUP;
+		return 0;
+	}
+
+	if (buf->len != setup->wLength) {
+		LOG_ERR("actual buffer length %d mis-matching wLength %d", buf->len,
+			setup->wLength);
+		errno = -ENOTSUP;
+		return 0;
+	}
+
+	memcpy(&el, buf->data, sizeof(el));
+	el.u2sel = sys_le16_to_cpu(el.u2sel);
+	el.u2pel = sys_le16_to_cpu(el.u2pel);
+
+	errno = udc_set_exit_latency(uds_ctx->dev, &el);
+	return 0;
+}
+
 static int std_request_to_device(struct usbd_context *const uds_ctx,
 				 struct net_buf *const buf)
 {
@@ -379,6 +405,9 @@ static int std_request_to_device(struct usbd_context *const uds_ctx,
 		break;
 	case USB_SREQ_SET_FEATURE:
 		ret = sreq_set_feature(uds_ctx);
+		break;
+	case USB_SREQ_SET_SEL:
+		ret = sreq_set_sel(uds_ctx, buf);
 		break;
 	default:
 		errno = -ENOTSUP;
@@ -617,6 +646,9 @@ static int sreq_get_desc_dev(struct usbd_context *const uds_ctx,
 	case USBD_SPEED_HS:
 		head = uds_ctx->hs_desc;
 		break;
+	case USBD_SPEED_SS:
+		head = uds_ctx->ss_desc;
+		break;
 	default:
 		errno = -ENOTSUP;
 		return 0;
@@ -664,30 +696,35 @@ static int sreq_get_dev_qualifier(struct usbd_context *const uds_ctx,
 {
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	/* At Full-Speed we want High-Speed descriptor and vice versa */
-	struct usb_device_descriptor *d_desc =
-		usbd_bus_speed(uds_ctx) == USBD_SPEED_FS ?
-		uds_ctx->hs_desc : uds_ctx->fs_desc;
+	struct usb_device_descriptor *d_desc;
 	struct usb_device_qualifier_descriptor q_desc = {
 		.bLength = sizeof(struct usb_device_qualifier_descriptor),
 		.bDescriptorType = USB_DESC_DEVICE_QUALIFIER,
-		.bcdUSB = d_desc->bcdUSB,
-		.bDeviceClass = d_desc->bDeviceClass,
-		.bDeviceSubClass = d_desc->bDeviceSubClass,
-		.bDeviceProtocol = d_desc->bDeviceProtocol,
-		.bMaxPacketSize0 = d_desc->bMaxPacketSize0,
-		.bNumConfigurations = d_desc->bNumConfigurations,
 		.bReserved = 0U,
 	};
 	size_t len;
 
-	/*
-	 * If the Device Qualifier descriptor is requested and the controller
-	 * does not support high speed, respond with an error.
-	 */
-	if (usbd_caps_speed(uds_ctx) != USBD_SPEED_HS) {
+	switch (usbd_bus_speed(uds_ctx)) {
+	case USBD_SPEED_SS:
+		d_desc = uds_ctx->ss_desc;
+		break;
+	case USBD_SPEED_HS:
+		d_desc = uds_ctx->hs_desc;
+		break;
+	default:
+		/*
+		 * If the Device Qualifier descriptor is requested and the controller
+		 * does not support super/high speed, respond with an error.
+		 */
 		errno = -ENOTSUP;
 		return 0;
 	}
+	q_desc.bcdUSB = d_desc->bcdUSB;
+	q_desc.bDeviceClass = d_desc->bDeviceClass;
+	q_desc.bDeviceSubClass = d_desc->bDeviceSubClass;
+	q_desc.bDeviceProtocol = d_desc->bDeviceProtocol;
+	q_desc.bMaxPacketSize0 = d_desc->bMaxPacketSize0;
+	q_desc.bNumConfigurations = d_desc->bNumConfigurations;
 
 	LOG_DBG("Get Device Qualifier");
 	len = MIN(setup->wLength, net_buf_tailroom(buf));
@@ -729,6 +766,9 @@ static int sreq_get_desc_bos(struct usbd_context *const uds_ctx,
 		break;
 	case USBD_SPEED_HS:
 		dev_dsc = uds_ctx->hs_desc;
+		break;
+	case USBD_SPEED_SS:
+		dev_dsc = uds_ctx->ss_desc;
 		break;
 	default:
 		errno = -ENOTSUP;

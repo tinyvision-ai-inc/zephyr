@@ -24,6 +24,8 @@ static sys_slist_t *usbd_configs(struct usbd_context *uds_ctx,
 		return &uds_ctx->fs_configs;
 	case USBD_SPEED_HS:
 		return &uds_ctx->hs_configs;
+	case USBD_SPEED_SS:
+		return &uds_ctx->ss_configs;
 	default:
 		return NULL;
 	}
@@ -266,11 +268,24 @@ int usbd_add_configuration(struct usbd_context *const uds_ctx,
 		goto add_configuration_exit;
 	}
 
-	if (speed == USBD_SPEED_HS &&
-	    usbd_caps_speed(uds_ctx) == USBD_SPEED_FS) {
-		LOG_ERR("Controller doesn't support HS");
-		ret = -ENOTSUP;
-		goto add_configuration_exit;
+	switch (speed) {
+	case USBD_SPEED_FS:
+		/* Assume Full Speed is always supported */
+		break;
+	case USBD_SPEED_HS:
+		if (usbd_caps_speed(uds_ctx) < USBD_SPEED_HS) {
+			LOG_ERR("Controller doesn't support HS");
+			ret = -ENOTSUP;
+			goto add_configuration_exit;
+		}
+		break;
+	case USBD_SPEED_SS:
+		if (usbd_caps_speed(uds_ctx) < USBD_SPEED_SS) {
+			LOG_ERR("Controller doesn't support SS");
+			ret = -ENOTSUP;
+			goto add_configuration_exit;
+		}
+		break;
 	}
 
 	if (desc->bmAttributes & USB_SCD_REMOTE_WAKEUP) {
@@ -285,10 +300,19 @@ int usbd_add_configuration(struct usbd_context *const uds_ctx,
 
 	configs = usbd_configs(uds_ctx, speed);
 	switch (speed) {
+	case USBD_SPEED_SS:
+		SYS_SLIST_FOR_EACH_NODE(&uds_ctx->ss_configs, node) {
+			if (node == &cfg_nd->node) {
+				LOG_ERR("SS config already on FS or HS list");
+				ret = -EINVAL;
+				goto add_configuration_exit;
+			}
+		}
+		break;
 	case USBD_SPEED_HS:
 		SYS_SLIST_FOR_EACH_NODE(&uds_ctx->fs_configs, node) {
 			if (node == &cfg_nd->node) {
-				LOG_ERR("HS config already on FS list");
+				LOG_ERR("HS config already on SS or FS list");
 				ret = -EINVAL;
 				goto add_configuration_exit;
 			}
@@ -297,7 +321,7 @@ int usbd_add_configuration(struct usbd_context *const uds_ctx,
 	case USBD_SPEED_FS:
 		SYS_SLIST_FOR_EACH_NODE(&uds_ctx->hs_configs, node) {
 			if (node == &cfg_nd->node) {
-				LOG_ERR("FS config already on HS list");
+				LOG_ERR("FS config already on SS or HS list");
 				ret = -EINVAL;
 				goto add_configuration_exit;
 			}

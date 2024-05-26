@@ -23,14 +23,17 @@ static inline uint8_t usbd_get_num_configs(const struct usbd_context *const uds_
 {
 	struct usb_device_descriptor *desc;
 
-	if (speed == USBD_SPEED_FS) {
-		desc = uds_ctx->fs_desc;
-	} else if (speed == USBD_SPEED_HS) {
+	switch (speed) {
+	case USBD_SPEED_SS:
+		desc = uds_ctx->ss_desc;
+		break;
+	case USBD_SPEED_HS:
 		desc = uds_ctx->hs_desc;
-	} else {
-		return 0;
+		break;
+	default:
+		desc = uds_ctx->fs_desc;
+		break;
 	}
-
 	return desc->bNumConfigurations;
 }
 
@@ -48,14 +51,17 @@ static inline void usbd_set_num_configs(struct usbd_context *const uds_ctx,
 {
 	struct usb_device_descriptor *desc;
 
-	if (speed == USBD_SPEED_FS) {
-		desc = uds_ctx->fs_desc;
-	} else if (speed == USBD_SPEED_HS) {
+	switch (speed) {
+	case USBD_SPEED_SS:
+		desc = uds_ctx->ss_desc;
+		break;
+	case USBD_SPEED_HS:
 		desc = uds_ctx->hs_desc;
-	} else {
-		return;
+		break;
+	default:
+		desc = uds_ctx->fs_desc;
+		break;
 	}
-
 	desc->bNumConfigurations = value;
 }
 

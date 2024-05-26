@@ -29,11 +29,12 @@ enum usbd_speed usbd_caps_speed(const struct usbd_context *const uds_ctx)
 {
 	struct udc_device_caps caps = udc_caps(uds_ctx->dev);
 
-	/* For now, either high speed is supported or not. */
+	if (caps.ss) {
+		return USBD_SPEED_SS;
+	}
 	if (caps.hs) {
 		return USBD_SPEED_HS;
 	}
-
 	return USBD_SPEED_FS;
 }
 
@@ -46,6 +47,8 @@ get_device_descriptor(struct usbd_context *const uds_ctx,
 		return uds_ctx->fs_desc;
 	case USBD_SPEED_HS:
 		return uds_ctx->hs_desc;
+	case USBD_SPEED_SS:
+		return uds_ctx->ss_desc;
 	default:
 		__ASSERT(false, "Not supported speed");
 		return NULL;
@@ -76,7 +79,7 @@ set_bcd_exit:
 int usbd_device_set_vid(struct usbd_context *const uds_ctx,
 			 const uint16_t vid)
 {
-	struct usb_device_descriptor *fs_desc, *hs_desc;
+	struct usb_device_descriptor *fs_desc, *hs_desc, *ss_desc;
 	int ret = 0;
 
 	usbd_device_lock(uds_ctx);
@@ -92,6 +95,9 @@ int usbd_device_set_vid(struct usbd_context *const uds_ctx,
 	hs_desc = get_device_descriptor(uds_ctx, USBD_SPEED_HS);
 	hs_desc->idVendor = sys_cpu_to_le16(vid);
 
+	ss_desc = get_device_descriptor(uds_ctx, USBD_SPEED_SS);
+	ss_desc->idVendor = sys_cpu_to_le16(vid);
+
 set_vid_exit:
 	usbd_device_unlock(uds_ctx);
 	return ret;
@@ -100,7 +106,7 @@ set_vid_exit:
 int usbd_device_set_pid(struct usbd_context *const uds_ctx,
 			 const uint16_t pid)
 {
-	struct usb_device_descriptor *fs_desc, *hs_desc;
+	struct usb_device_descriptor *fs_desc, *hs_desc, *ss_desc;
 	int ret = 0;
 
 	usbd_device_lock(uds_ctx);
@@ -115,6 +121,9 @@ int usbd_device_set_pid(struct usbd_context *const uds_ctx,
 
 	hs_desc = get_device_descriptor(uds_ctx, USBD_SPEED_HS);
 	hs_desc->idProduct = sys_cpu_to_le16(pid);
+
+	ss_desc = get_device_descriptor(uds_ctx, USBD_SPEED_SS);
+	ss_desc->idProduct = sys_cpu_to_le16(pid);
 
 set_pid_exit:
 	usbd_device_unlock(uds_ctx);
