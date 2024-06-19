@@ -32,9 +32,9 @@
 #endif
 LOG_MODULE_REGISTER(usbd_cdc_acm, CONFIG_USBD_CDC_ACM_LOG_LEVEL);
 
-NET_BUF_POOL_FIXED_DEFINE(cdc_acm_ep_pool,
-			  DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
-			  512, sizeof(struct udc_buf_info), NULL);
+NET_BUF_POOL_VAR_DEFINE(cdc_acm_ep_pool,
+			DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 4,
+			1024 * 4, sizeof(struct udc_buf_info), NULL);
 
 #define CDC_ACM_DEFAULT_LINECODING	{sys_cpu_to_le32(115200), 0, 0, 8}
 #define CDC_ACM_DEFAULT_INT_EP_MPS	16
@@ -128,7 +128,7 @@ struct net_buf *cdc_acm_buf_alloc(const uint8_t ep)
 	struct net_buf *buf = NULL;
 	struct udc_buf_info *bi;
 
-	buf = net_buf_alloc(&cdc_acm_ep_pool, K_NO_WAIT);
+	buf = net_buf_alloc_len(&cdc_acm_ep_pool, 1024, K_NO_WAIT);
 	if (!buf) {
 		return NULL;
 	}
@@ -136,6 +136,7 @@ struct net_buf *cdc_acm_buf_alloc(const uint8_t ep)
 	bi = udc_get_buf_info(buf);
 	memset(bi, 0, sizeof(struct udc_buf_info));
 	bi->ep = ep;
+	bi->zlp = USB_EP_DIR_IS_IN(ep);
 
 	return buf;
 }
