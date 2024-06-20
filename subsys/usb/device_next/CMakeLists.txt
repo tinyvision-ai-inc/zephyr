@@ -32,6 +32,11 @@ zephyr_library_sources_ifdef(
 	class/usbd_cdc_acm.c
 )
 
+zephyr_library_sources_ifdef(
+	CONFIG_USBD_CDC_RAW_CLASS
+	class/usbd_cdc_raw.c
+)
+
 zephyr_include_directories_ifdef(
 	CONFIG_USBD_CDC_ECM_CLASS
 	${ZEPHYR_BASE}/drivers/ethernet
