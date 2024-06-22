@@ -1,0 +1,18 @@
+# Copyright (c) 2024 tinyVision.ai
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config USBD_VIDEO_CLASS
+	bool "USB Video Class implementation [EXPERIMENTAL]"
+	depends on DT_HAS_ZEPHYR_UVC_ENABLED
+	help
+	  USB Device Video Class (UVC) implementation.
+
+if USBD_VIDEO_CLASS
+
+module = USBD_UVC
+module-str = usbd uvc
+default-count = 1
+source "subsys/logging/Kconfig.template.log_config"
+
+endif

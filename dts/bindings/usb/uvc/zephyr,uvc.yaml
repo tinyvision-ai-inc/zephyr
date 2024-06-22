@@ -4,3 +4,8 @@
 description: Common fields for the USB Video Class (UVC)
 compatible: "zephyr,uvc"
 on-bus: usb
+
+properties:
+  source:
+    type: phandle
+    required: true

@@ -32,8 +32,12 @@ LOG_MODULE_REGISTER(cdc_raw, CONFIG_USBD_CDC_RAW_LOG_LEVEL);
 #define CDC_ACM_INT_EP_MPS		64
 #define CDC_ACM_INT_INTERVAL		0x0A
 
+/** Data Terminal Ready flag */
+#define CDC_RAW_FLAG                    BIT(0)
+
 struct cdc_acm_desc {
 	struct usb_association_descriptor iad;
+
 	struct usb_if_descriptor if0;
 	struct cdc_header_descriptor if0_header;
 	struct cdc_cm_descriptor if0_cm;
