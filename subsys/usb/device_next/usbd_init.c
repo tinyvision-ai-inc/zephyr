@@ -31,6 +31,8 @@ static int assign_ep_addr(const struct device *dev,
 		uint16_t mps = ed->wMaxPacketSize;
 		uint8_t ep;
 
+		LOG_DBG("%s: %u", __func__, idx);
+
 		if (USB_EP_DIR_IS_IN(ed->bEndpointAddress)) {
 			ep = USB_EP_DIR_IN | idx;
 		} else {
@@ -123,6 +125,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 
 	LOG_DBG("Initializing configuration for %u speed", speed);
 	dhp = usbd_class_get_desc(c_nd->c_data, speed);
+	LOG_DBG("Initializing configuration for %u speed done", speed);
 	if (dhp == NULL) {
 		return 0;
 	}
@@ -131,7 +134,12 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 	c_nd->iface_bm = 0U;
 	c_nd->ep_active = 0U;
 
+	LOG_DBG("dhp=%p bLength=%u", *dhp, (*dhp)->bLength);
+
 	while (*dhp != NULL && (*dhp)->bLength != 0) {
+
+		LOG_DBG("bDescriptorType=%u USB_DESC_ENDPOINT=%u USB_DESC_INTERFACE=%u",
+			(*dhp)->bDescriptorType, USB_DESC_ENDPOINT, USB_DESC_INTERFACE);
 
 		if ((*dhp)->bDescriptorType == USB_DESC_INTERFACE) {
 			ifd = (struct usb_if_descriptor *)(*dhp);
@@ -142,6 +150,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 				ifd->bInterfaceNumber = tmp_nif;
 				c_nd->iface_bm |= BIT(tmp_nif);
 				tmp_nif++;
+				LOG_DBG("bAlternateSetting=0");
 			} else {
 				ifd->bInterfaceNumber = tmp_nif - 1;
 				/*
@@ -151,6 +160,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 				 * interfaces are ascending.
 				 */
 				unassign_eps(uds_ctx, config_ep_bm, &class_ep_bm);
+				LOG_DBG("unassing eps");
 			}
 
 			class_ep_bm = 0;
@@ -163,6 +173,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 			ret = assign_ep_addr(uds_ctx->dev, ed,
 					     config_ep_bm, &class_ep_bm);
 			if (ret) {
+				LOG_DBG("assing_ep-addr_error");
 				return ret;
 			}
 
@@ -174,6 +185,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 	}
 
 	if (tmp_nif <= *nif) {
+		LOG_DBG("tmp_nif=%u <= *nif=%u", tmp_nif, *nif);
 		return -EINVAL;
 	}
 

@@ -63,7 +63,7 @@ struct uvc_data {
 	const struct usb_desc_header **const hs_desc;
 	const struct usb_desc_header **const ss_desc;
 	/* Current and default values for the probe-commit controls */
-	struct uvc_vs_probe_control default_probe;
+	struct uvc_vs_probe_control default_probe __attribute__((aligned(4)));
 	/* Current selected format out of the Frame and Format descriptors */
 	uint8_t format_index;
 	uint8_t frame_index;
@@ -214,7 +214,9 @@ static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t 
 		*val = 1;
 		break;
 	case UVC_SET_CUR:
-		LOG_WRN("dwMaxVideoFrameSize is read-only");
+		if (*val > 0) {
+			LOG_WRN("dwMaxVideoFrameSize is read-only");
+		}
 		break;
 	}
 }
@@ -235,7 +237,9 @@ static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequ
 		*val = 1;
 		break;
 	case UVC_SET_CUR:
-		LOG_WRN("dwClockFrequency is read-only");
+		if (*val > 0) {
+			LOG_WRN("dwClockFrequency is read-only");
+		}
 		break;
 	}
 }
@@ -310,6 +314,8 @@ static void uvc_probe_layout_per_stream(struct uvc_data *const data, uint8_t bRe
 static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		     struct uvc_vs_probe_control *probe)
 {
+	uint32_t dw;
+
 	switch (bRequest) {
 	case UVC_GET_DEF:
 		memcpy(probe, &data->default_probe, sizeof(*probe));
@@ -328,9 +334,21 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		uvc_probe_comp_quality(data, bRequest, &probe->wCompQuality);
 		uvc_probe_comp_window_size(data, bRequest, &probe->wCompWindowSize);
 		uvc_probe_delay(data, bRequest, &probe->wDelay);
-		uvc_probe_max_video_frame_size(data, bRequest, &probe->dwMaxVideoFrameSize);
-		uvc_probe_max_payload_size(data, bRequest, &probe->dwMaxPayloadTransferSize);
-		uvc_probe_clock_frequency(data, bRequest, &probe->dwClockFrequency);
+
+		/* For alignment reasons, this needs to be done differently */
+
+		dw = probe->dwMaxVideoFrameSize;
+		uvc_probe_max_video_frame_size(data, bRequest, &dw);
+		probe->dwMaxVideoFrameSize = dw;
+
+		dw = probe->dwMaxPayloadTransferSize;
+		uvc_probe_max_payload_size(data, bRequest, &dw);
+		probe->dwMaxPayloadTransferSize = dw;
+
+		dw = probe->dwClockFrequency;
+		uvc_probe_clock_frequency(data, bRequest, &dw);
+		probe->dwClockFrequency = dw;
+
 		uvc_probe_framing_info(data, bRequest, &probe->bmFramingInfo);
 		uvc_probe_preferred_version(data, bRequest, &probe->bPreferedVersion);
 		uvc_probe_min_version(data, bRequest, &probe->bMinVersion);
@@ -373,21 +391,24 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		fmt.pitch = 0;
 		ret = video_set_format(vdev, VIDEO_EP_IN, &fmt);
 		if (ret < 0) {
-			LOG_WRN("unable to set video format: %d", ret);
-			return ret;
+			LOG_WRN("unable to set video format (err %d)", ret);
+			errno = ret;
+			return 0;
 		}
 
 		uvc_start_transfer(data);
 		break;
 	default:
 		LOG_ERR("invalid bRequest (%u)", bRequest);
-		return -EINVAL;
+		errno = -EINVAL;
+		return 0;
 	}
 	return 0;
 }
 
 static int uvc_probe_or_commit(struct uvc_data *const data,
-			       const struct usb_setup_packet *const setup, struct net_buf *const buf)
+			       const struct usb_setup_packet *const setup,
+			       struct net_buf *const buf)
 {
 	struct uvc_vs_probe_control probe = {0};
 
@@ -411,18 +432,21 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 	case UVC_SET_CUR:
 		if (buf->len != sizeof(probe)) {
 			LOG_ERR("Invalid wLength=%u for Probe or Commit", setup->wLength);
-			return -EINVAL;
+			errno = -EINVAL;
+			return 0;
 		}
 		break;
 	default:
 		LOG_ERR("Invalid bRequest (%d) for Probe or Commit", setup->bRequest);
-		return -EINVAL;
+		errno = -EINVAL;
+		return 0;
 	}
 
 	/* All remaining request work on a struct uvc_vs_probe_control */
 	if (setup->wLength != sizeof(probe)) {
 		LOG_ERR("Invalid wLength=%u for Probe or Commit", setup->wLength);
-		return -EINVAL;
+		errno = -EINVAL;
+		return 0;
 	}
 
 	switch (setup->wValue >> 8) {
@@ -435,24 +459,32 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 	}
 }
 
-/**
- * @brief Control To Host (CTH) requests.
- * The USB Device stack calls this function when the host issues a Control Read request.
- * This function fills the net_buf pointer with the data answered back in return.
- */
-static int uvc_control(struct usbd_class_data *const c_data,
-		       const struct usb_setup_packet *const setup, struct net_buf *const buf)
+static int uvc_control(struct uvc_data *data, const struct usb_setup_packet *const setup,
+		       struct net_buf *const buf)
 {
-	struct uvc_data *data = usbd_class_get_private(c_data);
-
 	switch (setup->wValue >> 8) {
 	case UVC_VS_PROBE_CONTROL:
 	case UVC_VS_COMMIT_CONTROL:
 		return uvc_probe_or_commit(data, setup, buf);
 	default:
 		LOG_WRN("unsupported wValue (%u)", setup->wValue);
-		return -ENOTSUP;
+		errno = -ENOTSUP;
+		return 0;
 	}
+}
+
+static int uvc_control_to_host(struct usbd_class_data *const c_data,
+			       const struct usb_setup_packet *const setup,
+			       struct net_buf *const buf)
+{
+	return uvc_control(usbd_class_get_private(c_data), setup, buf);
+}
+
+static int uvc_control_to_dev(struct usbd_class_data *const c_data,
+			      const struct usb_setup_packet *const setup,
+			      const struct net_buf *const buf)
+{
+	return uvc_control(usbd_class_get_private(c_data), setup, (struct net_buf *const)buf);
 }
 
 static int uvc_usb_enqueue(struct uvc_data *data, void *buf_data, size_t buf_size,
@@ -541,13 +573,12 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	struct uvc_data *data = usbd_class_get_private(c_data);
 	uint8_t ep_addr = udc_get_buf_info(buf)->ep;
 
-	LOG_DBG("buf=%p data=%p size=%u len=%u err=%u", buf, buf->data, buf->size, buf->len, err);
 	net_buf_unref(buf);
 	__ASSERT_NO_MSG(ep_addr == uvc_get_bulk_in(data));
 	return err;
 }
 
-static void uvc_update(struct uvc_data *const data, uint8_t iface, uint8_t alternate)
+static void uvc_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
 {
 	LOG_DBG("UVC Update");
 }
@@ -556,6 +587,8 @@ static int uvc_init(struct usbd_class_data *const c_data)
 {
 	struct uvc_data *data = usbd_class_get_private(c_data);
 	struct uvc_desc *desc = data->desc;
+
+	LOG_INF("Initializing UVC class");
 
 	/* Prepare the payload header fields that are constant over time */
 	data->payload_header->bHeaderLength = sizeof(struct uvc_payload_header);
@@ -589,18 +622,14 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 struct usbd_class_api uvc_api = {
 	.request = uvc_request,
 	.update = uvc_update,
-	.control_to_host = uvc_control,
-	.control_to_dev = uvc_control,
+	.control_to_host = uvc_control_to_host,
+	.control_to_dev = uvc_control_to_dev,
 	.init = uvc_init,
 	.get_desc = uvc_get_desc,
 };
 
-static int uvc_preinit(const struct device *dev)
-{
-	return 0;
-}
-
 #define DEFINE_UVC_DESCRIPTOR(n)                                                                   \
+                                                                                                   \
 	static struct uvc_desc uvc_desc_##n = {                                                    \
 		.iad =                                                                             \
 			{                                                                          \
@@ -825,8 +854,7 @@ static int uvc_preinit(const struct device *dev)
 		.video_dev = DEVICE_DT_GET(DT_PHANDLE(DT_DRV_INST(n), source)),                    \
 	};                                                                                         \
                                                                                                    \
-	USBD_DEFINE_CLASS(uvc_##n, &uvc_api, (void *)DEVICE_DT_GET(DT_DRV_INST(n)), NULL);         \
-                                                                                                   \
-	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL, 50, &uvc_api);
+	USBD_DEFINE_CLASS(uvc_##n, &uvc_api, &uvc_data_##n, NULL);                                 \
+	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &uvc_data_##n, NULL, POST_KERNEL, 50, &uvc_api);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_UVC_DEVICE)
