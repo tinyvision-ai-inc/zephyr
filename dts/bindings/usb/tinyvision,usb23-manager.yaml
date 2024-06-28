@@ -1,0 +1,13 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+    USB Manager to control a device endpoint of Lattice USB23
+
+compatible: "tinyvision,usb23-manager"
+
+include: base.yaml
+
+properties:
+  reg:
+    required: true
