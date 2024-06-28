@@ -10,17 +10,39 @@
 / {
 	chosen {
 		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
 		zephyr,console = &uart0;
 		zephyr,shell-uart = &uart0;
-		zephyr,sram = &ram0;
 		lattice,usb23-dma = &ram1;
 	};
 
 	soc {
-		flash0: flash@20100000 {
-			reg = <0x20100000 0x100000>;
+		flash0: flash@20000000 {
 			compatible = "soc-nv-flash";
+
+			reg = <0x20000000 0x100000>;
 			status = "okay";
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_partition: partition@0 {
+					label = "fpga";
+					reg = <0x000000 0x100000>;
+				};
+
+				slot0_partition: partition@100000 {
+					label = "image-0";
+					reg = <0x100000 0x100000>;
+				};
+
+				slot1_partition: partition@200000 {
+					label = "image-1";
+					reg = <0x200000 0x100000>;
+				};
+			};
 		};
 
 		ram0: memory@40000000 {
@@ -35,6 +57,16 @@
 			device_type = "memory";
 			reg = <0xb1000000 0x4000>;
 			zephyr,memory-region = "USB23_DMA";
+		};
+
+		usb23_manager: usb23-manager@b4000000 {
+			compatible = "tinyvision,usb23-manager";
+			status = "okay";
+			reg = <	0xb4000000 0x10000
+				0xb1200000 0x10000>;
+			reg-names =
+				"base",
+				"payload";
 		};
 
 		zephyr_udc0: usb@b0000000 {
