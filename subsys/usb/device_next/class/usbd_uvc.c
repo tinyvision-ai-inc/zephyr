@@ -161,36 +161,36 @@ static int uvc_send_frame(struct uvc_data *const data)
 	return 0;
 }
 
-static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	struct uvc_desc *desc = data->desc;
 
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		*val = 1;
+		probe->bFormatIndex = 1;
 		break;
 	case UVC_GET_MAX:
-		*val = desc->if1_stream_in.bNumFormats;
+		probe->bFormatIndex = desc->if1_stream_in.bNumFormats;
 		break;
 	case UVC_GET_RES:
-		*val = 1;
+		probe->bFormatIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		*val = data->format_index + 1;
+		probe->bFormatIndex = data->format_index + 1;
 		break;
 	case UVC_SET_CUR:
-		if (*val > desc->if1_stream_in.bNumFormats) {
+		if (probe->bFormatIndex > desc->if1_stream_in.bNumFormats) {
 			LOG_WRN("invalid format index");
 			return;
 		}
-		if (*val > 0) {
-			data->format_index = *val - 1;
+		if (probe->bFormatIndex > 0) {
+			data->format_index = probe->bFormatIndex - 1;
 		}
 		break;
 	}
 }
 
-static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	struct uvc_desc *desc = data->desc;
 
@@ -199,30 +199,30 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		*val = 1;
+		probe->bFrameIndex = 1;
 		break;
 	case UVC_GET_MAX:
-		*val = desc->if1_format0.bNumFrameDescriptors;
+		probe->bFrameIndex = desc->if1_format0.bNumFrameDescriptors;
 		break;
 	case UVC_GET_RES:
-		*val = 1;
+		probe->bFrameIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		*val = data->frame_index + 1;
+		probe->bFrameIndex = data->frame_index + 1;
 		break;
 	case UVC_SET_CUR:
-		if (*val > desc->if1_stream_in.bNumFormats) {
+		if (probe->bFrameIndex > desc->if1_stream_in.bNumFormats) {
 			LOG_WRN("invalid format index");
 			return;
 		}
-		if (*val > 0) {
-			data->format_index = *val - 1;
+		if (probe->bFrameIndex > 0) {
+			data->format_index = probe->bFrameIndex - 1;
 		}
 		break;
 	}
 }
 
-static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bRequest, uint32_t *val)
+static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	struct uvc_desc *desc = data->desc;
 
@@ -230,10 +230,10 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 	case UVC_GET_MIN:
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
-		*val = desc->if1_frame0.dwFrameInterval[0];
+		probe->dwFrameInterval = desc->if1_frame0.dwFrameInterval[0];
 		break;
 	case UVC_GET_RES:
-		*val = 1;
+		probe->dwFrameInterval = 1;
 		break;
 	case UVC_SET_CUR:
 		/* TODO call the frame interval API on the video source once supported */
@@ -241,34 +241,34 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 	}
 }
 
-static void uvc_probe_key_frame_rate(struct uvc_data *const data, uint8_t bRequest, uint16_t *val)
+static void uvc_probe_key_frame_rate(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->wKeyFrameRate = 0;
 }
 
-static void uvc_probe_p_frame_rate(struct uvc_data *const data, uint8_t bRequest, uint16_t *val)
+static void uvc_probe_p_frame_rate(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->wPFrameRate = 0;
 }
 
-static void uvc_probe_comp_quality(struct uvc_data *const data, uint8_t bRequest, uint16_t *val)
+static void uvc_probe_comp_quality(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->wCompQuality = 0;
 }
 
-static void uvc_probe_comp_window_size(struct uvc_data *const data, uint8_t bRequest, uint16_t *val)
+static void uvc_probe_comp_window_size(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->wCompWindowSize = 0;
 }
 
-static void uvc_probe_delay(struct uvc_data *const data, uint8_t bRequest, uint16_t *val)
+static void uvc_probe_delay(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	/* TODO devicetree */
-	*val = 1;
+	probe->wDelay = 1;
 }
 
 static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t bRequest,
-					   uint32_t *val)
+					   struct uvc_vs_probe_control *probe)
 {
 	struct uvc_desc *desc = data->desc;
 
@@ -280,69 +280,91 @@ static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t 
 	case UVC_GET_MIN:
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
-		*val = desc->if1_frame0.dwMaxVideoFrameBufferSize;
+		probe->dwMaxVideoFrameSize = desc->if1_frame0.dwMaxVideoFrameBufferSize;
 		break;
 	case UVC_GET_RES:
-		*val = 1;
+		probe->dwMaxVideoFrameSize = 1;
 		break;
 	case UVC_SET_CUR:
-		if (*val > 0) {
+		if (probe->dwMaxVideoFrameSize > 0 &&
+		    probe->dwMaxVideoFrameSize != desc->if1_frame0.dwMaxVideoFrameBufferSize) {
 			LOG_WRN("dwMaxVideoFrameSize is read-only");
 		}
 		break;
 	}
 }
 
-static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest, uint32_t *val)
+static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest,
+				       struct uvc_vs_probe_control *probe)
 {
-	/* Only supporting a single payload per transfer */
-	uvc_probe_max_video_frame_size(data, bRequest, val);
+	struct uvc_desc *desc = data->desc;
+
+	/* TODO walk through all bFormatIndex and bFrameIndex */
+	__ASSERT_NO_MSG(desc->if1_stream_in.bNumFormats == 1);
+	__ASSERT_NO_MSG(desc->if1_format0.bNumFrameDescriptors == 1);
+
+	switch (bRequest) {
+	case UVC_GET_MIN:
+	case UVC_GET_MAX:
+	case UVC_GET_CUR:
+		probe->dwMaxPayloadTransferSize = desc->if1_frame0.dwMaxVideoFrameBufferSize;
+		break;
+	case UVC_GET_RES:
+		probe->dwMaxPayloadTransferSize = 1;
+		break;
+	case UVC_SET_CUR:
+		if (probe->dwMaxPayloadTransferSize > 0 &&
+		    probe->dwMaxPayloadTransferSize != desc->if1_frame0.dwMaxVideoFrameBufferSize) {
+			LOG_WRN("dwPayloadTransferSize is read-only");
+		}
+		break;
+	}
 }
 
-static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequest, uint32_t *val)
+static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
 	case UVC_GET_RES:
-		*val = 1;
+		probe->dwClockFrequency = 1;
 		break;
 	case UVC_SET_CUR:
-		if (*val > 0) {
+		if (probe->dwClockFrequency > 0) {
 			LOG_WRN("dwClockFrequency is read-only");
 		}
 		break;
 	}
 }
 
-static void uvc_probe_framing_info(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_framing_info(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	/* Include Frame ID and EOF fields in the payload header */
-	*val = BIT(0) | BIT(1);
+	probe->bmFramingInfo = BIT(0) | BIT(1);
 }
 
-static void uvc_probe_preferred_version(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_prefered_version(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 1;
+	probe->bPreferedVersion = 1;
 }
 
-static void uvc_probe_min_version(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_min_version(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 1;
+	probe->bMaxVersion = 1;
 }
 
-static void uvc_probe_max_version(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_max_version(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 1;
+	probe->bMaxVersion = 1;
 }
 
-static void uvc_probe_usage(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_usage(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->bUsage = 0;
 }
 
-static void uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
 	/* TODO support other pixel format */
 	switch (bRequest) {
@@ -350,72 +372,71 @@ static void uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bReque
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
 		/* YUYV */
-		*val = 16 - 8;
+		probe->bBitDepthLuma = 16 - 8;
 		break;
 	case UVC_GET_RES:
-		*val = 8;
+		probe->bBitDepthLuma = 8;
 		break;
 	case UVC_SET_CUR:
-		if (*val > 0) {
+		if (probe->bBitDepthLuma > 0) {
 			LOG_WRN("does not support setting bBitDepthLuma");
 		}
 		break;
 	}
 }
 
-static void uvc_probe_settings(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_settings(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->bmSettings = 0;
 }
 
-static void uvc_probe_max_ref_frames(struct uvc_data *const data, uint8_t bRequest, uint8_t *val)
+static void uvc_probe_max_ref_frames(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
 {
-	*val = 1;
+	probe->bMaxNumberOfRefFramesPlus1 = 1;
 }
 
 static void uvc_probe_rate_control_modes(struct uvc_data *const data, uint8_t bRequest,
-					 uint16_t *val)
+					 struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->bmRateControlModes = 0;
 }
 
 static void uvc_probe_layout_per_stream(struct uvc_data *const data, uint8_t bRequest,
-					uint64_t *val)
+					 struct uvc_vs_probe_control *probe)
 {
-	*val = 0;
+	probe->bmLayoutPerStream = 0;
 }
 
-static void uvc_dump_probe(const struct uvc_vs_probe_control *probe)
+static void uvc_dump_probe(char const *name, const struct uvc_vs_probe_control *probe)
 {
-	LOG_DBG("  .bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
-	LOG_DBG("  .bFormatIndex = %u", probe->bFormatIndex);
-	LOG_DBG("  .bFrameIndex = %u", probe->bFrameIndex);
-	LOG_DBG("  .dwFrameInterval = %u ns", sys_le32_to_cpu(probe->dwFrameInterval) * 100);
-	LOG_DBG("  .wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
-	LOG_DBG("  .wPFrameRate = %u", probe->wPFrameRate);
-	LOG_DBG("  .wCompQuality = %u", probe->wCompQuality);
-	LOG_DBG("  .wCompWindowSize = %u", probe->wCompWindowSize);
-	LOG_DBG("  .wDelay = %u ms", sys_le16_to_cpu(probe->wDelay));
-	LOG_DBG("  .dwMaxVideoFrameSize = %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
-	LOG_DBG("  .dwMaxPayloadTransferSize = %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
-	LOG_DBG("  .dwClockFrequency = %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
-	LOG_DBG("  .bmFramingInfo = 0x%02x", probe->bmFramingInfo);
-	LOG_DBG("  .bPreferedVersion = %u", probe->bPreferedVersion);
-	LOG_DBG("  .bMinVersion = %u", probe->bMinVersion);
-	LOG_DBG("  .bMaxVersion = %u", probe->bMaxVersion);
-	LOG_DBG("  .bUsage = %u", probe->bUsage);
-	LOG_DBG("  .bBitDepthLuma = %u", probe->bBitDepthLuma + 8);
-	LOG_DBG("  .bmSettings = %u", probe->bmSettings);
-	LOG_DBG("  .bMaxNumberOfRefFramesPlus1 = %u", probe->bMaxNumberOfRefFramesPlus1);
-	LOG_DBG("  .bmRateControlModes = %u", probe->bmRateControlModes);
-	LOG_DBG("  .bmLayoutPerStream = 0x%08llx", probe->bmLayoutPerStream);
+	LOG_DBG("UVC_%s", name);
+	LOG_DBG("- bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
+	LOG_DBG("- bFormatIndex = %u", probe->bFormatIndex);
+	LOG_DBG("- bFrameIndex = %u", probe->bFrameIndex);
+	LOG_DBG("- dwFrameInterval = %u ns", sys_le32_to_cpu(probe->dwFrameInterval) * 100);
+	LOG_DBG("- wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
+	LOG_DBG("- wPFrameRate = %u", probe->wPFrameRate);
+	LOG_DBG("- wCompQuality = %u", probe->wCompQuality);
+	LOG_DBG("- wCompWindowSize = %u", probe->wCompWindowSize);
+	LOG_DBG("- wDelay = %u ms", sys_le16_to_cpu(probe->wDelay));
+	LOG_DBG("- dwMaxVideoFrameSize = %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
+	LOG_DBG("- dwMaxPayloadTransferSize = %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
+	LOG_DBG("- dwClockFrequency = %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
+	LOG_DBG("- bmFramingInfo = 0x%02x", probe->bmFramingInfo);
+	LOG_DBG("- bPreferedVersion = %u", probe->bPreferedVersion);
+	LOG_DBG("- bMinVersion = %u", probe->bMinVersion);
+	LOG_DBG("- bMaxVersion = %u", probe->bMaxVersion);
+	LOG_DBG("- bUsage = %u", probe->bUsage);
+	LOG_DBG("- bBitDepthLuma = %u", probe->bBitDepthLuma + 8);
+	LOG_DBG("- bmSettings = %u", probe->bmSettings);
+	LOG_DBG("- bMaxNumberOfRefFramesPlus1 = %u", probe->bMaxNumberOfRefFramesPlus1);
+	LOG_DBG("- bmRateControlModes = %u", probe->bmRateControlModes);
+	LOG_DBG("- bmLayoutPerStream = 0x%08llx", probe->bmLayoutPerStream);
 }
 
 static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		     struct uvc_vs_probe_control *probe)
 {
-	uint32_t dw;
-
 	LOG_DBG("UVC control: probe");
 
 	switch (bRequest) {
@@ -423,60 +444,43 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		memcpy(probe, &data->default_probe, sizeof(*probe));
 		break;
 	case UVC_SET_CUR:
-		LOG_DBG("UVC_SET_CUR");
-		uvc_dump_probe(probe);
+		uvc_dump_probe("SET_CUR", probe);
 		goto action;
 	case UVC_GET_CUR:
-		LOG_DBG("UVC_GET_CUR");
-		uvc_dump_probe(probe);
+		uvc_dump_probe("GET_CUR", probe);
 		goto action;
 	case UVC_GET_MIN:
-		LOG_DBG("UVC_GET_MIN");
-		uvc_dump_probe(probe);
+		uvc_dump_probe("GET_MIN", probe);
 		goto action;
 	case UVC_GET_MAX:
-		LOG_DBG("UVC_GET_MAX");
-		uvc_dump_probe(probe);
+		uvc_dump_probe("GET_MAX", probe);
 		goto action;
 	case UVC_GET_RES:
-		LOG_DBG("UVC_GET_RES");
-		uvc_dump_probe(probe);
+		uvc_dump_probe("SET_RES", probe);
 		goto action;
 	action:
 		/* TODO use bmHint to choose in which order configure the fields */
-		uvc_probe_format_index(data, bRequest, &probe->bFormatIndex);
-		uvc_probe_frame_index(data, bRequest, &probe->bFrameIndex);
-		uvc_probe_frame_interval(data, bRequest, &probe->dwFrameInterval);
-		uvc_probe_key_frame_rate(data, bRequest, &probe->wKeyFrameRate);
-		uvc_probe_p_frame_rate(data, bRequest, &probe->wPFrameRate);
-		uvc_probe_comp_quality(data, bRequest, &probe->wCompQuality);
-		uvc_probe_comp_window_size(data, bRequest, &probe->wCompWindowSize);
-		uvc_probe_delay(data, bRequest, &probe->wDelay);
-
-		/* For alignment reasons, this needs to be done differently */
-
-		dw = probe->dwMaxVideoFrameSize;
-		uvc_probe_max_video_frame_size(data, bRequest, &dw);
-		probe->dwMaxVideoFrameSize = dw;
-
-		dw = probe->dwMaxPayloadTransferSize;
-		uvc_probe_max_payload_size(data, bRequest, &dw);
-		probe->dwMaxPayloadTransferSize = dw;
-
-		dw = probe->dwClockFrequency;
-		uvc_probe_clock_frequency(data, bRequest, &dw);
-		probe->dwClockFrequency = dw;
-
-		uvc_probe_framing_info(data, bRequest, &probe->bmFramingInfo);
-		uvc_probe_preferred_version(data, bRequest, &probe->bPreferedVersion);
-		uvc_probe_min_version(data, bRequest, &probe->bMinVersion);
-		uvc_probe_max_version(data, bRequest, &probe->bMaxVersion);
-		uvc_probe_usage(data, bRequest, &probe->bUsage);
-		uvc_probe_bit_depth_luma(data, bRequest, &probe->bBitDepthLuma);
-		uvc_probe_settings(data, bRequest, &probe->bmSettings);
-		uvc_probe_max_ref_frames(data, bRequest, &probe->bMaxNumberOfRefFramesPlus1);
-		uvc_probe_rate_control_modes(data, bRequest, &probe->bmRateControlModes);
-		uvc_probe_layout_per_stream(data, bRequest, &probe->bmLayoutPerStream);
+		uvc_probe_format_index(data, bRequest, probe);
+		uvc_probe_frame_index(data, bRequest, probe);
+		uvc_probe_frame_interval(data, bRequest, probe);
+		uvc_probe_key_frame_rate(data, bRequest, probe);
+		uvc_probe_p_frame_rate(data, bRequest, probe);
+		uvc_probe_comp_quality(data, bRequest, probe);
+		uvc_probe_comp_window_size(data, bRequest, probe);
+		uvc_probe_delay(data, bRequest, probe);
+		uvc_probe_max_video_frame_size(data, bRequest, probe);
+		uvc_probe_max_payload_size(data, bRequest, probe);
+		uvc_probe_clock_frequency(data, bRequest, probe);
+		uvc_probe_framing_info(data, bRequest, probe);
+		uvc_probe_prefered_version(data, bRequest, probe);
+		uvc_probe_min_version(data, bRequest, probe);
+		uvc_probe_max_version(data, bRequest, probe);
+		uvc_probe_usage(data, bRequest, probe);
+		uvc_probe_bit_depth_luma(data, bRequest, probe);
+		uvc_probe_settings(data, bRequest, probe);
+		uvc_probe_max_ref_frames(data, bRequest, probe);
+		uvc_probe_rate_control_modes(data, bRequest, probe);
+		uvc_probe_layout_per_stream(data, bRequest, probe);
 		break;
 	default:
 		__ASSERT_NO_MSG(false);
