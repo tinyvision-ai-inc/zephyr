@@ -585,56 +585,49 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
  */
 
 #define USB23_MANAGER_IRQRAW                              0x0000
+#define USB23_MANAGER_IRQRAW_USB                          BIT(0)
+#define USB23_MANAGER_IRQRAW_IRQ                          BIT(1)
+#define USB23_MANAGER_IRQRAW_EOF                          BIT(2)
 #define USB23_MANAGER_IRQFORCE                            0x0004
 #define USB23_MANAGER_IRQFORCE_USB                        BIT(0)
 #define USB23_MANAGER_IRQFORCE_IRQ                        BIT(1)
-#define USB23_MANAGER_IRQFORCE_IRQSOF                     BIT(2)
-#define USB23_MANAGER_IRQFORCE_IRQEOF                     BIT(3)
-#define USB23_MANAGER_IRQFORCE_IRQOVFLOW                  BIT(4)
+#define USB23_MANAGER_IRQFORCE_EOF                        BIT(2)
 #define USB23_MANAGER_IRQMASK                             0x0008
-#define USB23_MANAGER_IRQMASK_MASK                        GENMASK(4, 0)
+#define USB23_MANAGER_IRQMASK_MASK                        GENMASK(2, 0)
 #define USB23_MANAGER_IRQMASK_USB                         BIT(0)
 #define USB23_MANAGER_IRQMASK_IRQ                         BIT(1)
-#define USB23_MANAGER_IRQMASK_IRQSOF                      BIT(2)
-#define USB23_MANAGER_IRQMASK_IRQEOF                      BIT(3)
-#define USB23_MANAGER_IRQMASK_IRQOVFLOW                   BIT(4)
+#define USB23_MANAGER_IRQMASK_EOF                         BIT(2)
 #define USB23_MANAGER_IRQSTATUS                           0x000c
 #define USB23_MANAGER_IRQSTATUS_USB                       BIT(0)
 #define USB23_MANAGER_IRQSTATUS_IRQ                       BIT(1)
-#define USB23_MANAGER_IRQSTATUS_IRQSOF                    BIT(2)
-#define USB23_MANAGER_IRQSTATUS_IRQEOF                    BIT(3)
-#define USB23_MANAGER_IRQSTATUS_IRQOVFLOW                 BIT(4)
+#define USB23_MANAGER_IRQSTATUS_EOF                       BIT(2)
 #define USB23_MANAGER_CONTROLSTATUS                       0x0010
 #define USB23_MANAGER_CONTROLSTATUS_ENABLE                BIT(0)
 #define USB23_MANAGER_CONTROLSTATUS_BUSY                  BIT(1)
-#define USB23_MANAGER_CONTROLSTATUS_FIFOFULL              BIT(2)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_SHIFT        3
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_MASK         GENMASK(6, 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_IDLE         (0x0 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WAIT         (0x1 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOCHECK    (0x2 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RTRBCTRL     (0x3 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBCTRL     (0x4 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RTRBSIZE     (0x5 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBSIZE     (0x6 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBADDR     (0x7 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RINGDOORBELL (0x8 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOEN       (0x9 << 3)
-#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE         (0xa << 3)
-#define USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT           7
-#define USB23_MANAGER_CONTROLSTATUS_TRBID_MASK            GENMASK(15, 7)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_SHIFT        2
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_MASK         GENMASK(5, 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_IDLE         (0x0 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOCHECK    (0x1 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WAIT         (0x2 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RTRBCTRL     (0x3 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBCTRL     (0x4 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RTRBSIZE     (0x5 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBSIZE     (0x6 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBADDR     (0x7 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RINGDOORBELL (0x8 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE         (0x9 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT           6
+#define USB23_MANAGER_CONTROLSTATUS_TRBID_MASK            GENMASK(13, 6)
 #define USB23_MANAGER_TRBADDR                             0x0014
-#define USB23_MANAGER_NUMWORDS                            0x0018
-#define USB23_MANAGER_DONEWORDS                           0x001c
-#define USB23_MANAGER_SENTWORDS                           0x0020
-#define USB23_MANAGER_DOORBELLADDR                        0x0024
-#define USB23_MANAGER_DOORBELLDATA                        0x0028
-#define USB23_MANAGER_FIFOTHRESHOLD                       0x002c
-#define USB23_MANAGER_STREAMADDRESS                       0x0030
-#define USB23_MANAGER_TRBCTRL                             0x0034
-#define USB23_MANAGER_NEWWORDS                            0x0038
+#define USB23_MANAGER_NUMBYTES                            0x0018
+#define USB23_MANAGER_DONEBYTES                           0x001c
+#define USB23_MANAGER_DOORBELLADDR                        0x0020
+#define USB23_MANAGER_DOORBELLDATA                        0x0024
+#define USB23_MANAGER_FIFOTHRESHOLD                       0x0028
+#define USB23_MANAGER_STREAMADDRESS                       0x002c
+#define USB23_MANAGER_TRBCTRL                             0x0030
 
-uint32_t usbm_fifothres = 4 * 1024;
+uint32_t usbm_fifothres = 1024;
 
 uint32_t usb23_manager_read(const struct device *dev, struct usb23_ep_data *ep_data, uint32_t reg)
 {
@@ -675,9 +668,7 @@ void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_dat
 	reg = USB23_MANAGER_IRQMASK_MASK;
 	reg &= ~USB23_MANAGER_IRQMASK_USB;
 	reg &= ~USB23_MANAGER_IRQMASK_IRQ;
-	reg &= ~USB23_MANAGER_IRQMASK_IRQSOF;
-	reg &= ~USB23_MANAGER_IRQMASK_IRQEOF;
-	reg &= ~USB23_MANAGER_IRQMASK_IRQOVFLOW;
+	reg &= ~USB23_MANAGER_IRQMASK_EOF;
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_IRQMASK, 0);
 }
 
@@ -1155,7 +1146,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	__ASSERT(size_total > usbm_fifothres, "cannot enqueue small buffers with USB23 Manger");
 
 	/* Number of bytes that must be ready before the USB23 Manager enqueues a new TRB */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres / 2);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres);
 
 	/* Disable the USB23 Manager when configuring it */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, 0);
@@ -1181,7 +1172,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLDATA, reg);
 
 	/* Configure the length according to the incoming net buf */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMWORDS, size_manager / 2);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMBYTES, size_manager);
 
 	/* Let the USB23 Manager enqueue until the FIFO is empty */
 	__ASSERT_NO_MSG((uintptr_t)buf->data == ep_data->manager_fifo);
@@ -2451,9 +2442,6 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 	case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RINGDOORBELL:
 		SHELL_OR_LOG(sh, "USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RINGDOORBELL");
 		break;
-	case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOEN:
-		SHELL_OR_LOG(sh, "USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOEN");
-		break;
 	case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE:
 		SHELL_OR_LOG(sh, "USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE");
 		break;
@@ -2463,15 +2451,13 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 		    GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID));
 
 	DUMP(USB23_MANAGER_TRBADDR);
-	DUMP(USB23_MANAGER_NUMWORDS);
-	DUMP(USB23_MANAGER_DONEWORDS);
-	DUMP(USB23_MANAGER_SENTWORDS);
+	DUMP(USB23_MANAGER_NUMBYTES);
+	DUMP(USB23_MANAGER_DONEBYTES);
 	DUMP(USB23_MANAGER_DOORBELLADDR);
 	DUMP(USB23_MANAGER_DOORBELLDATA);
 	DUMP(USB23_MANAGER_FIFOTHRESHOLD);
 	DUMP(USB23_MANAGER_STREAMADDRESS);
 	DUMP(USB23_MANAGER_TRBCTRL);
-	DUMP(USB23_MANAGER_NEWWORDS);
 #undef DUMP
 }
 
