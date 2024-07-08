@@ -23,7 +23,7 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define INC_LE(sz, x, i)          x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET ((1 << 0) | (1 << 1))
 #define FRAME_WIDTH               640
-#define FRAME_HEIGHT              50 /* TODO: find a way to enqueue larger net_buf: 16 bit size is too small */
+#define FRAME_HEIGHT              5 /* TODO: find a way to enqueue larger net_buf: 16 bit size is too small */
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
 #define TRANSFER_SIZE             (FRAME_SIZE + sizeof(struct uvc_payload_header))
