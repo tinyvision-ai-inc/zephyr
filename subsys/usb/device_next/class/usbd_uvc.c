@@ -75,16 +75,7 @@ struct uvc_data {
 
 static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 {
-	struct uvc_desc *desc = data->desc;
-
-	switch (usbd_bus_speed(data->c_data->uds_ctx)) {
-	case USBD_SPEED_SS:
-		return desc->if1_ss_in_ep.bEndpointAddress;
-	case USBD_SPEED_HS:
-		return desc->if1_hs_in_ep.bEndpointAddress;
-	default:
-		return desc->if1_fs_in_ep.bEndpointAddress;
-	}
+	return data->desc->if1_stream_in.bEndpointAddress;
 }
 
 static int uvc_usb_enqueue(struct uvc_data *data, void *buf_data, size_t buf_size,
@@ -646,7 +637,6 @@ static int uvc_init(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
-	struct uvc_desc *desc = data->desc;
 
 	LOG_INF("Initializing UVC class");
 
@@ -655,9 +645,6 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_PRESENTATIONTIME;
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
-
-	/* The descriptors ned some adjustments */
-	desc->iad.bFirstInterface = desc->if0.bInterfaceNumber;
 
 	/* The default probe is the current probe at startup */
 	uvc_probe(data, UVC_GET_CUR, &data->default_probe);
@@ -669,13 +656,21 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	struct uvc_desc *desc = data->desc;
+
+	/* The descriptors need some adjustments */
+	desc->iad.bFirstInterface = desc->if0.bInterfaceNumber;
+	desc->if0_vctl_hdr.baInterfaceNr = desc->if1.bInterfaceNumber;
 
 	switch (speed) {
 	case USBD_SPEED_SS:
+		desc->if1_stream_in.bEndpointAddress = desc->if1_ss_in_ep.bEndpointAddress;
 		return data->ss_desc;
 	case USBD_SPEED_HS:
+		desc->if1_stream_in.bEndpointAddress = desc->if1_hs_in_ep.bEndpointAddress;
 		return data->hs_desc;
 	default:
+		desc->if1_stream_in.bEndpointAddress = desc->if1_fs_in_ep.bEndpointAddress;
 		return data->fs_desc;
 	}
 }
