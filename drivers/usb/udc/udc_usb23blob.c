@@ -616,17 +616,22 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
 #define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_WTRBADDR     (0x7 << 2)
 #define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_RINGDOORBELL (0x8 << 2)
 #define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE         (0x9 << 2)
+#define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOWAIT     (0xa << 2)
 #define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_ERROR        (0xf << 2)
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT           6
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_MASK            GENMASK(13, 6)
 #define USB23_MANAGER_TRBADDR                             0x0014
-#define USB23_MANAGER_NUMBYTES                            0x0018
+#define USB23_MANAGER_NUMWORDS                            0x0018
 #define USB23_MANAGER_DONEBYTES                           0x001c
 #define USB23_MANAGER_DOORBELLADDR                        0x0020
 #define USB23_MANAGER_DOORBELLDATA                        0x0024
 #define USB23_MANAGER_FIFOTHRESHOLD                       0x0028
 #define USB23_MANAGER_STREAMADDRESS                       0x002c
 #define USB23_MANAGER_TRBCTRL                             0x0030
+#define USB23_MANAGER_FIFOOCCUPANCY                       0x0034
+#define USB23_MANAGER_TOTALBYTESOUT                       0x0038
+#define USB23_MANAGER_HEADER0                             0x003c
+#define USB23_MANAGER_HEADER1                             0x0040
 
 uint32_t usbm_fifothres = 1024;
 
@@ -1139,45 +1144,42 @@ static int usb23_trb_bulk_native(const struct device *dev, struct usb23_ep_data 
 static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 				  struct net_buf *buf)
 {
-	size_t size_total = USB_EP_DIR_IS_IN(ep_data->addr) ? buf->len : buf->size;
-	size_t size_native;
-	size_t size_manager;
 	uint32_t reg;
 
-	__ASSERT(size_total > usbm_fifothres, "cannot enqueue small buffers with USB23 Manger");
+	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
+		LOG_ERR("USB23 Manager only supports input direction");
+		return -1;
+	}
+	if (buf->len % 8 != 0) {
+		LOG_ERR("USB23 Manager assumes transfer sizes to be multiple of 8");
+		return -1;
+	}
 
-	/* Number of bytes that must be ready before the USB23 Manager enqueues a new TRB */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres);
+	LOG_DBG("TRB_BULK_MANAGER ep=0x%02x data=%p len=%d", ep_data->addr, buf->data, buf->len);
 
 	/* Disable the USB23 Manager when configuring it */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, 0);
 
-	/* Send the non-alingned bytes manually after the USB23 Manager */
-	size_native = size_total % usbm_fifothres;
-	if (size_native == 0) {
-		/* Always send the last TRB manually to add a ZLP flag as needed */
-		size_native = usbm_fifothres;
-	}
-	size_manager = size_total - size_native;
+	/* Number of bytes that must be ready before the USB23 Manager enqueues a new TRB */
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres);
 
-	LOG_DBG("TRB_BULK_MANAGER ep=0x%02x data=%p size_manager=%d size_native=%d", ep_data->addr,
-		buf->data, size_manager, size_native);
-
-	/* Configure the normal TRBs control field */
-	reg = USB23_TRB_CTRL_TRBCTL_NORMAL;
-	reg |= USB_EP_DIR_IS_IN(ep_data->addr) ? USB23_TRB_CTRL_CHN : USB23_TRB_CTRL_CSP;
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_TRBCTRL, reg);
+	/* Configure as a NORMAL TRB, letting the USB Manager decide when set the CHN field */
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_TRBCTRL, USB23_TRB_CTRL_TRBCTL_NORMAL);
 
 	/* Configure the TRB trigger data from the XFERRSCIDX result of the command */
 	reg = USB23_DEPCMD_DEPUPDXFER | (ep_data->xferrscidx << USB23_DEPCMD_XFERRSCIDX_SHIFT);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLDATA, reg);
 
 	/* Configure the length according to the incoming net buf */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMBYTES, size_manager);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMWORDS, (buf->len - 8) / 2);
 
 	/* Let the USB23 Manager enqueue until the FIFO is empty */
 	__ASSERT_NO_MSG((uintptr_t)buf->data == ep_data->manager_fifo);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_STREAMADDRESS, ep_data->manager_fifo);
+
+	/* Fill the payload header */
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_HEADER0, ep_data->manager_header[0]);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_HEADER1, ep_data->manager_header[1]);
 
 	/* Synchronize the current position between the driver and USB23 Manager then let the
 	 * USB23 Manager enqueue until the FIFO is empty */
@@ -1185,21 +1187,55 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	reg |= (ep_data->head << USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, reg);
 
-	/* Until the USB23 Manager can be filled needs to be filled */
-	buf->size = buf->len = size_native;
-
 	/* Keep the buffer of the USB23 Manager for later */
 	ep_data->manager_buf = buf;
+	return 0;
+}
+
+static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_ep_data *ep_data,
+				  struct net_buf *buf)
+{
+	int ret;
+
+	LOG_DBG("TRB_BULK_MANAGER_HEADER ep=0x%02x buf=%p data=%p size=%d len=%d", ep_data->addr, buf,
+		buf->data, buf->size, buf->len);
+
+	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
+		LOG_ERR("USB23 Manager header only supported for output direction");
+		return -1;
+	}
+
+	if (buf->len != sizeof(uint64_t)) {
+		LOG_ERR("USB23 Manager header only supports uint64_t sized buffer");
+		return -1;
+	}
+
+	ep_data->manager_header[0] = *(uint32_t *)(buf->data + sizeof(uint32_t));
+	ep_data->manager_header[1] = *(uint32_t *)(buf->data + 0);
+
+	/* Submit the buffer completed by the USB23 Manager back to Zephyr */
+	ret = udc_submit_ep_event(dev, buf, 0);
+	__ASSERT_NO_MSG(ret == 0);
+
 	return 0;
 }
 
 static int usb23_trb_bulk(const struct device *dev, struct usb23_ep_data *ep_data,
 			  struct net_buf *buf)
 {
-	/* Only use the USB23 Manager if the buffer is pointing at its FIFO, otherwise use CPU */
-	if (ep_data->manager_fifo == (uintptr_t)buf->data && ep_data->manager_base != 0) {
-		return usb23_trb_bulk_manager(dev, ep_data, buf);
+	/* If the USB23 Manager is configured for this endpoint */
+	if (ep_data->manager_base != 0) {
+
+		/* If we submit a buffer that goes for USB23 Manager endpoint address. */
+		if ((uintptr_t)buf->data == ep_data->manager_fifo) {
+			/* Use the USB23 Manager as an accelerator */
+			return usb23_trb_bulk_manager(dev, ep_data, buf);
+		} else {
+			/* Consider it as header and pass it first */
+			return usb23_trb_bulk_manager_header(dev, ep_data, buf);
+		}
 	} else {
+		/* Submit a native TRB without using RTL in the wayto manage the transfer */
 		return usb23_trb_bulk_native(dev, ep_data, buf);
 	}
 }
@@ -1264,6 +1300,7 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	struct net_buf *buf = ep_data->manager_buf;
 	uint32_t reg;
 	uint32_t next;
+	int ret;
 
 	/* Check that USB23 Manager just ran and that the driver did catch-up */
 	if (buf == NULL) {
@@ -1275,14 +1312,16 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	/* Sync the position in the ring buffer with the USB23 Manager */
 	reg = usb23_manager_read(dev, ep_data, USB23_MANAGER_CONTROLSTATUS);
 	next = (GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID) + 1) % (ep_data->num_of_trbs - 1);
-	ep_data->head = next; // Skip all the TRBs submitted by the USB23 Manager
 
-	/* Add an extra buffer to handle the remaining bytes */
-	buf->data = (void *)0xb1100000; /* TODO workaround for non-aligned transfer sizes */
-	usb23_enqueue_buf(dev, ep_data, buf);
+	/* Skip all the TRBs submitted by the USB23 Manager */
+	ep_data->head = next;
 
 	/* The USB23 Manager buffer was submitted as a normal TRB and will be picked-up later */
 	ep_data->manager_buf = NULL;
+
+	/* Submit the buffer completed by the USB23 Manager back to Zephyr */
+	ret = udc_submit_ep_event(dev, buf, 0);
+	__ASSERT_NO_MSG(ret == 0);
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
 	usb23_process_queue(dev, ep_data);
@@ -1876,9 +1915,8 @@ void usb23_on_event(const struct device *dev)
 
 		/* Fetch ongoing IRQ flags and acknowledge those we are about to process */
 		reg = usb23_manager_read(dev, *ep_data, USB23_MANAGER_CONTROLSTATUS);
-		switch (reg &= USB23_MANAGER_CONTROLSTATUS_FSMSTATE_MASK) {
+		switch (reg & USB23_MANAGER_CONTROLSTATUS_FSMSTATE_MASK) {
 		case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_IDLE:
-		case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_DONE:
 			usb23_on_manager_done(dev, *ep_data);
 		}
 	}
@@ -2037,7 +2075,7 @@ void usb23_enable(const struct device *dev)
 
 	/* Enable the USB23 Manager events */
 	for (struct usb23_ep_data **ep_data = config->manager_list; *ep_data != NULL; ep_data++) {
-		LOG_DBG("USB_MANAGER_EP=0x%02x", (*ep_data)->addr);
+		LOG_DBG("USB23_MANAGER_EP=0x%02x", (*ep_data)->addr);
 
 		/* For enabled endpoint, use the USB23 Manager to automatically reload the TRBs */
 		if ((*ep_data)->manager_base) {
@@ -2453,6 +2491,9 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 	case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_ERROR:
 		SHELL_OR_LOG(sh, "USB23_MANAGER_CONTROLSTATUS_FSMSTATE_ERROR");
 		break;
+	case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOWAIT:
+		SHELL_OR_LOG(sh, "USB23_MANAGER_CONTROLSTATUS_FSMSTATE_FIFOWAIT");
+		break;
 	default:
 		SHELL_OR_LOG(sh, "unknown state: 0x%02lx", GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_FSMSTATE));
 		break;
@@ -2462,13 +2503,17 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 		    GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID));
 
 	DUMP(USB23_MANAGER_TRBADDR);
-	DUMP(USB23_MANAGER_NUMBYTES);
+	DUMP(USB23_MANAGER_NUMWORDS);
 	DUMP(USB23_MANAGER_DONEBYTES);
 	DUMP(USB23_MANAGER_DOORBELLADDR);
 	DUMP(USB23_MANAGER_DOORBELLDATA);
 	DUMP(USB23_MANAGER_FIFOTHRESHOLD);
 	DUMP(USB23_MANAGER_STREAMADDRESS);
 	DUMP(USB23_MANAGER_TRBCTRL);
+	DUMP(USB23_MANAGER_FIFOOCCUPANCY);
+	DUMP(USB23_MANAGER_TOTALBYTESOUT);
+	DUMP(USB23_MANAGER_HEADER0);
+	DUMP(USB23_MANAGER_HEADER1);
 #undef DUMP
 }
 

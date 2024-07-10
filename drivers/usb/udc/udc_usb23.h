@@ -51,6 +51,9 @@ struct usb23_ep_data {
 	/* Whenever the USB Manager is running, this points to its buffer */
 	struct net_buf *manager_buf;
 
+	/* Header submitted before the payload */
+	uint32_t manager_header[2];
+
 	/* Buffer of pointers to net_bufs, matching the TRB buffers */
 	struct net_buf **net_buf;
 

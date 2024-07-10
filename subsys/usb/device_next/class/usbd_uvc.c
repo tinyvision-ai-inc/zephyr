@@ -23,7 +23,7 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define INC_LE(sz, x, i)          x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
 #define UVC_INFO_SUPPORTS_GET_SET ((1 << 0) | (1 << 1))
 #define FRAME_WIDTH               640
-#define FRAME_HEIGHT              5 /* TODO: find a way to enqueue larger net_buf: 16 bit size is too small */
+#define FRAME_HEIGHT              130 /* TODO: find a way to enqueue larger net_buf: 16 bit size is too small */
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
 #define TRANSFER_SIZE             (FRAME_SIZE + sizeof(struct uvc_payload_header))
@@ -118,14 +118,15 @@ static int uvc_send_frame(struct uvc_data *const data)
 
 	/* Toggle the FrameId bit for every new frame. */
 	data->payload_header->bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
-	INC_LE(32, data->payload_header->dwPresentationTime, 1);
-	INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
-	INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
+	//INC_LE(32, data->payload_header->dwPresentationTime, 1);
+	//INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
+	//INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
 
 	LOG_INF("Submitting a %ux%u frame with %u bits per pixel (%zd bytes)", FRAME_WIDTH,
 		FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 
-	err = uvc_usb_enqueue(data, data->payload_header, sizeof(struct uvc_payload_header), false);
+	// TODO: set the size of the payload header elsewhere, do not hardcode
+	err = uvc_usb_enqueue(data, data->payload_header, sizeof(uint64_t), false);
 	if (err != 0) {
 		return err;
 	}
@@ -641,9 +642,9 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	LOG_INF("Initializing UVC class");
 
 	/* Prepare the payload header fields that are constant over time */
-	data->payload_header->bHeaderLength = sizeof(struct uvc_payload_header);
-	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_PRESENTATIONTIME;
-	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
+	data->payload_header->bHeaderLength = sizeof(uint64_t); // TODO sizeof(anstruct uvc_payload_header);
+	//data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_PRESENTATIONTIME;
+	//data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
 	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
 
 	/* The default probe is the current probe at startup */
