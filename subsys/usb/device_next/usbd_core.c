@@ -34,7 +34,7 @@ K_MSGQ_DEFINE(usbd_msgq, sizeof(struct udc_event),
 static int usbd_event_carrier(const struct device *dev,
 			      const struct udc_event *const event)
 {
-	LOG_DBG("putting event %p to message queue %p", event, &usbd_msgq);
+	LOG_DBG("putting event %p to USBD message queue", event);
 	return k_msgq_put(&usbd_msgq, event, K_NO_WAIT);
 }
 
@@ -198,7 +198,7 @@ static void usbd_thread(void *p1, void *p2, void *p3)
 
 		STRUCT_SECTION_FOREACH(usbd_context, uds_ctx) {
 			if (uds_ctx->dev == event.dev) {
-				LOG_DBG("submitting event %p to context %p", &event, uds_ctx);
+				LOG_DBG("handling event for USBD context %p", uds_ctx);
 				usbd_event_handler(uds_ctx, &event);
 			}
 		}
