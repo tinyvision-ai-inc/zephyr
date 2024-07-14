@@ -20,19 +20,20 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define DT_DRV_COMPAT zephyr_uvc
 
-#define INC_LE(sz, x, i)          x = sys_cpu_to_le##sz(sys_le##sz##_to_cpu(x) + i)
-#define UVC_INFO_SUPPORTS_GET_SET ((1 << 0) | (1 << 1))
 #define FRAME_WIDTH               640
-#define FRAME_HEIGHT              130 /* TODO: find a way to enqueue larger net_buf: 16 bit size is too small */
+#define FRAME_HEIGHT              480
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
-#define TRANSFER_SIZE             (FRAME_SIZE + sizeof(struct uvc_payload_header))
-#define FRAME_DESC_NUM            1
-#define FPS_TO_US(fps)            (1000 * 1000 / (fps))
+#define TRANSFER_SIZE             (100 * 1000)
+#define EOF(header)               ((header).bmHeaderInfo & UVC_BMHEADERINFO_END_OF_FRAME)
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
-NET_BUF_POOL_FIXED_DEFINE(uvc_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
-			  sizeof(struct udc_buf_info), NULL);
+
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 30,
+			  0, sizeof(struct udc_buf_info), NULL);
+
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 30,
+			  CONFIG_USBD_VIDEO_HEADER_SIZE, sizeof(struct udc_buf_info), NULL);
 
 struct uvc_desc {
 	struct usb_association_descriptor iad;
@@ -70,7 +71,10 @@ struct uvc_data {
 	/* Video source, such as an image sensor */
 	const struct device *const video_dev;
 	/* UVC header passed just before the image data */
-	struct uvc_payload_header *payload_header;
+	struct uvc_payload_header payload_header;
+	/* Work queue to submit more UVC frames */
+	struct k_work_q work_q;
+	struct k_work work;
 };
 
 static uint8_t uvc_get_bulk_in(struct uvc_data *data)
@@ -78,18 +82,13 @@ static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 	return data->desc->if1_stream_in.bEndpointAddress;
 }
 
-static int uvc_usb_enqueue(struct uvc_data *data, void *buf_data, size_t buf_size,
-			   bool last_of_transfer)
+static int uvc_enqueue_buf(struct uvc_data *data, struct net_buf *buf, bool last_of_transfer)
 {
-	struct net_buf *buf;
 	struct udc_buf_info *bi;
 	int ret;
 
-	buf = net_buf_alloc_with_data(&uvc_buf_pool, buf_data, buf_size, K_FOREVER);
-	__ASSERT_NO_MSG(buf != NULL);
-
-	LOG_DBG("Enqueueing buf=%p addr=%p size=%u size=%u len=%u zlp=%u",
-		buf, buf->data, buf->size, buf_size, buf->len, last_of_transfer);
+	LOG_DBG("Enqueueing buf=%p data=%p size=%u len=%u zlp=%u",
+		buf, buf->data, buf->size, buf->len, last_of_transfer);
 
 	bi = udc_get_buf_info(buf);
 	__ASSERT_NO_MSG(bi != NULL);
@@ -102,55 +101,103 @@ static int uvc_usb_enqueue(struct uvc_data *data, void *buf_data, size_t buf_siz
 	if (ret != 0) {
 		LOG_WRN("Could not enqueue buf=%p", buf);
 		net_buf_unref(buf);
+		return ret;
 	}
-	return ret;
+
+	return 0;
+}
+
+static int uvc_send_transfer(struct uvc_data *const data, size_t size)
+{
+	const struct device *vdev = data->video_dev;
+	struct video_buffer vbuf = {.size = size};
+	struct video_buffer *vbufp = NULL;
+	struct net_buf *buf;
+	int ret;
+
+	LOG_INF("Fragment of %zu bytes bmHeaderInfo=0x%02x", size,
+		data->payload_header.bmHeaderInfo);
+
+	video_stream_start(vdev);
+
+	/* Header */
+
+	buf = net_buf_alloc(&uvc_pool_header, K_FOREVER);
+	if (buf == NULL) {
+		return -EAGAIN;
+	}
+
+	net_buf_add_mem(buf, &data->payload_header, 2);
+	while (buf->len < buf->size) {
+		net_buf_add_u8(buf, 0);
+	}
+
+	ret = uvc_enqueue_buf(data, buf, false);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* Payload */
+
+	ret = video_enqueue(vdev, VIDEO_EP_IN, &vbuf);
+	if (ret != 0) {
+		LOG_ERR("failed to submit the buffer to the video system");
+		return ret;
+	}
+
+	ret = video_dequeue(vdev, VIDEO_EP_IN, &vbufp, K_FOREVER);
+	if (ret != 0) {
+		LOG_ERR("failed to fetch the filled buffer from the video system");
+		return ret;
+	}
+
+	buf = net_buf_alloc_with_data(&uvc_pool_payload, vbufp->buffer, vbufp->bytesused, K_FOREVER);
+	if (buf == NULL) {
+		return -EAGAIN;
+	}
+
+	ret = uvc_enqueue_buf(data, buf, true);
+	if (ret != 0) {
+		return ret;
+	}
+
+	return 0;
 }
 
 static int uvc_send_frame(struct uvc_data *const data)
 {
 	struct uvc_desc *desc = data->desc;
-	const struct device *vdev = data->video_dev;
-	struct video_buffer vbuf = {0};
-	struct video_buffer *vbufp = NULL;
-	int err;
+	size_t size = desc->if1_frame0.dwMaxVideoFrameBufferSize;
+	int ret;
 
-	video_stream_start(vdev);
-
-	/* Toggle the FrameId bit for every new frame. */
-	data->payload_header->bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
-	//INC_LE(32, data->payload_header->dwPresentationTime, 1);
-	//INC_LE(32, data->payload_header->scrSourceClockSTC, 1);
-	//INC_LE(16, data->payload_header->scrSourceClockSOF, 1);
-
-	LOG_INF("Submitting a %ux%u frame with %u bits per pixel (%zd bytes)", FRAME_WIDTH,
+	LOG_INF("Submitting a %ux%u frame with %u bits per pixel (%zu bytes)", FRAME_WIDTH,
 		FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 
-	// TODO: set the size of the payload header elsewhere, do not hardcode
-	err = uvc_usb_enqueue(data, data->payload_header, sizeof(uint64_t), false);
-	if (err != 0) {
-		return err;
+	/* Toggle the FrameId bit for every new frame. */
+	data->payload_header.bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
+
+	/* Not setting the EOF flag until we reach the last transfer */
+	data->payload_header.bmHeaderInfo &= ~UVC_BMHEADERINFO_END_OF_FRAME;
+	for (; size > TRANSFER_SIZE; size -= TRANSFER_SIZE) {
+		ret = uvc_send_transfer(data, TRANSFER_SIZE);
+		if (ret != 0) {
+			return ret;
+		}
 	}
 
-	vbuf.size = desc->if1_frame0.dwMaxVideoFrameBufferSize;
-	err = video_enqueue(vdev, VIDEO_EP_IN, &vbuf);
-	if (err != 0) {
-		LOG_ERR("failed to submit the buffer to the video system");
-		return err;
-	}
-
-	err = video_dequeue(vdev, VIDEO_EP_IN, &vbufp, K_FOREVER);
-	if (err != 0) {
-		LOG_ERR("failed to fetch the filled buffer from the video system");
-		return err;
-	}
-
-	LOG_DBG("vbufp buffer=%p bytesused=%u", vbufp->buffer, vbufp->bytesused);
-	err = uvc_usb_enqueue(data, vbufp->buffer, vbufp->bytesused, true);
-	if (err != 0) {
-		return err;
+	/* For the last transfer, we set the EOF flag */
+	data->payload_header.bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
+	ret = uvc_send_transfer(data, size);
+	if (ret != 0) {
+		return ret;
 	}
 
 	return 0;
+}
+
+static void uvc_worker(struct k_work *work)
+{
+	uvc_send_frame(CONTAINER_OF(work, struct uvc_data, work));
 }
 
 static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest, struct uvc_vs_probe_control *probe)
@@ -513,7 +560,7 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		}
 
 		LOG_INF("Starting UVC transfer");
-		uvc_send_frame(data);
+		k_work_submit(&data->work);
 		break;
 	default:
 		LOG_ERR("invalid bRequest (%u)", bRequest);
@@ -613,7 +660,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	struct uvc_data *data = dev->data;
 	struct udc_buf_info bi = *udc_get_buf_info(buf);
 
-	LOG_DBG("UVC request done for ep=0x%02x buf=%p", bi.ep, buf);
+	LOG_DBG("UVC transfer done for ep=0x%02x buf=%p", bi.ep, buf);
 	net_buf_unref(buf);
 	__ASSERT_NO_MSG(bi.ep == uvc_get_bulk_in(data));
 
@@ -621,8 +668,10 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 		return err;
 	}
 
+	/* If this is a completion for the video stream */
 	if (bi.ep == uvc_get_bulk_in(data)) {
-		if (bi.zlp) {
+		/* Only for the last buffer of the transfer and last transfer of the frame */
+		if (bi.zlp && EOF(data->payload_header)) {
 			uvc_send_frame(data);
 		}
 	}
@@ -642,13 +691,13 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	LOG_INF("Initializing UVC class");
 
 	/* Prepare the payload header fields that are constant over time */
-	data->payload_header->bHeaderLength = sizeof(uint64_t); // TODO sizeof(anstruct uvc_payload_header);
-	//data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_PRESENTATIONTIME;
-	//data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_HAS_SOURCECLOCK;
-	data->payload_header->bmHeaderInfo |= UVC_BMHEADERINFO_END_OF_FRAME;
+	data->payload_header.bHeaderLength = sizeof(uint64_t); // TODO sizeof(anstruct uvc_payload_header);
 
 	/* The default probe is the current probe at startup */
 	uvc_probe(data, UVC_GET_CUR, &data->default_probe);
+
+	/* Worker to start the UVC feed */
+	k_work_init(&data->work, uvc_worker);
 
 	return 0;
 }
@@ -903,8 +952,6 @@ struct usbd_class_api uvc_api = {
                                                                                                    \
 	DEFINE_UVC_DESCRIPTOR(n);                                                                  \
                                                                                                    \
-	struct uvc_payload_header uvc_payload_header_##n;                                          \
-                                                                                                   \
 	USBD_DEFINE_CLASS(uvc_##n, &uvc_api, (void *)DEVICE_DT_GET(DT_DRV_INST(n)), NULL);         \
                                                                                                    \
 	static struct uvc_data uvc_data_##n = {                                                    \
@@ -913,7 +960,6 @@ struct usbd_class_api uvc_api = {
 		.fs_desc = uvc_fs_desc_##n,                                                        \
 		.hs_desc = uvc_hs_desc_##n,                                                        \
 		.ss_desc = uvc_ss_desc_##n,                                                        \
-		.payload_header = &uvc_payload_header_##n,                                         \
 		.video_dev = DEVICE_DT_GET(DT_PHANDLE(DT_DRV_INST(n), source)),                    \
 	};                                                                                         \
                                                                                                    \

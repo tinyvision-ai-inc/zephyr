@@ -10,6 +10,15 @@ config USBD_VIDEO_CLASS
 
 if USBD_VIDEO_CLASS
 
+config USBD_VIDEO_HEADER_SIZE
+	int "USB Video payload header size"
+	depends on USBD_VIDEO_CLASS
+	range 2 255
+	default 8
+	help
+	  Sets the size of the video payload header,
+	  to allow custom data to be added at the end of the mandatory fields.
+
 module = USBD_UVC
 module-str = usbd uvc
 default-count = 1
