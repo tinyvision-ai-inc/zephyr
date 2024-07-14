@@ -621,7 +621,7 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT           6
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_MASK            GENMASK(13, 6)
 #define USB23_MANAGER_TRBADDR                             0x0014
-#define USB23_MANAGER_NUMWORDS                            0x0018
+#define USB23_MANAGER_NUMBYTES                            0x0018
 #define USB23_MANAGER_DONEBYTES                           0x001c
 #define USB23_MANAGER_DOORBELLADDR                        0x0020
 #define USB23_MANAGER_DOORBELLDATA                        0x0024
@@ -1168,7 +1168,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLDATA, reg);
 
 	/* Configure the length according to the incoming net buf */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMWORDS, buf->len);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMBYTES, buf->len);
 
 	/* Let the USB23 Manager enqueue until the FIFO is empty */
 	__ASSERT_NO_MSG((uintptr_t)buf->data == ep_data->manager_fifo);
@@ -2508,7 +2508,7 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 		    GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID));
 
 	DUMP(USB23_MANAGER_TRBADDR);
-	DUMP(USB23_MANAGER_NUMWORDS);
+	DUMP(USB23_MANAGER_NUMBYTES);
 	DUMP(USB23_MANAGER_DONEBYTES);
 	DUMP(USB23_MANAGER_DOORBELLADDR);
 	DUMP(USB23_MANAGER_DOORBELLDATA);
