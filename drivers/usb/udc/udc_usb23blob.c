@@ -1168,7 +1168,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLDATA, reg);
 
 	/* Configure the length according to the incoming net buf */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMWORDS, (buf->len - 8) / 2);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMWORDS, buf->len);
 
 	/* Let the USB23 Manager enqueue until the FIFO is empty */
 	__ASSERT_NO_MSG((uintptr_t)buf->data == ep_data->manager_fifo);
