@@ -20,8 +20,8 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define DT_DRV_COMPAT zephyr_uvc
 
-#define FRAME_WIDTH               640
-#define FRAME_HEIGHT              480
+#define FRAME_WIDTH               1280
+#define FRAME_HEIGHT              720
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
 #define TRANSFER_SIZE             (100 * 1000)
@@ -29,10 +29,10 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 30,
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100,
 			  0, sizeof(struct udc_buf_info), NULL);
 
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 30,
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100,
 			  CONFIG_USBD_VIDEO_HEADER_SIZE, sizeof(struct udc_buf_info), NULL);
 
 struct uvc_desc {
@@ -73,7 +73,6 @@ struct uvc_data {
 	/* UVC header passed just before the image data */
 	struct uvc_payload_header payload_header;
 	/* Work queue to submit more UVC frames */
-	struct k_work_q work_q;
 	struct k_work work;
 };
 
@@ -672,7 +671,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	if (bi.ep == uvc_get_bulk_in(data)) {
 		/* Only for the last buffer of the transfer and last transfer of the frame */
 		if (bi.zlp && EOF(data->payload_header)) {
-			uvc_send_frame(data);
+			k_work_submit(&data->work);
 		}
 	}
 	return 0;
