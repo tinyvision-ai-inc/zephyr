@@ -84,6 +84,14 @@ static const struct udc_api usb23_api = {
 	.ep_dequeue = usb23_api_ep_dequeue,
 };
 
+static void usb23_ep_worker(struct k_work *work)
+{
+	struct usb23_ep_data *ep_data = CONTAINER_OF(work, struct usb23_ep_data, work);
+	const struct device *dev = ep_data->dev;
+
+	usb23_process_queue(dev, ep_data);
+}
+
 static void usb23_event_worker(struct k_work *work)
 {
 	const struct usb23_data *priv = CONTAINER_OF(work, struct usb23_data, work);
@@ -105,6 +113,8 @@ static int usb23_ep_preinit(const struct device *dev, uint8_t epn, int mps)
 
 	ep_data->addr = ep_cfg->addr = addr;
 	ep_data->epn = epn;
+	ep_data->dev = dev;
+	k_work_init(&ep_data->work, usb23_ep_worker);
 
 	/* Generic properties for Zephyr USB stack */
 	if (addr & USB_EP_DIR_IN) {

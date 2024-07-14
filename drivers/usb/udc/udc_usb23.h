@@ -42,6 +42,12 @@ struct usb23_config {
  * All data specific to one endpoint
  */
 struct usb23_ep_data {
+	/* A work queue entry to process the buffers to submit on that endpoint */
+	struct k_work work;
+
+	/* Point back to the device for work queues */
+	const struct device *dev;
+
 	/* Address at which the USB23 Manager control interface is */
 	uintptr_t manager_base;
 
@@ -186,5 +192,6 @@ int usb23_api_init(const struct device *dev);
 int usb23_api_set_address(const struct device *dev, const uint8_t addr);
 int usb23_api_set_exit_latency(const struct device *dev, const struct udc_exit_latency *el);
 void usb23_irq_handler(void *ptr);
+void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data);
 
 #endif // ZEPHYR_DRIVERS_USB_UDC_USB23_H

@@ -788,9 +788,6 @@ static union usb23_evt usb23_get_next_evt(const struct device *dev)
 	/* Cache the current event */
 	evt = config->evt_buf[priv->evt_next];
 
-	/* Clear it on the event buffer */
-	config->evt_buf[priv->evt_next].raw = 0x00000000;
-
 	/* This is a ring buffer, wrap around */
 	priv->evt_next++;
 	priv->evt_next %= CONFIG_USB23_EVT_NUM;
@@ -1148,11 +1145,11 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 
 	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
 		LOG_ERR("USB23 Manager only supports input direction");
-		return -1;
+		return -EINVAL;
 	}
 	if (buf->len % 8 != 0) {
 		LOG_ERR("USB23 Manager assumes transfer sizes to be multiple of 8");
-		return -1;
+		return -EINVAL;
 	}
 
 	LOG_DBG("TRB_BULK_MANAGER ep=0x%02x data=%p len=%d", ep_data->addr, buf->data, buf->len);
@@ -1202,12 +1199,12 @@ static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_
 
 	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
 		LOG_ERR("USB23 Manager header only supported for output direction");
-		return -1;
+		return -EINVAL;
 	}
 
 	if (buf->len != sizeof(uint64_t)) {
 		LOG_ERR("USB23 Manager header only supports uint64_t sized buffer");
-		return -1;
+		return -EINVAL;
 	}
 
 	ep_data->manager_header[0] = *(uint32_t *)(buf->data + sizeof(uint32_t));
@@ -1225,6 +1222,10 @@ static int usb23_trb_bulk(const struct device *dev, struct usb23_ep_data *ep_dat
 {
 	/* If the USB23 Manager is configured for this endpoint */
 	if (ep_data->manager_base != 0) {
+		if (ep_data->manager_buf != NULL) {
+			LOG_DBG("USB Manager is busy");
+			return -EAGAIN;
+		}
 
 		/* If we submit a buffer that goes for USB23 Manager endpoint address. */
 		if ((uintptr_t)buf->data == ep_data->manager_fifo) {
@@ -1260,10 +1261,12 @@ static void usb23_enqueue_buf(const struct device *dev, struct usb23_ep_data *ep
 	}
 }
 
-static void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data)
+void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data)
 {
 	struct net_buf *buf;
 	int ret;
+
+	LOG_DBG("Checking for awaiting events");
 
 	/* Do not interfer with the USB23 Manager operation */
 	if (ep_data->manager_buf) {
@@ -1324,7 +1327,9 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	__ASSERT_NO_MSG(ret == 0);
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
-	usb23_process_queue(dev, ep_data);
+	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+
+	LOG_DBG("------");
 }
 
 static void usb23_on_soft_reset(const struct device *dev)
@@ -1777,7 +1782,7 @@ static void usb23_on_xfer_done_norm(const struct device *dev, struct usb23_ep_da
 	__ASSERT_NO_MSG(ret == 0);
 
 	/* We just made some room for a new buffer, check if something more to enqueue */
-	usb23_process_queue(dev, ep_data);
+	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 }
 
 static void usb23_on_xfer_done_ctrl(const struct device *dev, struct usb23_ep_data *ep_data)
@@ -1831,7 +1836,12 @@ static void usb23_on_xfer_done(const struct device *dev, struct usb23_ep_data *e
 
 	switch (trb->status & USB23_TRB_STATUS_TRBSTS_MASK) {
 	case USB23_TRB_STATUS_TRBSTS_OK:
-		break;
+		if (USB_EP_IS_CONTROL(ep_data->addr)) {
+			usb23_on_xfer_done_ctrl(dev, ep_data);
+		} else {
+			usb23_on_xfer_done_norm(dev, ep_data);
+		}
+		return;
 	case USB23_TRB_STATUS_TRBSTS_MISSEDISOC:
 		LOG_ERR("USB23_TRB_STATUS_TRBSTS_MISSEDISOC");
 		break;
@@ -1846,12 +1856,6 @@ static void usb23_on_xfer_done(const struct device *dev, struct usb23_ep_data *e
 		break;
 	default:
 		__ASSERT_NO_MSG(false);
-	}
-
-	if (USB_EP_IS_CONTROL(ep_data->addr)) {
-		usb23_on_xfer_done_ctrl(dev, ep_data);
-	} else {
-		usb23_on_xfer_done_norm(dev, ep_data);
 	}
 }
 
@@ -1929,7 +1933,7 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	config->irq_clear_func();
-	k_work_submit(&priv->work);
+	k_work_submit_to_queue(udc_get_work_q(), &priv->work);
 }
 
 /*
