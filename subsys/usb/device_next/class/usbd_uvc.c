@@ -29,11 +29,14 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100,
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
 			  0, sizeof(struct udc_buf_info), NULL);
 
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 100,
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
 			  CONFIG_USBD_VIDEO_HEADER_SIZE, sizeof(struct udc_buf_info), NULL);
+
+static struct k_work_q uvc_work_q;
+static K_KERNEL_STACK_DEFINE(uvc_stack, 1024);
 
 struct uvc_desc {
 	struct usb_association_descriptor iad;
@@ -86,7 +89,7 @@ static int uvc_enqueue_buf(struct uvc_data *data, struct net_buf *buf, bool last
 	struct udc_buf_info *bi;
 	int ret;
 
-	LOG_DBG("Enqueueing buf=%p data=%p size=%u len=%u zlp=%u",
+	LOG_DBG("enqueue: buf=%p data=%p size=%u len=%u zlp=%u",
 		buf, buf->data, buf->size, buf->len, last_of_transfer);
 
 	bi = udc_get_buf_info(buf);
@@ -98,7 +101,7 @@ static int uvc_enqueue_buf(struct uvc_data *data, struct net_buf *buf, bool last
 
 	ret = usbd_ep_enqueue(data->c_data, buf);
 	if (ret != 0) {
-		LOG_WRN("Could not enqueue buf=%p", buf);
+		LOG_WRN("enqueue: error from usbd for buf=%p", buf);
 		net_buf_unref(buf);
 		return ret;
 	}
@@ -114,49 +117,57 @@ static int uvc_send_transfer(struct uvc_data *const data, size_t size)
 	struct net_buf *buf;
 	int ret;
 
-	LOG_INF("Fragment of %zu bytes bmHeaderInfo=0x%02x", size,
-		data->payload_header.bmHeaderInfo);
-
 	video_stream_start(vdev);
 
 	/* Header */
 
+	LOG_DBG("send header: allocating buffer");
 	buf = net_buf_alloc(&uvc_pool_header, K_FOREVER);
 	if (buf == NULL) {
+		LOG_ERR("send header: error allocating the buffer");
 		return -EAGAIN;
 	}
 
+	LOG_DBG("send header: filling buffer: bmHeaderInfo=0x%02x", data->payload_header.bmHeaderInfo);
 	net_buf_add_mem(buf, &data->payload_header, 2);
 	while (buf->len < buf->size) {
 		net_buf_add_u8(buf, 0);
 	}
 
+	LOG_DBG("send header: %u bytes to USB", buf->len);
 	ret = uvc_enqueue_buf(data, buf, false);
 	if (ret != 0) {
+		LOG_ERR("send header: error enqueueing the header buffer to USB");
 		return ret;
 	}
 
 	/* Payload */
 
+	LOG_DBG("send payload: putting buffer to video source");
 	ret = video_enqueue(vdev, VIDEO_EP_IN, &vbuf);
 	if (ret != 0) {
-		LOG_ERR("failed to submit the buffer to the video system");
+		LOG_ERR("send payload: failed to put buffer to video source");
 		return ret;
 	}
 
+	LOG_DBG("send payload: getting buffer from video source");
 	ret = video_dequeue(vdev, VIDEO_EP_IN, &vbufp, K_FOREVER);
 	if (ret != 0) {
-		LOG_ERR("failed to fetch the filled buffer from the video system");
+		LOG_ERR("send payload: failed to get buffer from video source");
 		return ret;
 	}
 
+	LOG_DBG("send payload: allocating buffer");
 	buf = net_buf_alloc_with_data(&uvc_pool_payload, vbufp->buffer, vbufp->bytesused, K_FOREVER);
 	if (buf == NULL) {
+		LOG_ERR("send payload: failed to allocate buffer");
 		return -EAGAIN;
 	}
 
+	LOG_DBG("send payload: %u bytes to USB", buf->len);
 	ret = uvc_enqueue_buf(data, buf, true);
 	if (ret != 0) {
+		LOG_ERR("send payload: failed to submit the buffer to USB");
 		return ret;
 	}
 
@@ -169,8 +180,8 @@ static int uvc_send_frame(struct uvc_data *const data)
 	size_t size = desc->if1_frame0.dwMaxVideoFrameBufferSize;
 	int ret;
 
-	LOG_INF("Submitting a %ux%u frame with %u bits per pixel (%zu bytes)", FRAME_WIDTH,
-		FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
+	LOG_INF("send: %ux%u frame, %u bits/pixel, %zu bytes",
+		FRAME_WIDTH, FRAME_HEIGHT, BITS_PER_PIXEL, FRAME_SIZE);
 
 	/* Toggle the FrameId bit for every new frame. */
 	data->payload_header.bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
@@ -218,7 +229,7 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 		break;
 	case UVC_SET_CUR:
 		if (probe->bFormatIndex > desc->if1_stream_in.bNumFormats) {
-			LOG_WRN("invalid format index");
+			LOG_WRN("probe: invalid format index");
 			return;
 		}
 		if (probe->bFormatIndex > 0) {
@@ -250,7 +261,7 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 		break;
 	case UVC_SET_CUR:
 		if (probe->bFrameIndex > desc->if1_stream_in.bNumFormats) {
-			LOG_WRN("invalid format index");
+			LOG_WRN("probe: invalid format index");
 			return;
 		}
 		if (probe->bFrameIndex > 0) {
@@ -326,7 +337,7 @@ static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t 
 	case UVC_SET_CUR:
 		if (probe->dwMaxVideoFrameSize > 0 &&
 		    probe->dwMaxVideoFrameSize != desc->if1_frame0.dwMaxVideoFrameBufferSize) {
-			LOG_WRN("dwMaxVideoFrameSize is read-only");
+			LOG_WRN("probe: dwMaxVideoFrameSize is read-only");
 		}
 		break;
 	}
@@ -353,7 +364,7 @@ static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bReq
 	case UVC_SET_CUR:
 		if (probe->dwMaxPayloadTransferSize > 0 &&
 		    probe->dwMaxPayloadTransferSize != desc->if1_frame0.dwMaxVideoFrameBufferSize) {
-			LOG_WRN("dwPayloadTransferSize is read-only");
+			LOG_WRN("probe: dwPayloadTransferSize is read-only");
 		}
 		break;
 	}
@@ -370,7 +381,7 @@ static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequ
 		break;
 	case UVC_SET_CUR:
 		if (probe->dwClockFrequency > 0) {
-			LOG_WRN("dwClockFrequency is read-only");
+			LOG_WRN("probe: dwClockFrequency is read-only");
 		}
 		break;
 	}
@@ -417,7 +428,7 @@ static void uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bReque
 		break;
 	case UVC_SET_CUR:
 		if (probe->bBitDepthLuma > 0) {
-			LOG_WRN("does not support setting bBitDepthLuma");
+			LOG_WRN("probe: does not support setting bBitDepthLuma");
 		}
 		break;
 	}
@@ -445,31 +456,31 @@ static void uvc_probe_layout_per_stream(struct uvc_data *const data, uint8_t bRe
 	probe->bmLayoutPerStream = 0;
 }
 
-static void uvc_dump_probe(char const *name, const struct uvc_vs_probe_control *probe)
+static void uvc_probe_dump(char const *name, const struct uvc_vs_probe_control *probe)
 {
-	LOG_DBG("UVC_%s", name);
-	LOG_DBG("- bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
-	LOG_DBG("- bFormatIndex = %u", probe->bFormatIndex);
-	LOG_DBG("- bFrameIndex = %u", probe->bFrameIndex);
-	LOG_DBG("- dwFrameInterval = %u ns", sys_le32_to_cpu(probe->dwFrameInterval) * 100);
-	LOG_DBG("- wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
-	LOG_DBG("- wPFrameRate = %u", probe->wPFrameRate);
-	LOG_DBG("- wCompQuality = %u", probe->wCompQuality);
-	LOG_DBG("- wCompWindowSize = %u", probe->wCompWindowSize);
-	LOG_DBG("- wDelay = %u ms", sys_le16_to_cpu(probe->wDelay));
-	LOG_DBG("- dwMaxVideoFrameSize = %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
-	LOG_DBG("- dwMaxPayloadTransferSize = %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
-	LOG_DBG("- dwClockFrequency = %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
-	LOG_DBG("- bmFramingInfo = 0x%02x", probe->bmFramingInfo);
-	LOG_DBG("- bPreferedVersion = %u", probe->bPreferedVersion);
-	LOG_DBG("- bMinVersion = %u", probe->bMinVersion);
-	LOG_DBG("- bMaxVersion = %u", probe->bMaxVersion);
-	LOG_DBG("- bUsage = %u", probe->bUsage);
-	LOG_DBG("- bBitDepthLuma = %u", probe->bBitDepthLuma + 8);
-	LOG_DBG("- bmSettings = %u", probe->bmSettings);
-	LOG_DBG("- bMaxNumberOfRefFramesPlus1 = %u", probe->bMaxNumberOfRefFramesPlus1);
-	LOG_DBG("- bmRateControlModes = %u", probe->bmRateControlModes);
-	LOG_DBG("- bmLayoutPerStream = 0x%08llx", probe->bmLayoutPerStream);
+	LOG_DBG("probe: UVC_%s", name);
+	LOG_DBG("probe: - bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
+	LOG_DBG("probe: - bFormatIndex = %u", probe->bFormatIndex);
+	LOG_DBG("probe: - bFrameIndex = %u", probe->bFrameIndex);
+	LOG_DBG("probe: - dwFrameInterval = %u ns", sys_le32_to_cpu(probe->dwFrameInterval) * 100);
+	LOG_DBG("probe: - wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
+	LOG_DBG("probe: - wPFrameRate = %u", probe->wPFrameRate);
+	LOG_DBG("probe: - wCompQuality = %u", probe->wCompQuality);
+	LOG_DBG("probe: - wCompWindowSize = %u", probe->wCompWindowSize);
+	LOG_DBG("probe: - wDelay = %u ms", sys_le16_to_cpu(probe->wDelay));
+	LOG_DBG("probe: - dwMaxVideoFrameSize = %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
+	LOG_DBG("probe: - dwMaxPayloadTransferSize = %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
+	LOG_DBG("probe: - dwClockFrequency = %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
+	LOG_DBG("probe: - bmFramingInfo = 0x%02x", probe->bmFramingInfo);
+	LOG_DBG("probe: - bPreferedVersion = %u", probe->bPreferedVersion);
+	LOG_DBG("probe: - bMinVersion = %u", probe->bMinVersion);
+	LOG_DBG("probe: - bMaxVersion = %u", probe->bMaxVersion);
+	LOG_DBG("probe: - bUsage = %u", probe->bUsage);
+	LOG_DBG("probe: - bBitDepthLuma = %u", probe->bBitDepthLuma + 8);
+	LOG_DBG("probe: - bmSettings = %u", probe->bmSettings);
+	LOG_DBG("probe: - bMaxNumberOfRefFramesPlus1 = %u", probe->bMaxNumberOfRefFramesPlus1);
+	LOG_DBG("probe: - bmRateControlModes = %u", probe->bmRateControlModes);
+	LOG_DBG("probe: - bmLayoutPerStream = 0x%08llx", probe->bmLayoutPerStream);
 }
 
 static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
@@ -482,19 +493,19 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		memcpy(probe, &data->default_probe, sizeof(*probe));
 		break;
 	case UVC_SET_CUR:
-		uvc_dump_probe("SET_CUR", probe);
+		uvc_probe_dump("SET_CUR", probe);
 		goto action;
 	case UVC_GET_CUR:
-		uvc_dump_probe("GET_CUR", probe);
+		uvc_probe_dump("GET_CUR", probe);
 		goto action;
 	case UVC_GET_MIN:
-		uvc_dump_probe("GET_MIN", probe);
+		uvc_probe_dump("GET_MIN", probe);
 		goto action;
 	case UVC_GET_MAX:
-		uvc_dump_probe("GET_MAX", probe);
+		uvc_probe_dump("GET_MAX", probe);
 		goto action;
 	case UVC_GET_RES:
-		uvc_dump_probe("SET_RES", probe);
+		uvc_probe_dump("SET_RES", probe);
 		goto action;
 	action:
 		/* TODO use bmHint to choose in which order configure the fields */
@@ -534,7 +545,7 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 	struct video_format fmt = {0};
 	int ret;
 
-	LOG_DBG("UVC control: commit");
+	LOG_DBG("commit: applying the probe data");
 
 	switch (bRequest) {
 	case UVC_GET_CUR:
@@ -553,16 +564,16 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		fmt.pitch = 0;
 		ret = video_set_format(vdev, VIDEO_EP_IN, &fmt);
 		if (ret < 0) {
-			LOG_WRN("unable to set video format (err %u)", ret);
+			LOG_WRN("commit: unable to set video format (err %u)", ret);
 			errno = ret;
 			return 0;
 		}
 
-		LOG_INF("Starting UVC transfer");
-		k_work_submit(&data->work);
+		LOG_INF("commit: starting UVC transfer");
+		k_work_submit_to_queue(&uvc_work_q, &data->work);
 		break;
 	default:
-		LOG_ERR("invalid bRequest (%u)", bRequest);
+		LOG_ERR("commit: invalid bRequest (%u)", bRequest);
 		errno = -EINVAL;
 		return 0;
 	}
@@ -594,20 +605,20 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 		break;
 	case UVC_SET_CUR:
 		if (buf->len != sizeof(probe)) {
-			LOG_ERR("Invalid wLength=%u for Probe or Commit", setup->wLength);
+			LOG_ERR("probe: invalid wLength=%u for Probe or Commit", setup->wLength);
 			errno = -EINVAL;
 			return 0;
 		}
 		break;
 	default:
-		LOG_ERR("Invalid bRequest (%u) for Probe or Commit", setup->bRequest);
+		LOG_ERR("probe: invalid bRequest (%u) for Probe or Commit", setup->bRequest);
 		errno = -EINVAL;
 		return 0;
 	}
 
 	/* All remaining request work on a struct uvc_vs_probe_control */
 	if (setup->wLength != sizeof(probe)) {
-		LOG_ERR("Invalid wLength=%u for Probe or Commit", setup->wLength);
+		LOG_ERR("probe: invalid wLength=%u for Probe or Commit", setup->wLength);
 		errno = -EINVAL;
 		return 0;
 	}
@@ -633,7 +644,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	case UVC_VS_COMMIT_CONTROL:
 		return uvc_probe_or_commit(data, setup, buf);
 	default:
-		LOG_WRN("unsupported wValue (%u)", setup->wValue);
+		LOG_WRN("api: control: unsupported wValue (%u)", setup->wValue);
 		errno = -ENOTSUP;
 		return 0;
 	}
@@ -659,7 +670,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	struct uvc_data *data = dev->data;
 	struct udc_buf_info bi = *udc_get_buf_info(buf);
 
-	LOG_DBG("UVC transfer done for ep=0x%02x buf=%p", bi.ep, buf);
+	LOG_DBG("api: transfer done, ep=0x%02x buf=%p", bi.ep, buf);
 	net_buf_unref(buf);
 	__ASSERT_NO_MSG(bi.ep == uvc_get_bulk_in(data));
 
@@ -671,7 +682,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	if (bi.ep == uvc_get_bulk_in(data)) {
 		/* Only for the last buffer of the transfer and last transfer of the frame */
 		if (bi.zlp && EOF(data->payload_header)) {
-			k_work_submit(&data->work);
+			k_work_submit_to_queue(&uvc_work_q, &data->work);
 		}
 	}
 	return 0;
@@ -679,15 +690,24 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 
 static void uvc_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
 {
-	LOG_DBG("UVC Update");
+	LOG_DBG("api: update");
 }
+
+static int uvc_init_wq(void)
+{
+	k_work_queue_init(&uvc_work_q);
+	k_work_queue_start(&uvc_work_q, uvc_stack, K_KERNEL_STACK_SIZEOF(uvc_stack),
+			   CONFIG_SYSTEM_WORKQUEUE_PRIORITY, NULL);
+	return 0;
+}
+SYS_INIT(uvc_init_wq, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
 static int uvc_init(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	LOG_INF("Initializing UVC class");
+	LOG_INF("api: initializing UVC class");
 
 	/* Prepare the payload header fields that are constant over time */
 	data->payload_header.bHeaderLength = sizeof(uint64_t); // TODO sizeof(anstruct uvc_payload_header);
