@@ -620,6 +620,7 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
 #define USB23_MANAGER_CONTROLSTATUS_FSMSTATE_ERROR        (0xf << 2)
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT           6
 #define USB23_MANAGER_CONTROLSTATUS_TRBID_MASK            GENMASK(13, 6)
+#define USB23_MANAGER_CONTROLSTATUS_CONTINUE              BIT(14)
 #define USB23_MANAGER_TRBADDR                             0x0014
 #define USB23_MANAGER_NUMBYTES                            0x0018
 #define USB23_MANAGER_DONEBYTES                           0x001c
@@ -632,6 +633,7 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
 #define USB23_MANAGER_TOTALBYTESOUT                       0x0038
 #define USB23_MANAGER_HEADER0                             0x003c
 #define USB23_MANAGER_HEADER1                             0x0040
+#define USB23_MANAGER_FRAMECOUNTER                        0x0044
 
 uint32_t usbm_fifothres = 1024;
 
@@ -1181,6 +1183,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	/* Synchronize the current position between the driver and USB23 Manager then let the
 	 * USB23 Manager enqueue until the FIFO is empty */
 	reg = USB23_MANAGER_CONTROLSTATUS_ENABLE;
+	reg |= USB23_MANAGER_CONTROLSTATUS_CONTINUE;
 	reg |= (ep_data->head << USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, reg);
 
@@ -2519,6 +2522,7 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 	DUMP(USB23_MANAGER_TOTALBYTESOUT);
 	DUMP(USB23_MANAGER_HEADER0);
 	DUMP(USB23_MANAGER_HEADER1);
+	DUMP(USB23_MANAGER_FRAMECOUNTER);
 #undef DUMP
 }
 
