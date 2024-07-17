@@ -55,19 +55,19 @@ static int uvcmanager_get_ctrl(const struct device *dev, unsigned int cid, void 
 	return -ENOTSUP;
 }
 
-#define FORMAT_CAP(fmt)                                                                            \
+#define FORMAT_CAP(fmt, wmax, hmax)                                                                \
 	{                                                                                          \
-		.pixelformat = fmt, .width_min = 1, .width_max = 3280, .height_min = 1,            \
-		.height_max = 2464, .width_step = 1, .height_step = 1,                             \
+		.pixelformat = fmt, .width_min = 1, .width_max = wmax, .height_min = 1,            \
+		.height_max = hmax, .width_step = 1, .height_step = 1,                             \
 	}
 
 static const struct video_format_cap fmts[] = {
-	FORMAT_CAP(VIDEO_PIX_FMT_BGGR8),
-	FORMAT_CAP(VIDEO_PIX_FMT_GBRG8),
-	FORMAT_CAP(VIDEO_PIX_FMT_GRBG8),
-	FORMAT_CAP(VIDEO_PIX_FMT_RGGB8),
-	FORMAT_CAP(VIDEO_PIX_FMT_RGB565),
-	FORMAT_CAP(VIDEO_PIX_FMT_YUYV),
+	FORMAT_CAP(VIDEO_PIX_FMT_BGGR8, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_GBRG8, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_GRBG8, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_RGGB8, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_RGB565, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_YUYV, UINT32_MAX),
 	{0}};
 
 static int uvcmanager_get_caps(const struct device *dev, enum video_endpoint_id ep, struct video_caps *caps)
@@ -102,7 +102,7 @@ static int uvcmanager_enqueue(const struct device *dev, enum video_endpoint_id e
 
 	/* No data transfer: the data is memory mapped by the hardware and immediately ready */
 	vbuf->buffer = (uint8_t *)conf->buf_addr;
-	vbuf->bytesused = MIN(vbuf->size, conf->buf_size);
+	vbuf->bytesused = vbuf->size;
 
 	LOG_DBG("uvcmanager: enqueuing vbuf=%p data=%p size=%u bytesused=%u max=%u",
 		vbuf, vbuf->buffer, vbuf->size, vbuf->bytesused, conf->buf_size);

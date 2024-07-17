@@ -24,7 +24,7 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define FRAME_HEIGHT              1080
 #define BITS_PER_PIXEL            16
 #define FRAME_SIZE                (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
-#define TRANSFER_SIZE             (1024 * 1024)
+#define TRANSFER_SIZE             (1024 * 1024 * 1024)
 #define EOF(header)               ((header).bmHeaderInfo & UVC_BMHEADERINFO_END_OF_FRAME)
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
