@@ -3,7 +3,7 @@
 
 description: Small pattern generator with an incrementing address
 
-compatible: "tinyvision,tinygen"
+compatible: "tinyvision,uvcmanager"
 
 # TODO generates an _ORD set to -1 when this is included on both side
 #include: video-device.yaml
