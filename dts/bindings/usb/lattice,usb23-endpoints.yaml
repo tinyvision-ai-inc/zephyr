@@ -16,5 +16,5 @@ child-binding:
     num-trbs:
       type: int
       required: true
-    usb23-manager:
+    uvcmanager:
       type: phandle

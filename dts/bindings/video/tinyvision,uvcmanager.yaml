@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 description: |
-    USB Manager to control a device endpoint of Lattice USB23
+    USB Video Class Manager to transfer a MIPI feed to an UVC video endpoint
 
-compatible: "tinyvision,usb23-manager"
+compatible: "tinyvision,uvcmanager"
 
 include: base.yaml
 

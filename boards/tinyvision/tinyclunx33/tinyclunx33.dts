@@ -59,8 +59,8 @@
 			zephyr,memory-region = "USB23_DMA";
 		};
 
-		usb23_manager: usb23_manager@b4000000 {
-			compatible = "tinyvision,usb23-manager";
+		uvcmanager: uvcmanager@b4000000 {
+			compatible = "tinyvision,uvcmanager";
 			status = "okay";
 			reg = <	0xb4000000 0x10000
 				0xb1200000 0x10000>;

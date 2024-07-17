@@ -194,18 +194,18 @@ int usb23_driver_preinit(const struct device *dev)
 #define USB23_EP_DATA_ENTRY(n)                                                                     \
 	{                                                                                          \
 		.manager_base =                                                                    \
-			COND_CODE_1(DT_NODE_HAS_PROP(n, usb23_manager),                            \
-				    (DT_REG_ADDR_BY_IDX(DT_PHANDLE(n, usb23_manager), 0)), (0)),   \
+			COND_CODE_1(DT_NODE_HAS_PROP(n, uvcmanager),                               \
+				    (DT_REG_ADDR_BY_NAME(DT_PHANDLE(n, uvcmanager), base)), (0)),  \
 		.manager_fifo =                                                                    \
-			COND_CODE_1(DT_NODE_HAS_PROP(n, usb23_manager),                            \
-				    (DT_REG_ADDR_BY_IDX(DT_PHANDLE(n, usb23_manager), 1)), (0)),   \
+			COND_CODE_1(DT_NODE_HAS_PROP(n, uvcmanager),                               \
+				    (DT_REG_ADDR_BY_NAME(DT_PHANDLE(n, uvcmanager), fifo)), (0)),  \
 		.num_of_trbs = DT_PROP(n, num_trbs),                                               \
 		.trb_buf = usb23_dma_trb_buf_##n,                                                  \
 		.net_buf = usb23_net_buf_##n,                                                      \
 	},
 
 #define USB23_MANAGER_LIST_ENTRY(n, o)                                                             \
-	COND_CODE_0(DT_NODE_HAS_PROP(n, usb23_manager), (),                                        \
+	COND_CODE_0(DT_NODE_HAS_PROP(n, uvcmanager), (),                                           \
 		    (&usb23_ep_data_##o[DT_NODE_CHILD_IDX(n)], ))
 
 #define USB23_DEVICE_DEFINE(n)                                                                     \

@@ -137,7 +137,7 @@ static const struct video_driver_api uvcmanager_driver_api = {
 	.dequeue = uvcmanager_dequeue,
 };
 
-#define DT_DRV_COMPAT tinyvision_usb23_manager
+#define DT_DRV_COMPAT tinyvision_uvcmanager
 
 #define UVCMANAGER_DEVICE_DEFINE(n)                                                                \
                                                                                                    \

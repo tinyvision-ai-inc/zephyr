@@ -578,7 +578,7 @@ LOG_MODULE_REGISTER(usb23blob, CONFIG_UDC_DRIVER_LOG_LEVEL);
 void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_data);
 
 /*
- * USB23 Manager
+ * uvcmanager
  *
  * Extra core that automates the endpoint enqueueing to increase throughput with smaller buffers.
  * This reduces memory usage and improves latency.
@@ -651,7 +651,7 @@ void usb23_manager_write(const struct device *dev, struct usb23_ep_data *ep_data
 }
 
 /*
- * Configure the USB23 Manager: a custom FPGA core that polls the HWO flag of a TRB to send a new
+ * Configure the uvcmanager: a custom FPGA core that polls the HWO flag of a TRB to send a new
  * TRB whenever the previous one is completed.
  */
 void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_data)
@@ -659,17 +659,17 @@ void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_dat
 	const struct usb23_config *config = dev->config;
 	uint32_t reg;
 
-	/* Disable the USB23 Manager while it is being configured */
+	/* Disable the uvcmanager while it is being configured */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, 0);
 
-	/* Let USB23 Manager know about the address of the TRB it uses */
+	/* Let uvcmanager know about the address of the TRB it uses */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_TRBADDR, (uint32_t)ep_data->trb_buf);
 
 	/* Configure the TRB trigger address of the USB23 core so it can enqueue TRBs */
 	reg = config->base + USB23_DEPCMD(ep_data->epn);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLADDR, reg);
 
-	/* Write the address of the FIFO stream that will be pulled by the USB23 Manager */
+	/* Write the address of the FIFO stream that will be pulled by the uvcmanager */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_STREAMADDRESS, ep_data->manager_fifo);
 
 	/* Enable the IRQs */
@@ -758,7 +758,7 @@ static struct net_buf *usb23_pop_trb(const struct device *dev, struct usb23_ep_d
 {
 	struct net_buf *buf = NULL;
 
-	/* Skip all the buffer left emtpy by the USB23 Manager */
+	/* Skip all the buffer left emtpy by the uvcmanager */
 	for (int i = 0;i < ep_data->num_of_trbs && buf == NULL; i++) {
 		/* Collect the buffer and clear it from the list */
 		buf = ep_data->net_buf[ep_data->tail];
@@ -1146,20 +1146,20 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	uint32_t reg;
 
 	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
-		LOG_ERR("trb: USB23 Manager only supports input direction");
+		LOG_ERR("trb: uvcmanager only supports input direction");
 		return -EINVAL;
 	}
 	if (buf->len % 8 != 0) {
-		LOG_ERR("trb: USB23 Manager assumes transfer sizes to be multiple of 8");
+		LOG_ERR("trb: uvcmanager assumes transfer sizes to be multiple of 8");
 		return -EINVAL;
 	}
 
 	LOG_DBG("trb: BULK_MANAGER ep=0x%02x data=%p len=%u", ep_data->addr, buf->data, buf->len);
 
-	/* Disable the USB23 Manager when configuring it */
+	/* Disable the uvcmanager when configuring it */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, 0);
 
-	/* Number of bytes that must be ready before the USB23 Manager enqueues a new TRB */
+	/* Number of bytes that must be ready before the uvcmanager enqueues a new TRB */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres);
 
 	/* Configure as a NORMAL TRB, letting the USB Manager decide when set the CHN field */
@@ -1172,7 +1172,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	/* Configure the length according to the incoming net buf */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_NUMBYTES, buf->len);
 
-	/* Let the USB23 Manager enqueue until the FIFO is empty */
+	/* Let the uvcmanager enqueue until the FIFO is empty */
 	__ASSERT_NO_MSG((uintptr_t)buf->data == ep_data->manager_fifo);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_STREAMADDRESS, ep_data->manager_fifo);
 
@@ -1180,14 +1180,14 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_HEADER0, ep_data->manager_header[0]);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_HEADER1, ep_data->manager_header[1]);
 
-	/* Synchronize the current position between the driver and USB23 Manager then let the
-	 * USB23 Manager enqueue until the FIFO is empty */
+	/* Synchronize the current position between the driver and uvcmanager then let the
+	 * uvcmanager enqueue until the FIFO is empty */
 	reg = USB23_MANAGER_CONTROLSTATUS_ENABLE;
 	reg |= USB23_MANAGER_CONTROLSTATUS_CONTINUE;
 	reg |= (ep_data->head << USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, reg);
 
-	/* Keep the buffer of the USB23 Manager for later */
+	/* Keep the buffer of the uvcmanager for later */
 	ep_data->manager_buf = buf;
 	return 0;
 }
@@ -1201,19 +1201,19 @@ static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_
 		buf->data, buf->size, buf->len);
 
 	if (!USB_EP_DIR_IS_IN(ep_data->addr)) {
-		LOG_ERR("trb: USB23 Manager header only supported for output direction");
+		LOG_ERR("trb: uvcmanager header only supported for output direction");
 		return -EINVAL;
 	}
 
 	if (buf->len != sizeof(uint64_t)) {
-		LOG_ERR("trb: USB23 Manager header only supports uint64_t sized buffer");
+		LOG_ERR("trb: uvcmanager header only supports uint64_t sized buffer");
 		return -EINVAL;
 	}
 
 	ep_data->manager_header[0] = *(uint32_t *)(buf->data + sizeof(uint32_t));
 	ep_data->manager_header[1] = *(uint32_t *)(buf->data + 0);
 
-	/* Submit the buffer completed by the USB23 Manager back to Zephyr */
+	/* Submit the buffer completed by the uvcmanager back to Zephyr */
 	ret = udc_submit_ep_event(dev, buf, 0);
 	__ASSERT_NO_MSG(ret == 0);
 
@@ -1223,16 +1223,16 @@ static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_
 static int usb23_trb_bulk(const struct device *dev, struct usb23_ep_data *ep_data,
 			  struct net_buf *buf)
 {
-	/* If the USB23 Manager is configured for this endpoint */
+	/* If the uvcmanager is configured for this endpoint */
 	if (ep_data->manager_base != 0) {
 		if (ep_data->manager_buf != NULL) {
-			LOG_DBG("trb: abort: USB23 Manager is busy");
+			LOG_DBG("trb: abort: uvcmanager is busy");
 			return -EAGAIN;
 		}
 
-		/* If we submit a buffer that goes for USB23 Manager endpoint address. */
+		/* If we submit a buffer that goes for uvcmanager endpoint address. */
 		if ((uintptr_t)buf->data == ep_data->manager_fifo) {
-			/* Use the USB23 Manager as an accelerator */
+			/* Use the uvcmanager as an accelerator */
 			return usb23_trb_bulk_manager(dev, ep_data, buf);
 		} else {
 			/* Consider it as header and pass it first */
@@ -1250,7 +1250,7 @@ static void usb23_enqueue_buf(const struct device *dev, struct usb23_ep_data *ep
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, ep_data->addr);
 	int ret;
 
-	/* Do not interfer with the USB23 Manager operation */
+	/* Do not interfer with the uvcmanager operation */
 	if (ep_cfg->stat.halted || ep_data->manager_buf) {
 		udc_buf_put(ep_cfg, buf);
 		return;
@@ -1271,9 +1271,9 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
 
 	LOG_DBG("queue: checking for pending transfers");
 
-	/* Do not interfer with the USB23 Manager operation */
+	/* Do not interfer with the uvcmanager operation */
 	if (ep_data->manager_buf) {
-		LOG_DBG("queue: abort: not interfering with USB23 Manager");
+		LOG_DBG("queue: abort: not interfering with uvcmanager");
 		return;
 	}
 
@@ -1311,24 +1311,24 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	uint32_t next;
 	int ret;
 
-	/* Check that USB23 Manager just ran and that the driver did catch-up */
+	/* Check that uvcmanager just ran and that the driver did catch-up */
 	if (buf == NULL) {
 		return;
 	}
 
 	LOG_EVENT(MANAGER_DONE);
 
-	/* Sync the position in the ring buffer with the USB23 Manager */
+	/* Sync the position in the ring buffer with the uvcmanager */
 	reg = usb23_manager_read(dev, ep_data, USB23_MANAGER_CONTROLSTATUS);
 	next = (GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID) + 1) % (ep_data->num_of_trbs - 1);
 
-	/* Skip all the TRBs submitted by the USB23 Manager */
+	/* Skip all the TRBs submitted by the uvcmanager */
 	ep_data->head = next;
 
-	/* The USB23 Manager buffer was submitted as a normal TRB and will be picked-up later */
+	/* The uvcmanager buffer was submitted as a normal TRB and will be picked-up later */
 	ep_data->manager_buf = NULL;
 
-	/* Submit the buffer completed by the USB23 Manager back to Zephyr */
+	/* Submit the buffer completed by the uvcmanager back to Zephyr */
 	ret = udc_submit_ep_event(dev, buf, 0);
 	__ASSERT_NO_MSG(ret == 0);
 
@@ -1919,7 +1919,7 @@ void usb23_on_event(const struct device *dev)
 		LOG_EVENT(*);
 	}
 
-	/* Process the USB23 Manager events */
+	/* Process the uvcmanager events */
 	for (struct usb23_ep_data **ep_data = config->manager_list; *ep_data != NULL; ep_data++) {
 		uint32_t reg;
 
@@ -2083,11 +2083,11 @@ void usb23_enable(const struct device *dev)
 {
 	const struct usb23_config *config = dev->config;
 
-	/* Enable the USB23 Manager events */
+	/* Enable the uvcmanager events */
 	for (struct usb23_ep_data **ep_data = config->manager_list; *ep_data != NULL; ep_data++) {
-		/* For enabled endpoint, use the USB23 Manager to automatically reload the TRBs */
+		/* For enabled endpoint, use the uvcmanager to automatically reload the TRBs */
 		if ((*ep_data)->manager_base) {
-			LOG_DBG("enable: USB23 Manager for ep=0x%02x", (*ep_data)->addr);
+			LOG_DBG("enable: uvcmanager for ep=0x%02x", (*ep_data)->addr);
 			usb23_manager_enable(dev, *ep_data);
 		}
 	}
@@ -2452,7 +2452,7 @@ void usb23_dump_manager(const struct device *dev, struct usb23_ep_data *ep_data,
 	uint32_t reg;
 
 	if (ep_data->manager_base == 0) {
-		shell_error(sh, "no USB23 Manager for this endpoint");
+		shell_error(sh, "no uvcmanager for this endpoint");
 		return;
 	}
 
@@ -2676,7 +2676,7 @@ static int cmd_usb23_all (const struct shell *sh, size_t argc, char **argv)
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_usb23,
 			       SHELL_CMD_ARG(manager, &dsub_device_name,
-					     "Dump the USB23 Manager registers\n"
+					     "Dump the uvcmanager registers\n"
 					     "Usage: manager <device> <ep>",
 					     cmd_usb23_manager, 3, 0),
 			       SHELL_CMD_ARG(trb, &dsub_device_name,
@@ -2700,7 +2700,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_usb23,
 					     "Usage: link <device>",
 					     cmd_usb23_link, 2, 0),
 			       SHELL_CMD_ARG(thres, &dsub_device_name,
-					     "Dump set the FIFO threshold for the USB23 Manager\n"
+					     "Dump set the FIFO threshold for the uvcmanager\n"
 					     "Usage: thres <num>",
 					     cmd_usb23_thres, 2, 0),
 			       SHELL_CMD_ARG(fifo, &dsub_device_name,

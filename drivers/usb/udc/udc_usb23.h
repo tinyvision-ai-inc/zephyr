@@ -48,10 +48,10 @@ struct usb23_ep_data {
 	/* Point back to the device for work queues */
 	const struct device *dev;
 
-	/* Address at which the USB23 Manager control interface is */
+	/* Address at which the uvcmanager control interface is */
 	uintptr_t manager_base;
 
-	/* Address at which the USB23 Manager data FIFO interface is */
+	/* Address at which the uvcmanager data FIFO interface is */
 	uintptr_t manager_fifo;
 
 	/* Whenever the USB Manager is running, this points to its buffer */
