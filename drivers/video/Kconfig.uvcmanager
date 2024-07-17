@@ -3,7 +3,7 @@
 
 config VIDEO_UVCMANAGER
 	bool "uvcmanager ad-hoc pattern generator"
-	depends on DT_HAS_TINYVISION_UVCMANAGER_ENABLED
+	depends on DT_HAS_TINYVISION_USB23_MANAGER_ENABLED
 	default y
 	help
 	  Enable driver for uvcmanager pattern generator

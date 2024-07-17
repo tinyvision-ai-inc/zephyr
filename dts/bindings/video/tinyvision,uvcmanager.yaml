@@ -1,9 +1,0 @@
-# Copyright (c) 2024 tinyVision.ai Inc.
-# SPDX-License-Identifier: Apache-2.0
-
-description: Small pattern generator with an incrementing address
-
-compatible: "tinyvision,uvcmanager"
-
-# TODO generates an _ORD set to -1 when this is included on both side
-#include: video-device.yaml

@@ -15,7 +15,6 @@ LOG_MODULE_REGISTER(uvcmanager, CONFIG_VIDEO_LOG_LEVEL);
 
 struct uvcmanager_conf {
 	uintptr_t buf_addr;
-	size_t buf_size;
 };
 
 struct uvcmanager_data {
@@ -62,12 +61,12 @@ static int uvcmanager_get_ctrl(const struct device *dev, unsigned int cid, void 
 	}
 
 static const struct video_format_cap fmts[] = {
-	FORMAT_CAP(VIDEO_PIX_FMT_BGGR8, UINT32_MAX),
-	FORMAT_CAP(VIDEO_PIX_FMT_GBRG8, UINT32_MAX),
-	FORMAT_CAP(VIDEO_PIX_FMT_GRBG8, UINT32_MAX),
-	FORMAT_CAP(VIDEO_PIX_FMT_RGGB8, UINT32_MAX),
-	FORMAT_CAP(VIDEO_PIX_FMT_RGB565, UINT32_MAX),
-	FORMAT_CAP(VIDEO_PIX_FMT_YUYV, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_BGGR8, UINT32_MAX, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_GBRG8, UINT32_MAX, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_GRBG8, UINT32_MAX, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_RGGB8, UINT32_MAX, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_RGB565, UINT32_MAX, UINT32_MAX),
+	FORMAT_CAP(VIDEO_PIX_FMT_YUYV, UINT32_MAX, UINT32_MAX),
 	{0}};
 
 static int uvcmanager_get_caps(const struct device *dev, enum video_endpoint_id ep, struct video_caps *caps)
@@ -104,8 +103,8 @@ static int uvcmanager_enqueue(const struct device *dev, enum video_endpoint_id e
 	vbuf->buffer = (uint8_t *)conf->buf_addr;
 	vbuf->bytesused = vbuf->size;
 
-	LOG_DBG("uvcmanager: enqueuing vbuf=%p data=%p size=%u bytesused=%u max=%u",
-		vbuf, vbuf->buffer, vbuf->size, vbuf->bytesused, conf->buf_size);
+	LOG_DBG("uvcmanager: enqueuing vbuf=%p data=%p size=%u bytesused=%u",
+		vbuf, vbuf->buffer, vbuf->size, vbuf->bytesused);
 
 	k_fifo_put(&data->fifo, vbuf);
 	return 0;
@@ -138,18 +137,17 @@ static const struct video_driver_api uvcmanager_driver_api = {
 	.dequeue = uvcmanager_dequeue,
 };
 
-#define DT_DRV_COMPAT tinyvision_uvcmanager
+#define DT_DRV_COMPAT tinyvision_usb23_manager
 
-#define UVCMANAGER_DEVICE_DEFINE(n)                                                                   \
+#define UVCMANAGER_DEVICE_DEFINE(n)                                                                \
                                                                                                    \
-	struct uvcmanager_conf uvcmanager_conf_##n = {                                                   \
-		.buf_addr = DT_INST_REG_ADDR(n),                                                   \
-		.buf_size = DT_INST_REG_SIZE(n),                                                   \
+	struct uvcmanager_conf uvcmanager_conf_##n = {                                             \
+		.buf_addr = DT_INST_REG_ADDR_BY_NAME(n, fifo),                                     \
 	};                                                                                         \
                                                                                                    \
-	struct uvcmanager_data uvcmanager_data_##n;                                                      \
+	struct uvcmanager_data uvcmanager_data_##n;                                                \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(n, uvcmanager_init, NULL, &uvcmanager_data_##n, &uvcmanager_conf_##n,         \
+	DEVICE_DT_INST_DEFINE(n, uvcmanager_init, NULL, &uvcmanager_data_##n, &uvcmanager_conf_##n,\
 			      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &uvcmanager_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(UVCMANAGER_DEVICE_DEFINE)
