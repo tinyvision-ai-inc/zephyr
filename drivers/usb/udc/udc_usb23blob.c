@@ -2053,7 +2053,9 @@ int usb23_api_set_address(const struct device *dev, const uint8_t addr)
 {
 	/* The address is set in the code earlier to improve latency, only
 	 * checking that it is still the value done for consistency. */
-	__ASSERT_NO_MSG(GETFIELD(usb23_io_read(dev, USB23_DCFG), USB23_DCFG_DEVADDR) == addr);
+	if (GETFIELD(usb23_io_read(dev, USB23_DCFG), USB23_DCFG_DEVADDR) != addr) {
+		return -EPROTO;
+	}
 	return 0;
 }
 
