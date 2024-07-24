@@ -93,7 +93,6 @@
 
 &i2c0 {
 	status = "okay";
-
 	pll0: si5351@60 {
 		reg = <0x60>;
 		compatible = "skyworks,si5351";

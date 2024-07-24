@@ -55,4 +55,6 @@ source "drivers/video/Kconfig.ov7670"
 
 source "drivers/video/Kconfig.uvcmanager"
 
+source "drivers/video/Kconfig.imx219"
+
 endif # VIDEO
