@@ -35,7 +35,7 @@ struct usb23_config {
 	void (*irq_clear_func)(void);
 
 	/* Pointers to event buffer fetched by USB23 with DMA */
-	volatile union usb23_evt *evt_buf;
+	volatile uint32_t *evt_buf;
 };
 
 /*
@@ -99,39 +99,6 @@ struct usb23_data {
 
 	/* Size of the data stage of control transaction */
 	size_t data_stage_length;
-};
-
-/*
- * Format for an endpoint-specific event.
- */
-struct usb23_depevt {
-	uint32_t category: 1;
-	uint32_t ep_num: 5;
-	uint32_t type: 4;
-	uint32_t reserved_11_10: 2;
-	uint32_t status: 4;
-	uint32_t parameters: 16;
-} __packed;
-
-/*
- * Format for a device event unrelated to any endpoint.
- */
-struct usb23_devt {
-	uint32_t category: 1;
-	uint32_t event: 7;
-	uint32_t type: 4;
-	uint32_t reserved_15_12: 4;
-	uint32_t evtinfo: 9;
-	uint32_t reserved_31_25: 7;
-} __packed;
-
-/*
- * Format of each entry of the event buffer.
- */
-union usb23_evt {
-	struct usb23_depevt depevt;
-	struct usb23_devt devt;
-	uint32_t raw;
 };
 
 /*

@@ -574,9 +574,6 @@ LOG_MODULE_REGISTER(usb23blob, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define LOG_EVENT(name)         LOG_DBG("--- %s ---", #name)
 #define USB_EP_IS_CONTROL(addr) ((addr) == USB_CONTROL_EP_IN || (addr) == USB_CONTROL_EP_OUT)
 
-/* Forward declarations */
-void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_data);
-
 /*
  * uvcmanager
  *
@@ -635,7 +632,40 @@ void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_d
 #define USB23_MANAGER_HEADER1                             0x0040
 #define USB23_MANAGER_FRAMECOUNTER                        0x0044
 
-uint32_t usbm_fifothres = 1024;
+/*
+ * Format for an endpoint-specific event.
+ */
+struct usb23_depevt {
+	uint32_t category: 1;
+	uint32_t ep_num: 5;
+	uint32_t type: 4;
+	uint32_t reserved_11_10: 2;
+	uint32_t status: 4;
+	uint32_t parameters: 16;
+} __packed;
+
+/*
+ * Format for a device event unrelated to any endpoint.
+ */
+struct usb23_devt {
+	uint32_t category: 1;
+	uint32_t event: 7;
+	uint32_t type: 4;
+	uint32_t reserved_15_12: 4;
+	uint32_t evtinfo: 9;
+	uint32_t reserved_31_25: 7;
+} __packed;
+
+/*
+ * Format of each entry of the event buffer.
+ */
+union usb23_evt {
+	struct usb23_depevt depevt;
+	struct usb23_devt devt;
+	uint32_t raw;
+};
+
+void usb23_dump_all(const struct device *dev, struct usb23_ep_data *ep_data, const struct shell *sh);
 
 uint32_t usb23_manager_read(const struct device *dev, struct usb23_ep_data *ep_data, uint32_t reg)
 {
@@ -656,7 +686,7 @@ void usb23_manager_write(const struct device *dev, struct usb23_ep_data *ep_data
  */
 void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_data)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 	uint32_t reg;
 
 	/* Disable the uvcmanager while it is being configured */
@@ -666,7 +696,7 @@ void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_dat
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_TRBADDR, (uint32_t)ep_data->trb_buf);
 
 	/* Configure the TRB trigger address of the USB23 core so it can enqueue TRBs */
-	reg = config->base + USB23_DEPCMD(ep_data->epn);
+	reg = conf->base + USB23_DEPCMD(ep_data->epn);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_DOORBELLADDR, reg);
 
 	/* Write the address of the FIFO stream that will be pulled by the uvcmanager */
@@ -690,16 +720,16 @@ void usb23_manager_enable(const struct device *dev, struct usb23_ep_data *ep_dat
 
 static uint32_t usb23_io_read(const struct device *dev, uint32_t addr)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 
-	return MEM32(config->base + addr);
+	return MEM32(conf->base + addr);
 }
 
 static void usb23_io_write(const struct device *dev, uint32_t addr, uint32_t data)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 
-	MEM32(config->base + addr) = data;
+	MEM32(conf->base + addr) = data;
 }
 
 static void usb23_io_wait_go_low(const struct device *dev, uint32_t addr, uint32_t mask)
@@ -771,7 +801,7 @@ static struct net_buf *usb23_pop_trb(const struct device *dev, struct usb23_ep_d
 	}
 	if (buf == NULL) {
 		LOG_ERR("pop: trying to pop empty stack");
-		usb23_fatal_error_dump(dev, ep_data);
+		usb23_dump_all(dev, ep_data, NULL);
 		return NULL;
 	}
 
@@ -779,22 +809,6 @@ static struct net_buf *usb23_pop_trb(const struct device *dev, struct usb23_ep_d
 	ep_data->full = false;
 
 	return buf;
-}
-
-static union usb23_evt usb23_get_next_evt(const struct device *dev)
-{
-	const struct usb23_config *config = dev->config;
-	struct usb23_data *priv = udc_get_private(dev);
-	volatile union usb23_evt evt;
-
-	/* Cache the current event */
-	evt = config->evt_buf[priv->evt_next];
-
-	/* This is a ring buffer, wrap around */
-	priv->evt_next++;
-	priv->evt_next %= CONFIG_USB23_EVT_NUM;
-
-	return evt;
 }
 
 /*
@@ -1043,7 +1057,7 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 
 static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, uint32_t ctrl)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, USB_CONTROL_EP_OUT);
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
 	volatile struct usb23_trb *trb = ep_data->trb_buf;
@@ -1060,7 +1074,7 @@ static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, ui
 	trb[0].ctrl = ctrl | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO;
 
 	/* TRB1 discarding any overflow data */
-	trb[1].addr_lo = config->discard;
+	trb[1].addr_lo = conf->discard;
 	trb[1].status = ep_cfg->mps - buf->size;
 	trb[1].ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO;
 
@@ -1160,7 +1174,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, 0);
 
 	/* Number of bytes that must be ready before the uvcmanager enqueues a new TRB */
-	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, usbm_fifothres);
+	usb23_manager_write(dev, ep_data, USB23_MANAGER_FIFOTHRESHOLD, 2048);
 
 	/* Configure as a NORMAL TRB, letting the USB Manager decide when set the CHN field */
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_TRBCTRL, USB23_TRB_CTRL_TRBCTL_NORMAL);
@@ -1340,7 +1354,7 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 
 static void usb23_on_soft_reset(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 	uint32_t reg;
 
 	/* Configure and reset the Device Controller */
@@ -1376,17 +1390,17 @@ static void usb23_on_soft_reset(const struct device *dev)
 	usb23_io_write(dev, USB23_GRXFIFOSIZ(0), 512 * 3);
 
 	/* Setup the event buffer address, size and start event reception */
-	memset((void *)config->evt_buf, 0, CONFIG_USB23_EVT_NUM * sizeof(union usb23_evt));
-	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)config->evt_buf));
-	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)config->evt_buf));
-	usb23_io_write(dev, USB23_GEVNTSIZ(0), CONFIG_USB23_EVT_NUM * sizeof(*config->evt_buf));
+	memset((void *)conf->evt_buf, 0, CONFIG_USB23_EVT_NUM * sizeof(union usb23_evt));
+	usb23_io_write(dev, USB23_GEVNTADR_LO(0), LO32((uintptr_t)conf->evt_buf));
+	usb23_io_write(dev, USB23_GEVNTADR_HI(0), HI32((uintptr_t)conf->evt_buf));
+	usb23_io_write(dev, USB23_GEVNTSIZ(0), CONFIG_USB23_EVT_NUM * sizeof(*conf->evt_buf));
 	usb23_io_write(dev, USB23_GEVNTCOUNT(0), 0);
 
 	/* Letting GCTL unchanged */
 
 	/* Set the USB device configuration, including max supported speed */
 	usb23_io_write(dev, USB23_DCFG, USB23_DCFG_PERFRINT_90);
-	switch (config->speed_idx) {
+	switch (conf->speed_idx) {
 	case USB23_SPEED_IDX_SUPER_SPEED:
 		usb23_io_set(dev, USB23_DCFG, USB23_DCFG_DEVSPD_SUPER_SPEED);
 		break;
@@ -1416,10 +1430,10 @@ static void usb23_on_soft_reset(const struct device *dev)
 
 static void usb23_on_usb_reset(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 
 	/* Reset all ongoing transfers on non-0 endpoints */
-	for (uint8_t addr = 1; addr < config->num_bidir_eps; addr++) {
+	for (uint8_t addr = 1; addr < conf->num_bidir_eps; addr++) {
 		struct usb23_ep_data *ep_data;
 
 		continue; /* TODO */
@@ -1899,11 +1913,13 @@ static void usb23_on_endpoint_event(const struct device *dev, struct usb23_depev
 
 void usb23_on_event(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
+	struct usb23_data *priv = udc_get_private(dev);
 
 	/* Process the USB23 events */
 	while (usb23_io_read(dev, USB23_GEVNTCOUNT(0)) > 0) {
-		union usb23_evt evt = usb23_get_next_evt(dev);
+		/* Cache the current event */
+		union usb23_evt evt = (union usb23_evt)conf->evt_buf[priv->evt_next];
 
 		if (evt.raw == 0x00000000) {
 			LOG_ERR("event: empty event received");
@@ -1917,10 +1933,14 @@ void usb23_on_event(const struct device *dev)
 		usb23_io_write(dev, USB23_GEVNTCOUNT(0), sizeof(evt));
 
 		LOG_EVENT(*);
+
+		/* This is a ring buffer, wrap around */
+		priv->evt_next++;
+		priv->evt_next %= CONFIG_USB23_EVT_NUM;
 	}
 
 	/* Process the uvcmanager events */
-	for (struct usb23_ep_data **ep_data = config->manager_list; *ep_data != NULL; ep_data++) {
+	for (struct usb23_ep_data **ep_data = conf->manager_list; *ep_data != NULL; ep_data++) {
 		uint32_t reg;
 
 		/* Fetch ongoing IRQ flags and acknowledge those we are about to process */
@@ -1935,10 +1955,10 @@ void usb23_on_event(const struct device *dev)
 void usb23_irq_handler(void *ptr)
 {
 	const struct device *dev = ptr;
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
 
-	config->irq_clear_func();
+	conf->irq_clear_func();
 	k_work_submit_to_queue(udc_get_work_q(), &priv->work);
 }
 
@@ -2083,10 +2103,10 @@ enum udc_bus_speed usb23_api_device_speed(const struct device *dev)
 
 void usb23_enable(const struct device *dev)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 
 	/* Enable the uvcmanager events */
-	for (struct usb23_ep_data **ep_data = config->manager_list; *ep_data != NULL; ep_data++) {
+	for (struct usb23_ep_data **ep_data = conf->manager_list; *ep_data != NULL; ep_data++) {
 		/* For enabled endpoint, use the uvcmanager to automatically reload the TRBs */
 		if ((*ep_data)->manager_base) {
 			LOG_DBG("enable: uvcmanager for ep=0x%02x", (*ep_data)->addr);
@@ -2099,7 +2119,7 @@ void usb23_enable(const struct device *dev)
 
 	/* Enable the USB23 events */
 	usb23_io_set(dev, USB23_DCTL, USB23_DCTL_RUNSTOP);
-	config->irq_enable_func();
+	conf->irq_enable_func();
 }
 
 /*
@@ -2329,89 +2349,89 @@ void usb23_dump_link_state(const struct device *dev, const struct shell *sh)
 	case USB23_DSTS_CONNECTSPD_FS:
 		SHELL_OR_LOG(sh, "USB23_DSTS_CONNECTSPD_FS");
 		goto usb2;
-	usb2:
-		switch (reg & USB23_DSTS_USBLNKST_MASK) {
-		case USB23_DSTS_USBLNKST_USB2_ON_STATE:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_ON_STATE");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_SLEEP_STATE:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_SLEEP_STATE");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_DISCONNECTED:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_DISCONNECTED");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_RESET:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_RESET");
-			break;
-		case USB23_DSTS_USBLNKST_USB2_RESUME:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_RESUME");
-			break;
-		}
-		break;
 	case USB23_DSTS_CONNECTSPD_SS:
 		SHELL_OR_LOG(sh, "USB23_DSTS_CONNECTSPD_SS");
-
-		switch (reg & USB23_DSTS_USBLNKST_MASK) {
-		case USB23_DSTS_USBLNKST_USB3_U0:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U0");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_U1:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U1");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_U2:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U2");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_U3:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U3");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_SS_DIS:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_SS_DIS");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_RX_DET:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RX_DET");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_SS_INACT:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_SS_INACT");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_POLL:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_POLL");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_RECOV:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RECOV");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_HRESET:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_HRESET");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_CMPLY:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_CMPLY");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_LPBK:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_LPBK");
-			break;
-		case USB23_DSTS_USBLNKST_USB3_RESET_RESUME:
-			SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RESET_RESUME");
-			break;
-		}
-		break;
+		goto usb3;
 	default:
 		shell_error(sh, "unknown speed");
-		return;
+	}
+	return;
+usb2:
+	switch (reg & USB23_DSTS_USBLNKST_MASK) {
+	case USB23_DSTS_USBLNKST_USB2_ON_STATE:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_ON_STATE");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_SLEEP_STATE:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_SLEEP_STATE");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_SUSPEND_STATE");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_DISCONNECTED:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_DISCONNECTED");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_EARLY_SUSPEND");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_RESET:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_RESET");
+		break;
+	case USB23_DSTS_USBLNKST_USB2_RESUME:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB2_RESUME");
+		break;
+	}
+	return;
+usb3:
+	switch (reg & USB23_DSTS_USBLNKST_MASK) {
+	case USB23_DSTS_USBLNKST_USB3_U0:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U0");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_U1:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U1");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_U2:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U2");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_U3:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_U3");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_SS_DIS:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_SS_DIS");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_RX_DET:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RX_DET");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_SS_INACT:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_SS_INACT");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_POLL:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_POLL");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_RECOV:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RECOV");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_HRESET:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_HRESET");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_CMPLY:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_CMPLY");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_LPBK:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_LPBK");
+		break;
+	case USB23_DSTS_USBLNKST_USB3_RESET_RESUME:
+		SHELL_OR_LOG(sh, "USB23_DSTS_USBLNKST_USB3_RESET_RESUME");
+		break;
 	}
 }
 
 void usb23_dump_events(const struct device *dev, const struct shell *sh)
 {
-	const struct usb23_config *config = dev->config;
+	const struct usb23_config *conf = dev->config;
 	struct usb23_data *priv = udc_get_private(dev);
 
 	for (int i = 0; i < CONFIG_USB23_EVT_NUM; i++) {
-		union usb23_evt evt = config->evt_buf[i];
+		union usb23_evt evt = (union usb23_evt)conf->evt_buf[i];
 		char *s = (i == priv->evt_next) ? " <-" : "";
 
 		SHELL_OR_LOG(sh, "evt 0x%02x: 0x%08x%s", i, evt.raw, s);
@@ -2564,11 +2584,6 @@ void usb23_dump_all(const struct device *dev, struct usb23_ep_data *ep_data, con
 	}
 }
 
-void usb23_fatal_error_dump(const struct device *dev, struct usb23_ep_data *ep_data)
-{
-	usb23_dump_all(dev, ep_data, NULL);
-}
-
 static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
 			     void (*fn)(const struct device *, const struct shell *sh))
 {
@@ -2660,12 +2675,6 @@ static int cmd_usb23_link(const struct shell *sh, size_t argc, char **argv)
 	return dump_cmd2_handler(sh, argc, argv, usb23_dump_link_state);
 }
 
-static int cmd_usb23_thres(const struct shell *sh, size_t argc, char **argv)
-{
-	usbm_fifothres = strtol(argv[1], NULL, 10);
-	return 0;
-}
-
 static int cmd_usb23_fifo(const struct shell *sh, size_t argc, char **argv)
 {
 	return dump_cmd2_handler(sh, argc, argv, usb23_dump_fifo_space);
@@ -2701,10 +2710,6 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_usb23,
 					     "Dump the USB link state\n"
 					     "Usage: link <device>",
 					     cmd_usb23_link, 2, 0),
-			       SHELL_CMD_ARG(thres, &dsub_device_name,
-					     "Dump set the FIFO threshold for the uvcmanager\n"
-					     "Usage: thres <num>",
-					     cmd_usb23_thres, 2, 0),
 			       SHELL_CMD_ARG(fifo, &dsub_device_name,
 					     "Dump the FIFO available space\n"
 					     "Usage: fifo <device>",

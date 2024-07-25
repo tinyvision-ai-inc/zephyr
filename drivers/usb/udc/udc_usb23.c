@@ -223,7 +223,7 @@ int usb23_driver_preinit(const struct device *dev)
 		*(volatile uint32_t *)DT_INST_REG_ADDR_BY_NAME(n, ev_pending) = 0xffffffff;        \
 	}                                                                                          \
                                                                                                    \
-	union usb23_evt usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                               \
+	uint32_t usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                                      \
 	struct udc_ep_config usb23_ep_cfg_##n[DT_INST_PROP(n, num_bidir_endpoints) * 2];           \
                                                                                                    \
 	DT_FOREACH_CHILD(DT_INST_CHILD(n, endpoints), USB23_EP_TRB_BUF_DEFINE)                     \
