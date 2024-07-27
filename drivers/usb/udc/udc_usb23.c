@@ -22,19 +22,14 @@ LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 static int usb23_api_enable(const struct device *dev)
 {
-	LOG_INF("%s", __func__);
+	LOG_INF("api: enable");
 	usb23_enable(dev);
 	return 0;
 }
 
 static int usb23_api_disable(const struct device *dev)
 {
-	LOG_INF("%s", __func__);
-	return 0;
-}
-
-static int usb23_api_host_wakeup(const struct device *dev)
-{
+	LOG_INF("api: disable");
 	return 0;
 }
 
@@ -43,7 +38,7 @@ static int usb23_api_host_wakeup(const struct device *dev)
  */
 static int usb23_api_shutdown(const struct device *dev)
 {
-	LOG_INF("%s", __func__);
+	LOG_INF("api: shutdown");
 	if (udc_ep_disable_internal(dev, USB_CONTROL_EP_OUT)) {
 		LOG_ERR("Failed to disable control endpoint");
 		return -EIO;
@@ -75,7 +70,6 @@ static const struct udc_api usb23_api = {
 	.shutdown = usb23_api_shutdown,
 	.set_address = usb23_api_set_address,
 	.set_exit_latency = usb23_api_set_exit_latency,
-	.host_wakeup = usb23_api_host_wakeup,
 	.ep_enable = usb23_api_ep_enable,
 	.ep_disable = usb23_api_ep_disable,
 	.ep_set_halt = usb23_api_ep_set_halt,
