@@ -94,6 +94,27 @@ struct video_caps {
 	 * the stream.
 	 */
 	uint8_t min_vbuf_count;
+	/** number of video buffers per frame. Video frames are
+	 * divided horizontally into buffers of equal size. Drivers may set this
+	 * value greater than 1 to indicate that they only stream part of a frame
+	 * into each vbuf
+	 */
+	uint8_t vbuf_per_frame;
+	/**
+	 * Feature flags for the video device. See @ref VIDEO_CAPS for all
+	 * supported feature flags
+	 */
+	uint8_t feature_flags;
+};
+
+/**
+ * @brief video_frame_fragmented_status enum
+ *
+ * Indicates the receiving status of fragmented frames.
+ */
+enum video_frame_fragmented_status {
+	VIDEO_BUF_FRAG,
+	VIDEO_BUF_EOF,
 };
 
 /**
@@ -116,6 +137,10 @@ struct video_buffer {
 	 * endpoints.
 	 */
 	uint32_t timestamp;
+	/** frame length for fragmented frames. */
+	uint32_t bytesframe;
+	/** receiving status for fragmented frames. */
+	uint32_t flags;
 };
 
 /**
