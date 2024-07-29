@@ -21,6 +21,10 @@ SECTIONS
 		/* CDC ACM class */
 		*(*.kheap_buf_net_buf_mem_pool_cdc_acm_ep_pool);
 
+		/* UVC class */
+		*(*.kheap_buf_net_buf_mem_pool_uvc_pool_header);
+		*(*.kheap_buf_video_buffer_pool);
+
 		/* TRB buffers and event buffer of USB23 driver */
 		*(.bss.usb23_dma_*);
 

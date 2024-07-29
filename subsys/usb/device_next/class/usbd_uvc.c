@@ -18,16 +18,16 @@
 
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
-#define FRAME_WIDTH    1920
-#define FRAME_HEIGHT   1080
+#define FRAME_WIDTH    50
+#define FRAME_HEIGHT   32
 #define BITS_PER_PIXEL 16
 #define FRAME_SIZE     (FRAME_WIDTH * FRAME_HEIGHT * BITS_PER_PIXEL / 8)
 #define EOF(header)    ((header).bmHeaderInfo & UVC_BMHEADERINFO_END_OF_FRAME)
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0);
 
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
-			  CONFIG_USBD_VIDEO_HEADER_SIZE, sizeof(struct udc_buf_info), NULL);
+NET_BUF_POOL_VAR_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
+			  CONFIG_USBD_VIDEO_HEADER_SIZE * 10, sizeof(struct udc_buf_info), NULL);
 
 NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
 			  sizeof(struct udc_buf_info), NULL);
@@ -557,15 +557,16 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	struct udc_buf_info bi = *udc_get_buf_info(buf);
 	struct video_buffer *vbuf;
 
-	LOG_DBG("api: transfer done, ep=0x%02x buf=%p", bi.ep, buf);
+	LOG_DBG("request: transfer done, ep=0x%02x buf=%p", bi.ep, buf);
 	net_buf_unref(buf);
 	__ASSERT_NO_MSG(bi.ep == uvc_get_bulk_in(data));
 
 	if (bi.ep == uvc_get_bulk_in(data)) {
 		/* Only for the last buffer of the transfer and last transfer of the frame */
-		if (bi.zlp && EOF(data->payload_header)) {
+		if (bi.zlp) {
 			/* Upon completion, move the buffer from submission to completion queue */
 			vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
+			LOG_DBG("request: vbuf=%p transferred", vbuf);
 			__ASSERT(vbuf != NULL, "expected a vbuf for each USB buffer queued");
 			k_fifo_put(&data->fifo_out, vbuf);
 		}
@@ -576,7 +577,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 
 static void uvc_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
 {
-	LOG_DBG("api: update");
+	LOG_DBG("update");
 }
 
 static int uvc_init(struct usbd_class_data *const c_data)
@@ -584,7 +585,7 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	LOG_INF("api: initializing UVC class");
+	LOG_INF("initializing UVC class");
 
 	k_fifo_init(&data->fifo_in);
 	k_fifo_init(&data->fifo_out);
@@ -670,7 +671,7 @@ static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
 
 	LOG_DBG("enqueue: video buffer of %u bytes", vbuf->size);
 
-	buf0 = net_buf_alloc(&uvc_pool_header, K_NO_WAIT);
+	buf0 = net_buf_alloc_len(&uvc_pool_header, CONFIG_USBD_VIDEO_HEADER_SIZE, K_NO_WAIT);
 	if (buf0 == NULL) {
 		LOG_DBG("enqueue: failed to allocate the header");
 		return -EAGAIN;
@@ -704,16 +705,16 @@ static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
 		return -EAGAIN;
 	}
 
-	ret = uvc_enqueue_usb(data, buf1, vbuf->flags | VIDEO_BUF_EOF);
+	LOG_DBG("enqueue: submitting vbuf=%p", vbuf);
+	k_fifo_put(&data->fifo_in, vbuf);
+
+	ret = uvc_enqueue_usb(data, buf1, true);
 	if (ret != 0) {
 		LOG_ERR("enqueue: failed to submit the payload to USB");
 		net_buf_unref(buf0);
 		net_buf_unref(buf1);
 		return ret;
 	}
-
-	/* On success, accept the buffer in the submission queue */
-	k_fifo_put(&data->fifo_in, vbuf);
 
 	return 0;
 }
