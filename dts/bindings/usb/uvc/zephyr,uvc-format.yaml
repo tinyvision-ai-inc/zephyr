@@ -1,0 +1,24 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# USB Video Class format common properties.
+
+child-binding:
+  description: |
+    Enumeration of all frame dimensions supported for this format.
+
+  properties:
+
+    size:
+      type: array
+      description: |
+        Frame width and size in pixel, from which can be deduced the
+        frame size since this is an uncompressed format.
+      required: true
+
+    fps:
+      type: int
+      description: |
+        Maximum FPS supported end-to-end for this frame format.
+        No min FPS: assumes that frames can be delayed indefinitely.
+      required: true

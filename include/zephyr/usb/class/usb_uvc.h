@@ -69,10 +69,10 @@
 #define UVC_VS_FORMAT_VP8_SIMULCAST		0x18
 
 /* Video Class-Specific Formats GUIDs */
-#define UVC_GUID_UNCOMPRESSED_YUY2 {GUID(0x32595559, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)}
-#define UVC_GUID_UNCOMPRESSED_NV12 {GUID(0x3231564E, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)}
-#define UVC_GUID_UNCOMPRESSED_M420 {GUID(0x3032344D, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)}
-#define UVC_GUID_UNCOMPRESSED_I420 {GUID(0x30323449, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)}
+#define UVC_GUID_UNCOMPRESSED_YUY2 GUID(0x32595559, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)
+#define UVC_GUID_UNCOMPRESSED_NV12 GUID(0x3231564E, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)
+#define UVC_GUID_UNCOMPRESSED_M420 GUID(0x3032344D, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)
+#define UVC_GUID_UNCOMPRESSED_I420 GUID(0x30323449, 0x0000, 0x0010, 0x8000, 0x00AA00389B71)
 
 /* Video Class-Specific Endpoint Descriptor Subtypes */
 #define UVC_EP_UNDEFINED			0x00
@@ -248,18 +248,6 @@ struct uvc_payload_header {
 	//uint8_t padding[64 - 12];
 } __packed;
 
-/** Class-Specific Video Control Interface Descriptor */
-struct uvc_control_if_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bDescriptorSubType;
-	uint16_t bcdUVC;
-	uint16_t wTotalLength;
-	uint32_t dwClockFrequency;
-	uint8_t bInCollection;
-	uint8_t baInterfaceNr_baInterfaceNr[1];
-} __packed;
-
 /** Interface Header Descriptor */
 struct uvc_interface_header_descriptor {
 	uint8_t bLength;
@@ -270,6 +258,7 @@ struct uvc_interface_header_descriptor {
 	uint32_t dwClockFrequency;
 	uint8_t bInCollection;
 	uint8_t baInterfaceNr;
+	/* Only a single Video Streaming interface supported for now */
 } __packed;
 
 /** Input Terminal Descriptor */
@@ -437,6 +426,15 @@ struct uvc_color_matching_descriptor {
  * (USB_Video_Payload_Frame_Based.pdf).
  */
 
+/** Header of an USB Video Format Descriptor */
+struct uvc_format_descriptor {
+	uint8_t bLength;
+	uint8_t bDescriptorType;
+	uint8_t bDescriptorSubtype;
+	uint8_t bFormatIndex;
+	uint8_t bNumFrameDescriptors;
+} __packed;
+
 /** Uncompressed Video Format Descriptor */
 struct uvc_uncompressed_format_descriptor {
 	uint8_t bLength;
@@ -451,23 +449,6 @@ struct uvc_uncompressed_format_descriptor {
 	uint8_t bAspectRatioY;
 	uint8_t bmInterlaceFlags;
 	uint8_t bCopyProtect;
-} __packed;
-
-/** Uncompressed Video Frame Descriptors */
-struct uvc_uncompressed_frame_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bDescriptorSubtype;
-	uint8_t bFrameIndex;
-	uint8_t bmCapabilities;
-	uint16_t wWidth;
-	uint16_t wHeight;
-	uint32_t dwMinBitRate;
-	uint32_t dwMaxBitRate;
-	uint32_t dwMaxVideoFrameBufferSize;
-	uint32_t dwDefaultFrameInterval;
-	uint8_t bFrameIntervalType;
-	uint32_t dwFrameInterval[1];
 } __packed;
 
 /** Motion-JPEG Video Format Descriptor */
@@ -486,8 +467,8 @@ struct uvc_mjpeg_format_descriptor {
 	uint8_t bCopyProtect;
 } __packed;
 
-/** Motion-JPEG Video Frame Descriptor */
-struct uvc_mjpeg_frame_descriptor {
+/** Uncompressed and Motion-JPEG Video Frame Descriptors */
+struct uvc_frame_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
 	uint8_t bDescriptorSubtype;
@@ -499,7 +480,6 @@ struct uvc_mjpeg_frame_descriptor {
 	uint32_t dwMaxBitRate;
 	uint32_t dwMaxVideoFrameBufferSize;
 	uint32_t dwDefaultFrameInterval;
-	/* Only continuous frame interval supported here */
 	uint8_t bFrameIntervalType;
 	uint32_t dwMinFrameInterval;
 	uint32_t dwMaxFrameInterval;
