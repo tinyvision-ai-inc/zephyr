@@ -25,12 +25,6 @@ NET_BUF_POOL_VAR_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) 
 NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
 			  sizeof(struct udc_buf_info), NULL);
 
-#define UVC_NEXT_DESC(desc) ((struct usb_desc_header *)(((uint8_t *)desc) + (desc)->bLength))
-#define UVC_FOREACH_DESC(desc, first)                                                              \
-	for (struct usb_desc_header *desc = (struct usb_desc_header *)first; desc->bLength > 0;    \
-	     desc = UVC_NEXT_DESC(desc))
-#define UVC_SUBTYPE(type, subtype) (((type) << 8) | (subtype))
-
 struct uvc_desc {
 	/* UVC Interface association */
 	struct usb_association_descriptor iad;
@@ -55,8 +49,8 @@ struct uvc_data {
 	/* USBD class structure */
 	const struct usbd_class_data *const c_data;
 	/* UVC interface and format currenly selected */
-	struct uvc_format_descriptor *format;
-	struct uvc_frame_descriptor *frame;
+	struct uvc_format_descriptor **format;
+	struct uvc_frame_descriptor **frame;
 	/* UVC Descriptors */
 	struct uvc_desc *const desc;
 	struct usb_desc_header *const *const formats;
@@ -91,26 +85,25 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 		probe->bFormatIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		probe->bFormatIndex = data->format->bFormatIndex;
+		probe->bFormatIndex = (*data->format)->bFormatIndex;
 		break;
 	case UVC_SET_CUR:
-		if (probe->bFormatIndex > data->desc->if1_header.bNumFormats) {
-			LOG_WRN("probe: invalid format index");
-			return;
-		}
-		UVC_FOREACH_DESC(desc, data->fs_desc[0])
-		{
-			struct uvc_format_descriptor *format = (void *)desc;
+		/* Search a format desc with a matching bFormatIndex through the entire list */
+		for (struct usb_desc_header **desc = data->fs_desc;; desc++) {
+			struct uvc_frame_descriptor *frame = (void *)*desc;
 
-			switch (UVC_SUBTYPE(desc->bDescriptorType, format->bDescriptorSubtype)) {
-			case UVC_SUBTYPE(UVC_CS_INTERFACE, UVC_VS_FORMAT_UNCOMPRESSED):
-			case UVC_SUBTYPE(UVC_CS_INTERFACE, UVC_VS_FORMAT_MJPEG):
-				if (format->bFormatIndex == probe->bFormatIndex) {
-					data->format = format;
-					return;
-				}
+			if (format->bDescriptorType != UVC_CS_INTERFACE) {
+				continue;
+			}
+
+			if ((format->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+			     format->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG) &&
+			    format->bFormatIndex == probe->bFormatIndex) {
+				data->format = desc;
+				return;
 			}
 		}
+		LOG_WRN("probe: format index not found");
 		break;
 	}
 }
@@ -123,36 +116,31 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 		probe->bFrameIndex = 1;
 		break;
 	case UVC_GET_MAX:
-		probe->bFrameIndex = data->format->bNumFrameDescriptors;
+		probe->bFrameIndex = (*data->format)->bNumFrameDescriptors;
 		break;
 	case UVC_GET_RES:
 		probe->bFrameIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		probe->bFrameIndex = data->frame->bFrameIndex;
+		probe->bFrameIndex = (*data->frame)->bFrameIndex;
 		break;
 	case UVC_SET_CUR:
-		if (probe->bFrameIndex > data->desc->if1_header.bNumFormats) {
-			LOG_WRN("probe: invalid format index");
-			return;
-		}
-		UVC_FOREACH_DESC(desc, UVC_NEXT_DESC(data->format))
-		{
-			struct uvc_frame_descriptor *frame = (void *)desc;
+		/* Search a frame desc with a matching bFrameIndex below the current format desc */
+		for (struct usb_desc_header **desc = data->format + 1;; desc++) {
+			struct uvc_frame_descriptor *frame = (void *)*desc;
 
-			switch (UVC_SUBTYPE(desc->bDescriptorType, frame->bDescriptorSubtype)) {
-			case UVC_SUBTYPE(UVC_CS_INTERFACE, UVC_VS_FRAME_UNCOMPRESSED):
-			case UVC_SUBTYPE(UVC_CS_INTERFACE, UVC_VS_FRAME_MJPEG):
-				if (frame->bFrameIndex == probe->bFrameIndex) {
-					data->frame = frame;
-					return;
-				}
-			default:
-				LOG_WRN("probe: format index out of range");
+			if ((*desc)->bDescriptorType != UVC_CS_INTERFACE ||
+			    (frame->bDescriptorSubtype != UVC_VS_FRAME_UNCOMPRESSED &&
+			     frame->bDescriptorSubtype != UVC_FS_FRAME_MJPEG)) {
+				break;
+			}
+
+			if (frame->bFrameIndex == probe->bFrameIndex) {
+				data->frame = desc;
 				return;
 			}
 		}
-		break;
+		LOG_WRN("probe: frame index not found");
 	}
 }
 
@@ -161,12 +149,12 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		probe->dwFrameInterval = data->frame->dwMinFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwMinFrameInterval;
 	case UVC_GET_MAX:
-		probe->dwFrameInterval = data->frame->dwMaxFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwMaxFrameInterval;
 	case UVC_GET_CUR:
 		/* TODO call the frame interval API on the video source once supported */
-		probe->dwFrameInterval = data->frame->dwMaxFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwMaxFrameInterval;
 		break;
 	case UVC_GET_RES:
 		probe->dwFrameInterval = 1;
@@ -215,14 +203,14 @@ static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t 
 	case UVC_GET_MIN:
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
-		probe->dwMaxVideoFrameSize = data->frame->dwMaxVideoFrameBufferSize;
+		probe->dwMaxVideoFrameSize = (*data->frame)->dwMaxVideoFrameBufferSize;
 		break;
 	case UVC_GET_RES:
 		probe->dwMaxVideoFrameSize = 1;
 		break;
 	case UVC_SET_CUR:
 		if (probe->dwMaxVideoFrameSize > 0 &&
-		    probe->dwMaxVideoFrameSize != data->frame->dwMaxVideoFrameBufferSize) {
+		    probe->dwMaxVideoFrameSize != (*data->frame)->dwMaxVideoFrameBufferSize) {
 			LOG_WRN("probe: dwMaxVideoFrameSize is read-only");
 		}
 		break;
@@ -236,14 +224,14 @@ static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bReq
 	case UVC_GET_MIN:
 	case UVC_GET_MAX:
 	case UVC_GET_CUR:
-		probe->dwMaxPayloadTransferSize = data->frame->dwMaxVideoFrameBufferSize;
+		probe->dwMaxPayloadTransferSize = (*data->frame)->dwMaxVideoFrameBufferSize;
 		break;
 	case UVC_GET_RES:
 		probe->dwMaxPayloadTransferSize = 1;
 		break;
 	case UVC_SET_CUR:
 		if (probe->dwMaxPayloadTransferSize > 0 &&
-		    probe->dwMaxPayloadTransferSize != data->frame->dwMaxVideoFrameBufferSize) {
+		    probe->dwMaxPayloadTransferSize != (*data->frame)->dwMaxVideoFrameBufferSize) {
 			LOG_WRN("probe: dwPayloadTransferSize is read-only");
 		}
 		break;
@@ -443,8 +431,8 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		uvc_probe(data, bRequest, probe);
 
 		fmt.pixelformat = VIDEO_PIX_FMT_YUYV;
-		fmt.width = data->frame->wWidth;
-		fmt.height = data->frame->wHeight;
+		fmt.width = (*data->frame)->wWidth;
+		fmt.height = (*data->frame)->wHeight;
 		fmt.pitch = 0;
 
 		/* TODO add video_set_format() towards the sensor here */
@@ -584,6 +572,8 @@ static int uvc_init(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	int frame_index = 1;
+	int format_index = 1;
 
 	LOG_INF("initializing UVC class");
 
@@ -596,6 +586,28 @@ static int uvc_init(struct usbd_class_data *const c_data)
 
 	/* The default probe is the current probe at startup */
 	uvc_probe(data, UVC_GET_CUR, &data->default_probe);
+
+	/* Set the frame and format indexes */
+	for (struct usb_desc_header **desc = data->fs_desc; (*desc)->bLength > 0; desc++) {
+		struct uvc_format_descriptor *format_desc = (void *)*desc;
+	        struct uvc_frame_descriptor *frame_desc = (void *)*desc;
+
+		if ((*desc)->bDescriptorType != UVC_CS_INTERFACE) {
+			continue;
+		}
+
+		switch (frame->bDescriptorSubtype) {
+		case UVC_VS_FORMAT_MJPEG:
+		case UVC_VS_FORMAT_UNCOMPRESSED:
+			format_desc->bFormatIndex = format_index++;
+			frame_index = 1;
+			break;
+		case UVC_VS_FRAME_MJPEG:
+		case UVC_VS_FRAME_UNCOMPRESSED:
+			frame_desc->bFrameIndex = frame_index++;
+			break;
+		}
+	}
 
 	return 0;
 }
