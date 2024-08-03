@@ -3,6 +3,14 @@
 
 # USB Video Class format common properties.
 
+properties:
+  fourcc:
+    type: string
+    description: |
+      The four-character string that uniquely identifies a pixel format.
+      This must be matching the definition on "include/zephyr/drivers/video.h".
+    required: true
+
 child-binding:
   description: |
     Enumeration of all frame dimensions supported for this format.

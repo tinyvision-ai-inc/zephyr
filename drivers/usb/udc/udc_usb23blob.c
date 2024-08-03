@@ -803,7 +803,7 @@ static struct net_buf *usb23_pop_trb(const struct device *dev, struct usb23_ep_d
 		buf = ep_data->net_buf[ep_data->tail];
 		ep_data->net_buf[ep_data->tail] = NULL;
 
-		LOG_DBG("POP %u ep=0x%02x buf=%p", ep_data->addr, ep_data->tail, buf);
+		LOG_DBG("POP %u ep=0x%02x buf=%p data=%p", ep_data->tail, ep_data->addr, buf, buf->data);
 
 		/* Move to the next position in the ring buffer */
 		ep_data->tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);

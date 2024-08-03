@@ -12,8 +12,8 @@ properties:
   guid:
     type: uint8-array
     description: |
-      GUID that identifies the frame format. A list of GUIDs suported by the
-      Linux kernel can be found on the include/linux/usb/uvc.h file.
+      A GUID identifier that identifies the frame format. A list of GUIDs can
+      be found in "include/zephyr/dt-bindings/usb/video.h" already encoded.
     required: true
 
   bits-per-pixel:
