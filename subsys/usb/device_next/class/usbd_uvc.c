@@ -341,7 +341,7 @@ static void uvc_probe_dump(char const *name, const struct uvc_vs_probe_control *
 	LOG_DBG("probe: - bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
 	LOG_DBG("probe: - bFormatIndex = %u", probe->bFormatIndex);
 	LOG_DBG("probe: - bFrameIndex = %u", probe->bFrameIndex);
-	LOG_DBG("probe: - dwFrameInterval = %u ns", sys_le32_to_cpu(probe->dwFrameInterval) * 100);
+	LOG_DBG("probe: - dwFrameInterval = %u us", sys_le32_to_cpu(probe->dwFrameInterval) / 10);
 	LOG_DBG("probe: - wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
 	LOG_DBG("probe: - wPFrameRate = %u", probe->wPFrameRate);
 	LOG_DBG("probe: - wCompQuality = %u", probe->wCompQuality);
@@ -823,12 +823,13 @@ struct video_driver_api uvc_video_api = {
 		.dwMinBitRate = sys_cpu_to_le32(15360000),                                         \
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),                                         \
 		.dwMaxVideoFrameBufferSize =                                                       \
-			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1)),  \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(1000000 / DT_PROP(n, fps)),              \
+			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) +  \
+			                CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
+		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),             \
 		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(1000000 / DT_PROP(n, fps)),                  \
+		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),                 \
 		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
-		.dwFrameIntervalStep = sys_cpu_to_le32(1),                                         \
+		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
 	};
 
 #define UVC_MJPEG_FORMAT_DEFINE(n)                                                                 \
@@ -861,12 +862,13 @@ struct video_driver_api uvc_video_api = {
 		.dwMaxBitRate = sys_cpu_to_le32(15360000),                                         \
 		.dwMaxVideoFrameBufferSize =                                                       \
 			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) *  \
-					DT_PROP(DT_PARENT(n), bits_per_pixel) / 8),                \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(1000000 / DT_PROP(n, fps)),              \
+					DT_PROP(DT_PARENT(n), bits_per_pixel) / 8 +                \
+					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
+		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),             \
 		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(1000000 / DT_PROP(n, fps)),                  \
+		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),                 \
 		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
-		.dwFrameIntervalStep = sys_cpu_to_le32(1),                                         \
+		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
 	};
 
 #define UVC_UNCOMPRESSED_FORMAT_DEFINE(n)                                                          \
