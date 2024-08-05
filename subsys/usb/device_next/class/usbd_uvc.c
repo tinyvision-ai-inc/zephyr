@@ -10,6 +10,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/class/usb_uvc.h>
@@ -19,29 +20,7 @@
 
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
-NET_BUF_POOL_VAR_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
-			CONFIG_USBD_VIDEO_HEADER_SIZE * 10, sizeof(struct udc_buf_info), NULL);
-
-NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
-			  sizeof(struct udc_buf_info), NULL);
-
-static bool uvc_desc_is_format(struct usb_desc_header *desc)
-{
-	struct uvc_format_descriptor *format = (void *)desc;
-
-	return desc->bDescriptorType == UVC_CS_INTERFACE &&
-	       (format->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
-		format->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG);
-}
-
-static bool uvc_desc_is_frame(struct usb_desc_header *desc)
-{
-	struct uvc_frame_descriptor *frame = (void *)desc;
-
-	return desc->bDescriptorType == UVC_CS_INTERFACE &&
-	       (frame->bDescriptorSubtype == UVC_VS_FRAME_UNCOMPRESSED ||
-		frame->bDescriptorSubtype == UVC_VS_FRAME_MJPEG);
-}
+#define UVC_CLASS_ENABLED 0
 
 struct uvc_desc {
 	/* UVC Interface association */
@@ -66,6 +45,8 @@ struct uvc_desc {
 struct uvc_data {
 	/* USBD class structure */
 	const struct usbd_class_data *const c_data;
+	/* USBD class state */
+	atomic_t state;
 	/* Video format with same index position as USB formats */
 	const struct video_format_cap *fmts;
 	/* UVC interface and format currenly selected */
@@ -84,6 +65,35 @@ struct uvc_data {
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
 };
+
+struct uvc_buf_info {
+	struct udc_buf_info udc;
+	struct video_buffer *vbuf;
+} __packed;
+
+NET_BUF_POOL_VAR_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10,
+			CONFIG_USBD_VIDEO_HEADER_SIZE * 10, sizeof(struct uvc_buf_info), NULL);
+
+NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
+			  sizeof(struct uvc_buf_info), NULL);
+
+static bool uvc_desc_is_format(struct usb_desc_header *desc)
+{
+	struct uvc_format_descriptor *format = (void *)desc;
+
+	return desc->bDescriptorType == UVC_CS_INTERFACE &&
+	       (format->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+		format->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG);
+}
+
+static bool uvc_desc_is_frame(struct usb_desc_header *desc)
+{
+	struct uvc_frame_descriptor *frame = (void *)desc;
+
+	return desc->bDescriptorType == UVC_CS_INTERFACE &&
+	       (frame->bDescriptorSubtype == UVC_VS_FRAME_UNCOMPRESSED ||
+		frame->bDescriptorSubtype == UVC_VS_FRAME_MJPEG);
+}
 
 static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 {
@@ -525,23 +535,19 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
-	struct udc_buf_info bi = *udc_get_buf_info(buf);
-	struct video_buffer *vbuf;
+	struct uvc_buf_info *bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
 
-	LOG_DBG("request: transfer done, ep=0x%02x buf=%p", bi.ep, buf);
-	net_buf_unref(buf);
-	__ASSERT_NO_MSG(bi.ep == uvc_get_bulk_in(data));
-
-	if (bi.ep == uvc_get_bulk_in(data)) {
+	if (bi->udc.ep == uvc_get_bulk_in(data)) {
 		/* Only for the last buffer of the transfer and last transfer of the frame */
-		if (bi.zlp) {
+		if (bi->vbuf) {
 			/* Upon completion, move the buffer from submission to completion queue */
-			vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
-			LOG_DBG("request: vbuf=%p transferred", vbuf);
-			__ASSERT(vbuf != NULL, "expected a vbuf for each USB buffer queued");
-			k_fifo_put(&data->fifo_out, vbuf);
+			LOG_DBG("request: vbuf=%p transferred", bi->vbuf);
+			k_fifo_put(&data->fifo_out, bi->vbuf);
 		}
 	}
+
+	LOG_DBG("request: transfer done, ep=0x%02x buf=%p", bi->udc.ep, buf);
+	net_buf_unref(buf);
 
 	return err;
 }
@@ -555,19 +561,21 @@ static int uvc_init(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
-	int frame_index = 1;
-	int format_index = 1;
-
-	LOG_INF("initializing UVC class");
-
-	k_fifo_init(&data->fifo_in);
-	k_fifo_init(&data->fifo_out);
-
-	/* Prepare the payload header fields that are constant over time */
-	data->payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE;
 
 	/* The default probe is the current probe at startup */
 	uvc_probe(data, UVC_GET_CUR, &data->default_probe);
+
+	return 0;
+}
+
+static int uvc_preinit(const struct device *dev)
+{
+	struct uvc_data *data = dev->data;
+	int frame_index = 1;
+	int format_index = 1;
+
+	k_fifo_init(&data->fifo_in);
+	k_fifo_init(&data->fifo_out);
 
 	/* Set the frame and format indexes */
 	for (struct usb_desc_header *const *desc = data->fs_desc; (*desc)->bLength > 0; desc++) {
@@ -623,21 +631,12 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 	}
 }
 
-struct usbd_class_api uvc_class_api = {
-	.request = uvc_request,
-	.update = uvc_update,
-	.control_to_host = uvc_control_to_host,
-	.control_to_dev = uvc_control_to_dev,
-	.init = uvc_init,
-	.get_desc = uvc_get_desc,
-};
-
 static int uvc_enqueue_usb(struct uvc_data *data, struct net_buf *buf, bool last_of_transfer)
 {
 	struct udc_buf_info *bi;
 	int ret;
 
-	LOG_DBG("enqueue: usb buf=%p data=%p size=%u len=%u zlp=%u", buf, buf->data, buf->size,
+	LOG_DBG("queue: usb buf=%p data=%p size=%u len=%u zlp=%u", buf, buf->data, buf->size,
 		buf->len, last_of_transfer);
 
 	bi = udc_get_buf_info(buf);
@@ -649,31 +648,35 @@ static int uvc_enqueue_usb(struct uvc_data *data, struct net_buf *buf, bool last
 
 	ret = usbd_ep_enqueue(data->c_data, buf);
 	if (ret != 0) {
-		LOG_WRN("enqueue: error from usbd for buf=%p", buf);
-		net_buf_unref(buf);
+		LOG_ERR("enqueue: error from usbd for buf=%p", buf);
 		return ret;
 	}
 
 	return 0;
 }
 
-static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
-		       struct video_buffer *vbuf)
+static int uvc_process_queue(struct uvc_data *data)
 {
-	struct uvc_data *data = dev->data;
+	struct video_buffer *vbuf;
 	struct net_buf *buf0;
 	struct net_buf *buf1;
 	int ret;
 
-	if (ep != VIDEO_EP_IN && ep != VIDEO_EP_ANY) {
-		return -EINVAL;
+	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED)) {
+		LOG_DBG("queue: USB configuration is not enabled yet");
+		return -EAGAIN;
+        }
+
+	vbuf = k_fifo_peek_head(&data->fifo_in);
+	if (vbuf == NULL) {
+		return -EAGAIN;
 	}
 
-	LOG_DBG("enqueue: video buffer of %u bytes", vbuf->bytesused);
+	LOG_DBG("queue: video buffer of %u bytes", vbuf->bytesused);
 
 	buf0 = net_buf_alloc_len(&uvc_pool_header, CONFIG_USBD_VIDEO_HEADER_SIZE, K_NO_WAIT);
 	if (buf0 == NULL) {
-		LOG_DBG("enqueue: failed to allocate the header");
+		LOG_DBG("queue: failed to allocate the header");
 		return -EAGAIN;
 	}
 
@@ -696,27 +699,78 @@ static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
 
 	ret = uvc_enqueue_usb(data, buf0, false);
 	if (ret != 0) {
-		LOG_ERR("enqueue: failed to submit the header to USB");
+		LOG_ERR("queue: failed to submit the header to USB");
 		net_buf_unref(buf0);
 		return ret;
 	}
 
 	buf1 = net_buf_alloc_with_data(&uvc_pool_payload, vbuf->buffer, vbuf->bytesused, K_NO_WAIT);
 	if (buf1 == NULL) {
-		LOG_DBG("enqueue: failed to allocate the header");
+		LOG_ERR("queue: failed to allocate the header");
 		net_buf_unref(buf1);
 		return -EAGAIN;
 	}
 
-	LOG_DBG("enqueue: submitting vbuf=%p", vbuf);
-	k_fifo_put(&data->fifo_in, vbuf);
+	LOG_DBG("queue: submitting vbuf=%p", vbuf);
 
 	ret = uvc_enqueue_usb(data, buf1, true);
 	if (ret != 0) {
-		LOG_ERR("enqueue: failed to submit the payload to USB");
+		LOG_ERR("queue: failed to submit the payload to USB");
 		net_buf_unref(buf0);
 		net_buf_unref(buf1);
 		return ret;
+	}
+
+	k_fifo_get(&data->fifo_in, K_NO_WAIT);
+	return 0;
+}
+
+static void uvc_enable(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	atomic_set_bit(&data->state, UVC_CLASS_ENABLED);
+
+	/* Catch-up with buffers that might have been delayed */
+	while (uvc_process_queue(data) == 0) {
+		continue;
+	}
+}
+
+static void uvc_disable(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	atomic_clear_bit(&data->state, UVC_CLASS_ENABLED);
+}
+
+struct usbd_class_api uvc_class_api = {
+	.enable = uvc_enable,
+	.disable = uvc_disable,
+	.request = uvc_request,
+	.update = uvc_update,
+	.control_to_host = uvc_control_to_host,
+	.control_to_dev = uvc_control_to_dev,
+	.init = uvc_init,
+	.get_desc = uvc_get_desc,
+};
+
+static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
+		       struct video_buffer *vbuf)
+{
+	struct uvc_data *data = dev->data;
+
+	if (ep != VIDEO_EP_IN && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
+
+	k_fifo_put(&data->fifo_in, vbuf);
+
+	/* Process this buffer as well as others pending */
+	while (uvc_process_queue(data) == 0) {
+		continue;
 	}
 
 	return 0;
@@ -1105,9 +1159,10 @@ struct video_driver_api uvc_video_api = {
 		.fs_desc = uvc_fs_desc_##n,                                                        \
 		.hs_desc = uvc_hs_desc_##n,                                                        \
 		.ss_desc = uvc_ss_desc_##n,                                                        \
+		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,                     \
 	};                                                                                         \
                                                                                                    \
-	DEVICE_DT_INST_DEFINE(n, NULL, NULL, &uvc_data_##n, NULL, POST_KERNEL,                     \
+	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL,              \
 			      CONFIG_VIDEO_INIT_PRIORITY, &uvc_video_api);
 
 DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_uncompressed, UVC_UNCOMPRESSED_FORMAT_DEFINE)

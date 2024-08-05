@@ -1267,36 +1267,17 @@ static int usb23_trb_bulk(const struct device *dev, struct usb23_ep_data *ep_dat
 	}
 }
 
-static void usb23_enqueue_buf(const struct device *dev, struct usb23_ep_data *ep_data,
-			      struct net_buf *buf)
-{
-	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, ep_data->addr);
-	int ret;
-
-	/* Do not interfer with the uvcmanager operation */
-	if (ep_cfg->stat.halted || ep_data->manager_buf) {
-		udc_buf_put(ep_cfg, buf);
-		return;
-	}
-
-	/* Try to enqueue, and if full, send to FIFO instead */
-	ret = usb23_trb_bulk(dev, ep_data, buf);
-	if (ret < 0) {
-		udc_buf_put(ep_cfg, buf);
-		return;
-	}
-}
-
 void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data)
 {
+	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, ep_data->addr);
 	struct net_buf *buf;
 	int ret;
 
 	LOG_DBG("queue: checking for pending transfers");
 
 	/* Do not interfer with the uvcmanager operation */
-	if (ep_data->manager_buf) {
-		LOG_DBG("queue: abort: not interfering with uvcmanager");
+	if (ep_cfg->stat.halted || ep_data->manager_buf) {
+		LOG_DBG("queue: abort: not interfering with uvcmanager or halted endpoints");
 		return;
 	}
 
@@ -1942,6 +1923,7 @@ int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *ep_cfg,
 		__ASSERT_NO_MSG(ep_data->net_buf[0] == NULL);
 		ep_data->net_buf[0] = buf;
 
+		/* Control buffers are managed directly without a queue */
 		if (bi->data) {
 			usb23_trb_ctrl_data_in(dev);
 		} else if (bi->status && udc_ctrl_stage_is_no_data(dev)) {
@@ -1956,7 +1938,11 @@ int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *ep_cfg,
 		__ASSERT(false, "expected to be handled by the driver directly");
 		break;
 	default:
-		usb23_enqueue_buf(dev, ep_data, buf);
+		/* Submit the buffer to the queue */
+		udc_buf_put(ep_cfg, buf);
+
+		/* Process this buffer along with other waiting */
+		usb23_process_queue(dev, ep_data);
 	}
 
 	return 0;
@@ -1993,6 +1979,8 @@ int usb23_api_ep_set_halt(const struct device *dev, struct udc_ep_config *const 
 
 	LOG_WRN("api: stall ep=0x%02x", ep_data->addr);
 
+	/* TODO: empty the buffers from the queue */
+
 	switch (ep_data->addr) {
 	case USB_CONTROL_EP_IN:
 		/* Remove the TRBs transfer for the cancelled sequence */
@@ -2028,6 +2016,7 @@ int usb23_api_ep_clear_halt(const struct device *dev, struct udc_ep_config *cons
 
 	usb23_depcmd_clear_stall(dev, ep_data);
 	ep_cfg->stat.halted = false;
+
 	return 0;
 }
 
