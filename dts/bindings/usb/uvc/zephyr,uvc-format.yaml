@@ -24,9 +24,10 @@ child-binding:
         frame size since this is an uncompressed format.
       required: true
 
-    fps:
+    max-fps:
       type: int
       description: |
-        Maximum FPS supported end-to-end for this frame format.
-        No min FPS: assumes that frames can be delayed indefinitely.
+        Maximum FPS that can be sustained by theh device for this frame format.
+        The actual FPS might be lower if the host throttles the transfer, or if
+        it desires to receive frames less fast.
       required: true
