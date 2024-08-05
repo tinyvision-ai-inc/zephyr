@@ -1292,7 +1292,7 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
 
 		LOG_DBG("queue: success: buffer enqueued");
 		udc_buf_get(dev, ep_data->addr);
-	} 
+	}
 	LOG_DBG("queue: done");
 }
 
@@ -1942,7 +1942,7 @@ int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *ep_cfg,
 		udc_buf_put(ep_cfg, buf);
 
 		/* Process this buffer along with other waiting */
-		usb23_process_queue(dev, ep_data);
+		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 	}
 
 	return 0;
