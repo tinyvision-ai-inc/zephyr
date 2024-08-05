@@ -11,14 +11,13 @@
 
 #define DT_DRV_COMPAT lattice_usb23
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
-/*
- * USB device controller (UDC) for Lattice USB2 and USB3 hardened FPGA core.
- */
 #include "udc_common.h"
 #include "udc_usb23.h"
+
+LOG_MODULE_REGISTER(usb23, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 static int usb23_api_enable(const struct device *dev)
 {

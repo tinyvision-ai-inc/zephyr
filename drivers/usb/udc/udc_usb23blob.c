@@ -6,9 +6,6 @@
  * but released as a binary blob for now.
  */
 
-#include "udc_common.h"
-#include "udc_usb23.h"
-
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,15 +15,14 @@
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/shell/shell.h>
-#include <app_version.h>
-
 #include <zephyr/logging/log.h>
+
+#include "udc_common.h"
+#include "udc_usb23.h"
+
 LOG_MODULE_REGISTER(usb23blob, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
-/*
- * USB23 silicon core present on Lattice CrossLinkU-NX FPGAs.
- */
-
+/* TRB memory buffer fields */
 #define USB23_TRB_STATUS_BUFSIZ_MASK           GENMASK(23, 0)
 #define USB23_TRB_STATUS_BUFSIZ_SHIFT          0
 #define USB23_TRB_STATUS_PCM1_MASK             GENMASK(25, 24)
@@ -1337,7 +1333,7 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	__ASSERT_NO_MSG(ret == 0);
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
-	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+	k_work_submit(&ep_data->work);
 
 	LOG_EVENT(*);
 }
@@ -1795,7 +1791,7 @@ static void usb23_on_xfer_done_norm(const struct device *dev, uint32_t evt)
 	__ASSERT_NO_MSG(ret == 0);
 
 	/* We just made some room for a new buffer, check if something more to enqueue */
-	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+	k_work_submit(&ep_data->work);
 }
 
 void usb23_on_event(const struct device *dev)
@@ -1902,7 +1898,7 @@ void usb23_irq_handler(void *ptr)
 	struct usb23_data *priv = udc_get_private(dev);
 
 	conf->irq_clear_func();
-	k_work_submit_to_queue(udc_get_work_q(), &priv->work);
+	k_work_submit(&priv->work);
 }
 
 /*
@@ -1942,7 +1938,7 @@ int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *ep_cfg,
 		udc_buf_put(ep_cfg, buf);
 
 		/* Process this buffer along with other waiting */
-		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+		k_work_submit(&ep_data->work);
 	}
 
 	return 0;

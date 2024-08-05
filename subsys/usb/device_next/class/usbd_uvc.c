@@ -888,9 +888,9 @@ static int uvc_preinit(const struct device *dev)
 		.dwMaxVideoFrameBufferSize =                                                       \
 			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) +  \
 					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),             \
+		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
 		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),                 \
+		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),             \
 		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
 		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
 	};
@@ -927,9 +927,9 @@ static int uvc_preinit(const struct device *dev)
 			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) *  \
 					DT_PROP(DT_PARENT(n), bits_per_pixel) / 8 +                \
 					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),             \
+		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
 		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, fps)),                 \
+		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),             \
 		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
 		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
 	};
