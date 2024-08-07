@@ -3,9 +3,8 @@
 
 description: |
   Emulated Video DMA engine for testing purpose
-  
   Endpoint 0 is expected to be connected to a zephyr,video-emul-imager device.
-  Endpoint 1 is optional and is the output to a sink.
+  Endpoint 1 is optional and is the output to any sink.
 
 compatible: "zephyr,video-emul-rx"
 

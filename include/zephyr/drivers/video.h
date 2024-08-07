@@ -791,7 +791,7 @@ void video_closest_frmival_stepwise(const struct video_frmival_stepwise *stepwis
  *
  * To compute the closest match, fill @p match with the following fields:
  *
- * - @c match->format to the @struct video_format of interest.
+ * - @c match->format to the @ref video_format of interest.
  * - @c match->type to @ref VIDEO_FRMIVAL_TYPE_DISCRETE.
  * - @c match->discrete to the desired frame interval.
  *

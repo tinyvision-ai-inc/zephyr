@@ -1,0 +1,13 @@
+sample:
+  name: USB Video sample
+tests:
+  sample.subsys.usb.uvc:
+    depends_on:
+      - usbd
+      - video
+    tags: usb video
+    platform_allow:
+      - frdm_mcxn947/mcxn947/cpu0
+      - mini_stm32h743
+      - rpi_pico
+    harness: TBD
