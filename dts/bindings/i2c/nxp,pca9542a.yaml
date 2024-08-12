@@ -1,0 +1,13 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: NXP PCA9542A 2-channel multiplexer
+
+compatible: "nxp,pca9542a"
+
+include: i2c-device.yaml
+
+child-binding:
+  compatible: "nxp,pca9542a-channel"
+  include: i2c-controller.yaml
+  on-bus: i2c

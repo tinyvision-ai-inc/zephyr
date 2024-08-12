@@ -1,0 +1,27 @@
+# pca9542a
+
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig I2C_PCA9542A
+	bool "NXP PCA9542A 2-channel multiplexer"
+	default y
+	depends on DT_HAS_NXP_PCA9542A_ENABLED
+	help
+	  Enable NXP PCA9542A 2-channel multiplexer
+
+if I2C_PCA9542A
+
+config I2C_PCA9542A_ROOT_INIT_PRIO
+	int "PCA9542A root driver init priority"
+	default I2C_INIT_PRIORITY
+	help
+	  Should be lower than `I2C_PCA9542A_CHANNEL_INIT_PRIO`
+
+config I2C_PCA9542A_CHANNEL_INIT_PRIO
+	int "PCA9542A channel driver init priority"
+	default I2C_INIT_PRIORITY
+	help
+	  Should be higher than `I2C_PCA9542A_ROOT_INIT_PRIO`
+
+endif
