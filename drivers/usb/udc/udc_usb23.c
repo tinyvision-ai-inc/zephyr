@@ -179,6 +179,14 @@ int usb23_driver_preinit(const struct device *dev)
 	return 0;
 }
 
+void irq_thread_main(void *dev, void *, void *)
+{
+	while (true) {
+		usb23_irq_handler(dev);
+		k_sleep(K_MSEC(10));
+	}
+}
+
 #define USB23_EP_TRB_BUF_DEFINE(n)                                                                 \
 	static struct usb23_trb usb23_dma_trb_buf_##n[DT_PROP(n, num_trbs)];
 
@@ -215,6 +223,9 @@ int usb23_driver_preinit(const struct device *dev)
 	{                                                                                          \
 		*(volatile uint32_t *)DT_INST_REG_ADDR_BY_NAME(n, ev_pending) = 0xffffffff;        \
 	}                                                                                          \
+                                                                                                   \
+	K_THREAD_DEFINE(usb23_##n, 256,                                                            \
+			irq_thread_main, DEVICE_DT_GET(DT_DRV_INST(n)), NULL, NULL, 5, 0, 0);      \
                                                                                                    \
 	uint32_t usb23_dma_evt_buf_##n[CONFIG_USB23_EVT_NUM];                                      \
 	struct udc_ep_config usb23_ep_cfg_##n[DT_INST_PROP(n, num_bidir_endpoints) * 2];           \
