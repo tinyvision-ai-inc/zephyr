@@ -83,10 +83,177 @@
 				"ev_pending",
 				"ev_enable";
 			maximum-speed = "super-speed";
+			num-bidir-endpoints = <16>;
 			interrupts = <0x0 0>;
 			interrupt-names = "usb";
 			interrupt-parent = <&intc0>;
 			status = "okay";
+
+			endpoints {
+				compatible = "lattice,usb23-endpoints";
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				ep@00 {
+					reg = <0x00>;
+					num-trbs = <2>;
+				};
+
+				ep@80 {
+					reg = <0x80>;
+					num-trbs = <2>;
+				};
+
+				ep@01 {
+					reg = <0x01>;
+					num-trbs = <4>;
+				};
+
+				ep@81 {
+					reg = <0x81>;
+					num-trbs = <4>;
+				};
+
+				ep@02 {
+					reg = <0x02>;
+					num-trbs = <4>;
+				};
+
+				ep@82 {
+					reg = <0x82>;
+					num-trbs = <4>;
+				};
+
+				ep@03 {
+					reg = <0x03>;
+					num-trbs = <4>;
+				};
+
+				ep@83 {
+					reg = <0x83>;
+					num-trbs = <4>;
+				};
+
+				ep@04 {
+					reg = <0x04>;
+					num-trbs = <4>;
+				};
+
+				ep@84 {
+					reg = <0x84>;
+					num-trbs = <4>;
+				};
+
+				ep@05 {
+					reg = <0x05>;
+					num-trbs = <4>;
+				};
+
+				ep@85 {
+					reg = <0x85>;
+					num-trbs = <4>;
+				};
+
+				ep@06 {
+					reg = <0x06>;
+					num-trbs = <4>;
+				};
+
+				ep@86 {
+					reg = <0x86>;
+					num-trbs = <4>;
+				};
+
+				ep@07 {
+					reg = <0x07>;
+					num-trbs = <4>;
+				};
+
+				ep@87 {
+					reg = <0x87>;
+					num-trbs = <4>;
+				};
+
+				ep@08 {
+					reg = <0x08>;
+					num-trbs = <4>;
+				};
+
+				ep@88 {
+					reg = <0x88>;
+					num-trbs = <4>;
+				};
+
+				ep@09 {
+					reg = <0x09>;
+					num-trbs = <4>;
+				};
+
+				ep@89 {
+					reg = <0x89>;
+					num-trbs = <4>;
+				};
+
+				ep@0a {
+					reg = <0x0a>;
+					num-trbs = <4>;
+				};
+
+				ep@8a {
+					reg = <0x8a>;
+					num-trbs = <4>;
+				};
+
+				ep@0b {
+					reg = <0x0b>;
+					num-trbs = <4>;
+				};
+
+				ep@8b {
+					reg = <0x8b>;
+					num-trbs = <4>;
+				};
+
+				ep@0c {
+					reg = <0x0c>;
+					num-trbs = <4>;
+				};
+
+				ep@8c {
+					reg = <0x8c>;
+					num-trbs = <4>;
+				};
+
+				ep@0d {
+					reg = <0x0d>;
+					num-trbs = <4>;
+				};
+
+				ep@8d {
+					reg = <0x8d>;
+					num-trbs = <4>;
+				};
+
+				ep@0e {
+					reg = <0x0e>;
+					num-trbs = <4>;
+				};
+
+				ep@8e {
+					reg = <0x8e>;
+					num-trbs = <4>;
+				};
+
+				ep@0f {
+					reg = <0x0f>;
+					num-trbs = <4>;
+				};
+
+				ep@8f {
+					reg = <0x8f>;
+					num-trbs = <4>;
+				};
+			};
 		};
 	};
 };
