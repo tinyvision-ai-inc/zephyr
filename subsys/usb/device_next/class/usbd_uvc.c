@@ -784,10 +784,7 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			break;
 		}
 		if (uvc_desc_is_frame(*desc)) {
-			LOG_DBG("frame=yes curr=%u this=%u", ((struct uvc_frame_descriptor *)(*desc))->bFrameIndex, (*data->frame)->bFrameIndex);
 			cap++;
-		} else {
-			LOG_DBG("frame=no");
 		}
 	}
 
