@@ -1063,8 +1063,6 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, uint32_t ctrl)
 {
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, USB_CONTROL_EP_OUT);
-	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT);
-	const struct usb23_config *conf = dev->config;
 	volatile struct usb23_trb *trb = ep_data->trb_buf;
 
 	__ASSERT_NO_MSG(buf != NULL);
@@ -1076,12 +1074,7 @@ static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, ui
 	/* TRB0 for recieinving the data */
 	trb[0].addr_lo = (uintptr_t)ep_data->net_buf[0]->data;
 	trb[0].status = buf->size;
-	trb[0].ctrl = ctrl | USB23_TRB_CTRL_CHN | USB23_TRB_CTRL_HWO;
-
-	/* TRB1 discarding any overflow data */
-	trb[1].addr_lo = conf->discard;
-	trb[1].status = ep_cfg->mps - buf->size;
-	trb[1].ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO;
+	trb[0].ctrl = ctrl | USB23_TRB_CTRL_LST | USB23_TRB_CTRL_HWO;
 
 	/* Start a new transfer every time: no ring buffer */
 	usb23_depcmd_start_xfer(dev, ep_data);
@@ -1097,10 +1090,9 @@ static void usb23_trb_ctrl_setup_out(const struct device *dev)
 
 static void usb23_trb_ctrl_data_out(const struct device *dev)
 {
-	struct usb23_data *priv = udc_get_private(dev);
-	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, priv->data_stage_length);
+	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 512);
 
-	LOG_DBG("trb: CONTROL_DATA_OUT ep=0x%02x", USB_CONTROL_EP_OUT);
+	LOG_DBG("trb: CONTROL_DATA_OUT ep=0x%02x size=%u", USB_CONTROL_EP_OUT, buf->size);
 	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 

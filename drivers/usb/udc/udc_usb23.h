@@ -27,9 +27,6 @@ struct usb23_config {
 	/* Base address at which the USB23 core registers are mapped */
 	uintptr_t base;
 
-	/* Base address of a memory region that ignores all write requests */
-	uintptr_t discard;
-
 	/* Functions pointers for managing the IRQs from LiteX */
 	void (*irq_enable_func)(void);
 	void (*irq_clear_func)(void);

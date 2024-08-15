@@ -242,7 +242,6 @@ void irq_thread_main(void *dev, void *, void *)
                                                                                                    \
 	static const struct usb23_config usb23_config_##n = {                                      \
 		.base = DT_INST_REG_ADDR_BY_NAME(n, base),                                         \
-		.discard = DT_INST_REG_ADDR_BY_NAME(n, discard),                                   \
 		.num_bidir_eps = DT_INST_PROP(n, num_bidir_endpoints),                             \
 		.ep_cfg = usb23_ep_cfg_##n,                                                        \
 		.ep_data = usb23_ep_data_##n,                                                      \
