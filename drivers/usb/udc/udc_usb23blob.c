@@ -1273,7 +1273,7 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
 
 	/* Do not interfer with the uvcmanager operation */
 	if (ep_cfg->stat.halted || ep_data->manager_buf) {
-		LOG_DBG("queue: abort: not interfering with uvcmanager or halted endpoints");
+		LOG_DBG("queue: abort: now is not a good time yet");
 		return;
 	}
 
@@ -1938,7 +1938,9 @@ int usb23_api_ep_enqueue(const struct device *dev, struct udc_ep_config *ep_cfg,
 		udc_buf_put(ep_cfg, buf);
 
 		/* Process this buffer along with other waiting */
-		k_work_submit(&ep_data->work);
+		if (usb23_io_read(dev, USB23_DCTL) & USB23_DCTL_RUNSTOP) {
+			k_work_submit(&ep_data->work);
+		}
 	}
 
 	return 0;
@@ -2069,6 +2071,11 @@ void usb23_enable(const struct device *dev)
 	conf->irq_enable_func();
 }
 
+void usb23_disable(const struct device *dev)
+{
+	usb23_io_clear(dev, USB23_DCTL, USB23_DCTL_RUNSTOP);
+}
+
 /*
  * Hardware Init
  *
@@ -2090,6 +2097,9 @@ int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep
 
 	/* Starting from here, the endpoint can be used */
 	usb23_io_set(dev, USB23_DALEPENA, USB23_DALEPENA_USBACTEP(ep_data->epn));
+
+	/* Walk through the list of buffer to enqueue we might have blocked */
+	k_work_submit(&ep_data->work);
 
 	return 0;
 }

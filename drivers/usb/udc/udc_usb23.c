@@ -29,6 +29,7 @@ static int usb23_api_enable(const struct device *dev)
 static int usb23_api_disable(const struct device *dev)
 {
 	LOG_INF("api: disable");
+	usb23_disable(dev);
 	return 0;
 }
 

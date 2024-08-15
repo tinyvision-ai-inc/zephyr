@@ -148,6 +148,7 @@ static inline struct usb23_ep_data *usb23_get_ep_data(const struct device *dev, 
 void usb23_on_event(const struct device *dev);
 enum udc_bus_speed usb23_api_device_speed(const struct device *dev);
 void usb23_enable(const struct device *dev);
+void usb23_disable(const struct device *dev);
 int usb23_api_ep_clear_halt(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_dequeue(const struct device *dev, struct udc_ep_config *const ep_cfg);
 int usb23_api_ep_disable(const struct device *dev, struct udc_ep_config *const ep_cfg);
