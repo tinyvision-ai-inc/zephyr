@@ -680,7 +680,8 @@ static void uvc_worker(struct k_work *work)
 		return;
 	}
 
-	LOG_DBG("queue: submitting vbuf=%p", vbuf);
+	LOG_DBG("queue: submitting vbuf=%p buffer=%p bytesused=%u",
+		vbuf, vbuf->buffer, vbuf->bytesused);
 
 	/* Attach the video buffer to the USB buffer so that we get it back from USB */
 	bi = (void *)udc_get_buf_info(buf1);
