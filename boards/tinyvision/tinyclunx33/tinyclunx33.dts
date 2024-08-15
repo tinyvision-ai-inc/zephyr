@@ -72,13 +72,11 @@
 		zephyr_udc0: usb@b0000000 {
 			compatible = "lattice,usb23";
 			reg = <	0xb0000000 0x1000000
-				0xb1100000 0x1000000
 				0xe0005800 0x4
 				0xe0005804 0x4
 				0xe0005808 0x4>;
 			reg-names =
 				"base",
-				"discard",
 				"ev_status",
 				"ev_pending",
 				"ev_enable";
@@ -94,7 +92,7 @@
 				#address-cells = <1>;
 				#size-cells = <0>;
 
-				ep@00 {
+				ep@0 {
 					reg = <0x00>;
 					num-trbs = <2>;
 				};
@@ -104,7 +102,7 @@
 					num-trbs = <2>;
 				};
 
-				ep@01 {
+				ep@1 {
 					reg = <0x01>;
 					num-trbs = <4>;
 				};
@@ -114,7 +112,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@02 {
+				ep@2 {
 					reg = <0x02>;
 					num-trbs = <4>;
 				};
@@ -124,7 +122,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@03 {
+				ep@3 {
 					reg = <0x03>;
 					num-trbs = <4>;
 				};
@@ -134,7 +132,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@04 {
+				ep@4 {
 					reg = <0x04>;
 					num-trbs = <4>;
 				};
@@ -144,7 +142,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@05 {
+				ep@5 {
 					reg = <0x05>;
 					num-trbs = <4>;
 				};
@@ -154,7 +152,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@06 {
+				ep@6 {
 					reg = <0x06>;
 					num-trbs = <4>;
 				};
@@ -164,7 +162,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@07 {
+				ep@7 {
 					reg = <0x07>;
 					num-trbs = <4>;
 				};
@@ -174,7 +172,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@08 {
+				ep@8 {
 					reg = <0x08>;
 					num-trbs = <4>;
 				};
@@ -184,7 +182,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@09 {
+				ep@9 {
 					reg = <0x09>;
 					num-trbs = <4>;
 				};
@@ -194,7 +192,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0a {
+				ep@a {
 					reg = <0x0a>;
 					num-trbs = <4>;
 				};
@@ -204,7 +202,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0b {
+				ep@b {
 					reg = <0x0b>;
 					num-trbs = <4>;
 				};
@@ -214,7 +212,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0c {
+				ep@c {
 					reg = <0x0c>;
 					num-trbs = <4>;
 				};
@@ -224,7 +222,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0d {
+				ep@d {
 					reg = <0x0d>;
 					num-trbs = <4>;
 				};
@@ -234,7 +232,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0e {
+				ep@e {
 					reg = <0x0e>;
 					num-trbs = <4>;
 				};
@@ -244,7 +242,7 @@
 					num-trbs = <4>;
 				};
 
-				ep@0f {
+				ep@f {
 					reg = <0x0f>;
 					num-trbs = <4>;
 				};
