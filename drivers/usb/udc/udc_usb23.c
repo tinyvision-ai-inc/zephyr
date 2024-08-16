@@ -103,7 +103,7 @@ static int usb23_ep_preinit(const struct device *dev, uint8_t epn, int mps)
 	struct udc_ep_config *ep_cfg = &config->ep_cfg[epn];
 	struct usb23_ep_data *ep_data = &config->ep_data[epn];
 	uint8_t addr = usb23_get_addr(epn);
-	int ret;
+	int err;
 
 	ep_data->addr = ep_cfg->addr = addr;
 	ep_data->epn = epn;
@@ -125,10 +125,10 @@ static int usb23_ep_preinit(const struct device *dev, uint8_t epn, int mps)
 	}
 	ep_cfg->caps.mps = mps;
 
-	ret = udc_register_ep(dev, ep_cfg);
-	if (ret != 0) {
+	err = udc_register_ep(dev, ep_cfg);
+	if (err) {
 		LOG_ERR("Failed to register endpoint");
-		return ret;
+		return err;
 	}
 
 	return 0;
@@ -144,7 +144,7 @@ int usb23_driver_preinit(const struct device *dev)
 	struct usb23_data *priv = udc_get_private(dev);
 	struct udc_data *data = dev->data;
 	uint16_t mps = 0;
-	int ret;
+	int err;
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->work, &usb23_event_worker);
@@ -171,9 +171,10 @@ int usb23_driver_preinit(const struct device *dev)
 	}
 
 	for (uint8_t epn = 0; epn < config->num_bidir_eps * 2; epn++) {
-		ret = usb23_ep_preinit(dev, epn, mps);
-		if (ret < 0) {
-			return ret;
+		err = usb23_ep_preinit(dev, epn, mps);
+		if (err) {
+			LOG_ERR("preinit: could not setup endpoint 0x%02x", usb23_get_addr(epn));
+			return err;
 		}
 	}
 

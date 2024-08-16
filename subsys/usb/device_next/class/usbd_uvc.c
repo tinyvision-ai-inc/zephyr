@@ -63,10 +63,11 @@ struct uvc_data {
 	struct uvc_vs_probe_control default_probe;
 	/* UVC payload header, passed just before the image data */
 	struct uvc_payload_header payload_header;
+	/* Video device controlled by the host via UVC */
+	const struct device *source_dev;
 	/* Video FIFOs for submission (in) and completion (out) queue */
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
-	const struct device *source_dev;
 };
 
 struct uvc_buf_info {
@@ -433,6 +434,8 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		      struct uvc_vs_probe_control *probe)
 {
+	int err;
+
 	switch (bRequest) {
 	case UVC_GET_CUR:
 		uvc_probe(data, bRequest, probe);
@@ -441,8 +444,12 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		uvc_probe(data, bRequest, probe);
 		LOG_DBG("commit: ready to transfer frames");
 		/* TODO: signal the application that the current format might have changed */
-		if (data->source_dev && video_stream_start(data->source_dev)) {
-			return -EIO;
+		if (data->source_dev != NULL) {
+			err = video_stream_start(data->source_dev);
+			if (err) {
+				LOG_ERR("Could not start the video source");
+				return err;
+			}
 		}
 		break;
 	default:
@@ -556,7 +563,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 
 	LOG_DBG("request: transfer done, ep=0x%02x buf=%p", bi.udc.ep, buf);
 
-	return err;
+	return 0;
 }
 
 static void uvc_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
@@ -602,7 +609,7 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 static int uvc_enqueue_usb(struct uvc_data *data, struct net_buf *buf, bool last_of_transfer)
 {
 	struct udc_buf_info *bi;
-	int ret;
+	int err;
 
 	LOG_DBG("queue: usb buf=%p data=%p size=%u len=%u zlp=%u", buf, buf->data, buf->size,
 		buf->len, last_of_transfer);
@@ -614,10 +621,10 @@ static int uvc_enqueue_usb(struct uvc_data *data, struct net_buf *buf, bool last
 	bi->ep = uvc_get_bulk_in(data);
 	bi->zlp = last_of_transfer;
 
-	ret = usbd_ep_enqueue(data->c_data, buf);
-	if (ret != 0) {
+	err = usbd_ep_enqueue(data->c_data, buf);
+	if (err) {
 		LOG_ERR("enqueue: error from usbd for buf=%p", buf);
-		return ret;
+		return err;
 	}
 
 	return 0;
@@ -630,7 +637,7 @@ static void uvc_worker(struct k_work *work)
 	struct video_buffer *vbuf;
 	struct net_buf *buf0;
 	struct net_buf *buf1;
-	int ret;
+	int err;
 
 	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED)) {
 		LOG_DBG("queue: USB configuration is not enabled yet");
@@ -670,8 +677,8 @@ static void uvc_worker(struct k_work *work)
 	bi = (void *)udc_get_buf_info(buf0);
 	bi->vbuf = NULL;
 
-	ret = uvc_enqueue_usb(data, buf0, false);
-	if (ret != 0) {
+	err = uvc_enqueue_usb(data, buf0, false);
+	if (err) {
 		LOG_ERR("queue: failed to submit the header to USB");
 		net_buf_unref(buf0);
 		return;
@@ -691,8 +698,8 @@ static void uvc_worker(struct k_work *work)
 	bi = (void *)udc_get_buf_info(buf1);
 	bi->vbuf = vbuf;
 
-	ret = uvc_enqueue_usb(data, buf1, true);
-	if (ret != 0) {
+	err = uvc_enqueue_usb(data, buf1, true);
+	if (err) {
 		LOG_ERR("queue: failed to submit the payload to USB");
 		net_buf_unref(buf0);
 		net_buf_unref(buf1);
@@ -1171,7 +1178,7 @@ static int uvc_preinit(const struct device *dev)
 		.hs_desc = uvc_hs_desc_##n,                                                        \
 		.ss_desc = uvc_ss_desc_##n,                                                        \
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,                     \
-		.source_dev = DEVICE_DT_GET(DT_INST_PHANDLE(0, source)),                           \
+		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, source)),                   \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL,              \

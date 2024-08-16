@@ -1206,7 +1206,7 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_ep_data *ep_data,
 				  struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("trb: BULK_MANAGER_HEADER ep=0x%02x buf=%p data=%p size=%u len=%u", ep_data->addr, buf,
 		buf->data, buf->size, buf->len);
@@ -1225,8 +1225,11 @@ static int usb23_trb_bulk_manager_header(const struct device *dev, struct usb23_
 	ep_data->manager_header[1] = *(uint32_t *)(buf->data + 0);
 
 	/* Submit the buffer completed by the uvcmanager back to Zephyr */
-	ret = udc_submit_ep_event(dev, buf, 0);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_submit_ep_event(dev, buf, 0);
+	if (err) {
+		LOG_ERR("trb: could not send the commpletion event to the USB stack");
+		return err;
+	}
 
 	return 0;
 }
@@ -1259,7 +1262,7 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
 {
 	struct udc_ep_config *ep_cfg = udc_get_ep_cfg(dev, ep_data->addr);
 	struct net_buf *buf;
-	int ret;
+	int err;
 
 	LOG_DBG("queue: checking for pending transfers");
 
@@ -1272,8 +1275,8 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
 	while ((buf = udc_buf_peek(dev, ep_data->addr)) != NULL) {
 		LOG_DBG("processing buffer %p from queue", buf);
 
-		ret = usb23_trb_bulk(dev, ep_data, buf);
-		if (ret != 0) {
+		err = usb23_trb_bulk(dev, ep_data, buf);
+		if (err) {
 			LOG_DBG("queue: abort: no more room for buffer");
 			break;
 		}
@@ -1301,7 +1304,7 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	struct net_buf *buf = ep_data->manager_buf;
 	uint32_t reg;
 	uint32_t next;
-	int ret;
+	int err;
 
 	/* Check that uvcmanager just ran and that the driver did catch-up */
 	if (buf == NULL) {
@@ -1321,8 +1324,8 @@ static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data
 	ep_data->manager_buf = NULL;
 
 	/* Submit the buffer completed by the uvcmanager back to Zephyr */
-	ret = udc_submit_ep_event(dev, buf, 0);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_submit_ep_event(dev, buf, 0);
+	__ASSERT_NO_MSG(!err);
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
 	k_work_submit(&ep_data->work);
@@ -1557,23 +1560,23 @@ static void usb23_on_ctrl_write_setup(const struct device *dev, struct net_buf *
 /* OUT */
 static void usb23_on_ctrl_write_data(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_WRITE_DATA (out) buf=%p", buf);
 	udc_ctrl_update_stage(dev, buf);
-	ret = udc_ctrl_submit_s_out_status(dev, buf);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_s_out_status(dev, buf);
+	__ASSERT_NO_MSG(!err);
 	k_sleep(K_MSEC(1));
 }
 
 /* IN */
 static void usb23_on_ctrl_write_status(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_WRITE_STATUS (in) buf=%p", buf);
-	ret = udc_ctrl_submit_status(dev, buf);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(!err);
 	udc_ctrl_update_stage(dev, buf);
 }
 
@@ -1582,11 +1585,11 @@ static void usb23_on_ctrl_write_status(const struct device *dev, struct net_buf 
 /* OUT */
 static void usb23_on_ctrl_read_setup(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_READ_SETUP (out) buf=%p", buf);
-	ret = udc_ctrl_submit_s_in_status(dev);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_s_in_status(dev);
+	__ASSERT_NO_MSG(!err);
 }
 
 /* IN */
@@ -1601,11 +1604,11 @@ static void usb23_on_ctrl_read_data(const struct device *dev, struct net_buf *bu
 /* OUT */
 static void usb23_on_ctrl_read_status(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_READ_STATUS (out) buf=%p", buf);
-	ret = udc_ctrl_submit_status(dev, buf);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(!err);
 	udc_ctrl_update_stage(dev, buf);
 }
 
@@ -1614,21 +1617,21 @@ static void usb23_on_ctrl_read_status(const struct device *dev, struct net_buf *
 /* OUT */
 static void usb23_on_ctrl_nodata_setup(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_NODATA_SETUP (out) buf=%p", buf);
-	ret = udc_ctrl_submit_s_status(dev);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_s_status(dev);
+	__ASSERT_NO_MSG(!err);
 }
 
 /* IN */
 static void usb23_on_ctrl_nodata_status(const struct device *dev, struct net_buf *buf)
 {
-	int ret;
+	int err;
 
 	LOG_DBG("evt: CTRL_NODATA_STATUS (in) buf=%p", buf);
-	ret = udc_ctrl_submit_status(dev, buf);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_ctrl_submit_status(dev, buf);
+	__ASSERT_NO_MSG(!err);
 	udc_ctrl_update_stage(dev, buf);
 }
 
@@ -1766,7 +1769,7 @@ static void usb23_on_xfer_done_norm(const struct device *dev, uint32_t evt)
 	struct usb23_ep_data *ep_data = usb23_get_ep_data(dev, ep_addr);
 	struct usb23_trb *trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
-	int ret;
+	int err;
 
 	/* Clear the TRB that triggered the event */
 	buf = usb23_pop_trb(dev, ep_data);
@@ -1779,8 +1782,8 @@ static void usb23_on_xfer_done_norm(const struct device *dev, uint32_t evt)
 		buf->len = buf->size - GETFIELD(trb->status, USB23_TRB_STATUS_BUFSIZ);
 	}
 
-	ret = udc_submit_ep_event(dev, buf, 0);
-	__ASSERT_NO_MSG(ret == 0);
+	err = udc_submit_ep_event(dev, buf, 0);
+	__ASSERT_NO_MSG(!err);
 
 	/* We just made some room for a new buffer, check if something more to enqueue */
 	k_work_submit(&ep_data->work);
@@ -2104,7 +2107,7 @@ int usb23_api_ep_enable(const struct device *dev, struct udc_ep_config *const ep
 int usb23_api_init(const struct device *dev)
 {
 	struct udc_data *data = dev->data;
-	int ret;
+	int err;
 
 	/* Issue a soft reset to the core and USB2 and USB3 PHY */
 	usb23_io_set(dev, USB23_GCTL, USB23_GCTL_CORESOFTRESET);
@@ -2131,16 +2134,22 @@ int usb23_api_init(const struct device *dev)
 	usb23_on_soft_reset(dev);
 
 	/* Configure the control OUT endpoint */
-	ret = udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT, USB_EP_TYPE_CONTROL, data->caps.mps0,
+	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT, USB_EP_TYPE_CONTROL, data->caps.mps0,
 				     0);
-	__ASSERT_NO_MSG(ret == 0);
+	if (err) {
+		LOG_ERR("init: could not enable control OUT ep");
+		return err;
+	}
 
 	/* Configure the control IN endpoint */
-	ret = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, data->caps.mps0,
+	err = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, data->caps.mps0,
 				     0);
-	__ASSERT_NO_MSG(ret == 0);
+	if (err) {
+		LOG_ERR("init: could not enable control IN ep");
+		return err;
+	}
 
-	return ret;
+	return 0;
 }
 
 /*
