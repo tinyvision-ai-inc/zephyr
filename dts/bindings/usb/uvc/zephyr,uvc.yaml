@@ -6,12 +6,16 @@ description: USB Video Class instance
 compatible: "zephyr,uvc"
 
 properties:
-  source : 
-    type : phandle 
+  source: 
+    type: phandle
+    description: |
+      A reference to an associated video-device. This device will get started,
+      stopped or configured following the requests from the host.
+    required: false
 
 # Child nodes of "zephyr,uvc" compatibles are supposed to be:
-# - Video Control entity named "port", which also matches the
-#   port/endpoint/remote-endpoint syntax of devicetrees.
+# - Video Control entity named "port", which also matches the port, endpoint,
+#   remote-endpoint syntax of devicetrees.
 # - Video Streaming entity, which list the formats available.
 
 on-bus: usb
