@@ -66,6 +66,7 @@ struct uvc_data {
 	/* Video FIFOs for submission (in) and completion (out) queue */
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
+	const struct device *source_dev;
 };
 
 struct uvc_buf_info {
@@ -440,6 +441,9 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		uvc_probe(data, bRequest, probe);
 		LOG_DBG("commit: ready to transfer frames");
 		/* TODO: signal the application that the current format might have changed */
+		if (data->source_dev && video_stream_start(data->source_dev)) {
+			return -EIO;
+		}
 		break;
 	default:
 		LOG_ERR("commit: invalid bRequest (%u)", bRequest);
@@ -1167,6 +1171,7 @@ static int uvc_preinit(const struct device *dev)
 		.hs_desc = uvc_hs_desc_##n,                                                        \
 		.ss_desc = uvc_ss_desc_##n,                                                        \
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,                     \
+		.source_dev = DEVICE_DT_GET(DT_INST_PHANDLE(0, source)),                           \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL,              \
