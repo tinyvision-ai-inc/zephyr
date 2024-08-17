@@ -14,6 +14,7 @@
 LOG_MODULE_REGISTER(uvcmanager, CONFIG_VIDEO_LOG_LEVEL);
 
 struct uvcmanager_conf {
+	const struct device *source_dev;
 	uintptr_t buf_addr;
 };
 
@@ -32,26 +33,34 @@ static int uvcmanager_init(const struct device *dev)
 
 static int uvcmanager_stream_start(const struct device *dev)
 {
-	LOG_DBG("uvcmanager: start");
+	const struct uvcmanager_conf *conf = dev->config;
+	int err;
+
+	if (conf->source_dev != NULL) {
+		err = video_stream_start(conf->source_dev);
+		if (err) {
+			LOG_ERR("failed to start the source device");
+			return err;
+		}
+	}
+
 	return 0;
 }
 
 static int uvcmanager_stream_stop(const struct device *dev)
 {
-	LOG_DBG("uvcmanager: stop");
+	const struct uvcmanager_conf *conf = dev->config;
+	int err;
+
+	if (conf->source_dev != NULL) {
+		err = video_stream_start(conf->source_dev);
+		if (err) {
+			LOG_ERR("failed to stop the source device");
+			return err;
+		}
+	}
+
 	return 0;
-}
-
-static int uvcmanager_set_ctrl(const struct device *dev, unsigned int cid, void *p)
-{
-	LOG_DBG("uvcmanager: set cid=%d val=%p", cid, p);
-	return -ENOTSUP;
-}
-
-static int uvcmanager_get_ctrl(const struct device *dev, unsigned int cid, void *p)
-{
-	LOG_DBG("uvcmanager: get cid=%d", cid);
-	return -ENOTSUP;
 }
 
 #define FORMAT_CAP(fmt, wmax, hmax)                                                                \
@@ -71,26 +80,53 @@ static const struct video_format_cap fmts[] = {
 
 static int uvcmanager_get_caps(const struct device *dev, enum video_endpoint_id ep, struct video_caps *caps)
 {
-	LOG_DBG("uvcmanager: caps");
+	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
+
 	caps->format_caps = fmts;
 	return 0;
 }
 
-static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_id ep, struct video_format *format)
+static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_id ep, struct video_format *fmt)
 {
 	struct uvcmanager_data *data = dev->data;
+	const struct uvcmanager_conf *conf = dev->config;
+	struct video_format child_fmt = *fmt;
+	int err;
 
-	LOG_DBG("uvcmanager: set ep=%d format=%p", ep, format);
-	memcpy(&data->format, format, sizeof(data->format));
+	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
+
+	LOG_DBG("setting format to %ux%u", fmt->width, fmt->height);
+
+	if (conf->source_dev != NULL) {
+		/* Requires 2 extra pixels for debayer */
+		child_fmt.width += 2;
+		child_fmt.height += 2;
+
+		err = video_set_format(conf->source_dev, VIDEO_EP_OUT, &child_fmt);
+		if (err) {
+			LOG_ERR("failed to set source device's format to %ux%u",
+				child_fmt.width, child_fmt.height);
+			return err;
+		}
+	}
+	data->format = *fmt;
+
 	return 0;
 }
 
-static int uvcmanager_get_format(const struct device *dev, enum video_endpoint_id ep, struct video_format *format)
+static int uvcmanager_get_format(const struct device *dev, enum video_endpoint_id ep, struct video_format *fmt)
 {
 	struct uvcmanager_data *data = dev->data;
 
-	LOG_DBG("uvcmanager: get ep=%d", ep);
-	memcpy(format, &data->format, sizeof(*format));
+	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
+
+	*fmt = data->format;
 	return 0;
 }
 
@@ -98,6 +134,10 @@ static int uvcmanager_enqueue(const struct device *dev, enum video_endpoint_id e
 {
 	const struct uvcmanager_conf *conf = dev->config;
 	struct uvcmanager_data *data = dev->data;
+
+	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
 
 	/* No data transfer: the data is memory mapped by the hardware and immediately ready */
 	vbuf->buffer = (uint8_t *)conf->buf_addr;
@@ -114,6 +154,10 @@ static int uvcmanager_dequeue(const struct device *dev, enum video_endpoint_id e
 {
 	struct uvcmanager_data *data = dev->data;
 
+	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
+		return -EINVAL;
+	}
+
 	*vbufp = k_fifo_get(&data->fifo, timeout);
 	if (*vbufp == NULL) {
 		LOG_ERR("uvcmanager: Cannot dequeue a buffer");
@@ -128,8 +172,6 @@ static int uvcmanager_dequeue(const struct device *dev, enum video_endpoint_id e
 static const struct video_driver_api uvcmanager_driver_api = {
 	.set_format = uvcmanager_set_format,
 	.get_format = uvcmanager_get_format,
-	.set_ctrl = uvcmanager_set_ctrl,
-	.get_ctrl = uvcmanager_get_ctrl,
 	.get_caps = uvcmanager_get_caps,
 	.stream_start = uvcmanager_stream_start,
 	.stream_stop = uvcmanager_stream_stop,
@@ -141,13 +183,14 @@ static const struct video_driver_api uvcmanager_driver_api = {
 
 #define UVCMANAGER_DEVICE_DEFINE(n)                                                                \
                                                                                                    \
-	struct uvcmanager_conf uvcmanager_conf_##n = {                                             \
+	const struct uvcmanager_conf uvcmanager_conf_##n = {                                       \
 		.buf_addr = DT_INST_REG_ADDR_BY_NAME(n, fifo),                                     \
+		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, source)),                   \
 	};                                                                                         \
                                                                                                    \
 	struct uvcmanager_data uvcmanager_data_##n;                                                \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, uvcmanager_init, NULL, &uvcmanager_data_##n, &uvcmanager_conf_##n,\
-			      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &uvcmanager_driver_api);
+			      POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY, &uvcmanager_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(UVCMANAGER_DEVICE_DEFINE)

@@ -11,3 +11,12 @@ include: base.yaml
 properties:
   reg:
     required: true
+
+  source:
+    type: phandle
+    description: |
+      Source device that is to provide data to the UVC Manager.
+      In order to perform debayer, it needs to support 2 more rows and columns
+      of pixels than what the UVC Manager is confirued for, usually from the
+      USB host over UVC probe/commit commands.
+    required: false
