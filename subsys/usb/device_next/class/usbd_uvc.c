@@ -81,6 +81,9 @@ NET_BUF_POOL_VAR_DEFINE(uvc_pool_header, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) 
 NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 10, 0,
 			  sizeof(struct uvc_buf_info), NULL);
 
+static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
+			  struct video_format *fmt);
+
 static bool uvc_desc_is_format(struct usb_desc_header *desc)
 {
 	struct uvc_format_descriptor *format = (void *)desc;
@@ -434,8 +437,6 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		      struct uvc_vs_probe_control *probe)
 {
-	int err;
-
 	switch (bRequest) {
 	case UVC_GET_CUR:
 		uvc_probe(data, bRequest, probe);
@@ -443,12 +444,27 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 	case UVC_SET_CUR:
 		uvc_probe(data, bRequest, probe);
 		LOG_DBG("commit: ready to transfer frames");
-		/* TODO: signal the application that the current format might have changed */
+
 		if (data->source_dev != NULL) {
-			err = video_stream_start(data->source_dev);
-			if (err) {
+			const struct device *dev = usbd_class_get_private(data->c_data);
+			struct video_format fmt = {0};
+
+			errno = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
+			if (errno) {
+				LOG_ERR("Failed to prepare format to the source");
+				return 0;
+			}
+
+			errno = video_set_format(data->source_dev, VIDEO_EP_OUT, &fmt);
+			if (errno) {
+				LOG_ERR("Could not set the format of the video source");
+				return 0;
+			}
+
+			errno = video_stream_start(data->source_dev);
+			if (errno) {
 				LOG_ERR("Could not start the video source");
-				return err;
+				return 0;
 			}
 		}
 		break;
