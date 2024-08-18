@@ -21,6 +21,7 @@
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 #define UVC_CLASS_ENABLED 0
+#define UVC_CLASS_READY   1
 
 struct uvc_desc {
 	/* UVC Interface association */
@@ -449,6 +450,8 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 			const struct device *dev = usbd_class_get_private(data->c_data);
 			struct video_format fmt = {0};
 
+			LOG_DBG("Setting format of the video source and starting it");
+
 			errno = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
 			if (errno) {
 				LOG_ERR("Failed to prepare format to the source");
@@ -467,6 +470,10 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 				return 0;
 			}
 		}
+
+		/* Now ready to process  */
+		atomic_set_bit(&data->state, UVC_CLASS_READY);
+		k_work_submit(&data->work);
 		break;
 	default:
 		LOG_ERR("commit: invalid bRequest (%u)", bRequest);
@@ -655,11 +662,13 @@ static void uvc_worker(struct k_work *work)
 	struct net_buf *buf1;
 	int err;
 
-	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED)) {
-		LOG_DBG("queue: USB configuration is not enabled yet");
+	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED) ||
+	    !atomic_test_bit(&data->state, UVC_CLASS_READY)) {
+		LOG_DBG("queue: UVC not ready to work yet");
 		return;
 	}
 
+	/* Only remove the buffer from the queue after it is submitted to USB */
 	vbuf = k_fifo_peek_head(&data->fifo_in);
 	if (vbuf == NULL) {
 		return;
@@ -722,7 +731,10 @@ static void uvc_worker(struct k_work *work)
 		return;
 	}
 
+	/* Remove the buffer from the queue now that USB driver received it */
 	k_fifo_get(&data->fifo_in, K_NO_WAIT);
+
+	/* Work on the next buffer */
 	k_work_submit(&data->work);
 }
 
@@ -731,9 +743,8 @@ static void uvc_enable(struct usbd_class_data *const c_data)
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	atomic_set_bit(&data->state, UVC_CLASS_ENABLED);
-
 	/* Catch-up with buffers that might have been delayed */
+	atomic_set_bit(&data->state, UVC_CLASS_ENABLED);
 	k_work_submit(&data->work);
 }
 
@@ -766,10 +777,7 @@ static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
 	}
 
 	k_fifo_put(&data->fifo_in, vbuf);
-
-	/* Process this buffer as well as others pending */
 	k_work_submit(&data->work);
-
 	return 0;
 }
 
