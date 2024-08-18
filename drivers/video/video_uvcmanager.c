@@ -92,7 +92,6 @@ static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_i
 {
 	struct uvcmanager_data *data = dev->data;
 	const struct uvcmanager_conf *conf = dev->config;
-	struct video_format child_fmt = *fmt;
 	int err;
 
 	if (ep != VIDEO_EP_OUT && ep != VIDEO_EP_ANY) {
@@ -102,9 +101,14 @@ static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_i
 	LOG_DBG("setting format to %ux%u", fmt->width, fmt->height);
 
 	if (conf->source_dev != NULL) {
-		/* Requires 2 extra pixels for debayer */
+		struct video_format child_fmt = *fmt;
+
+		/* Requires 2 extra pixels for debayer, and in bayer format */
 		child_fmt.width += 2;
 		child_fmt.height += 2;
+		child_fmt.pixelformat = VIDEO_PIX_FMT_BGGR8;
+
+		LOG_DBG("setting child format to %ux%u", child_fmt.width, child_fmt.height);
 
 		err = video_set_format(conf->source_dev, VIDEO_EP_OUT, &child_fmt);
 		if (err) {
