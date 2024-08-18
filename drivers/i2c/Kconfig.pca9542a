@@ -19,5 +19,14 @@ config I2C_PCA9542A_CHANNEL_INIT_PRIO
 	default I2C_INIT_PRIORITY
 	help
 	  Should be higher than `I2C_PCA9542A_ROOT_INIT_PRIO`
-	  
+
+config I2C_PCA9542A_IGNORE_FAILURE
+	bool "send the I2C messages when the channel selection fails"
+	default false
+	help
+	  This permits to let I2C message reach their target in case something
+	  goes wrong with the I2C multiplexer, or replaced by plain wires.
+	  This is disabled by default as I2C messages to the wrong target could
+	  have undesired effects.
+
 endif

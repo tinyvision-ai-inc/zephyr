@@ -58,9 +58,9 @@ static int pca9542a_configure(const struct device *dev, uint32_t dev_config)
 
 static int pca9542a_set_channel(const struct device *dev, uint8_t select_mask)
 {
-	int res = 0;
 	struct pca9542a_root_data *data = dev->data;
 	const struct pca9542a_root_config *cfg = dev->config;
+	int res = 0;
 
 	/* Only select the channel if its different from the last channel */
 	if (data->selected_chan != select_mask) {
@@ -88,9 +88,11 @@ static int pca9542a_transfer(const struct device *dev, struct i2c_msg *msgs, uin
 	}
 
 	res = pca9542a_set_channel(down_cfg->root, down_cfg->chan_mask);
+#if CONFIG_I2C_PCA9542A_IGNORE_FAILURE
 	if (res != 0) {
 		goto end_trans;
 	}
+#endif
 
 	res = i2c_transfer(config->i2c.bus, msgs, num_msgs, addr);
 
@@ -101,10 +103,9 @@ end_trans:
 
 static int pca9542a_root_init(const struct device *dev)
 {
-
 	struct pca9542a_root_data *i2c_pca9542a = dev->data;
 	const struct pca9542a_root_config *config = dev->config;
-	printf("inside root init...\n");
+
 	if (!device_is_ready(config->i2c.bus)) {
 		LOG_ERR("I2C bus %s not ready", config->i2c.bus->name);
 		return -ENODEV;
@@ -119,6 +120,7 @@ static int pca9542a_channel_init(const struct device *dev)
 {
 	const struct pca9542a_channel_config *chan_cfg = dev->config;
 	const struct pca9542a_root_config *root_cfg = get_root_config_from_channel(dev);
+
 	if (!device_is_ready(chan_cfg->root)) {
 		LOG_ERR("I2C mux root %s not ready", chan_cfg->root->name);
 		return -ENODEV;
