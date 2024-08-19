@@ -32,9 +32,6 @@ LOG_MODULE_REGISTER(cdc_raw, CONFIG_USBD_CDC_RAW_LOG_LEVEL);
 #define CDC_ACM_INT_EP_MPS		64
 #define CDC_ACM_INT_INTERVAL		0x0A
 
-/** Data Terminal Ready flag */
-#define CDC_RAW_FLAG                    BIT(0)
-
 struct cdc_acm_desc {
 	struct usb_association_descriptor iad;
 
@@ -73,7 +70,7 @@ struct cdc_raw_data {
 	cdc_raw_callback_t *read_callback;
 	cdc_raw_callback_t *write_callback;
 	/* Data Terminal Ready signal */
-	bool line_state_dtr;
+	bool line_state;
 };
 
 static uint8_t usbd_cdc_raw_get_bulk_in(struct usbd_class_data *const c_data)
@@ -151,7 +148,7 @@ bool cdc_raw_is_ready(const struct device *dev)
 {
 	struct cdc_raw_data *data = dev->data;
 
-	return data->line_state_dtr;
+	return !!(data->line_state & SET_CONTROL_LINE_STATE_DTR);
 }
 
 static int usbd_cdc_raw_cth(struct usbd_class_data *const c_data,
@@ -171,10 +168,8 @@ static int usbd_cdc_raw_ctd(struct usbd_class_data *const c_data,
 
 	switch (setup->bRequest) {
 	case SET_CONTROL_LINE_STATE:
-		if ((setup->wValue & SET_CONTROL_LINE_STATE_DTR)) {
-			LOG_DBG("Data Terminal Ready set");
-			data->line_state_dtr = true;
-		}
+		LOG_DBG("Data Terminal Ready set");
+		data->line_state = setup->wValue;
 		break;
 	}
 	return 0;
@@ -215,27 +210,6 @@ static int usbd_cdc_raw_request(struct usbd_class_data *const c_data,
 	return 0;
 }
 
-static void usbd_cdc_raw_update(struct usbd_class_data *const c_data,
-				uint8_t iface, uint8_t alternate)
-{
-}
-
-static void usbd_cdc_raw_enable(struct usbd_class_data *const c_data)
-{
-}
-
-static void usbd_cdc_raw_disable(struct usbd_class_data *const c_data)
-{
-}
-
-static void usbd_cdc_raw_suspended(struct usbd_class_data *const c_data)
-{
-}
-
-static void usbd_cdc_raw_resumed(struct usbd_class_data *const c_data)
-{
-}
-
 static void *usbd_cdc_raw_get_desc(struct usbd_class_data *const c_data,
 				   const enum usbd_speed speed)
 {
@@ -254,11 +228,6 @@ static void *usbd_cdc_raw_get_desc(struct usbd_class_data *const c_data,
 
 struct usbd_class_api usbd_cdc_raw_api = {
 	.request = usbd_cdc_raw_request,
-	.update = usbd_cdc_raw_update,
-	.enable = usbd_cdc_raw_enable,
-	.disable = usbd_cdc_raw_disable,
-	.suspended = usbd_cdc_raw_suspended,
-	.resumed = usbd_cdc_raw_resumed,
 	.control_to_host = usbd_cdc_raw_cth,
 	.control_to_dev = usbd_cdc_raw_ctd,
 	.init = usbd_cdc_raw_init,
