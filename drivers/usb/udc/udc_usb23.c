@@ -185,7 +185,7 @@ void irq_thread_main(void *dev, void *, void *)
 {
 	while (true) {
 		usb23_irq_handler(dev);
-		k_sleep(K_MSEC(10));
+		k_sleep(K_MSEC(2));
 	}
 }
 

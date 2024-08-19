@@ -358,6 +358,7 @@ static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 	const struct imx219_config *cfg = dev->config;
 	int ret;
 	int i;
+
 	for (i = 0; i < ARRAY_SIZE(fmts); ++i) {
 		if (fmt->pixelformat == fmts[i].pixelformat && fmt->width >= fmts[i].width_min &&
 		    fmt->width <= fmts[i].width_max && fmt->height >= fmts[i].height_min &&
@@ -391,6 +392,7 @@ static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 		}
 	}
 
+	LOG_INF("Setting IMX219 format to %ux%u", fmt->width, fmt->height);
 	return 0;
 }
 

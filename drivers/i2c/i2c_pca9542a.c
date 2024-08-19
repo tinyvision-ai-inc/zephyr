@@ -88,15 +88,15 @@ static int pca9542a_transfer(const struct device *dev, struct i2c_msg *msgs, uin
 	}
 
 	res = pca9542a_set_channel(down_cfg->root, down_cfg->chan_mask);
-#if CONFIG_I2C_PCA9542A_IGNORE_FAILURE
 	if (res != 0) {
-		goto end_trans;
-	}
+#ifdef CONFIG_I2C_PCA9542A_IGNORE_FAILURE
+		res = i2c_transfer(config->i2c.bus, msgs, num_msgs, addr);
 #endif
+		goto end;
+	}
 
 	res = i2c_transfer(config->i2c.bus, msgs, num_msgs, addr);
-
-end_trans:
+end:
 	k_mutex_unlock(&data->lock);
 	return res;
 }
