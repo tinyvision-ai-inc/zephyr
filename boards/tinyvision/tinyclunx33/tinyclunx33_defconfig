@@ -25,6 +25,9 @@ CONFIG_UART_CONSOLE=y
 CONFIG_UART_LITEUART=y
 CONFIG_UART_LINE_CTRL=y
 
+# Optimize the shell to much more TX buffer size
+CONFIG_SHELL_BACKEND_SERIAL_TX_RING_BUFFER_SIZE=256
+
 # Enable the system timer
 CONFIG_LITEX_TIMER=y
 
