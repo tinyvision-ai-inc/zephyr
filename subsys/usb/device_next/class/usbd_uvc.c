@@ -54,7 +54,7 @@ struct uvc_data {
 	const struct video_format_cap *fmts;
 	/* UVC interface and format currenly selected */
 	struct uvc_format_descriptor **format;
-	struct uvc_frame_descriptor **frame;
+	struct uvc_frame_descriptor_discrete_1 **frame;
 	/* UVC Descriptors */
 	struct uvc_desc *const desc;
 	struct usb_desc_header *const *const fs_desc;
@@ -96,7 +96,7 @@ static bool uvc_desc_is_format(struct usb_desc_header *desc)
 
 static bool uvc_desc_is_frame(struct usb_desc_header *desc)
 {
-	struct uvc_frame_descriptor *frame = (void *)desc;
+	struct uvc_frame_descriptor_discrete_1 *frame = (void *)desc;
 
 	return desc->bDescriptorType == UVC_CS_INTERFACE &&
 	       (frame->bDescriptorSubtype == UVC_VS_FRAME_UNCOMPRESSED ||
@@ -164,7 +164,7 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 	case UVC_SET_CUR:
 		/* Search a frame desc with a matching bFrameIndex below the current format desc */
 		for (struct usb_desc_header *const *desc = (void *)(data->format + 1);; desc++) {
-			struct uvc_frame_descriptor *frame = (void *)*desc;
+			struct uvc_frame_descriptor_discrete_1 *frame = (void *)*desc;
 
 			if (!uvc_desc_is_frame(*desc)) {
 				break;
@@ -184,12 +184,12 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		probe->dwFrameInterval = (*data->frame)->dwMinFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
 	case UVC_GET_MAX:
-		probe->dwFrameInterval = (*data->frame)->dwMaxFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
 	case UVC_GET_CUR:
 		/* TODO call the frame interval API on the video source once supported */
-		probe->dwFrameInterval = (*data->frame)->dwMaxFrameInterval;
+		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
 		break;
 	case UVC_GET_RES:
 		probe->dwFrameInterval = 1;
@@ -476,7 +476,7 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		k_work_submit(&data->work);
 		break;
 	default:
-		LOG_ERR("commit: invalid bRequest (%u)", bRequest);
+		LOG_WRN("commit: invalid bRequest (%u)", bRequest);
 		errno = -EINVAL;
 		return 0;
 	}
@@ -502,26 +502,31 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 	case UVC_GET_DEF:
 	case UVC_GET_RES:
 	case UVC_GET_CUR:
+		if (buf->size != sizeof(probe)) {
+			LOG_WRN("probe: invalid size %u, wanted %u", buf->size, sizeof(probe));
+			errno = -EINVAL;
+			return 0;
+		}
 		if (net_buf_add(buf, sizeof(probe)) == NULL) {
 			return -ENOMEM;
 		}
 		break;
 	case UVC_SET_CUR:
 		if (buf->len != sizeof(probe)) {
-			LOG_ERR("probe: invalid wLength=%u for Probe or Commit", setup->wLength);
+			LOG_WRN("probe: invalid size %u, wanted %u", buf->len, sizeof(probe));
 			errno = -EINVAL;
 			return 0;
 		}
 		break;
 	default:
-		LOG_ERR("probe: invalid bRequest (%u) for Probe or Commit", setup->bRequest);
+		LOG_WRN("probe: invalid bRequest (%u) for Probe or Commit", setup->bRequest);
 		errno = -EINVAL;
 		return 0;
 	}
 
 	/* All remaining request work on a struct uvc_vs_probe_control */
 	if (setup->wLength != sizeof(probe)) {
-		LOG_ERR("probe: invalid wLength=%u for Probe or Commit", setup->wLength);
+		LOG_WRN("probe: invalid wLength %u, wanted %u", setup->wLength, sizeof(probe));
 		errno = -EINVAL;
 		return 0;
 	}
@@ -880,7 +885,7 @@ static int uvc_preinit(const struct device *dev)
 	/* Set the frame and format indexes */
 	for (struct usb_desc_header *const *desc = data->fs_desc; (*desc)->bLength > 0; desc++) {
 		struct uvc_format_descriptor *format_desc = (void *)*desc;
-		struct uvc_frame_descriptor *frame_desc = (void *)*desc;
+		struct uvc_frame_descriptor_discrete_1 *frame_desc = (void *)*desc;
 
 		if ((*desc)->bDescriptorType != UVC_CS_INTERFACE) {
 			continue;
@@ -908,8 +913,8 @@ static int uvc_preinit(const struct device *dev)
 }
 
 #define UVC_MJPEG_FRAME_DEFINE(n)                                                                  \
-	struct uvc_frame_descriptor n = {                                                          \
-		.bLength = sizeof(struct uvc_frame_descriptor),                                    \
+	struct uvc_frame_descriptor_discrete_1 n = {                                               \
+		.bLength = sizeof(struct uvc_frame_descriptor_discrete_1),                         \
 		.bDescriptorType = UVC_CS_INTERFACE,                                               \
 		.bDescriptorSubtype = UVC_VS_FRAME_MJPEG,                                          \
 		.bFrameIndex = DT_CHILD_NUM(n) + 1,                                                \
@@ -922,10 +927,8 @@ static int uvc_preinit(const struct device *dev)
 			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) +  \
 					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
 		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
-		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),             \
-		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
-		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
+		.bFrameIntervalType = 1,                                                           \
+		.dwFrameInterval = { sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)) },            \
 	};
 
 #define UVC_MJPEG_FORMAT_DEFINE(n)                                                                 \
@@ -946,8 +949,8 @@ static int uvc_preinit(const struct device *dev)
 	DT_FOREACH_CHILD(n, UVC_MJPEG_FRAME_DEFINE)
 
 #define UVC_UNCOMPRESSED_FRAME_DEFINE(n)                                                           \
-	struct uvc_frame_descriptor n = {                                                          \
-		.bLength = sizeof(struct uvc_frame_descriptor),                                    \
+	struct uvc_frame_descriptor_discrete_1 n = {                                               \
+		.bLength = sizeof(struct uvc_frame_descriptor_discrete_1),                         \
 		.bDescriptorType = UVC_CS_INTERFACE,                                               \
 		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,                                   \
 		.bFrameIndex = DT_CHILD_NUM(n) + 1,                                                \
@@ -961,10 +964,8 @@ static int uvc_preinit(const struct device *dev)
 					DT_PROP(DT_PARENT(n), bits_per_pixel) / 8 +                \
 					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
 		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
-		.bFrameIntervalType = 0,                                                           \
-		.dwMinFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),             \
-		.dwMaxFrameInterval = sys_cpu_to_le32(INT32_MAX),                                  \
-		.dwFrameIntervalStep = sys_cpu_to_le32(10), /* 1 us */                             \
+		.bFrameIntervalType = 1,                                                           \
+		.dwFrameInterval = { sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)) },            \
 	};
 
 #define UVC_UNCOMPRESSED_FORMAT_DEFINE(n)                                                          \
@@ -1102,7 +1103,7 @@ static int uvc_preinit(const struct device *dev)
 				.wTotalLength = sys_cpu_to_le16(                                   \
 					sizeof(struct uvc_stream_input_header_descriptor) +        \
 					sizeof(struct uvc_uncompressed_format_descriptor) +        \
-					sizeof(struct uvc_frame_descriptor)),                      \
+					sizeof(struct uvc_frame_descriptor_discrete_1)),           \
 				.bEndpointAddress = 0x81,                                          \
 				.bmInfo = 0,                                                       \
 				.bTerminalLink = 2,                                                \
