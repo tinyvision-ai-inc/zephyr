@@ -1203,7 +1203,7 @@ static int uvc_preinit(const struct device *dev)
 		.hs_desc = uvc_hs_desc_##n,                                                        \
 		.ss_desc = uvc_ss_desc_##n,                                                        \
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,                     \
-		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(0, source)),                   \
+		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(n, source)),                   \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL,              \
