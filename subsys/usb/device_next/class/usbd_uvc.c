@@ -973,7 +973,7 @@ static int uvc_preinit(const struct device *dev)
 
 #define VIDEO_FORMAT_CAP(node)							\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format), (		\
-		DT_FOREACH_CHILD_VARGS(node, UVC_VIDEO_FRAME_CAP, node)		\
+		DT_FOREACH_CHILD_VARGS(node, VIDEO_FRAME_CAP, node)		\
 	))
 
 #define UVC_FORMAT_ENTRY(frame, format)						\
@@ -992,18 +992,18 @@ static int uvc_preinit(const struct device *dev)
 
 #define UVC_DEVICE_DEFINE(node)							\
 										\
-	UVC_DESCRIPTOR_ARRAYS(node);						\
+	UVC_DESCRIPTOR_ARRAYS(node)						\
 										\
 	static struct usb_desc_header *const node##_fs_desc[] = {		\
 		UVC_FULLSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\
 	static struct usb_desc_header *const node##_hs_desc[] = {		\
-		UVC_HIGHSPEED_DESCRIPTOR_PTRS_HS(node)				\
+		UVC_HIGHSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\
 	static struct usb_desc_header *const node##_ss_desc[] = {		\
-		UVC_SUPERSPEED_DESCRIPTOR_PTRS(node)					\
+		UVC_SUPERSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\
 	static const struct video_format_cap node##_caps[] = {			\
@@ -1012,7 +1012,7 @@ static int uvc_preinit(const struct device *dev)
 	};									\
 										\
 	static const struct uvc_format node##_formats[] = {			\
-		DT_FOREACH_CHILD(node, UVC_FORMAT)				\
+		DT_FOREACH_CHILD(node, UVC_FORMAT_LOOKUP_TABLE)			\
 		{0}								\
 	};									\
 										\
@@ -1021,7 +1021,6 @@ static int uvc_preinit(const struct device *dev)
 										\
 	static struct uvc_data node##_data = {					\
 		.c_data = &node##_c_data,					\
-		.desc = &node##_desc,						\
 		.caps = node##_caps,						\
 		.formats = node##_formats,					\
 		.format_id = 0,							\
@@ -1040,7 +1039,7 @@ static int uvc_preinit(const struct device *dev)
 		.source_dev = DEVICE_DT_GET_OR_NULL(DT_PHANDLE(node, source)),	\
 	};									\
 										\
-	BUILD_ASSERT(DT_INST_ON_BUS(node, usb),					\
+	BUILD_ASSERT(DT_ON_BUS(node, usb),					\
 		     "node " DT_NODE_PATH(node) " is not"			\
 		     " assigned to a USB device controller");			\
 										\

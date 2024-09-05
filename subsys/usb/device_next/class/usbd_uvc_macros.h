@@ -10,6 +10,7 @@
  * for the USB host to use (and parse).
  */
 
+#include <zephyr/devicetree.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/usb/usb_ch9.h>
 
@@ -201,7 +202,7 @@
 	(((value) & 0xFF00) >> 8),						\
 	(((value) & 0xFF0000) >> 16),						\
 	(((value) & 0xFF000000) >> 24)
-#define GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
+#define U8_GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
 
 /* Automatically assign Entity IDs based on entities order in devicetree */
 #define VC_ENTITY_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
@@ -215,17 +216,6 @@
 #define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n))
 #define VC_CONTROLS64(entity)							\
 	(DT_FOREACH_PROP_ELEM_SEP(entity, controls, VC_CONTROL_BIT, (|)))
-
-/* Get the smallest number of bytes that can represent the given (uint64_t) */
-#define VC_CONTROL_SIZE(entity)							\
-	((VC_CONTROLS64(entity) >> 0x38) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x30) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x28) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x20) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x18) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x10) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x08) > 0) +					\
-	((VC_CONTROLS64(entity) >> 0x00) > 0)
 
 /* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
 #define VC_CONTROLS(entity, n)							\
@@ -245,7 +235,7 @@
 	 CONFIG_USBD_VIDEO_HEADER_SIZE)
 
 #define DT_CHILD_NUM_COMPAT(node, compat)					\
-	DT_FOREACH_CHILD_VARGS_SEP(node, DT_NODE_HAS_COMPAT, compat, (+))
+	DT_FOREACH_CHILD_SEP_VARGS(node, DT_NODE_HAS_COMPAT, (+), compat)
 
 #define VC_DESCRIPTOR(entity)							\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_input_terminal), (	\
@@ -279,9 +269,10 @@
 		DT_FOREACH_CHILD(format, VS_MJPEG_FRAME_DESCRIPTOR)		\
 	))									\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format_uncompressed), (\
-		CAMERA_TERMINAL_DESCRIPTOR(format)				\
-		DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)	\
-	))									\
+		VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
+	))
+
+//		DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)	\
 
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD(node, VS_DESCRIPTOR)
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
@@ -316,7 +307,7 @@
 	0x0c + 1,					/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_HEADER,					/* bDescriptorSubtype */\
-	0x0150,						/* bcdUVC */		\
+	U16_LE(0x0150),					/* bcdUVC */		\
 	U16_LE(VC_TOTAL_LENGTH(node)),			/* wTotalLength */	\
 	U32_LE(30000000),				/* dwClockFrequency */	\
 	0x01,						/* bInCollection */	\
@@ -394,16 +385,16 @@
 
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
-	0x18 + VC_SOURCE_NUM(entity) + VC_CONTROL_SIZE(entity),/* bLength */	\
+	0x20 + VC_SOURCE_NUM(entity),			/* bLength */	\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bUnitID */		\
-	GUID(entity),					/* guidExtensionCode */	\
+	U8_GUID(entity),				/* guidExtensionCode */	\
 	VC_NUM_CTRL(entity),				/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
 	VC_SOURCE_ID(entity)				/* baSourceID */	\
-	VC_CONTROL_SIZE(entity),			/* bControlSize */	\
-	VC_CONTROLS(entity, VC_CONTROL_SIZE(entity))	/* bmControls */	\
+	0x08,						/* bControlSize */	\
+	VC_CONTROLS(entity, 8),				/* bmControls */	\
 	0x00,						/* iExtension */
 
 /* Video Streaming Descriptors */
@@ -421,7 +412,9 @@
 	0x00,						/* iInterface */
 
 /* 3.9.2.1 Input Header Descriptor */
-#define VS_FORMAT_CONTROLS(format) 0x00,
+#define VS_FORMAT_CONTROL(format)						\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format), (0x00,))
+#define VS_FORMAT_CONTROLS(node) DT_FOREACH_CHILD(node, VS_FORMAT_CONTROL)
 #define VS_NUM_FORMATS(node)							\
 	(DT_CHILD_NUM_COMPAT(node, zephyr_uvc_format_mjpeg) +			\
 	 DT_CHILD_NUM_COMPAT(node, zephyr_uvc_format_uncompressed))
@@ -438,7 +431,7 @@
 	0x00,						/* bTriggerSupport */	\
 	0x00,						/* bTriggerUsage */	\
 	0x01,						/* bControlSize */	\
-	VS_FOREACH_FORMAT(node, VS_FORMAT_CONTROLS),	/* bmaControls */
+	VS_FORMAT_CONTROLS(node)			/* bmaControls */
 
 /* 3.10 VideoStreaming Bulk FullSpeed Endpoint Descriptors */
 #define VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
@@ -450,7 +443,7 @@
 	0x00,						/* bInterval */
 
 /* 3.10 VideoStreaming Bulk HighSpeed Endpoint Descriptors */
-#define VS_HIGHSPEED_BULK_ENDPOINT_HS_DESCRIPTOR(node)				\
+#define VS_HIGHSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
 	0x08,						/* bLength */		\
 	USB_DESC_ENDPOINT,				/* bDescriptorType */	\
 	0x81,						/* bEndpointAddress */	\
@@ -484,7 +477,7 @@
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
-	GUID(format),					/* guidFormat */	\
+	U8_GUID(format),				/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
 	0x01,						/* bDefaultFrameIndex */\
 	0x00,						/* bAspectRatioX */	\
@@ -611,17 +604,18 @@
 #define VS_DESCRIPTOR_PTRS(format)						\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format), (		\
 		((struct usb_desc_header *)&format##_desc),			\
-		DT_FOREACH_CHILD_STATUS_OKAY(format, DESCRIPTOR_PTR)		\
 	))
+
+//		DT_FOREACH_CHILD(format, DESCRIPTOR_PTR)			\
 
 #define UVC_DESCRIPTOR_PTRS(node)						\
 	(struct usb_desc_header *)node##_desc_iad,				\
 	(struct usb_desc_header *)node##_desc_if_vc,				\
 	(struct usb_desc_header *)node##_desc_if_vc_header,			\
-	DT_INST_FOREACH_CHILD(node, VC_DESCRIPTOR_PTRS)				\
+	DT_FOREACH_CHILD(node, VC_DESCRIPTOR_PTRS)				\
 	(struct usb_desc_header *)node##_desc_if_vs,				\
 	(struct usb_desc_header *)node##_desc_if_vs_header,			\
-	DT_INST_FOREACH_CHILD(node, VS_DESCRIPTOR_PTRS)				\
+	DT_FOREACH_CHILD(node, VS_DESCRIPTOR_PTRS)				\
 
 #define UVC_FULLSPEED_DESCRIPTOR_PTRS(node)					\
 	UVC_DESCRIPTOR_PTRS(node)						\
