@@ -13,15 +13,31 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/usb_ch9.h>
-#include <zephyr/usb/class/usb_uvc.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
-#define UVC_CLASS_ENABLED 0
-#define UVC_CLASS_READY   1
+#define UVC_CLASS_ENABLED			0
+#define UVC_CLASS_READY				1
+
+/* Video Class-Specific Request Codes */
+#define UVC_RC_UNDEFINED			0x00
+#define UVC_SET_CUR				0x01
+#define UVC_SET_CUR_ALL				0x11
+#define UVC_GET_CUR				0x81
+#define UVC_GET_MIN				0x82
+#define UVC_GET_MAX				0x83
+#define UVC_GET_RES				0x84
+#define UVC_GET_LEN				0x85
+#define UVC_GET_INFO				0x86
+#define UVC_GET_DEF				0x87
+#define UVC_GET_CUR_ALL				0x91
+#define UVC_GET_MIN_ALL				0x92
+#define UVC_GET_MAX_ALL				0x93
+#define UVC_GET_RES_ALL				0x94
+#define UVC_GET_DEF_ALL				0x97
 
 /* Video Control Interface Status Packet Format */
 struct uvc_control_status_packet {
@@ -45,37 +61,19 @@ struct uvc_stream_status_packet {
 struct uvc_payload_header {
 	uint8_t bHeaderLength;
 	uint8_t bmHeaderInfo;
-#define UVC_BMHEADERINFO_FRAMEID              (1 << 0)
-#define UVC_BMHEADERINFO_END_OF_FRAME         (1 << 1)
-#define UVC_BMHEADERINFO_HAS_PRESENTATIONTIME (1 << 2)
-#define UVC_BMHEADERINFO_HAS_SOURCECLOCK      (1 << 3)
-#define UVC_BMHEADERINFO_PAYLOAD_SPECIFIC_BIT (1 << 4)
-#define UVC_BMHEADERINFO_STILL_IMAGE          (1 << 5)
-#define UVC_BMHEADERINFO_ERROR                (1 << 6)
-#define UVC_BMHEADERINFO_END_OF_HEADER        (1 << 7)
-	uint32_t dwPresentationTime; /* optional */
-	uint32_t scrSourceClockSTC;  /* optional */
-	uint16_t scrSourceClockSOF;  /* optional */
+	uint32_t dwPresentationTime;	/* optional */
+	uint32_t scrSourceClockSTC;	/* optional */
+	uint16_t scrSourceClockSOF;	/* optional */
 } __packed;
 
-struct uvc_desc {
-	/* UVC Interface association */
-	struct usb_association_descriptor iad;
-	/* UVC Interface 0: Video Control */
-	struct usb_if_descriptor if0;
-	struct uvc_interface_header_descriptor if0_header;
-	struct uvc_output_terminal_descriptor if0_output;
-	struct uvc_input_terminal_descriptor if0_input;
-	/* UVC Interface 1: Video Streaming */
-	struct usb_if_descriptor if1;
-	struct uvc_stream_input_header_descriptor if1_header;
-	/* UVC Endpoints */
-	struct usb_ep_descriptor ep_fs;
-	struct usb_ep_descriptor ep_hs;
-	struct usb_ep_descriptor ep_ss;
-	struct usb_ep_companion ep_comp;
-	/* USBD Terminator field */
-	struct usb_desc_header nil_desc;
+struct uvc_format {
+	/* USB-side data from the descriptor */
+	uint8_t bFormatIndex;
+	uint8_t bFrameIndex;
+	uint8_t bDescriptorSubtype;
+	/* Video-side data */
+	uint32_t frame_interval;	/* see #72254 */
+	struct video_format_cap *cap;
 };
 
 struct uvc_data {
@@ -86,15 +84,21 @@ struct uvc_data {
 	/* UVC worker to process the queue */
 	struct k_work work;
 	/* Video format with same index position as USB formats */
-	const struct video_format_cap *fmts;
-	/* UVC interface and format currenly selected */
-	struct uvc_format_descriptor **format;
-	struct uvc_frame_descriptor_discrete_1 **frame;
+	const struct video_format_cap *format_caps;
+	/* UVC interface and format currenly selected */	
+	const struct uvc_formats *format_cur;
+	const struct uvc_formats *format_all;
 	/* UVC Descriptors */
-	struct uvc_desc *const desc;
 	struct usb_desc_header *const *const fs_desc;
 	struct usb_desc_header *const *const hs_desc;
 	struct usb_desc_header *const *const ss_desc;
+	/* UVC Fields that need to be accessed */
+	uint8_t *const desc_iad_if_num;
+	uint8_t *const desc_vc_if_num;
+	uint8_t *const desc_vs_ep_addr;
+	uint8_t *const fs_desc_ep_addr;
+	uint8_t *const hs_desc_ep_addr;
+	uint8_t *const ss_desc_ep_addr;
 	/* UVC probe-commit control default values */
 	struct uvc_vs_probe_control default_probe;
 	/* UVC payload header, passed just before the image data */
@@ -120,27 +124,19 @@ NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPA
 static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt);
 
-static bool uvc_desc_is_format(struct usb_desc_header *desc)
+static uint8_t get_bulk_in(struct uvc_data *data)
 {
-	struct uvc_format_descriptor *format = (void *)desc;
-
-	return desc->bDescriptorType == UVC_CS_INTERFACE &&
-	       (format->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
-		format->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG);
-}
-
-static bool uvc_desc_is_frame(struct usb_desc_header *desc)
-{
-	struct uvc_frame_descriptor_discrete_1 *frame = (void *)desc;
-
-	return desc->bDescriptorType == UVC_CS_INTERFACE &&
-	       (frame->bDescriptorSubtype == UVC_VS_FRAME_UNCOMPRESSED ||
-		frame->bDescriptorSubtype == UVC_VS_FRAME_MJPEG);
-}
-
-static uint8_t uvc_get_bulk_in(struct uvc_data *data)
-{
-	return data->desc->if1_header.bEndpointAddress;
+	switch (usbd_bus_speed(usbd_class_get_ctx(data->c_data))) {
+	case USBD_SPEED_FS:
+		return *data->fs_desc_ep_addr;
+	case USBD_SPEED_HS:
+		return *data->hs_desc_ep_addr;
+	case USBD_SPEED_SS:
+		return *data->ss_desc_ep_addr;
+	default:
+		__ASSERT_NO_MSG(false);
+		return 0;
+	}
 }
 
 static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest,
@@ -148,35 +144,32 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		probe->bFormatIndex = 1;
+		probe->bFormatIndex = UINT8_MAX;
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			probe->bFormatIndex = MIN(fmt->bFormatIndex, probe->bFormatIndex);
+		}
 		break;
 	case UVC_GET_MAX:
-		probe->bFormatIndex = data->desc->if1_header.bNumFormats;
+		probe->bFormatIndex = 0;
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			probe->bFormatIndex = MAX(fmt->bFormatIndex, probe->bFormatIndex);
+		}
 		break;
 	case UVC_GET_RES:
 		probe->bFormatIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		probe->bFormatIndex = (*data->format)->bFormatIndex;
+		probe->bFormatIndex = data->format_cur->bFormatIndex;
 		break;
 	case UVC_SET_CUR:
-		/* Search a format desc with a matching bFormatIndex through the entire list */
-		for (struct usb_desc_header *const *desc = data->fs_desc;; desc++) {
-			struct uvc_format_descriptor *format = (void *)*desc;
-
-			if (format->bLength == 0) {
-				break;
-			}
-
-			if (uvc_desc_is_format(*desc) &&
-			    format->bFormatIndex == probe->bFormatIndex) {
-				data->format = (void *)desc;
-				data->frame = (void *)(desc + 1);
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			if (fmt->bFormatIndex == probe->bFormatIndex) {
+				data->format_cur = fmt;
 				return;
 			}
 		}
 		LOG_WRN("probe: format index not found");
-		break;
+		errno = -EINVAL;
 	}
 }
 
@@ -185,32 +178,37 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		probe->bFrameIndex = 1;
+		probe->bFrameIndex = UINT8_MAX;
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			if (fmt->bFormatIndex == data->format_cur->bFormatIndex) {
+				probe->bFrameIndex = MIN(fmt->bFrameIndex, probe->bFrameIndex);
+			}
+		}
 		break;
 	case UVC_GET_MAX:
-		probe->bFrameIndex = (*data->format)->bNumFrameDescriptors;
+		probe->bFrameIndex = 0;
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			if (fmt->bFormatIndex == data->format_cur->bFormatIndex) {
+				probe->bFrameIndex = MAX(fmt->bFrameIndex, probe->bFrameIndex);
+			}
+		}
 		break;
 	case UVC_GET_RES:
 		probe->bFrameIndex = 1;
 		break;
 	case UVC_GET_CUR:
-		probe->bFrameIndex = (*data->frame)->bFrameIndex;
+		probe->bFrameIndex = data->cur_format->bframeindex;
 		break;
 	case UVC_SET_CUR:
-		/* Search a frame desc with a matching bFrameIndex below the current format desc */
-		for (struct usb_desc_header *const *desc = (void *)(data->format + 1);; desc++) {
-			struct uvc_frame_descriptor_discrete_1 *frame = (void *)*desc;
-
-			if (!uvc_desc_is_frame(*desc)) {
-				break;
-			}
-
-			if (frame->bFrameIndex == probe->bFrameIndex) {
-				data->frame = (void *)desc;
+		for (struct uvc_format *fmt = data->format_all; fmt->cap != NULL; fmt++) {
+			if (fmt->bFrameIndex == data->format_cur->bFormatIndex &&
+			    fmt->bFormatIndex == probe->bFormatIndex) {
+				data->format_cur = fmt;
 				return;
 			}
 		}
 		LOG_WRN("probe: frame index not found");
+		errno = -EINVAL;
 	}
 }
 
@@ -219,18 +217,16 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
-		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
 	case UVC_GET_MAX:
-		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
-	case UVC_GET_CUR:
 		/* TODO call the frame interval API on the video source once supported */
-		probe->dwFrameInterval = (*data->frame)->dwFrameInterval[0];
+		probe->dwFrameInterval = data->format_cur->frame_interval;
 		break;
 	case UVC_GET_RES:
 		probe->dwFrameInterval = 1;
 		break;
 	case UVC_SET_CUR:
 		/* TODO call the frame interval API on the video source once supported */
+		data->format_cur->frame_interval = probe->dwFrameInterval;
 		break;
 	}
 }
@@ -645,27 +641,33 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	return 0;
 }
 
+static void uvc_update_desc(struct uvc_data *const data)
+{
+	uint8_t ep_addr = uvc_get_bulk_in(data);
+	uint8_t if_num = data->desc_vc->bInterfaceNumber;
+
+	data->desc_iad_if_num[0] = if_num;
+	data->desc_vc_if_num[0] = if_num;
+	data->desc_vc_if_num[1] = if_num;
+	data->desc_vs_ep_addr[0] = ep_addr;
+}
+
 static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
-	struct uvc_desc *desc = data->desc;
 
-	/* The descriptors need some adjustments */
-
-	desc->iad.bFirstInterface = desc->if0.bInterfaceNumber;
-	desc->if0_header.baInterfaceNr = desc->if1.bInterfaceNumber;
+	uvc_update_desc(data);
 
 	switch (speed) {
-	case USBD_SPEED_SS:
-		desc->if1_header.bEndpointAddress = desc->ep_ss.bEndpointAddress;
-		return (void *)data->ss_desc;
+	case USBD_SPEED_FS:
+		return data->fs_desc
 	case USBD_SPEED_HS:
-		desc->if1_header.bEndpointAddress = desc->ep_hs.bEndpointAddress;
-		return (void *)data->hs_desc;
+		return data->hs_desc;
+	case USBD_SPEED_SS:
+		return data->ss_desc;
 	default:
-		desc->if1_header.bEndpointAddress = desc->ep_fs.bEndpointAddress;
-		return (void *)data->fs_desc;
+		__ASSERT_NO_MSG(false);
 	}
 }
 
@@ -842,7 +844,7 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt)
 {
 	struct uvc_data *data = dev->data;
-	const struct video_format_cap *cap = data->fmts;
+	const struct video_format_cap *cap = data->format_cur->cap;
 
 	if (ep != VIDEO_EP_IN && ep != VIDEO_EP_ANY) {
 		return -EINVAL;
@@ -850,25 +852,11 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 
 	memset(fmt, 0, sizeof(*fmt));
 
-	for (struct usb_desc_header *const *desc = data->fs_desc;; desc++) {
-		if ((*desc)->bLength == 0 || cap->pixelformat == 0) {
-			/* This could happen if called before uvc_init() */
-			LOG_ERR("Overflowing formats or descriptors list");
-			return -EINVAL;
-		}
-		if (desc == (struct usb_desc_header **)data->frame) {
-			break;
-		}
-		if (uvc_desc_is_frame(*desc)) {
-			cap++;
-		}
-	}
-
 	fmt->pixelformat = cap->pixelformat;
 	fmt->width = (*data->frame)->wWidth;
 	fmt->height = (*data->frame)->wHeight;
 
-	if ((*data->format)->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED) {
+	if (data->format_cur->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED) {
 		struct uvc_uncompressed_format_descriptor *uncompressed = (void *)*data->format;
 
 		fmt->pitch = (*data->frame)->wWidth * uncompressed->bBitsPerPixel / 8;
@@ -894,7 +882,7 @@ static int uvc_get_caps(const struct device *dev, enum video_endpoint_id ep,
 {
 	struct uvc_data *data = dev->data;
 
-	caps->format_caps = data->fmts;
+	caps->format_caps = data->format_caps;
 	return 0;
 }
 
@@ -910,210 +898,80 @@ struct video_driver_api uvc_video_api = {
 static int uvc_preinit(const struct device *dev)
 {
 	struct uvc_data *data = dev->data;
-	int frame_index = 1;
-	int format_index = 1;
 
 	k_fifo_init(&data->fifo_in);
 	k_fifo_init(&data->fifo_out);
 	k_work_init(&data->work, &uvc_worker);
 
-	/* Set the frame and format indexes */
-	for (struct usb_desc_header *const *desc = data->fs_desc; (*desc)->bLength > 0; desc++) {
-		struct uvc_format_descriptor *format_desc = (void *)*desc;
-		struct uvc_frame_descriptor_discrete_1 *frame_desc = (void *)*desc;
-
-		if ((*desc)->bDescriptorType != UVC_CS_INTERFACE) {
-			continue;
-		}
-
-		switch (format_desc->bDescriptorSubtype) {
-		case UVC_VS_FORMAT_MJPEG:
-		case UVC_VS_FORMAT_UNCOMPRESSED:
-			if (data->format == NULL) {
-				data->format = (void *)desc;
-			}
-			format_desc->bFormatIndex = format_index++;
-			frame_index = 1;
-			data->desc->if1_header.bNumFormats++;
-			break;
-		case UVC_VS_FRAME_MJPEG:
-		case UVC_VS_FRAME_UNCOMPRESSED:
-			frame_desc->bFrameIndex = frame_index++;
-			break;
-		}
-	}
-	data->frame = (void *)(data->format + 1);
-
 	return 0;
 }
 
-#define UVC_MJPEG_FRAME_DEFINE(n)                                                                  \
-	struct uvc_frame_descriptor_discrete_1 n = {                                               \
-		.bLength = sizeof(struct uvc_frame_descriptor_discrete_1),                         \
-		.bDescriptorType = UVC_CS_INTERFACE,                                               \
-		.bDescriptorSubtype = UVC_VS_FRAME_MJPEG,                                          \
-		.bFrameIndex = DT_CHILD_NUM(n) + 1,                                                \
-		.bmCapabilities = 0x00,                                                            \
-		.wWidth = sys_cpu_to_le16(DT_PROP_BY_IDX(n, size, 0)),                             \
-		.wHeight = sys_cpu_to_le16(DT_PROP_BY_IDX(n, size, 1)),                            \
-		.dwMinBitRate = sys_cpu_to_le32(15360000),                                         \
-		.dwMaxBitRate = sys_cpu_to_le32(15360000),                                         \
-		.dwMaxVideoFrameBufferSize =                                                       \
-			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) +  \
-					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
-		.bFrameIntervalType = 1,                                                           \
-		.dwFrameInterval = { sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)) },            \
-	};
-
-#define UVC_MJPEG_FORMAT_DEFINE(n)                                                                 \
-	struct uvc_mjpeg_format_descriptor n = {                                                   \
-		.bLength = sizeof(struct uvc_mjpeg_format_descriptor),                             \
-		.bDescriptorType = UVC_CS_INTERFACE,                                               \
-		.bDescriptorSubtype = UVC_VS_FORMAT_MJPEG,                                         \
-		.bFormatIndex = 0,                                                                 \
-		.bNumFrameDescriptors = DT_CHILD_NUM(n),                                           \
-		.bmFlags = BIT(0),                                                                 \
-		.bDefaultFrameIndex = 1,                                                           \
-		.bAspectRatioX = 0,                                                                \
-		.bAspectRatioY = 0,                                                                \
-		.bmInterlaceFlags = 0x00,                                                          \
-		.bCopyProtect = 0,                                                                 \
-	};                                                                                         \
-                                                                                                   \
-	DT_FOREACH_CHILD(n, UVC_MJPEG_FRAME_DEFINE)
-
-#define UVC_UNCOMPRESSED_FRAME_DEFINE(n)                                                           \
-	struct uvc_frame_descriptor_discrete_1 n = {                                               \
-		.bLength = sizeof(struct uvc_frame_descriptor_discrete_1),                         \
-		.bDescriptorType = UVC_CS_INTERFACE,                                               \
-		.bDescriptorSubtype = UVC_VS_FRAME_UNCOMPRESSED,                                   \
-		.bFrameIndex = DT_CHILD_NUM(n) + 1,                                                \
-		.bmCapabilities = 0x00,                                                            \
-		.wWidth = sys_cpu_to_le16(DT_PROP_BY_IDX(n, size, 0)),                             \
-		.wHeight = sys_cpu_to_le16(DT_PROP_BY_IDX(n, size, 1)),                            \
-		.dwMinBitRate = sys_cpu_to_le32(15360000),                                         \
-		.dwMaxBitRate = sys_cpu_to_le32(15360000),                                         \
-		.dwMaxVideoFrameBufferSize =                                                       \
-			sys_cpu_to_le32(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) *  \
-					DT_PROP(DT_PARENT(n), bits_per_pixel) / 8 +                \
-					CONFIG_USBD_VIDEO_HEADER_SIZE),                            \
-		.dwDefaultFrameInterval = sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)),         \
-		.bFrameIntervalType = 1,                                                           \
-		.dwFrameInterval = { sys_cpu_to_le32(10000000 / DT_PROP(n, max_fps)) },            \
-	};
-
-#define UVC_UNCOMPRESSED_FORMAT_DEFINE(n)                                                          \
-	struct uvc_uncompressed_format_descriptor n = {                                            \
-		.bLength = sizeof(struct uvc_uncompressed_format_descriptor),                      \
-		.bDescriptorType = UVC_CS_INTERFACE,                                               \
-		.bDescriptorSubtype = UVC_VS_FORMAT_UNCOMPRESSED,                                  \
-		.bFormatIndex = 0,                                                                 \
-		.bNumFrameDescriptors = DT_CHILD_NUM(n),                                           \
-		.guidFormat = DT_PROP(n, guid),                                                    \
-		.bBitsPerPixel = DT_PROP(n, bits_per_pixel),                                       \
-		.bDefaultFrameIndex = 1,                                                           \
-		.bAspectRatioX = 0,                                                                \
-		.bAspectRatioY = 0,                                                                \
-		.bmInterlaceFlags = 0x00,                                                          \
-		.bCopyProtect = 0,                                                                 \
-	};                                                                                         \
-                                                                                                   \
-	DT_FOREACH_CHILD(n, UVC_UNCOMPRESSED_FRAME_DEFINE)
-
-#define UVC_POINTER(n) ((struct usb_desc_header *)&n),
-
-#define UVC_POINTER_LIST(n)                                                                        \
-	IF_ENABLED(DT_NODE_HAS_COMPAT(n, zephyr_uvc_format), (                                     \
-		UVC_POINTER(n) DT_FOREACH_CHILD_STATUS_OKAY(n, UVC_POINTER)                        \
-	))
-
-#define UVC_VIDEO_FRAME_CAP(n, fmt)                                                                \
-	{                                                                                          \
-		.pixelformat = video_fourcc(DT_PROP(fmt, fourcc)[0], DT_PROP(fmt, fourcc)[1],      \
-					    DT_PROP(fmt, fourcc)[2], DT_PROP(fmt, fourcc)[3]),     \
-		.width_min = DT_PROP_BY_IDX(n, size, 0),                                           \
-		.width_max = DT_PROP_BY_IDX(n, size, 0),                                           \
-		.width_step = 0,                                                                   \
-		.height_min = DT_PROP_BY_IDX(n, size, 1),                                          \
-		.height_max = DT_PROP_BY_IDX(n, size, 1),                                          \
-		.height_step = 0                                                                   \
+#define UVC_VIDEO_FRAME_CAP(n, fmt)						\
+	{									\
+		.pixelformat = video_fourcc(DT_PROP(fmt, fourcc)[0],		\
+					    DT_PROP(fmt, fourcc)[1],		\
+					    DT_PROP(fmt, fourcc)[2],		\
+					    DT_PROP(fmt, fourcc)[3]),		\
+		.width_min = DT_PROP_BY_IDX(n, size, 0),			\
+		.width_max = DT_PROP_BY_IDX(n, size, 0),			\
+		.width_step = 0,						\
+		.height_min = DT_PROP_BY_IDX(n, size, 1),			\
+		.height_max = DT_PROP_BY_IDX(n, size, 1),			\
+		.height_step = 0						\
 	},
 
-#define UVC_VIDEO_FORMAT_CAP(n)                                                                    \
-	IF_ENABLED(DT_NODE_HAS_COMPAT(n, zephyr_uvc_format), (                                     \
-		DT_FOREACH_CHILD_VARGS(n, UVC_VIDEO_FRAME_CAP, n)                                  \
+#define UVC_VIDEO_FORMAT_CAP(n)							\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(n, zephyr_uvc_format), (			\
+		DT_FOREACH_CHILD_VARGS(n, UVC_VIDEO_FRAME_CAP, n)		\
 	))
 
-#define UVC_DEVICE_DEFINE(n)                                                                       \
-                                                                                                   \
-	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),                                                       \
-		     "node " DT_NODE_PATH(DT_DRV_INST(n)) " is not"                                \
-							  " assigned to a USB device controller"); \
-                                                                                                   \
-	USBD_DEFINE_CLASS(uvc_##n, &uvc_class_api, (void *)DEVICE_DT_GET(DT_DRV_INST(n)), NULL);   \
-                                                                                                   \
-	static struct usb_desc_header *const uvc_fs_desc_##n[] = {                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.iad,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_header,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_output,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_input,                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.if1,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if1_header,                                \
-		DT_INST_FOREACH_CHILD(n, UVC_POINTER_LIST)                                         \
-		(struct usb_desc_header *)&uvc_desc_##n.ep_fs,                                     \
-		(struct usb_desc_header *)&uvc_desc_##n.nil_desc,                                  \
-	};                                                                                         \
-                                                                                                   \
-	static struct usb_desc_header *const uvc_hs_desc_##n[] = {                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.iad,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_header,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_output,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_input,                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.if1,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if1_header,                                \
-		DT_INST_FOREACH_CHILD(n, UVC_POINTER_LIST)                                         \
-		(struct usb_desc_header *)&uvc_desc_##n.ep_hs,                                     \
-		(struct usb_desc_header *)&uvc_desc_##n.nil_desc,                                  \
-	};                                                                                         \
-                                                                                                   \
-	static struct usb_desc_header *const uvc_ss_desc_##n[] = {                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.iad,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_header,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_output,                                \
-		(struct usb_desc_header *)&uvc_desc_##n.if0_input,                                 \
-		(struct usb_desc_header *)&uvc_desc_##n.if1,                                       \
-		(struct usb_desc_header *)&uvc_desc_##n.if1_header,                                \
-		DT_INST_FOREACH_CHILD(n, UVC_POINTER_LIST)                                         \
-		(struct usb_desc_header *)&uvc_desc_##n.ep_ss,                                     \
-		(struct usb_desc_header *)&uvc_desc_##n.ep_comp,                                   \
-		(struct usb_desc_header *)&uvc_desc_##n.nil_desc,                                  \
-	};                                                                                         \
-                                                                                                   \
-	static const struct video_format_cap fmts_##n[] = {                                        \
-		DT_INST_FOREACH_CHILD(n, UVC_VIDEO_FORMAT_CAP)                                     \
-		{0}                                                                                \
-	};                                                                                         \
-                                                                                                   \
-	static struct uvc_data uvc_data_##n = {                                                    \
-		.c_data = &uvc_##n,                                                                \
-		.desc = &uvc_desc_##n,                                                             \
-		.fmts = fmts_##n,                                                                  \
-		.fs_desc = uvc_fs_desc_##n,                                                        \
-		.hs_desc = uvc_hs_desc_##n,                                                        \
-		.ss_desc = uvc_ss_desc_##n,                                                        \
-		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,                     \
-		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(n, source)),                   \
-	};                                                                                         \
-                                                                                                   \
-	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL, POST_KERNEL,              \
-			      CONFIG_VIDEO_INIT_PRIORITY, &uvc_video_api);
+#define UVC_DEVICE_DEFINE(n)							\
+										\
+	BUILD_ASSERT(DT_INST_ON_BUS(n, usb),					\
+		     "node " DT_NODE_PATH(DT_DRV_INST(n)) " is not"		\
+		     " assigned to a USB device controller");			\
+										\
+	USBD_DEFINE_CLASS(uvc_##n, &uvc_class_api,				\
+			  (void *)DEVICE_DT_GET(DT_DRV_INST(n)), NULL);		\
+										\
+	static struct usb_desc_header *const uvc_fs_desc_##n[] = {		\
+		UVC_DESCRIPTOR_PTRS_FS(node)					\
+	};									\
+										\
+	static struct usb_desc_header *const uvc_hs_desc_##n[] = {		\
+		UVC_DESCRIPTOR_PTRS_HS(node)					\
+	};									\
+										\
+	static struct usb_desc_header *const uvc_ss_desc_##n[] = {		\
+		UVC_DESCRIPTOR_PTRS_SS(node)					\
+	};									\
+										\
+	static const struct video_format_cap format_caps_##n[] = {		\
+		DT_INST_FOREACH_CHILD(n, UVC_VIDEO_FORMAT_CAP)			\
+		{0}								\
+	};									\
+										\
+	static struct uvc_data uvc_data_##n = {					\
+		.c_data = &uvc_##n,						\
+		.desc = &uvc_desc_##n,						\
+		.format_caps = format_caps_##n,					\
+		.fs_desc = uvc_fs_desc_##n,					\
+		.hs_desc = uvc_hs_desc_##n,					\
+		.ss_desc = uvc_ss_desc_##n,					\
+		.desc_iad_if_num = uvc_desc_##n##_iad + 2,			\
+		.desc_vc_if_num = uvc_desc_##n##_if_vc_header + 10,		\
+		.desc_vs_ep_addr = uvc_desc_##n##_if_vs_header + 6,		\
+		.fs_desc_ep_addr = uvc_fs_desc_##n##_ep + 2,			\
+		.hs_desc_ep_addr = uvc_hs_desc_##n##_ep + 2,			\
+		.ss_desc_ep_addr = uvc_ss_desc_##n##_ep + 2,			\
+		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
+		.source_dev = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(n, source)),\
+	};									\
+										\
+	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL,	\
+			      POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,		\
+			      &uvc_video_api);
 
-DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_uncompressed, UVC_UNCOMPRESSED_FORMAT_DEFINE)
-
-DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_mjpeg, UVC_MJPEG_FORMAT_DEFINE)
-
+DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_uncompressed, UVC_UNCOMPRESSED_DESCRIPTOR_ARRAYS)
+DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_mjpeg, UVC_MJPEG_DESCRIPTOR_ARRAYS)
 DT_INST_FOREACH_STATUS_OKAY(UVC_DEVICE_DEFINE)
