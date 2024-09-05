@@ -266,13 +266,12 @@
 #define VS_DESCRIPTOR(format)							\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format_mjpeg), (	\
 		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
-		DT_FOREACH_CHILD(format, VS_MJPEG_FRAME_DESCRIPTOR)		\
+		DT_FOREACH_CHILD_SEP(format, VS_MJPEG_FRAME_DESCRIPTOR, ())	\
 	))									\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format_uncompressed), (\
 		VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
+		DT_FOREACH_CHILD_SEP(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR, ())\
 	))
-
-//		DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)	\
 
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD(node, VS_DESCRIPTOR)
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
@@ -604,9 +603,8 @@
 #define VS_DESCRIPTOR_PTRS(format)						\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format), (		\
 		((struct usb_desc_header *)&format##_desc),			\
+		DT_FOREACH_CHILD_SEP(format, DESCRIPTOR_PTR, ())		\
 	))
-
-//		DT_FOREACH_CHILD(format, DESCRIPTOR_PTR)			\
 
 #define UVC_DESCRIPTOR_PTRS(node)						\
 	(struct usb_desc_header *)node##_desc_iad,				\

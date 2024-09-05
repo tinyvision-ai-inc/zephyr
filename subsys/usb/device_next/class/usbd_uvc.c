@@ -108,7 +108,7 @@ struct uvc_format {
 
 struct uvc_data {
 	/* USBD class structure */
-	const struct usbd_class_data *const c_data;
+	const struct usbd_class_data *c_data;
 	/* USBD class state */
 	atomic_t state;
 	/* UVC worker to process the queue */
@@ -118,18 +118,18 @@ struct uvc_data {
 	const struct video_format_cap *caps;
 	const struct uvc_format *formats;
 	/* UVC Descriptors */
-	struct usb_desc_header *const *const fs_desc;
-	struct usb_desc_header *const *const hs_desc;
-	struct usb_desc_header *const *const ss_desc;
+	struct usb_desc_header *const *fs_desc;
+	struct usb_desc_header *const *hs_desc;
+	struct usb_desc_header *const *ss_desc;
 	/* UVC Fields that need to be accessed */
-	uint8_t *const desc_iad_ifnum;
-	uint8_t *const desc_if_vc_ifnum;
-	uint8_t *const desc_if_vc_header_ifnum;
-	uint8_t *const desc_if_vs_ifnum;
-	uint8_t *const desc_if_vs_header_epaddr;
-	uint8_t *const fs_desc_ep_epaddr;
-	uint8_t *const hs_desc_ep_epaddr;
-	uint8_t *const ss_desc_ep_epaddr;
+	uint8_t *desc_iad_ifnum;
+	uint8_t *desc_if_vc_ifnum;
+	uint8_t *desc_if_vc_header_ifnum;
+	uint8_t *desc_if_vs_ifnum;
+	uint8_t *desc_if_vs_header_epaddr;
+	uint8_t *fs_desc_ep_epaddr;
+	uint8_t *hs_desc_ep_epaddr;
+	uint8_t *ss_desc_ep_epaddr;
 	/* UVC probe-commit control default values */
 	struct uvc_vs_probe_control default_probe;
 	/* UVC payload header, passed just before the image data */
@@ -172,8 +172,8 @@ static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 
 static uint32_t uvc_get_max_frame_size(struct uvc_data *data, int id)
 {
-	struct video_format_cap *cap = &data->caps[id];
-	struct uvc_format *ufmt = &data->formats[id];
+	const struct video_format_cap *cap = &data->caps[id];
+	const struct uvc_format *ufmt = &data->formats[id];
 
 	return cap->width_max * cap->width_min * ufmt->bits_per_pixel;
 }
@@ -184,13 +184,13 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 	switch (bRequest) {
 	case UVC_GET_MIN:
 		probe->bFormatIndex = UINT8_MAX;
-		for (struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
+		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
 			probe->bFormatIndex = MIN(fmt->bFormatIndex, probe->bFormatIndex);
 		}
 		break;
 	case UVC_GET_MAX:
 		probe->bFormatIndex = 0;
-		for (struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
+		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
 			probe->bFormatIndex = MAX(fmt->bFormatIndex, probe->bFormatIndex);
 		}
 		break;
@@ -215,12 +215,12 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 				  struct uvc_vs_probe_control *probe)
 {
-	struct uvc_format *cur = &data->formats[data->format_id];
+	const struct uvc_format *cur = &data->formats[data->format_id];
 
 	switch (bRequest) {
 	case UVC_GET_MIN:
 		probe->bFrameIndex = UINT8_MAX;
-		for (struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
+		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
 			if (fmt->bFormatIndex == cur->bFormatIndex) {
 				probe->bFrameIndex = MIN(fmt->bFrameIndex, probe->bFrameIndex);
 			}
@@ -228,7 +228,7 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 		break;
 	case UVC_GET_MAX:
 		probe->bFrameIndex = 0;
-		for (struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
+		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
 			if (fmt->bFormatIndex == cur->bFormatIndex) {
 				probe->bFrameIndex = MAX(fmt->bFrameIndex, probe->bFrameIndex);
 			}
@@ -242,7 +242,7 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 		break;
 	case UVC_SET_CUR:
 		for (size_t i = 0; data->formats[i].bFormatIndex; i++) {
-			struct uvc_format *fmt = &data->formats[i];
+			const struct uvc_format *fmt = &data->formats[i];
 
 			if (fmt->bFrameIndex == cur->bFormatIndex &&
 			    fmt->bFormatIndex == probe->bFormatIndex) {
@@ -704,11 +704,11 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 
 	switch (speed) {
 	case USBD_SPEED_FS:
-		return data->fs_desc;
+		return (void *)data->fs_desc;
 	case USBD_SPEED_HS:
-		return data->hs_desc;
+		return (void *)data->hs_desc;
 	case USBD_SPEED_SS:
-		return data->ss_desc;
+		return (void *)data->ss_desc;
 	default:
 		__ASSERT_NO_MSG(false);
 	}
@@ -1043,10 +1043,9 @@ static int uvc_preinit(const struct device *dev)
 		     "node " DT_NODE_PATH(node) " is not"			\
 		     " assigned to a USB device controller");			\
 										\
-										\
 	DEVICE_DT_DEFINE(node, uvc_preinit, NULL, &node##_data, NULL,		\
-			      POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,		\
-			      &uvc_video_api);
+			 POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,		\
+			 &uvc_video_api);
 
 DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_uncompressed, VS_UNCOMPRESSED_DESCRIPTOR_ARRAYS)
 DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_mjpeg, VS_MJPEG_DESCRIPTOR_ARRAYS)
