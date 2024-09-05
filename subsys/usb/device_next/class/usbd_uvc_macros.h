@@ -194,6 +194,15 @@
 
 /* Descriptors Content */
 
+/* Turn larger types into */
+#define U16_LE(value) ((value) & 0xFF), (((value) & 0xFF00) >> 8)
+#define U32_LE(value)								\
+	((value) & 0xFF),							\
+	(((value) & 0xFF00) >> 8),						\
+	(((value) & 0xFF0000) >> 16),						\
+	(((value) & 0xFF000000) >> 24)
+#define GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
+
 /* Automatically assign Entity IDs based on entities order in devicetree */
 #define VC_ENTITY_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
 
@@ -207,7 +216,7 @@
 #define VC_CONTROLS64(entity)							\
 	(DT_FOREACH_PROP_ELEM_SEP(entity, controls, VC_CONTROL_BIT, (|)))
 
-/* Get the number of non-zero bytes in an (uint64_t) */
+/* Get the smallest number of bytes that can represent the given (uint64_t) */
 #define VC_CONTROL_SIZE(entity)							\
 	((VC_CONTROLS64(entity) >> 0x38) > 0) +					\
 	((VC_CONTROLS64(entity) >> 0x30) > 0) +					\
@@ -218,7 +227,7 @@
 	((VC_CONTROLS64(entity) >> 0x08) > 0) +					\
 	((VC_CONTROLS64(entity) >> 0x00) > 0)
 
-/* Split an (uint64_t) into a list of 'n' times (uint8_t) */
+/* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
 #define VC_CONTROLS(entity, n)							\
 	IF_ENABLED(n > 0, ((VC_CONTROLS64(entity) >> 0x38) & 0xff,))		\
 	IF_ENABLED(n > 1, ((VC_CONTROLS64(entity) >> 0x30) & 0xff,))		\
@@ -227,12 +236,12 @@
 	IF_ENABLED(n > 4, ((VC_CONTROLS64(entity) >> 0x18) & 0xff,))		\
 	IF_ENABLED(n > 5, ((VC_CONTROLS64(entity) >> 0x10) & 0xff,))		\
 	IF_ENABLED(n > 6, ((VC_CONTROLS64(entity) >> 0x08) & 0xff,))		\
-	IF_ENABLED(n > 7, ((VC_CONTROLS64(entity) >> 0x00) & 0xff,))
+	IF_ENABLED(n > 7, ((VC_CONTROLS64(entity) >> 0x00) & 0xff,)x)
 
 /* Estimate the frame buffer size out of other fields */
 #define MAX_VIDEO_FRAME_BUFFER_SIZE(node)					\
-	(DT_PROP_BY_IDX(n, size, 0) * DT_PROP_BY_IDX(n, size, 1) *		\
-	 DT_PROP(DT_PARENT(n), bits_per_pixel) / 8 +				\
+	(DT_PROP_BY_IDX(node, size, 0) * DT_PROP_BY_IDX(node, size, 1) *	\
+	 DT_PROP(DT_PARENT(node), bits_per_pixel) / 8 +				\
 	 CONFIG_USBD_VIDEO_HEADER_SIZE)
 
 #define DT_CHILD_NUM_COMPAT(node, compat)					\
@@ -305,7 +314,7 @@
 /* 3.7.2 Interface Header Descriptor */
 #define VC_INTERFACE_HEADER_DESCRIPTOR(node)					\
 	0x0c + 1,					/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_HEADER,					/* bDescriptorSubtype */\
 	0x0150,						/* bcdUVC */		\
 	U16_LE(VC_TOTAL_LENGTH(node)),			/* wTotalLength */	\
@@ -316,7 +325,7 @@
 /* 3.7.2.1 Input Terminal Descriptor */
 #define VC_INPUT_TERMINAL_DESCRIPTOR(entity)					\
 	0x08,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
 	U16_LE(UVC_ITT_CAMERA),				/* wTerminalType */	\
@@ -326,7 +335,7 @@
 /* 3.7.2.2 Output Terminal Descriptor */
 #define VC_OUTPUT_TERMINAL_DESCRIPTOR(entity)					\
 	0x09,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_OUTPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
 	U16_LE(UVC_TT_STREAMING),			/* wTerminalType */	\
@@ -337,7 +346,7 @@
 /* 3.7.2.3 Camera Terminal Descriptor */
 #define VC_CAMERA_TERMINAL_DESCRIPTOR(entity)					\
 	0x12,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
 	U16_LE(UVC_ITT_CAMERA),				/* wTerminalType */	\
@@ -352,7 +361,7 @@
 /* 3.7.2.4 Selector Unit Descriptor */
 #define VC_SELECTOR_UNIT_DESCRIPTOR(entity)					\
 	0x06 + VC_SOURCE_NUM(entity),			/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_SELECTOR_UNIT,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bUnitID */		\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
@@ -362,7 +371,7 @@
 /* 3.7.2.5 Processing Unit Descriptor */
 #define VC_PROCESSING_UNIT_DESCRIPTOR(entity)					\
 	0x0d,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_PROCESSING_UNIT,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bUnitID */		\
 	VC_SOURCES_IDS(entity),				/* bSourceID */		\
@@ -375,7 +384,7 @@
 /* 3.7.2.6 Encoding Unit Descriptor */
 #define VC_ENCODING_UNIT_DESCRIPTOR(entity)					\
 	0x0d,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_ENCODING_UNIT,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bUnitID */		\
 	VC_SOURCE_ID(entity),				/* bSourceID */		\
@@ -386,10 +395,10 @@
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
 	0x18 + VC_SOURCE_NUM(entity) + VC_CONTROL_SIZE(entity),/* bLength */	\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bUnitID */		\
-	DT_PROP(entity, guid),				/* guidExtensionCode */	\
+	GUID(entity),					/* guidExtensionCode */	\
 	VC_NUM_CTRL(entity),				/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
 	VC_SOURCE_ID(entity)				/* baSourceID */	\
@@ -418,7 +427,7 @@
 	 DT_CHILD_NUM_COMPAT(node, zephyr_uvc_format_uncompressed))
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
 	0x0d + VS_NUM_FORMATS(node),			/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_INPUT_HEADER,				/* bDescriptorSubtype */\
 	VS_NUM_FORMATS(node),				/* bNumFormats */	\
 	U16_LE(VS_TOTAL_LENGTH(node)),			/* wTotalLength */	\
@@ -471,11 +480,11 @@
 /* 3.1.1 Uncompressed Video Format Descriptor */
 #define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)				\
 	0x1b,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
-	DT_PROP(format, guid),				/* guidFormat */	\
+	GUID(format),					/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
 	0x01,						/* bDefaultFrameIndex */\
 	0x00,						/* bAspectRatioX */	\
@@ -486,12 +495,12 @@
 /* 3.2.1 Uncompressed Video Frame Descriptors (discrete) */
 #define VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)					\
 	0x25,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_UNCOMPRESSED,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(frame),				/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
-	U16_LE(DT_PROP_BY_IDX(node, size, 0)),		/* wWidth */		\
-	U16_LE(DT_PROP_BY_IDX(node, size, 1)),		/* wHeight */		\
+	U16_LE(DT_PROP_BY_IDX(frame, size, 0)),		/* wWidth */		\
+	U16_LE(DT_PROP_BY_IDX(frame, size, 1)),		/* wHeight */		\
 	U32_LE(15360000),				/* dwMinBitRate */	\
 	U32_LE(15360000),				/* dwMaxBitRate */	\
 	U32_LE(MAX_VIDEO_FRAME_BUFFER_SIZE(frame)),	/* dwMaxVideoFrameBufferSize */\
@@ -504,7 +513,7 @@
 /* 3.1.1 Motion-JPEG Video Format Descriptor */
 #define VS_MJPEG_FORMAT_DESCRIPTOR(format)					\
 	0x0b,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_MJPEG,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
@@ -518,7 +527,7 @@
 /* 3.2.1 Motion-JPEG Video Frame Descriptors (discrete) */
 #define VS_MJPEG_FRAME_DESCRIPTOR(frame)					\
 	0x1d,						/* bLength */		\
-	USB_CS_INTERFACE,				/* bDescriptorType */	\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_MJPEG,					/* bDescriptorSubtype */\
 	VC_ENTITY_ID(frame),				/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
@@ -568,26 +577,26 @@
 	};									\
 
 #define VS_MJPEG_FRAME_DESCRIPTOR_ARRAYS(frame)					\
-	static const uint8_t frame##_desc = {					\
+	static const uint8_t frame##_desc[] = {					\
 		VS_MJPEG_FRAME_DESCRIPTOR(frame)				\
 	};
 
-#define VS_MJPEG_FORMAT_DESCRIPTOR_ARRAYS(format)				\
-	static const uint8_t format##_desc = {					\
-		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
-	};									\
-	DT_FOREACH_CHILD(format, UVC_MJPEG_FRAME_DESCRIPTOR_ARRAYS)
-
 #define VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAYS(frame)				\
-	static const uint8_t frame##_desc = {					\
+	static const uint8_t frame##_desc[] = {					\
 		VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)				\
 	};
 
-#define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR_ARRAYS(format)			\
-	static const uint8_t format##_desc = {					\
-		UVC_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
+#define VS_MJPEG_DESCRIPTOR_ARRAYS(format)					\
+	static const uint8_t format##_desc[] = {				\
+		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
 	};									\
-	DT_FOREACH_CHILD(format, UVC_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAYS)
+	DT_FOREACH_CHILD(format, VS_MJPEG_FRAME_DESCRIPTOR_ARRAYS)
+
+#define VS_UNCOMPRESSED_DESCRIPTOR_ARRAYS(format)				\
+	static const uint8_t format##_desc[] = {				\
+		VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
+	};									\
+	DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAYS)
 
 /* Descriptor Pointers */
 
