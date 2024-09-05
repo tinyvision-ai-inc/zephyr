@@ -534,57 +534,57 @@
 /* Descriptor Arrays */
 
 #define UVC_DESCRIPTOR_ARRAYS(node)						\
-	static uint8_t uvc_desc_##node##_iad[] = {				\
+	static uint8_t node##_desc_iad[] = {					\
 		UVC_INTERFACE_ASSOCIATION_DESCRIPTOR(node)			\
 	};									\
-	static uint8_t uvc_desc_##node##_if_vc[] = {				\
+	static uint8_t node##_desc_if_vc[] = {					\
 		VC_INTERFACE_DESCRIPTOR(node)					\
 	};									\
-	static uint8_t uvc_desc_##node##_if_vc_header[] = {			\
+	static uint8_t node##_desc_if_vc_header[] = {				\
 		VC_INTERFACE_HEADER_DESCRIPTOR(node)				\
 	};									\
-	static uint8_t uvc_desc_##node##_if_vs[] = {				\
+	static uint8_t node##_desc_if_vs[] = {					\
 		VS_INTERFACE_DESCRIPTOR(node)					\
 	};									\
-	static uint8_t uvc_desc_##node##_if_vs_header[] = {			\
+	static uint8_t node##_desc_if_vs_header[] = {				\
 		VS_INPUT_HEADER_DESCRIPTOR(node)				\
 	};									\
-	static uint8_t uvc_fs_desc_##node##_ep[] = {				\
+	static uint8_t node##_fs_desc_ep[] = {					\
 		VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)			\
 	};									\
-	static uint8_t uvc_hs_desc_##node##_ep[] = {				\
+	static uint8_t node##_hs_desc_ep[] = {					\
 		VS_HIGHSPEED_BULK_ENDPOINT_DESCRIPTOR(node)			\
 	};									\
-	static uint8_t uvc_ss_desc_##node##_ep[] = {				\
+	static uint8_t node##_ss_desc_ep[] = {					\
 		VS_SUPERSPEED_BULK_ENDPOINT_DESCRIPTOR(node)			\
 	};									\
-	static uint8_t uvc_ss_desc_##node##_ep_comp[] = {			\
+	static uint8_t node##_ss_desc_ep_comp[] = {				\
 		VS_SUPERSPEED_BULK_ENDPOINT_COMPANION_DESCRIPTOR(node)		\
 	};
 
 #define VC_ENTITY_DESCRIPTOR_ARRAYS(entity)					\
-	static uint8_t uvc_desc_##entity[] = {					\
+	static const uint8_t entity##_desc[] = {				\
 		ENTITY_DESCRIPTOR(entity)					\
 	};									\
 
 #define VS_MJPEG_FRAME_DESCRIPTOR_ARRAYS(frame)					\
-	static const uint8_t uvc_desc_##frame = {				\
+	static const uint8_t frame##_desc = {					\
 		VS_MJPEG_FRAME_DESCRIPTOR(frame)				\
 	};
 
 #define VS_MJPEG_FORMAT_DESCRIPTOR_ARRAYS(format)				\
-	static const uint8_t uvc_desc_##format = {				\
+	static const uint8_t format##_desc = {					\
 		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
 	};									\
 	DT_FOREACH_CHILD(format, UVC_MJPEG_FRAME_DESCRIPTOR_ARRAYS)
 
 #define VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAYS(frame)				\
-	static const uint8_t uvc_desc_##frame = {				\
+	static const uint8_t frame##_desc = {					\
 		VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)				\
 	};
 
 #define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR_ARRAYS(format)			\
-	static const uint8_t uvc_desc_##format = {				\
+	static const uint8_t format##_desc = {					\
 		UVC_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
 	};									\
 	DT_FOREACH_CHILD(format, UVC_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAYS)
@@ -592,42 +592,44 @@
 /* Descriptor Pointers */
 
 #define DESCRIPTOR_PTR(node) 							\
-	((struct usb_desc_header *)&uvc_desc_##node),
+	((struct usb_desc_header *)&node##_desc),
 
 #define VC_DESCRIPTOR_PTRS(entity)						\
 	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(entity)), (				\
-		(struct usb_desc_header *) &uvc_desc_##entity,			\
+		(struct usb_desc_header *) &entity##_desc,			\
 	))
 
 #define VS_DESCRIPTOR_PTRS(format)						\
 	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format), (		\
-		((struct usb_desc_header *)&uvc_desc_##format),			\
+		((struct usb_desc_header *)&format##_desc),			\
 		DT_FOREACH_CHILD_STATUS_OKAY(format, DESCRIPTOR_PTR)		\
 	))
 
 #define UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)uvc_desc_##node##_iad,			\
-	(struct usb_desc_header *)uvc_desc_##node##_if_vc,			\
-	(struct usb_desc_header *)uvc_desc_##node##_if_vc_header,		\
+	(struct usb_desc_header *)node##_desc_iad,				\
+	(struct usb_desc_header *)node##_desc_if_vc,				\
+	(struct usb_desc_header *)node##_desc_if_vc_header,			\
 	DT_INST_FOREACH_CHILD(node, VC_DESCRIPTOR_PTRS)				\
-	(struct usb_desc_header *)uvc_desc_##node##_if_vs,			\
-	(struct usb_desc_header *)uvc_desc_##node##_if_vs_header,		\
+	(struct usb_desc_header *)node##_desc_if_vs,				\
+	(struct usb_desc_header *)node##_desc_if_vs_header,			\
 	DT_INST_FOREACH_CHILD(node, VS_DESCRIPTOR_PTRS)				\
 
 #define UVC_FULLSPEED_DESCRIPTOR_PTRS(node)					\
 	UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)uvc_fs_desc_##node##_ep,			\
-	(struct usb_desc_header *)uvc_desc_nil,
+	(struct usb_desc_header *)node##_fs_desc_ep,				\
+	(struct usb_desc_header *)&nil_desc,
 
 #define UVC_HIGHSPEED_DESCRIPTOR_PTRS(node)					\
 	UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)uvc_hs_desc_##node##_ep,			\
-	(struct usb_desc_header *)uvc_desc_nil,
+	(struct usb_desc_header *)node##_hs_desc_ep,				\
+	(struct usb_desc_header *)&nil_desc,
 
 #define UVC_SUPERSPEED_DESCRIPTOR_PTRS(node)					\
 	UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)uvc_ss_desc_##node##_ep,			\
-	(struct usb_desc_header *)uvc_ss_desc_##node##_ep_comp,			\
-	(struct usb_desc_header *)uvc_desc_nil,
+	(struct usb_desc_header *)node##_ss_desc_ep,				\
+	(struct usb_desc_header *)node##_ss_desc_ep_comp,			\
+	(struct usb_desc_header *)&nil_desc,
+
+static const struct usb_desc_header nil_desc;
 
 #endif /* ZEPHYR_INCLUDE_USBD_UVC_MACROS_H_ */
