@@ -956,13 +956,12 @@ static int uvc_preinit(const struct device *dev)
 	return 0;
 }
 
-#define FORMAT_FOURCC(format)							\
-	video_fourcc(DT_PROP(format, fourcc)[0], DT_PROP(format, fourcc)[1],	\
-		     DT_PROP(format, fourcc)[2], DT_PROP(format, fourcc)[3])
-
 #define VIDEO_FRAME_CAP(frame, format)						\
 	{									\
-		.pixelformat = FORMAT_FOURCC(format),				\
+		.pixelformat = video_fourcc(DT_PROP(format, fourcc)[0],		\
+					    DT_PROP(format, fourcc)[1],		\
+					    DT_PROP(format, fourcc)[2],		\
+					    DT_PROP(format, fourcc)[3]),	\
 		.width_min = DT_PROP_BY_IDX(frame, size, 0),			\
 		.width_max = DT_PROP_BY_IDX(frame, size, 0),			\
 		.width_step = 0,						\
@@ -1047,6 +1046,4 @@ static int uvc_preinit(const struct device *dev)
 			 POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,		\
 			 &uvc_video_api);
 
-DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_uncompressed, VS_UNCOMPRESSED_DESCRIPTOR_ARRAYS)
-DT_FOREACH_STATUS_OKAY(zephyr_uvc_format_mjpeg, VS_MJPEG_DESCRIPTOR_ARRAYS)
 DT_FOREACH_STATUS_OKAY(DT_DRV_COMPAT, UVC_DEVICE_DEFINE)
