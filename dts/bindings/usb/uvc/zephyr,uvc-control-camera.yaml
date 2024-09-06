@@ -3,6 +3,6 @@
 
 description: UVC Input Terminal for controlling image sensors
 
-compatible: "zephyr,uvc-control-camera.yaml"
+compatible: "zephyr,uvc-control-camera"
 
 include: "zephyr,uvc-control.yaml"

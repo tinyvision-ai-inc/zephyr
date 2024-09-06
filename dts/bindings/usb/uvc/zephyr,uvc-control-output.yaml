@@ -3,12 +3,12 @@
 
 description: UVC Output Terminal representing the data going out of the device.
 
-compatible: "zephyr,uvc-control-output.yaml"
+compatible: "zephyr,uvc-control-output"
 
 properties:
 
   source-entity:
     type: phandle
-    requited: true
+    required: true
     description: |
       Last entity of the chain before the output of the device.

@@ -6,7 +6,7 @@
 properties:
 
   control-target:
-    type: phandle-array
+    type: phandle
     description: |
       Reference to a video device which this control should affect.
 

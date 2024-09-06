@@ -993,15 +993,15 @@ static int uvc_preinit(const struct device *dev)
 										\
 	UVC_DESCRIPTOR_ARRAYS(node)						\
 										\
-	static struct usb_desc_header *const node##_fs_desc[] = {		\
+	static struct usb_desc_header *node##_fs_desc[] = {			\
 		UVC_FULLSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\
-	static struct usb_desc_header *const node##_hs_desc[] = {		\
+	static struct usb_desc_header *node##_hs_desc[] = {			\
 		UVC_HIGHSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\
-	static struct usb_desc_header *const node##_ss_desc[] = {		\
+	static struct usb_desc_header *node##_ss_desc[] = {			\
 		UVC_SUPERSPEED_DESCRIPTOR_PTRS(node)				\
 	};									\
 										\

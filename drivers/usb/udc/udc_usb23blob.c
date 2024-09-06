@@ -1102,7 +1102,7 @@ static void usb23_trb_ctrl_data_out(const struct device *dev)
 
 static void usb23_trb_ctrl_data_in(const struct device *dev)
 {
-	LOG_DBG("trb: CONTROL_DATA_IN ep=0x%02x len=%u", USB_CONTROL_EP_IN);
+	LOG_DBG("trb: CONTROL_DATA_IN ep=0x%02x", USB_CONTROL_EP_IN);
 	usb23_trb_ctrl_in(dev, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 

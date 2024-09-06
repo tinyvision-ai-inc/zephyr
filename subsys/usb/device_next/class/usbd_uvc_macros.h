@@ -213,20 +213,20 @@
 #define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source_entity)
 
 /* Convert a list of integers to an (uint64_t) bitmap */
-#define CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n))
-#define CONTROLS_U64(entity)							\
-	(DT_FOREACH_PROP_ELEM_SEP(entity, control_ids, CONTROL_BIT, (|)))
+#define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n))
+#define VC_CONTROLS_U64(entity)							\
+	(DT_FOREACH_PROP_ELEM_SEP(entity, control_ids, VC_CONTROL_BIT, (|)))
 
 /* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
-#define CONTROLS(entity, n)							\
-	IF_ENABLED(n > 0, ((CONTROLS_U64(entity) >> 0x38) & 0xff,))		\
-	IF_ENABLED(n > 1, ((CONTROLS_U64(entity) >> 0x30) & 0xff,))		\
-	IF_ENABLED(n > 2, ((CONTROLS_U64(entity) >> 0x28) & 0xff,))		\
-	IF_ENABLED(n > 3, ((CONTROLS_U64(entity) >> 0x20) & 0xff,))		\
-	IF_ENABLED(n > 4, ((CONTROLS_U64(entity) >> 0x18) & 0xff,))		\
-	IF_ENABLED(n > 5, ((CONTROLS_U64(entity) >> 0x10) & 0xff,))		\
-	IF_ENABLED(n > 6, ((CONTROLS_U64(entity) >> 0x08) & 0xff,))		\
-	IF_ENABLED(n > 7, ((CONTROLS_U64(entity) >> 0x00) & 0xff,))
+#define VC_CONTROLS(entity, n)							\
+	IF_ENABLED(n > 0, ((VC_CONTROLS_U64(entity) >> 0x38) & 0xff,))		\
+	IF_ENABLED(n > 1, ((VC_CONTROLS_U64(entity) >> 0x30) & 0xff,))		\
+	IF_ENABLED(n > 2, ((VC_CONTROLS_U64(entity) >> 0x28) & 0xff,))		\
+	IF_ENABLED(n > 3, ((VC_CONTROLS_U64(entity) >> 0x20) & 0xff,))		\
+	IF_ENABLED(n > 4, ((VC_CONTROLS_U64(entity) >> 0x18) & 0xff,))		\
+	IF_ENABLED(n > 5, ((VC_CONTROLS_U64(entity) >> 0x10) & 0xff,))		\
+	IF_ENABLED(n > 6, ((VC_CONTROLS_U64(entity) >> 0x08) & 0xff,))		\
+	IF_ENABLED(n > 7, ((VC_CONTROLS_U64(entity) >> 0x00) & 0xff,))
 
 /* Estimate the frame buffer size out of other fields */
 #define MAX_VIDEO_FRAME_BUFFER_SIZE(node)					\
@@ -278,7 +278,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
-	U16_LE(UVC_ITT_CAMERA),				/* wTerminalType */	\
+	U16_LE(ITT_VENDOR_SPECIFIC),			/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x00,						/* iTerminal */
 
@@ -288,7 +288,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_OUTPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
-	U16_LE(UVC_TT_STREAMING),			/* wTerminalType */	\
+	U16_LE(TT_STREAMING),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x01,						/* bSourceID */		\
 	0x00,						/* iTerminal */
@@ -299,7 +299,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
 	VC_ENTITY_ID(entity),				/* bTerminalID */	\
-	U16_LE(UVC_ITT_CAMERA),				/* wTerminalType */	\
+	U16_LE(ITT_CAMERA),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x00,						/* iTerminal */		\
 	U16_LE(0),					/* wObjectiveFocalLengthMin */\
@@ -358,25 +358,25 @@
 
 /* Video Control descriptor content of a node according to its type */
 #define VC_DESCRIPTOR(entity)							\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_input_terminal), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_input), (	\
 		VC_INPUT_TERMINAL_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_camera_terminal), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_camera), (	\
 		VC_CAMERA_TERMINAL_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_output_terminal), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_output), (	\
 		VC_OUTPUT_TERMINAL_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_selector_unit), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_selector), (	\
 		VC_SELECTOR_UNIT_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_processing_unit), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_processing), (	\
 		VC_PROCESSING_UNIT_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_encoding_unit), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_encoding), (	\
 		VC_ENCODING_UNIT_DESCRIPTOR(entity)				\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_extension_unit), (	\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_extension), (	\
 		VC_EXTENSION_UNIT_DESCRIPTOR(entity)				\
 	))
 
@@ -384,7 +384,7 @@
 
 /* 3.9 VideoStreaming Interface Descriptors */
 #define VS_INTERFACE_DESCRIPTOR(node)						\
-	0x07,						/* bLength */		\
+	0x09,						/* bLength */		\
 	USB_DESC_INTERFACE,				/* bDescriptorType */	\
 	0x01,						/* bInterfaceNumber */	\
 	0x00,						/* bAlternateSetting */	\
@@ -401,7 +401,7 @@
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD_SEP(node, VS_DESCRIPTOR, ())
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
-	0x0d,						/* bLength */		\
+	0x0e,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_INPUT_HEADER,				/* bDescriptorSubtype */\
 	VS_NUM_FORMATS(node),				/* bNumFormats */	\
@@ -412,7 +412,8 @@
 	0x00,						/* bStillCaptureMethod */\
 	0x00,						/* bTriggerSupport */	\
 	0x00,						/* bTriggerUsage */	\
-	0x00,						/* bControlSize */
+	0x01,						/* bControlSize */	\
+	0x00,						/* bmaControls */
 
 /* 3.10 VideoStreaming Bulk FullSpeed Endpoint Descriptors */
 #define VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
@@ -528,17 +529,17 @@
 /* Descriptor Arrays */
 
 #define VS_MJPEG_FRAME_DESCRIPTOR_ARRAY(frame)					\
-	static const uint8_t frame##_desc[] = {					\
+	static uint8_t frame##_desc[] = {					\
 		VS_MJPEG_FRAME_DESCRIPTOR(frame)				\
 	};
 
 #define VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY(frame)				\
-	static const uint8_t frame##_desc[] = {					\
+	static uint8_t frame##_desc[] = {					\
 		VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)				\
 	};
 
 #define INTERFACE_DESCRIPTOR_ARRAYS(node)					\
-	static const uint8_t node##_desc[] = {					\
+	static uint8_t node##_desc[] = {					\
 		VC_DESCRIPTOR(node)						\
 		VS_DESCRIPTOR(node)						\
 	};									\
@@ -620,6 +621,6 @@
 	(struct usb_desc_header *)node##_ss_desc_ep_comp,			\
 	(struct usb_desc_header *)&nil_desc,
 
-static const struct usb_desc_header nil_desc;
+static struct usb_desc_header nil_desc;
 
 #endif /* ZEPHYR_INCLUDE_USBD_UVC_MACROS_H_ */
