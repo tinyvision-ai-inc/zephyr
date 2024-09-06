@@ -209,13 +209,13 @@
 
 /* Connect the entities to their source(s) */
 #define VC_PROP_N_ID(entity, prop, n) DT_ENTITY_ID(DT_PHANDLE_BY_IDX(entity, prop, n)),
-#define VC_SOURCE_ID(entity) DT_FOREACH_PROP_ELEM(entity, source, VC_PROP_N_ID)
-#define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source)
+#define VC_SOURCE_ID(entity) DT_FOREACH_PROP_ELEM(entity, source_entity, VC_PROP_N_ID)
+#define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source_entity)
 
 /* Convert a list of integers to an (uint64_t) bitmap */
 #define CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n))
 #define CONTROLS_U64(entity)							\
-	(DT_FOREACH_PROP_ELEM_SEP(entity, controls, CONTROL_BIT, (|)))
+	(DT_FOREACH_PROP_ELEM_SEP(entity, control_ids, CONTROL_BIT, (|)))
 
 /* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
 #define CONTROLS(entity, n)							\

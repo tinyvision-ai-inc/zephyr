@@ -56,9 +56,9 @@ struct uvc_vs_probe_control {
 	uint32_t dwMaxPayloadTransferSize;
 	uint32_t dwClockFrequency;
 	uint8_t bmFramingInfo;
-#define UVC_BMFRAMING_INFO_FID (1 << 0)
-#define UVC_BMFRAMING_INFO_EOF (1 << 1)
-#define UVC_BMFRAMING_INFO_EOS (1 << 2)
+#define UVC_BMFRAMING_INFO_FID			BIT(0)
+#define UVC_BMFRAMING_INFO_EOF			BIT(1)
+#define UVC_BMFRAMING_INFO_EOS			BIT(2)
 	uint8_t bPreferedVersion;
 	uint8_t bMinVersion;
 	uint8_t bMaxVersion;

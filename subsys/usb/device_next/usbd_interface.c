@@ -79,7 +79,7 @@ static int usbd_interface_modify(struct usbd_context *const uds_ctx,
 			if (ifd->bInterfaceNumber == iface &&
 			    ifd->bAlternateSetting == alt) {
 				found_iface = true;
-				LOG_DBG("Found interface %u %p", iface, c_nd);
+				LOG_INF("Found interface %u %p", iface, c_nd);
 				if (ifd->bNumEndpoints == 0) {
 					LOG_INF("No endpoints, skip interface");
 					break;

@@ -1051,6 +1051,9 @@ static void usb23_trb_ctrl_in(const struct device *dev, uint32_t ctrl)
 	struct net_buf *buf = ep_data->net_buf[0];
 	volatile struct usb23_trb *trb = ep_data->trb_buf;
 
+	__ASSERT_NO_MSG(buf != NULL);
+	LOG_DBG("trb: CONTROL_IN len=%u", buf->len);
+
 	/* TRB0 sending the data */
 	trb[0].addr_lo = (uintptr_t)buf->data;
 	trb[0].status = buf->len;
@@ -1066,6 +1069,7 @@ static void usb23_trb_ctrl_out(const struct device *dev, struct net_buf *buf, ui
 	volatile struct usb23_trb *trb = ep_data->trb_buf;
 
 	__ASSERT_NO_MSG(buf != NULL);
+	LOG_DBG("trb: CONTROL_OUT size=%u", buf->size);
 
 	/* Associate the buffer with the TRB for picking it up later */
 	__ASSERT_NO_MSG(ep_data->net_buf[0] == NULL);
@@ -1084,7 +1088,7 @@ static void usb23_trb_ctrl_setup_out(const struct device *dev)
 {
 	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 8);
 
-	LOG_DBG("trb: CONTROL_SETUP ep=0x%02x size=%u", USB_CONTROL_EP_OUT, buf->size);
+	LOG_DBG("trb: CONTROL_SETUP ep=0x%02x", USB_CONTROL_EP_OUT);
 	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 }
 
@@ -1092,13 +1096,13 @@ static void usb23_trb_ctrl_data_out(const struct device *dev)
 {
 	struct net_buf *buf = udc_ctrl_alloc(dev, USB_CONTROL_EP_OUT, 512);
 
-	LOG_DBG("trb: CONTROL_DATA_OUT ep=0x%02x size=%u", USB_CONTROL_EP_OUT, buf->size);
+	LOG_DBG("trb: CONTROL_DATA_OUT ep=0x%02x", USB_CONTROL_EP_OUT);
 	usb23_trb_ctrl_out(dev, buf, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 
 static void usb23_trb_ctrl_data_in(const struct device *dev)
 {
-	LOG_DBG("trb: CONTROL_DATA_IN ep=0x%02x", USB_CONTROL_EP_IN);
+	LOG_DBG("trb: CONTROL_DATA_IN ep=0x%02x len=%u", USB_CONTROL_EP_IN);
 	usb23_trb_ctrl_in(dev, USB23_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 

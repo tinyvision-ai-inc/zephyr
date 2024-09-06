@@ -1,0 +1,18 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# USB Video Class control common properties.
+
+properties:
+
+  control-target:
+    type: phandle-array
+    description: |
+      Reference to a video device which this control should affect.
+
+  control-ids:
+    type: array
+    description: |
+      List of control IDs which marked as supported by the USB device.
+      UVC controls are mapped to entries of video-controls.h when passed to
+      the control target.

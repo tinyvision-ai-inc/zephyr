@@ -138,8 +138,7 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 
 	while (*dhp != NULL && (*dhp)->bLength != 0) {
 
-		LOG_DBG("bDescriptorType=%u USB_DESC_ENDPOINT=%u USB_DESC_INTERFACE=%u",
-			(*dhp)->bDescriptorType, USB_DESC_ENDPOINT, USB_DESC_INTERFACE);
+		LOG_DBG("bDescriptorType=%u", (*dhp)->bDescriptorType);
 
 		if ((*dhp)->bDescriptorType == USB_DESC_INTERFACE) {
 			ifd = (struct usb_if_descriptor *)(*dhp);
@@ -150,7 +149,6 @@ static int init_configuration_inst(struct usbd_context *const uds_ctx,
 				ifd->bInterfaceNumber = tmp_nif;
 				c_nd->iface_bm |= BIT(tmp_nif);
 				tmp_nif++;
-				LOG_DBG("bAlternateSetting=0");
 			} else {
 				ifd->bInterfaceNumber = tmp_nif - 1;
 				/*
