@@ -130,7 +130,7 @@ static int si5351_init(const struct device *dev)
 		continue;
 	}
 
-	return ret;
+	return 0;
 }
 
 static int si5351_on(const struct device *dev, clock_control_subsys_t sys)

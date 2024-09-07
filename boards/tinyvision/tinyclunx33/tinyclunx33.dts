@@ -258,6 +258,7 @@
 
 &i2c0 {
 	status = "okay";
+
 	pll0: si5351@60 {
 		reg = <0x60>;
 		compatible = "skyworks,si5351";
@@ -267,8 +268,12 @@
 };
 
 &uart0 {
+	/* Turned off to let the board start when ther is no PLL */
 	clocks = <&pll0>;
-	current-speed = <192000>; // Value for RTL Reference Design v0.5
+
+	/* Value for RTL Reference Design v0.5 */
+	current-speed = <192000>;
+
 	status = "okay";
 };
 
