@@ -399,12 +399,16 @@ static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 static int imx219_stream_start(const struct device *dev)
 {
 	const struct imx219_config *cfg = dev->config;
+
+	LOG_INF("Starting the IMX219 sensor");
 	return imx219_write_reg(&cfg->i2c, IMX219_REG_MODE_SELECT, IMX219_MODE_STREAMING);
 }
 
 static int imx219_stream_stop(const struct device *dev)
 {
 	const struct imx219_config *cfg = dev->config;
+
+	LOG_INF("Stopping the IMX219 sensor");
 	return imx219_write_reg(&cfg->i2c, IMX219_REG_MODE_SELECT, IMX219_MODE_STANDBY);
 }
 

@@ -37,11 +37,15 @@ static int uvcmanager_stream_start(const struct device *dev)
 	int err;
 
 	if (conf->source_dev != NULL) {
+		LOG_INF("Starting the stream of the UVCManager source device");
+
 		err = video_stream_start(conf->source_dev);
 		if (err) {
 			LOG_ERR("failed to start the source device");
 			return err;
 		}
+	} else {
+		LOG_WRN("No source dev associated with this UVCManager");
 	}
 
 	return 0;
@@ -53,11 +57,15 @@ static int uvcmanager_stream_stop(const struct device *dev)
 	int err;
 
 	if (conf->source_dev != NULL) {
+		LOG_INF("Stopping the stream of the UVCManager source device");
+
 		err = video_stream_start(conf->source_dev);
 		if (err) {
 			LOG_ERR("failed to stop the source device");
 			return err;
 		}
+	} else {
+		LOG_WRN("No source dev associated with this UVCManager");
 	}
 
 	return 0;
@@ -98,7 +106,7 @@ static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_i
 		return -EINVAL;
 	}
 
-	LOG_DBG("setting format to %ux%u", fmt->width, fmt->height);
+	LOG_DBG("Setting UVCManager format to %ux%u", fmt->width, fmt->height);
 
 	if (conf->source_dev != NULL) {
 		struct video_format child_fmt = *fmt;
@@ -108,7 +116,8 @@ static int uvcmanager_set_format(const struct device *dev, enum video_endpoint_i
 		child_fmt.height += 2;
 		child_fmt.pixelformat = VIDEO_PIX_FMT_BGGR8;
 
-		LOG_DBG("setting child format to %ux%u", child_fmt.width, child_fmt.height);
+		LOG_DBG("Setting UVCManager child format to %ux%u",
+			child_fmt.width, child_fmt.height);
 
 		err = video_set_format(conf->source_dev, VIDEO_EP_OUT, &child_fmt);
 		if (err) {

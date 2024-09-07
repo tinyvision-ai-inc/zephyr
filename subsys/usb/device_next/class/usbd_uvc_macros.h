@@ -205,10 +205,15 @@
 #define U8_GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
 
 /* Automatically assign Entity IDs based on entities order in devicetree */
-#define VC_ENTITY_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
+#define NODE_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
+
+/* Fetch the ID of a child node with the given compat */
+#define COMPAT_ID(node, compat)							\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(node, compat), (NODE_ID(node)))
+#define LOOKUP_ID(node, compat) DT_FOREACH_CHILD_VARGS(node, COMPAT_ID, compat)
 
 /* Connect the entities to their source(s) */
-#define VC_PROP_N_ID(entity, prop, n) DT_ENTITY_ID(DT_PHANDLE_BY_IDX(entity, prop, n)),
+#define VC_PROP_N_ID(entity, prop, n) DT_NODE_ID(DT_PHANDLE_BY_IDX(entity, prop, n)),
 #define VC_SOURCE_ID(entity) DT_FOREACH_PROP_ELEM(entity, source_entity, VC_PROP_N_ID)
 #define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source_entity)
 
@@ -219,24 +224,24 @@
 
 /* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
 #define VC_CONTROLS(entity, n)							\
-	IF_ENABLED(n > 0, ((VC_CONTROLS_U64(entity) >> 0x38) & 0xff,))		\
-	IF_ENABLED(n > 1, ((VC_CONTROLS_U64(entity) >> 0x30) & 0xff,))		\
-	IF_ENABLED(n > 2, ((VC_CONTROLS_U64(entity) >> 0x28) & 0xff,))		\
-	IF_ENABLED(n > 3, ((VC_CONTROLS_U64(entity) >> 0x20) & 0xff,))		\
-	IF_ENABLED(n > 4, ((VC_CONTROLS_U64(entity) >> 0x18) & 0xff,))		\
-	IF_ENABLED(n > 5, ((VC_CONTROLS_U64(entity) >> 0x10) & 0xff,))		\
-	IF_ENABLED(n > 6, ((VC_CONTROLS_U64(entity) >> 0x08) & 0xff,))		\
-	IF_ENABLED(n > 7, ((VC_CONTROLS_U64(entity) >> 0x00) & 0xff,))
+	IF_ENABLED(n > 0, ((VC_CONTROLS_U64(entity) >> 0x00) & 0xff,))		\
+	IF_ENABLED(n > 1, ((VC_CONTROLS_U64(entity) >> 0x08) & 0xff,))		\
+	IF_ENABLED(n > 2, ((VC_CONTROLS_U64(entity) >> 0x10) & 0xff,))		\
+	IF_ENABLED(n > 3, ((VC_CONTROLS_U64(entity) >> 0x18) & 0xff,))		\
+	IF_ENABLED(n > 4, ((VC_CONTROLS_U64(entity) >> 0x20) & 0xff,))		\
+	IF_ENABLED(n > 5, ((VC_CONTROLS_U64(entity) >> 0x28) & 0xff,))		\
+	IF_ENABLED(n > 6, ((VC_CONTROLS_U64(entity) >> 0x30) & 0xff,))		\
+	IF_ENABLED(n > 7, ((VC_CONTROLS_U64(entity) >> 0x38) & 0xff,))
 
 /* Estimate the frame buffer size out of other fields */
-#define MAX_VIDEO_FRAME_BUFFER_SIZE(node)					\
-	(DT_PROP_BY_IDX(node, size, 0) * DT_PROP_BY_IDX(node, size, 1) *	\
-	 DT_PROP(DT_PARENT(node), bits_per_pixel) / 8 +				\
+#define MAX_VIDEO_FRAME_BUFFER_SIZE(frame)					\
+	(DT_PROP_BY_IDX(frame, size, 0) * DT_PROP_BY_IDX(frame, size, 1) *	\
+	 DT_PROP(DT_PARENT(frame), bits_per_pixel) / 8 +			\
 	 CONFIG_USBD_VIDEO_HEADER_SIZE)
 
 /* 3.6 Interface Association Descriptor */
 #define UVC_INTERFACE_ASSOCIATION_DESCRIPTOR(node)				\
-	0x08,						/* bLength */		\
+	8,						/* bLength */		\
 	USB_DESC_INTERFACE_ASSOC,			/* bDescriptorType */	\
 	0x00,						/* bFirstInterface */	\
 	0x02,						/* bInterfaceCount */	\
@@ -249,7 +254,7 @@
 
 /* 3.7 VideoControl Interface Descriptors */
 #define VC_INTERFACE_DESCRIPTOR(node)						\
-	0x09,						/* bLength */		\
+	9,						/* bLength */		\
 	USB_DESC_INTERFACE,				/* bDescriptorType */	\
 	0x00,						/* bInterfaceNumber */	\
 	0x00,						/* bAlternateSetting */	\
@@ -263,7 +268,7 @@
 #define VC_DESCRIPTORS(node) DT_FOREACH_CHILD(node, VC_DESCRIPTOR)
 #define VC_TOTAL_LENGTH(node) sizeof((uint8_t []){VC_DESCRIPTORS(node)})
 #define VC_INTERFACE_HEADER_DESCRIPTOR(node)					\
-	0x0c + 1,					/* bLength */		\
+	12 + 1,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_HEADER,					/* bDescriptorSubtype */\
 	U16_LE(0x0150),					/* bcdUVC */		\
@@ -274,20 +279,20 @@
 
 /* 3.7.2.1 Input Terminal Descriptor */
 #define VC_INPUT_TERMINAL_DESCRIPTOR(entity)					\
-	0x08,						/* bLength */		\
+	8,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bTerminalID */	\
+	NODE_ID(entity),				/* bTerminalID */	\
 	U16_LE(ITT_VENDOR_SPECIFIC),			/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x00,						/* iTerminal */
 
 /* 3.7.2.2 Output Terminal Descriptor */
 #define VC_OUTPUT_TERMINAL_DESCRIPTOR(entity)					\
-	0x09,						/* bLength */		\
+	9,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_OUTPUT_TERMINAL,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bTerminalID */	\
+	NODE_ID(entity),				/* bTerminalID */	\
 	U16_LE(TT_STREAMING),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x01,						/* bSourceID */		\
@@ -295,10 +300,10 @@
 
 /* 3.7.2.3 Camera Terminal Descriptor */
 #define VC_CAMERA_TERMINAL_DESCRIPTOR(entity)					\
-	0x12,						/* bLength */		\
+	18,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bTerminalID */	\
+	NODE_ID(entity),				/* bTerminalID */	\
 	U16_LE(ITT_CAMERA),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
 	0x00,						/* iTerminal */		\
@@ -310,20 +315,20 @@
 
 /* 3.7.2.4 Selector Unit Descriptor */
 #define VC_SELECTOR_UNIT_DESCRIPTOR(entity)					\
-	0x06 + VC_SOURCE_NUM(entity),			/* bLength */		\
+	6 + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_SELECTOR_UNIT,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bUnitID */		\
+	NODE_ID(entity),				/* bUnitID */		\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
 	VC_SOURCE_ID(entity),				/* baSourceID */	\
 	0x00,						/* iSelector */
 
 /* 3.7.2.5 Processing Unit Descriptor */
 #define VC_PROCESSING_UNIT_DESCRIPTOR(entity)					\
-	0x0d,						/* bLength */		\
+	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_PROCESSING_UNIT,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bUnitID */		\
+	NODE_ID(entity),				/* bUnitID */		\
 	VC_SOURCES_IDS(entity),				/* bSourceID */		\
 	U16_LE(0),					/* wMaxMultiplier */	\
 	0x03,						/* bControlSize */	\
@@ -333,10 +338,10 @@
 
 /* 3.7.2.6 Encoding Unit Descriptor */
 #define VC_ENCODING_UNIT_DESCRIPTOR(entity)					\
-	0x0d,						/* bLength */		\
+	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_ENCODING_UNIT,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bUnitID */		\
+	NODE_ID(entity),				/* bUnitID */		\
 	VC_SOURCE_ID(entity),				/* bSourceID */		\
 	0x00,						/* iEncoding */		\
 	0x03,						/* bControlSize */	\
@@ -344,10 +349,10 @@
 
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
-	0x20 + VC_SOURCE_NUM(entity),			/* bLength */		\
+	32x + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(entity),				/* bUnitID */		\
+	NODE_ID(entity),				/* bUnitID */		\
 	U8_GUID(entity),				/* guidExtensionCode */	\
 	VC_NUM_CTRL(entity),				/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
@@ -384,7 +389,7 @@
 
 /* 3.9 VideoStreaming Interface Descriptors */
 #define VS_INTERFACE_DESCRIPTOR(node)						\
-	0x09,						/* bLength */		\
+	9,						/* bLength */		\
 	USB_DESC_INTERFACE,				/* bDescriptorType */	\
 	0x01,						/* bInterfaceNumber */	\
 	0x00,						/* bAlternateSetting */	\
@@ -401,23 +406,22 @@
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD_SEP(node, VS_DESCRIPTOR, ())
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
-	0x0e,						/* bLength */		\
+	14,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_INPUT_HEADER,				/* bDescriptorSubtype */\
 	VS_NUM_FORMATS(node),				/* bNumFormats */	\
 	U16_LE(VS_TOTAL_LENGTH(node)),			/* wTotalLength */	\
 	0x81,						/* bEndpointAddress */	\
 	0x00,						/* bmInfo */		\
-	0x02,	/* TODO lookup the ENTITY_ID */		/* bTerminalLink */	\
+	LOOKUP_ID(node, zephyr_uvc_control_output),	/* bTerminalLink */	\
 	0x00,						/* bStillCaptureMethod */\
 	0x00,						/* bTriggerSupport */	\
 	0x00,						/* bTriggerUsage */	\
-	0x01,						/* bControlSize */	\
-	0x00,						/* bmaControls */
+	0x00,						/* bControlSize */	\
 
 /* 3.10 VideoStreaming Bulk FullSpeed Endpoint Descriptors */
 #define VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
-	0x08,						/* bLength */		\
+	7,						/* bLength */		\
 	USB_DESC_ENDPOINT,				/* bDescriptorType */	\
 	0x81,						/* bEndpointAddress */	\
 	USB_EP_TYPE_BULK,				/* bmAttributes */	\
@@ -426,7 +430,7 @@
 
 /* 3.10 VideoStreaming Bulk HighSpeed Endpoint Descriptors */
 #define VS_HIGHSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
-	0x08,						/* bLength */		\
+	7,						/* bLength */		\
 	USB_DESC_ENDPOINT,				/* bDescriptorType */	\
 	0x81,						/* bEndpointAddress */	\
 	USB_EP_TYPE_BULK,				/* bmAttributes */	\
@@ -435,7 +439,7 @@
 
 /* 3.10 VideoStreaming Bulk SuperSpeed Endpoint Descriptors */
 #define VS_SUPERSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
-	0x08,						/* bLength */		\
+	7,						/* bLength */		\
 	USB_DESC_ENDPOINT,				/* bDescriptorType */	\
 	0x81,						/* bEndpointAddress */	\
 	USB_EP_TYPE_BULK,				/* bmAttributes */	\
@@ -444,7 +448,7 @@
 
 /* 3.10 VideoStreaming Bulk SuperSpeed Endpoint Companion Descriptors */
 #define VS_SUPERSPEED_BULK_ENDPOINT_COMPANION_DESCRIPTOR(node)			\
-	0x06,						/* bLength */		\
+	6,						/* bLength */		\
 	USB_DESC_ENDPOINT_COMPANION,			/* bDescriptorType */	\
 	0x00,						/* bMaxBurst */		\
 	0x00,						/* bmAttributes */	\
@@ -454,10 +458,10 @@
 
 /* 3.1.1 Uncompressed Video Format Descriptor */
 #define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)				\
-	0x1b,						/* bLength */		\
+	27,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(format),				/* bFormatIndex */	\
+	NODE_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	U8_GUID(format),				/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
@@ -469,10 +473,10 @@
 
 /* 3.2.1 Uncompressed Video Frame Descriptors (discrete) */
 #define VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)					\
-	0x25,						/* bLength */		\
+	26 + 4,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(frame),				/* bFrameIndex */	\
+	NODE_ID(frame),					/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
 	U16_LE(DT_PROP_BY_IDX(frame, size, 0)),		/* wWidth */		\
 	U16_LE(DT_PROP_BY_IDX(frame, size, 1)),		/* wHeight */		\
@@ -487,10 +491,10 @@
 
 /* 3.1.1 Motion-JPEG Video Format Descriptor */
 #define VS_MJPEG_FORMAT_DESCRIPTOR(format)					\
-	0x0b,						/* bLength */		\
+	11,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_MJPEG,				/* bDescriptorSubtype */\
-	VC_ENTITY_ID(format),				/* bFormatIndex */	\
+	NODE_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	BIT(0),						/* bmFlags */		\
 	0x01,						/* bDefaultFrameIndex */\
@@ -501,10 +505,10 @@
 
 /* 3.2.1 Motion-JPEG Video Frame Descriptors (discrete) */
 #define VS_MJPEG_FRAME_DESCRIPTOR(frame)					\
-	0x1d,						/* bLength */		\
+	29,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_MJPEG,					/* bDescriptorSubtype */\
-	VC_ENTITY_ID(frame),				/* bFrameIndex */	\
+	NODE_ID(frame),					/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
 	U16_LE(DT_PROP_BY_IDX(frame, size, 0)),		/* wWidth */		\
 	U16_LE(DT_PROP_BY_IDX(frame, size, 1)),		/* wHeight */		\
