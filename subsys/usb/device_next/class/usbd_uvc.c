@@ -15,6 +15,7 @@
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/drivers/video.h>
+#include <zephyr/dt-bindings/usb/video.h>
 #include <zephyr/logging/log.h>
 
 #include "usbd_uvc_macros.h"
@@ -41,8 +42,10 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define UVC_GET_RES_ALL				0x94
 #define UVC_GET_DEF_ALL				0x97
 
+struct uvc_data;
+
 /* Video Probe and Commit Controls */
-struct uvc_vs_probe_control {
+struct uvc_probe {
 	uint16_t bmHint;
 	uint8_t bFormatIndex;
 	uint8_t bFrameIndex;
@@ -70,24 +73,6 @@ struct uvc_vs_probe_control {
 	uint64_t bmLayoutPerStream;
 } __packed;
 
-/* Video Control Interface Status Packet Format */
-struct uvc_control_status_packet {
-	uint8_t bStatusType;
-	uint8_t bOriginator;
-	uint8_t bEvent;
-	uint8_t bSelector;
-	uint8_t bAttribute;
-	uint8_t bValue;
-} __packed;
-
-/* Video Streaming Interface Status Packet Format */
-struct uvc_stream_status_packet {
-	uint8_t bStatusType;
-	uint8_t bOriginator;
-	uint8_t bEvent;
-	uint8_t bValue;
-} __packed;
-
 /* Video and Still Image Payload Headers */
 struct uvc_payload_header {
 	uint8_t bHeaderLength;
@@ -97,12 +82,19 @@ struct uvc_payload_header {
 	uint16_t scrSourceClockSOF;	/* optional */
 } __packed;
 
+/* Lookup table between the format and frame index, and the video caps */
 struct uvc_format {
-	/* USB-side data from the descriptor */
 	uint8_t bFormatIndex;
 	uint8_t bFrameIndex;
 	uint8_t bits_per_pixel;
 	uint32_t frame_interval;	/* see #72254 */
+};
+
+/* Lookup table between the interface ID and the control function */
+struct uvc_control {
+	uint8_t entity_id;
+	int (*fn)(struct uvc_data *const, const struct usb_setup_packet *const,
+		  struct net_buf *const);
 };
 
 struct uvc_data {
@@ -112,10 +104,12 @@ struct uvc_data {
 	atomic_t state;
 	/* UVC worker to process the queue */
 	struct k_work work;
-	/* UVC and Video format and lookup tables */
+	/* UVC format lookup tables */
 	int format_id;
 	const struct video_format_cap *caps;
 	const struct uvc_format *formats;
+	/* UVC control lookup table */
+	const struct uvc_control *controls;
 	/* UVC Descriptors */
 	struct usb_desc_header *const *fs_desc;
 	struct usb_desc_header *const *hs_desc;
@@ -130,7 +124,7 @@ struct uvc_data {
 	uint8_t *hs_desc_ep_epaddr;
 	uint8_t *ss_desc_ep_epaddr;
 	/* UVC probe-commit control default values */
-	struct uvc_vs_probe_control default_probe;
+	struct uvc_probe default_probe;
 	/* UVC payload header, passed just before the image data */
 	struct uvc_payload_header payload_header;
 	/* Video device controlled by the host via UVC */
@@ -165,8 +159,8 @@ static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 		return *data->ss_desc_ep_epaddr;
 	default:
 		__ASSERT_NO_MSG(false);
-		return 0;
 	}
+	return 0;
 }
 
 static uint32_t uvc_get_max_frame_size(struct uvc_data *data, int id)
@@ -177,8 +171,8 @@ static uint32_t uvc_get_max_frame_size(struct uvc_data *data, int id)
 	return cap->width_max * cap->height_max * ufmt->bits_per_pixel / 8;
 }
 
-static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest,
-				   struct uvc_vs_probe_control *probe)
+static int uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest,
+				   struct uvc_probe *probe)
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
@@ -201,21 +195,22 @@ static void uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest
 		break;
 	case UVC_SET_CUR:
 		if (probe->bFormatIndex == 0) {
-			return;
+			return 0;
 		}
 		for (size_t i = 0; data->formats[i].bFormatIndex; i++) {
 			if (data->formats[i].bFormatIndex == probe->bFormatIndex) {
 				data->format_id = i;
-				return;
+				return 0;
 			}
 		}
 		LOG_WRN("probe: format index not found");
-		errno = EINVAL;
+		return -EINVAL;
 	}
+	return 0;
 }
 
-static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
-				  struct uvc_vs_probe_control *probe)
+static int uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
+				  struct uvc_probe *probe)
 {
 	const struct uvc_format *cur = &data->formats[data->format_id];
 
@@ -244,7 +239,7 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 		break;
 	case UVC_SET_CUR:
 		if (probe->bFrameIndex == 0) {
-			return;
+			return 0;
 		}
 		for (size_t i = 0; data->formats[i].bFormatIndex; i++) {
 			const struct uvc_format *fmt = &data->formats[i];
@@ -256,16 +251,17 @@ static void uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 			if (fmt->bFormatIndex == cur->bFormatIndex &&
 			    fmt->bFrameIndex == probe->bFrameIndex) {
 				data->format_id = i;
-				return;
+				return 0;
 			}
 		}
 		LOG_WRN("probe: frame index not found");
-		errno = EINVAL;
+		return -EINVAL;
 	}
+	return 0;
 }
 
-static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bRequest,
-				     struct uvc_vs_probe_control *probe)
+static int uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bRequest,
+				     struct uvc_probe *probe)
 {
 	uint32_t frmival = data->formats[data->format_id].frame_interval;
 
@@ -282,41 +278,47 @@ static void uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReque
 		/* TODO call the frame interval API on the video source once supported */
 		break;
 	}
+	return 0;
 }
 
-static void uvc_probe_key_frame_rate(struct uvc_data *const data, uint8_t bRequest,
-				     struct uvc_vs_probe_control *probe)
+static int uvc_probe_key_frame_rate(struct uvc_data *const data, uint8_t bRequest,
+				     struct uvc_probe *probe)
 {
 	probe->wKeyFrameRate = sys_cpu_to_le16(0);
+	return 0;
 }
 
-static void uvc_probe_p_frame_rate(struct uvc_data *const data, uint8_t bRequest,
-				   struct uvc_vs_probe_control *probe)
+static int uvc_probe_p_frame_rate(struct uvc_data *const data, uint8_t bRequest,
+				   struct uvc_probe *probe)
 {
 	probe->wPFrameRate = sys_cpu_to_le16(0);
+	return 0;
 }
 
-static void uvc_probe_comp_quality(struct uvc_data *const data, uint8_t bRequest,
-				   struct uvc_vs_probe_control *probe)
+static int uvc_probe_comp_quality(struct uvc_data *const data, uint8_t bRequest,
+				   struct uvc_probe *probe)
 {
 	probe->wCompQuality = sys_cpu_to_le16(0);
+	return 0;
 }
 
-static void uvc_probe_comp_window_size(struct uvc_data *const data, uint8_t bRequest,
-				       struct uvc_vs_probe_control *probe)
+static int uvc_probe_comp_window_size(struct uvc_data *const data, uint8_t bRequest,
+				       struct uvc_probe *probe)
 {
 	probe->wCompWindowSize = sys_cpu_to_le16(0);
+	return 0;
 }
 
-static void uvc_probe_delay(struct uvc_data *const data, uint8_t bRequest,
-			    struct uvc_vs_probe_control *probe)
+static int uvc_probe_delay(struct uvc_data *const data, uint8_t bRequest,
+			    struct uvc_probe *probe)
 {
 	/* TODO devicetree */
 	probe->wDelay = sys_cpu_to_le16(1);
+	return 0;
 }
 
-static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t bRequest,
-					   struct uvc_vs_probe_control *probe)
+static int uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t bRequest,
+					   struct uvc_probe *probe)
 {
 	uint32_t max_frame_size = uvc_get_max_frame_size(data, data->format_id);
 
@@ -336,10 +338,11 @@ static void uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t 
 		}
 		break;
 	}
+	return 0;
 }
 
-static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest,
-				       struct uvc_vs_probe_control *probe)
+static int uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest,
+				       struct uvc_probe *probe)
 {
 	uint32_t max_payload_size = uvc_get_max_frame_size(data, data->format_id) +
 		 CONFIG_USBD_VIDEO_HEADER_SIZE;
@@ -360,10 +363,11 @@ static void uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bReq
 		}
 		break;
 	}
+	return 0;
 }
 
-static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequest,
-				      struct uvc_vs_probe_control *probe)
+static int uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequest,
+				      struct uvc_probe *probe)
 {
 	switch (bRequest) {
 	case UVC_GET_MIN:
@@ -378,71 +382,82 @@ static void uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequ
 		}
 		break;
 	}
+	return 0;
 }
 
-static void uvc_probe_framing_info(struct uvc_data *const data, uint8_t bRequest,
-				   struct uvc_vs_probe_control *probe)
+static int uvc_probe_framing_info(struct uvc_data *const data, uint8_t bRequest,
+				   struct uvc_probe *probe)
 {
 	/* Include Frame ID and EOF fields in the payload header */
 	probe->bmFramingInfo = BIT(0) | BIT(1);
+	return 0;
 }
 
-static void uvc_probe_prefered_version(struct uvc_data *const data, uint8_t bRequest,
-				       struct uvc_vs_probe_control *probe)
+static int uvc_probe_prefered_version(struct uvc_data *const data, uint8_t bRequest,
+				       struct uvc_probe *probe)
 {
 	probe->bPreferedVersion = 1;
+	return 0;
 }
 
-static void uvc_probe_min_version(struct uvc_data *const data, uint8_t bRequest,
-				  struct uvc_vs_probe_control *probe)
+static int uvc_probe_min_version(struct uvc_data *const data, uint8_t bRequest,
+				  struct uvc_probe *probe)
 {
 	probe->bMinVersion = 1;
+	return 0;
 }
 
-static void uvc_probe_max_version(struct uvc_data *const data, uint8_t bRequest,
-				  struct uvc_vs_probe_control *probe)
+static int uvc_probe_max_version(struct uvc_data *const data, uint8_t bRequest,
+				  struct uvc_probe *probe)
 {
 	probe->bMaxVersion = 1;
+	return 0;
 }
 
-static void uvc_probe_usage(struct uvc_data *const data, uint8_t bRequest,
-			    struct uvc_vs_probe_control *probe)
+static int uvc_probe_usage(struct uvc_data *const data, uint8_t bRequest,
+			    struct uvc_probe *probe)
 {
 	probe->bUsage = 0;
+	return 0;
 }
 
-static void uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bRequest,
-				     struct uvc_vs_probe_control *probe)
+static int uvc_probe_bit_depth_luma(struct uvc_data *const data, uint8_t bRequest,
+				     struct uvc_probe *probe)
 {
 	/* Bit depth of color/chroma/luma channel, ignored as absent from the Video API. */
 	probe->bBitDepthLuma = 0;
+	return 0;
 }
 
-static void uvc_probe_settings(struct uvc_data *const data, uint8_t bRequest,
-			       struct uvc_vs_probe_control *probe)
+static int uvc_probe_settings(struct uvc_data *const data, uint8_t bRequest,
+			       struct uvc_probe *probe)
 {
 	probe->bmSettings = 0;
+	return 0;
 }
 
-static void uvc_probe_max_ref_frames(struct uvc_data *const data, uint8_t bRequest,
-				     struct uvc_vs_probe_control *probe)
+static int uvc_probe_max_ref_frames(struct uvc_data *const data, uint8_t bRequest,
+				     struct uvc_probe *probe)
 {
 	probe->bMaxNumberOfRefFramesPlus1 = 1;
+	return 0;
 }
 
-static void uvc_probe_rate_control_modes(struct uvc_data *const data, uint8_t bRequest,
-					 struct uvc_vs_probe_control *probe)
+static int uvc_probe_rate_control_modes(struct uvc_data *const data, uint8_t bRequest,
+					 struct uvc_probe *probe)
 {
 	probe->bmRateControlModes = 0;
+	return 0;
 }
 
-static void uvc_probe_layout_per_stream(struct uvc_data *const data, uint8_t bRequest,
-					struct uvc_vs_probe_control *probe)
+static int uvc_probe_layout_per_stream(struct uvc_data *const data, uint8_t bRequest,
+					struct uvc_probe *probe)
 {
 	probe->bmLayoutPerStream = 0;
+	return 0;
 }
 
-static void uvc_probe_dump(char const *name, const struct uvc_vs_probe_control *probe)
+static void uvc_probe_dump(char const *name, const struct uvc_probe *probe)
 {
 	LOG_DBG("probe: UVC_%s", name);
 	LOG_DBG("probe: - bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
@@ -471,8 +486,10 @@ static void uvc_probe_dump(char const *name, const struct uvc_vs_probe_control *
 }
 
 static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
-		     struct uvc_vs_probe_control *probe)
+		     struct uvc_probe *probe)
 {
+	int err;
+
 	LOG_DBG("UVC control: probe");
 
 	switch (bRequest) {
@@ -481,52 +498,55 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 		break;
 	case UVC_SET_CUR:
 		uvc_probe_dump("SET_CUR", probe);
-		goto action;
+		break;
 	case UVC_GET_CUR:
 		uvc_probe_dump("GET_CUR", probe);
-		goto action;
+		break;
 	case UVC_GET_MIN:
 		uvc_probe_dump("GET_MIN", probe);
-		goto action;
+		break;
 	case UVC_GET_MAX:
 		uvc_probe_dump("GET_MAX", probe);
-		goto action;
+		break;
 	case UVC_GET_RES:
 		uvc_probe_dump("SET_RES", probe);
-		goto action;
-	action:
-		/* TODO use bmHint to choose in which order configure the fields */
-		uvc_probe_format_index(data, bRequest, probe);
-		uvc_probe_frame_index(data, bRequest, probe);
-		uvc_probe_frame_interval(data, bRequest, probe);
-		uvc_probe_key_frame_rate(data, bRequest, probe);
-		uvc_probe_p_frame_rate(data, bRequest, probe);
-		uvc_probe_comp_quality(data, bRequest, probe);
-		uvc_probe_comp_window_size(data, bRequest, probe);
-		uvc_probe_delay(data, bRequest, probe);
-		uvc_probe_max_video_frame_size(data, bRequest, probe);
-		uvc_probe_max_payload_size(data, bRequest, probe);
-		uvc_probe_clock_frequency(data, bRequest, probe);
-		uvc_probe_framing_info(data, bRequest, probe);
-		uvc_probe_prefered_version(data, bRequest, probe);
-		uvc_probe_min_version(data, bRequest, probe);
-		uvc_probe_max_version(data, bRequest, probe);
-		uvc_probe_usage(data, bRequest, probe);
-		uvc_probe_bit_depth_luma(data, bRequest, probe);
-		uvc_probe_settings(data, bRequest, probe);
-		uvc_probe_max_ref_frames(data, bRequest, probe);
-		uvc_probe_rate_control_modes(data, bRequest, probe);
-		uvc_probe_layout_per_stream(data, bRequest, probe);
 		break;
 	default:
 		__ASSERT_NO_MSG(false);
+	}
+
+	/* TODO use bmHint to choose in which order configure the fields */
+	if ((err = uvc_probe_format_index(data, bRequest, probe)) ||
+	    (err = uvc_probe_frame_index(data, bRequest, probe)) ||
+	    (err = uvc_probe_frame_interval(data, bRequest, probe)) ||
+	    (err = uvc_probe_key_frame_rate(data, bRequest, probe)) ||
+	    (err = uvc_probe_p_frame_rate(data, bRequest, probe)) ||
+	    (err = uvc_probe_comp_quality(data, bRequest, probe)) ||
+	    (err = uvc_probe_comp_window_size(data, bRequest, probe)) ||
+	    (err = uvc_probe_delay(data, bRequest, probe)) ||
+	    (err = uvc_probe_max_video_frame_size(data, bRequest, probe)) ||
+	    (err = uvc_probe_max_payload_size(data, bRequest, probe)) ||
+	    (err = uvc_probe_clock_frequency(data, bRequest, probe)) ||
+	    (err = uvc_probe_framing_info(data, bRequest, probe)) ||
+	    (err = uvc_probe_prefered_version(data, bRequest, probe)) ||
+	    (err = uvc_probe_min_version(data, bRequest, probe)) ||
+	    (err = uvc_probe_max_version(data, bRequest, probe)) ||
+	    (err = uvc_probe_usage(data, bRequest, probe)) ||
+	    (err = uvc_probe_bit_depth_luma(data, bRequest, probe)) ||
+	    (err = uvc_probe_settings(data, bRequest, probe)) ||
+	    (err = uvc_probe_max_ref_frames(data, bRequest, probe)) ||
+	    (err = uvc_probe_rate_control_modes(data, bRequest, probe)) ||
+	    (err = uvc_probe_layout_per_stream(data, bRequest, probe))) {
+		return err;
 	}
 	return 0;
 }
 
 static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
-		      struct uvc_vs_probe_control *probe)
+		      struct uvc_probe *probe)
 {
+	int err;
+
 	switch (bRequest) {
 	case UVC_GET_CUR:
 		uvc_probe(data, bRequest, probe);
@@ -539,25 +559,25 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 			const struct device *dev = usbd_class_get_private(data->c_data);
 			struct video_format fmt = {0};
 
-			errno = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
-			if (errno) {
+			err = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
+			if (err) {
 				LOG_ERR("Failed to inquire the current UVC format");
-				return 0;
+				return err;
 			}
 
 			LOG_DBG("Setting UVC format to %ux%u of the video source and starting it",
 				fmt.width, fmt.height);
 
-			errno = video_set_format(data->source_dev, VIDEO_EP_OUT, &fmt);
-			if (errno) {
+			err = video_set_format(data->source_dev, VIDEO_EP_OUT, &fmt);
+			if (err) {
 				LOG_ERR("Could not set the format of the video source");
-				return 0;
+				return err;
 			}
 
-			errno = video_stream_start(data->source_dev);
-			if (errno) {
+			err = video_stream_start(data->source_dev);
+			if (err) {
 				LOG_ERR("Could not start the video source");
-				return 0;
+				return err;
 			}
 		}
 
@@ -567,17 +587,99 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 		break;
 	default:
 		LOG_WRN("commit: invalid bRequest (%u)", bRequest);
-		errno = EINVAL;
-		return 0;
+		return -EINVAL;
 	}
 	return 0;
 }
 
-static int uvc_probe_or_commit(struct uvc_data *const data,
-			       const struct usb_setup_packet *const setup,
-			       struct net_buf *const buf)
+static int zephyr_uvc_control_output(struct uvc_data *const data,
+				     const struct usb_setup_packet *const setup,
+				     struct net_buf *const buf)
 {
-	struct uvc_vs_probe_control probe = {0};
+	LOG_INF("no control supported for the output");
+	return 0;
+}
+
+static int zephyr_uvc_control_camera(struct uvc_data *const data,
+				     const struct usb_setup_packet *const setup,
+				     struct net_buf *const buf)
+{
+	uint8_t control_selector = setup->wValue >> 8;
+
+	switch (control_selector) {
+	case UVC_CONTROL_CAMERA_UNDEFINED:
+		LOG_INF("UVC_CONTROL_CAMERA_UNDEFINED");
+		break;
+	case UVC_CONTROL_CAMERA_SCANNING_MODE:
+		LOG_INF("UVC_CONTROL_CAMERA_SCANNING_MODE");
+		break;
+	case UVC_CONTROL_CAMERA_AE_MODE:
+		LOG_INF("UVC_CONTROL_CAMERA_AE_MODE");
+		break;
+	case UVC_CONTROL_CAMERA_AE_PRIORITY:
+		LOG_INF("UVC_CONTROL_CAMERA_AE_PRIORITY");
+		break;
+	case UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_EXPOSURE_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_EXPOSURE_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_FOCUS_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_FOCUS_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_FOCUS_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_FOCUS_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_FOCUS_AUTO:
+		LOG_INF("UVC_CONTROL_CAMERA_FOCUS_AUTO");
+		break;
+	case UVC_CONTROL_CAMERA_IRIS_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_IRIS_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_IRIS_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_IRIS_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_ZOOM_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_ZOOM_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_PANTILT_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_PANTILT_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_PANTILT_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_PANTILT_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_ROLL_ABSOLUTE:
+		LOG_INF("UVC_CONTROL_CAMERA_ROLL_ABSOLUTE");
+		break;
+	case UVC_CONTROL_CAMERA_ROLL_RELATIVE:
+		LOG_INF("UVC_CONTROL_CAMERA_ROLL_RELATIVE");
+		break;
+	case UVC_CONTROL_CAMERA_PRIVACY:
+		LOG_INF("UVC_CONTROL_CAMERA_PRIVACY");
+		break;
+	case UVC_CONTROL_CAMERA_FOCUS_SIMPLE:
+		LOG_INF("UVC_CONTROL_CAMERA_FOCUS_SIMPLE");
+		break;
+	case UVC_CONTROL_CAMERA_WINDOW:
+		LOG_INF("UVC_CONTROL_CAMERA_WINDOW");
+		break;
+	case UVC_CONTROL_CAMERA_REGION_OF_INTEREST:
+		LOG_INF("UVC_CONTROL_CAMERA_REGION_OF_INTEREST");
+		break;
+	}
+	return 0;
+}
+
+static int uvc_control_format(struct uvc_data *const data,
+			      const struct usb_setup_packet *const setup,
+			      struct net_buf *const buf)
+{
+	struct uvc_probe probe = {0};
+	uint8_t control_selector = setup->wValue >> 8;
 
 	switch (setup->bRequest) {
 	case UVC_GET_LEN:
@@ -594,8 +696,7 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 	case UVC_GET_CUR:
 		if (buf->size != sizeof(probe)) {
 			LOG_WRN("probe: invalid size %u, wanted %u", buf->size, sizeof(probe));
-			errno = EINVAL;
-			return 0;
+			return -EINVAL;
 		}
 		if (net_buf_add(buf, sizeof(probe)) == NULL) {
 			return -ENOMEM;
@@ -604,30 +705,28 @@ static int uvc_probe_or_commit(struct uvc_data *const data,
 	case UVC_SET_CUR:
 		if (buf->len != sizeof(probe)) {
 			LOG_WRN("probe: invalid size %u, wanted %u", buf->len, sizeof(probe));
-			errno = EINVAL;
-			return 0;
+			return -EINVAL;
 		}
 		break;
 	default:
 		LOG_WRN("probe: invalid bRequest (%u) for Probe or Commit", setup->bRequest);
-		errno = EINVAL;
-		return 0;
+		return -EINVAL;
 	}
 
-	/* All remaining request work on a struct uvc_vs_probe_control */
+	/* All remaining request work on a (struct uvc_probe) */
 	if (setup->wLength != sizeof(probe)) {
 		LOG_WRN("probe: invalid wLength %u, wanted %u", setup->wLength, sizeof(probe));
-		errno = EINVAL;
-		return 0;
+		return -EINVAL;
 	}
 
-	switch (setup->wValue >> 8) {
-	case VS_PROBE_CONTROL:
+	switch (control_selector) {
+	case UVC_CONTROL_FORMAT_PROBE:
 		return uvc_probe(data, setup->bRequest, (void *)buf->data);
-	case VS_COMMIT_CONTROL:
+	case UVC_CONTROL_FORMAT_COMMIT:
 		return uvc_commit(data, setup->bRequest, (void *)buf->data);
 	default:
-		__ASSERT_NO_MSG(false);
+		LOG_WRN("control: unknown control selector %u", control_selector);
+		return -EINVAL;
 	}
 }
 
@@ -636,30 +735,39 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	uint8_t interface = (setup->wIndex >> 8) & 0xff;
+	uint8_t entity_id = (setup->wIndex >> 0) & 0xff;
 
-	switch (setup->wValue >> 8) {
-	case VS_PROBE_CONTROL:
-	case VS_COMMIT_CONTROL:
-		return uvc_probe_or_commit(data, setup, buf);
-	default:
-		LOG_WRN("api: control: unsupported wValue (%u)", setup->wValue);
-		errno = ENOTSUP;
-		return 0;
+	if (interface == *data->desc_if_vs_ifnum) {
+		return uvc_control_format(data, setup, buf);
 	}
+
+	if (interface == *data->desc_if_vc_ifnum) {
+		for (const struct uvc_control *p = data->controls; p->entity_id != 0; p++) {
+			if (p->entity_id == entity_id) {
+				return p->fn(data, setup, buf);
+			}
+		}
+	}
+
+	LOG_WRN("control: no controls found for interface %u", interface);
+	return -EINVAL;
 }
 
 static int uvc_control_to_host(struct usbd_class_data *const c_data,
 			       const struct usb_setup_packet *const setup,
 			       struct net_buf *const buf)
 {
-	return uvc_control(c_data, setup, buf);
+	errno = uvc_control(c_data, setup, buf);
+	return 0;
 }
 
 static int uvc_control_to_dev(struct usbd_class_data *const c_data,
 			      const struct usb_setup_packet *const setup,
 			      const struct net_buf *const buf)
 {
-	return uvc_control(c_data, setup, (struct net_buf *const)buf);
+	errno = uvc_control(c_data, setup, (struct net_buf *const)buf);
+	return 0;
 }
 
 static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf, int err)
@@ -907,12 +1015,10 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 	}
 
 	memset(fmt, 0, sizeof(*fmt));
-
 	fmt->pixelformat = cap->pixelformat;
 	fmt->width = cap->width_max;
 	fmt->height = cap->height_max;
 	fmt->pitch = fmt->width * ufmt->bits_per_pixel / 8;
-
 	return 0;
 }
 
@@ -934,7 +1040,6 @@ static int uvc_get_caps(const struct device *dev, enum video_endpoint_id ep,
 	struct uvc_data *data = dev->data;
 
 	caps->format_caps = data->caps;
-
 	return 0;
 }
 
@@ -954,7 +1059,6 @@ static int uvc_preinit(const struct device *dev)
 	k_fifo_init(&data->fifo_in);
 	k_fifo_init(&data->fifo_out);
 	k_work_init(&data->work, &uvc_worker);
-
 	return 0;
 }
 
@@ -990,6 +1094,12 @@ static int uvc_preinit(const struct device *dev)
 		DT_FOREACH_CHILD_VARGS(format, UVC_FORMAT_ENTRY, format)	\
 	))
 
+#define UVC_CONTROL(node)							\
+	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(node)), ({				\
+		.entity_id = NODE_ID(node),					\
+		.fn = DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
+	},))
+
 #define UVC_DEVICE_DEFINE(node)							\
 										\
 	UVC_DESCRIPTOR_ARRAYS(node)						\
@@ -1011,6 +1121,11 @@ static int uvc_preinit(const struct device *dev)
 		{0}								\
 	};									\
 										\
+	static const struct uvc_control node##_controls[] = {			\
+		DT_FOREACH_CHILD(node, UVC_CONTROL)				\
+		{0}								\
+	};									\
+										\
 	static const struct uvc_format node##_formats[] = {			\
 		DT_FOREACH_CHILD(node, UVC_FORMATS)				\
 		{0}								\
@@ -1023,6 +1138,7 @@ static int uvc_preinit(const struct device *dev)
 		.c_data = &node##_c_data,					\
 		.caps = node##_caps,						\
 		.formats = node##_formats,					\
+		.controls = node##_controls,					\
 		.format_id = 0,							\
 		.fs_desc = node##_fs_desc,					\
 		.hs_desc = node##_hs_desc,					\

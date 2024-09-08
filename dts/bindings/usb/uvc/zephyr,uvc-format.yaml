@@ -3,6 +3,8 @@
 
 # USB Video Class format common properties.
 
+include: base.yaml
+
 properties:
   fourcc:
     type: string

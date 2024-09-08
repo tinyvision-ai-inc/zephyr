@@ -83,96 +83,6 @@
 #define VC_VIDEO_POWER_MODE_CONTROL		0x01
 #define VC_REQUEST_ERROR_CODE_CONTROL		0x02
 
-/* Terminal Control Selectors */
-#define TE_CONTROL_UNDEFINED			0x00
-
-/* Selector Unit Control Selectors */
-#define SU_CONTROL_UNDEFINED			0x00
-#define SU_INPUT_SELECT_CONTROL			0x01
-
-/* Camera Terminal Control Selectors */
-#define CT_CONTROL_UNDEFINED			0x00
-#define CT_SCANNING_MODE_CONTROL		0x01
-#define CT_AE_MODE_CONTROL			0x02
-#define CT_AE_PRIORITY_CONTROL			0x03
-#define CT_EXPOSURE_TIME_ABSOLUTE_CONTROL	0x04
-#define CT_EXPOSURE_TIME_RELATIVE_CONTROL	0x05
-#define CT_FOCUS_ABSOLUTE_CONTROL		0x06
-#define CT_FOCUS_RELATIVE_CONTROL		0x07
-#define CT_FOCUS_AUTO_CONTROL			0x08
-#define CT_IRIS_ABSOLUTE_CONTROL		0x09
-#define CT_IRIS_RELATIVE_CONTROL		0x0A
-#define CT_ZOOM_ABSOLUTE_CONTROL		0x0B
-#define CT_ZOOM_RELATIVE_CONTROL		0x0C
-#define CT_PANTILT_ABSOLUTE_CONTROL		0x0D
-#define CT_PANTILT_RELATIVE_CONTROL		0x0E
-#define CT_ROLL_ABSOLUTE_CONTROL		0x0F
-#define CT_ROLL_RELATIVE_CONTROL		0x10
-#define CT_PRIVACY_CONTROL			0x11
-#define CT_FOCUS_SIMPLE_CONTROL			0x12
-#define CT_WINDOW_CONTROL			0x13
-#define CT_REGION_OF_INTEREST_CONTROL		0x14
-
-/* Processing Unit Control Selectors */
-#define PU_CONTROL_UNDEFINED			0x00
-#define PU_BACKLIGHT_COMPENSATION_CONTROL	0x01
-#define PU_BRIGHTNESS_CONTROL			0x02
-#define PU_CONTRAST_CONTROL			0x03
-#define PU_GAIN_CONTROL				0x04
-#define PU_POWER_LINE_FREQUENCY_CONTROL		0x05
-#define PU_HUE_CONTROL				0x06
-#define PU_SATURATION_CONTROL			0x07
-#define PU_SHARPNESS_CONTROL			0x08
-#define PU_GAMMA_CONTROL			0x09
-#define PU_WHITE_BALANCE_TEMPERATURE_CONTROL 	0x0A
-#define PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL 0x0B
-#define PU_WHITE_BALANCE_COMPONENT_CONTROL	0x0C
-#define PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL	0x0D
-#define PU_DIGITAL_MULTIPLIER_CONTROL		0x0E
-#define PU_DIGITAL_MULTIPLIER_LIMIT_CONTROL	0x0F
-#define PU_HUE_AUTO_CONTROL			0x10
-#define PU_ANALOG_VIDEO_STANDARD_CONTROL	0x11
-#define PU_ANALOG_LOCK_STATUS_CONTROL		0x12
-#define PU_CONTRAST_AUTO_CONTROL		0x13
-
-/* Encoding Unit Control Selectors */
-#define EU_CONTROL_UNDEFINED			0x00
-#define EU_SELECT_LAYER_CONTROL			0x01
-#define EU_PROFILE_TOOLSET_CONTROL		0x02
-#define EU_VIDEO_RESOLUTION_CONTROL		0x03
-#define EU_MIN_FRAME_INTERVAL_CONTROL		0x04
-#define EU_SLICE_MODE_CONTROL			0x05
-#define EU_RATE_CONTROL_MODE_CONTROL		0x06
-#define EU_AVERAGE_BITRATE_CONTROL		0x07
-#define EU_CPB_SIZE_CONTROL			0x08
-#define EU_PEAK_BIT_RATE_CONTROL		0x09
-#define EU_QUANTIZATION_PARAMS_CONTROL		0x0A
-#define EU_SYNC_REF_FRAME_CONTROL		0x0B
-#define EU_LTR_BUFFER_				0x0C
-#define EU_LTR_PICTURE_CONTROL			0x0D
-#define EU_LTR_VALIDATION_CONTROL		0x0E
-#define EU_LEVEL_IDC_LIMIT_CONTROL		0x0F
-#define EU_SEI_PAYLOADTYPE_CONTROL		0x10
-#define EU_QP_RANGE_CONTROL			0x11
-#define EU_PRIORITY_CONTROL			0x12
-#define EU_START_OR_STOP_LAYER_CONTROL		0x13
-#define EU_ERROR_RESILIENCY_CONTROL		0x14
-
-/* Extension Unit Control Selectors */
-#define XU_CONTROL_UNDEFINED			0x00
-
-/* VideoStreaming Interface Control Selectors */
-#define VS_CONTROL_UNDEFINED			0x00
-#define VS_PROBE_CONTROL			0x01
-#define VS_COMMIT_CONTROL			0x02
-#define VS_STILL_PROBE_CONTROL			0x03
-#define VS_STILL_COMMIT_CONTROL			0x04
-#define VS_STILL_IMAGE_TRIGGER_CONTROL		0x05
-#define VS_STREAM_ERROR_CODE_CONTROL		0x06
-#define VS_GENERATE_KEY_FRAME_CONTROL		0x07
-#define VS_UPDATE_FRAME_SEGMENT_CONTROL		0x08
-#define VS_SYNCH_DELAY_CONTROL			0x09
-
 /* USB Terminal Types */
 #define TT_VENDOR_SPECIFIC			0x0100
 #define TT_STREAMING				0x0101
@@ -196,13 +106,15 @@
 /* Descriptors Content */
 
 /* Turn larger types into list of bytes */
-#define U16_LE(value) ((value) & 0xFF), (((value) & 0xFF00) >> 8)
-#define U32_LE(value)								\
-	(((value) & 0xFF) >> 0),						\
-	(((value) & 0xFF00) >> 8),						\
-	(((value) & 0xFF0000) >> 16),						\
-	(((value) & 0xFF000000) >> 24)
-#define U8_GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
+#define U(value, shift) (((value) >> shift) & 0xFF)
+#define U16_LE(n) U(n, 0), U(n, 8)
+#define U24_LE(n) U(n, 0), U(n, 8), U(n, 16)
+#define U32_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24)
+#define U40_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32)
+#define U48_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40)
+#define U56_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48)
+#define U64_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48), U(n, 56)
+#define GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
 
 /* Automatically assign Entity IDs based on entities order in devicetree */
 #define NODE_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
@@ -218,20 +130,9 @@
 #define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source_entity)
 
 /* Convert a list of integers to an (uint64_t) bitmap */
-#define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n))
-#define VC_CONTROLS_U64(entity)							\
+#define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n) - 1)
+#define VC_CONTROLS(entity)							\
 	(DT_FOREACH_PROP_ELEM_SEP(entity, control_ids, VC_CONTROL_BIT, (|)))
-
-/* Split an (uint64_t) into a list of 'n' values each (uint8_t) */
-#define VC_CONTROLS(entity, n)							\
-	IF_ENABLED(n > 0, ((VC_CONTROLS_U64(entity) >> 0x00) & 0xff,))		\
-	IF_ENABLED(n > 1, ((VC_CONTROLS_U64(entity) >> 0x08) & 0xff,))		\
-	IF_ENABLED(n > 2, ((VC_CONTROLS_U64(entity) >> 0x10) & 0xff,))		\
-	IF_ENABLED(n > 3, ((VC_CONTROLS_U64(entity) >> 0x18) & 0xff,))		\
-	IF_ENABLED(n > 4, ((VC_CONTROLS_U64(entity) >> 0x20) & 0xff,))		\
-	IF_ENABLED(n > 5, ((VC_CONTROLS_U64(entity) >> 0x28) & 0xff,))		\
-	IF_ENABLED(n > 6, ((VC_CONTROLS_U64(entity) >> 0x30) & 0xff,))		\
-	IF_ENABLED(n > 7, ((VC_CONTROLS_U64(entity) >> 0x38) & 0xff,))
 
 /* Estimate the frame buffer size out of other fields */
 #define MAX_VIDEO_FRAME_BUFFER_SIZE(frame)					\
@@ -311,7 +212,7 @@
 	U16_LE(0),					/* wObjectiveFocalLengthMax */\
 	U16_LE(0),					/* wOcularFocalLength */\
 	0x03,						/* bControlSize */	\
-	VC_CONTROLS(entity, 3)				/* bmControls */
+	U24_LE(VC_CONTROLS(entity)),			/* bmControls */
 
 /* 3.7.2.4 Selector Unit Descriptor */
 #define VC_SELECTOR_UNIT_DESCRIPTOR(entity)					\
@@ -332,7 +233,7 @@
 	VC_SOURCES_IDS(entity),				/* bSourceID */		\
 	U16_LE(0),					/* wMaxMultiplier */	\
 	0x03,						/* bControlSize */	\
-	VC_CONTROLS(entity, 3)				/* bmControls */	\
+	U24_LE(VC_CONTROLS(entity)),			/* bmControls */	\
 	0x00,						/* iProcessing */	\
 	0x00,						/* bmVideoStandards */
 
@@ -345,7 +246,7 @@
 	VC_SOURCE_ID(entity),				/* bSourceID */		\
 	0x00,						/* iEncoding */		\
 	0x03,						/* bControlSize */	\
-	VC_CONTROLS(entity, 6)				/* bmControls+Runtime */
+	U48_LE(VC_CONTROLS(entity)),			/* bmControls+Runtime */
 
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
@@ -353,12 +254,12 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
-	U8_GUID(entity),				/* guidExtensionCode */	\
+	GUID(entity),					/* guidExtensionCode */	\
 	VC_NUM_CTRL(entity),				/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
 	VC_SOURCE_ID(entity)				/* baSourceID */	\
 	0x08,						/* bControlSize */	\
-	VC_CONTROLS(entity, 8),				/* bmControls */	\
+	U64_LE(VC_CONTROLS(entity)),			/* bmControls */	\
 	0x00,						/* iExtension */
 
 /* Video Control descriptor content of a node according to its type */
@@ -463,7 +364,7 @@
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
 	NODE_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
-	U8_GUID(format),				/* guidFormat */	\
+	GUID(format),					/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
 	0x01,						/* bDefaultFrameIndex */\
 	0x00,						/* bAspectRatioX */	\
@@ -586,7 +487,7 @@
 
 /* Descriptor Pointers */
 
-#define DESCRIPTOR_PTR(node) 							\
+#define DESCRIPTOR_PTR(node)							\
 	((struct usb_desc_header *)&node##_desc),
 
 #define VC_DESCRIPTOR_PTRS(entity)						\

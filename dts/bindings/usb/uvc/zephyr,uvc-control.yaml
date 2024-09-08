@@ -3,6 +3,8 @@
 
 # USB Video Class control common properties.
 
+include: base.yaml
+
 properties:
 
   control-target:

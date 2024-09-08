@@ -5,6 +5,8 @@ description: UVC Output Terminal representing the data going out of the device.
 
 compatible: "zephyr,uvc-control-output"
 
+include: base.yaml
+
 properties:
 
   source-entity:
