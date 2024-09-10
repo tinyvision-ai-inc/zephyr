@@ -434,26 +434,8 @@ static int imx219_set_ctrl(const struct device *dev, unsigned int cid, void *val
 	LOG_INF("cid=0x%08x", cid);
 
 	switch (cid) {
-	case VIDEO_CID_CAMERA_EXPOSURE:
-		LOG_INF("VIDEO_CID_CAMERA_EXPOSURE: %u", u32);
-		break;
-	case VIDEO_CID_CAMERA_ZOOM:
-		LOG_INF("VIDEO_CID_CAMERA_ZOOM: %u", u32);
-		break;
-	case VIDEO_CID_CAMERA_BRIGHTNESS:
-		LOG_INF("VIDEO_CID_CAMERA_BRIGHTNESS: %u", u32);
-		break;
-	case VIDEO_CID_CAMERA_CONTRAST:
-		LOG_INF("VIDEO_CID_CAMERA_CONTRAST: %u", u32);
-		break;
 	case VIDEO_CID_CAMERA_GAIN:
 		LOG_INF("VIDEO_CID_CAMERA_GAIN: %u", u32);
-		break;
-	case VIDEO_CID_CAMERA_SATURATION:
-		LOG_INF("VIDEO_CID_CAMERA_SATURATION: %u", u32);
-		break;
-	case VIDEO_CID_CAMERA_WHITE_BAL:
-		LOG_INF("VIDEO_CID_CAMERA_WHITE_BAL: %u", u32);
 		break;
 	}
 
@@ -465,26 +447,8 @@ static int imx219_get_ctrl(const struct device *dev, unsigned int cid, void *val
 	LOG_INF("cid=0x%08x", cid);
 
 	switch (cid) {
-	case VIDEO_CID_CAMERA_EXPOSURE:
-		LOG_INF("VIDEO_CID_CAMERA_EXPOSURE");
-		break;
-	case VIDEO_CID_CAMERA_ZOOM:
-		LOG_INF("VIDEO_CID_CAMERA_ZOOM");
-		break;
-	case VIDEO_CID_CAMERA_BRIGHTNESS:
-		LOG_INF("VIDEO_CID_CAMERA_BRIGHTNESS");
-		break;
-	case VIDEO_CID_CAMERA_CONTRAST:
-		LOG_INF("VIDEO_CID_CAMERA_CONTRAST");
-		break;
 	case VIDEO_CID_CAMERA_GAIN:
 		LOG_INF("VIDEO_CID_CAMERA_GAIN");
-		break;
-	case VIDEO_CID_CAMERA_SATURATION:
-		LOG_INF("VIDEO_CID_CAMERA_SATURATION");
-		break;
-	case VIDEO_CID_CAMERA_WHITE_BAL:
-		LOG_INF("VIDEO_CID_CAMERA_WHITE_BAL");
 		break;
 	}
 

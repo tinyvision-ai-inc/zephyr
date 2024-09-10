@@ -89,15 +89,15 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define EU_SELECT_LAYER_CONTROL			0x01
 #define EU_PROFILE_TOOLSET_CONTROL		0x02
 #define EU_VIDEO_RESOLUTION_CONTROL		0x03
-#define EU_ MIN_FRAME_INTERVAL_CONTROL		0x04
-#define EU_ SLICE_MODE_CONTROL			0x05
+#define EU_MIN_FRAME_INTERVAL_CONTROL		0x04
+#define EU_SLICE_MODE_CONTROL			0x05
 #define EU_RATE_CONTROL_MODE_CONTROL		0x06
 #define EU_AVERAGE_BITRATE_CONTROL		0x07
 #define EU_CPB_SIZE_CONTROL			0x08
 #define EU_PEAK_BIT_RATE_CONTROL		0x09
 #define EU_QUANTIZATION_PARAMS_CONTROL		0x0A
 #define EU_SYNC_REF_FRAME_CONTROL		0x0B
-#define EU_LTR_BUFFER_ CONTROL			0x0C
+#define EU_LTR_BUFFER_CONTROL			0x0C
 #define EU_LTR_PICTURE_CONTROL			0x0D
 #define EU_LTR_VALIDATION_CONTROL		0x0E
 #define EU_LEVEL_IDC_LIMIT_CONTROL		0x0F
@@ -719,7 +719,7 @@ static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struc
 	case CT_AE_PRIORITY_CONTROL:
 		return uvc_control_fix(setup, buf, 1, 0);
 	case CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_EXPOSURE);
+		return uvc_control_int(setup, buf, 4, dev, VIDEO_CID_CAMERA_EXPOSURE);
 	case CT_ZOOM_ABSOLUTE_CONTROL:
 		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_ZOOM);
 	default:
@@ -831,7 +831,6 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	}
 
 	LOG_DBG("request: transfer done, ep=0x%02x buf=%p", bi.udc.ep, buf);
-
 	return 0;
 }
 
