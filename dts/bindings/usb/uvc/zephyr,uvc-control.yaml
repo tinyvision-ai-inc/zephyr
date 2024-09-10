@@ -10,7 +10,7 @@ properties:
   control-target:
     type: phandle
     description: |
-      Reference to a video device which this control should affect.
+      Reference to a video device which these controls affect.
 
   control-ids:
     type: array

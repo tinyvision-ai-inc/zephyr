@@ -9,6 +9,12 @@ include: base.yaml
 
 properties:
 
+  control-target:
+    type: phandle
+    required: true
+    description: |
+      Device affected by the UVC controls that start and stop the stream.
+
   source-entity:
     type: phandle
     required: true

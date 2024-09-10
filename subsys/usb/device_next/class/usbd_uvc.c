@@ -36,6 +36,10 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define GET_INFO				0x86
 #define GET_DEF					0x87
 
+/* Flags announcing which controls are supported */
+#define INFO_SUPPORTS_GET			BIT(0)
+#define INFO_SUPPORTS_SET			BIT(0)
+
 struct uvc_data;
 
 /* Video Probe and Commit Controls */
@@ -87,7 +91,7 @@ struct uvc_format {
 /* Lookup table between the interface ID and the control function */
 struct uvc_control {
 	uint8_t entity_id;
-	int (*fn)(const struct usb_setup_packet *const, struct net_buf *, const struct device *);
+	int (*fn)(const struct usb_setup_packet *, struct net_buf *, const struct device *);
 	const struct device *target;
 };
 
@@ -142,6 +146,42 @@ NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPA
 static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt);
 
+static int uvc_buf_add(struct net_buf *buf, uint16_t length, uint32_t value)
+{
+	switch (length) {
+	case 4:
+		net_buf_add_le32(buf, value);
+		return 0;
+	case 2:
+		net_buf_add_le16(buf, value);
+		return 0;
+	case 1:
+		net_buf_add_u8(buf, value);
+		return 0;
+	default:
+		LOG_WRN("control: invalid size %u", length);
+		return -ENOTSUP;
+	}
+}
+
+static int uvc_buf_remove(struct net_buf *buf, uint16_t length, uint32_t *value)
+{
+	switch (length) {
+	case 4:
+		*value = net_buf_remove_le32(buf);
+		return 0;
+	case 2:
+		*value = net_buf_remove_le16(buf);
+		return 0;
+	case 1:
+		*value = net_buf_remove_u8(buf);
+		return 0;
+	default:
+		LOG_WRN("control: invalid size %u", length);
+		return -ENOTSUP;
+	}
+}
+
 static uint8_t uvc_get_bulk_in(struct uvc_data *data)
 {
 	switch (usbd_bus_speed(usbd_class_get_ctx(data->c_data))) {
@@ -165,10 +205,10 @@ static uint32_t uvc_get_max_frame_size(struct uvc_data *data, int id)
 	return cap->width_max * cap->height_max * ufmt->bits_per_pixel / 8;
 }
 
-static int uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest,
-				   struct uvc_probe *probe)
+static int uvc_control_probe_format_index(struct uvc_data *data, uint8_t request,
+					  struct uvc_probe *probe)
 {
-	switch (bRequest) {
+	switch (request) {
 	case GET_MIN:
 		probe->bFormatIndex = UINT8_MAX;
 		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
@@ -197,18 +237,18 @@ static int uvc_probe_format_index(struct uvc_data *const data, uint8_t bRequest,
 				return 0;
 			}
 		}
-		LOG_WRN("probe: format index not found");
+		LOG_WRN("probe: format index %u not found", probe->bFormatIndex);
 		return -ENOTSUP;
 	}
 	return 0;
 }
 
-static int uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
-				  struct uvc_probe *probe)
+static int uvc_control_probe_frame_index(struct uvc_data *data, uint8_t request,
+					 struct uvc_probe *probe)
 {
 	const struct uvc_format *cur = &data->formats[data->format_id];
 
-	switch (bRequest) {
+	switch (request) {
 	case GET_MIN:
 		probe->bFrameIndex = UINT8_MAX;
 		for (const struct uvc_format *fmt = data->formats; fmt->bFormatIndex; fmt++) {
@@ -248,18 +288,18 @@ static int uvc_probe_frame_index(struct uvc_data *const data, uint8_t bRequest,
 				return 0;
 			}
 		}
-		LOG_WRN("probe: frame index not found");
+		LOG_WRN("probe: frame index %u not found", probe->bFrameIndex);
 		return -ENOTSUP;
 	}
 	return 0;
 }
 
-static int uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bRequest,
-				     struct uvc_probe *probe)
+static int uvc_control_probe_frame_interval(struct uvc_data *data, uint8_t request,
+					    struct uvc_probe *probe)
 {
 	uint32_t frmival = data->formats[data->format_id].frame_interval;
 
-	switch (bRequest) {
+	switch (request) {
 	case GET_MIN:
 	case GET_MAX:
 		/* TODO call the frame interval API on the video source once supported */
@@ -275,12 +315,12 @@ static int uvc_probe_frame_interval(struct uvc_data *const data, uint8_t bReques
 	return 0;
 }
 
-static int uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t bRequest,
-					   struct uvc_probe *probe)
+static int uvc_control_probe_max_video_frame_size(struct uvc_data *data, uint8_t request,
+						  struct uvc_probe *probe)
 {
 	uint32_t max_frame_size = uvc_get_max_frame_size(data, data->format_id);
 
-	switch (bRequest) {
+	switch (request) {
 	case GET_MIN:
 	case GET_MAX:
 	case GET_CUR:
@@ -299,13 +339,13 @@ static int uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t b
 	return 0;
 }
 
-static int uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest,
-				       struct uvc_probe *probe)
+static int uvc_control_probe_max_payload_size(struct uvc_data *data, uint8_t request,
+					      struct uvc_probe *probe)
 {
 	uint32_t max_payload_size =
 		uvc_get_max_frame_size(data, data->format_id) + CONFIG_USBD_VIDEO_HEADER_SIZE;
 
-	switch (bRequest) {
+	switch (request) {
 	case GET_MIN:
 	case GET_MAX:
 	case GET_CUR:
@@ -324,9 +364,51 @@ static int uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequ
 	return 0;
 }
 
-static void uvc_probe_dump(char const *name, const struct uvc_probe *probe)
+static int uvc_control_probe(struct uvc_data *data, uint8_t request, struct uvc_probe *probe)
 {
-	LOG_DBG("%s", name);
+	int err;
+
+	switch (request) {
+	case GET_MIN:
+	case GET_MAX:
+	case GET_RES:
+	case GET_CUR:
+	case SET_CUR:
+		break;
+	default:
+		LOG_WRN("control: invalid bRequest %u", request);
+		return -EINVAL;
+	}
+
+	/* Static or unimplemented fields */
+	probe->dwClockFrequency = sys_cpu_to_le32(1);
+	/* Include Frame ID and EOF fields in the payload header */
+	probe->bmFramingInfo = BIT(0) | BIT(1);
+	probe->bPreferedVersion = 1;
+	probe->bMinVersion = 1;
+	probe->bMaxVersion = 1;
+	probe->bUsage = 0;
+	probe->bBitDepthLuma = 0;
+	probe->bmSettings = 0;
+	probe->bMaxNumberOfRefFramesPlus1 = 1;
+	probe->bmRateControlModes = 0;
+	probe->bmLayoutPerStream = 0;
+	probe->wKeyFrameRate = sys_cpu_to_le16(0);
+	probe->wPFrameRate = sys_cpu_to_le16(0);
+	probe->wCompQuality = sys_cpu_to_le16(0);
+	probe->wCompWindowSize = sys_cpu_to_le16(0);
+	/* TODO devicetree */
+	probe->wDelay = sys_cpu_to_le16(1);
+
+	/* Dynamic fields */
+	if ((err = uvc_control_probe_format_index(data, request, probe)) ||
+	    (err = uvc_control_probe_frame_index(data, request, probe)) ||
+	    (err = uvc_control_probe_frame_interval(data, request, probe)) ||
+	    (err = uvc_control_probe_max_video_frame_size(data, request, probe)) ||
+	    (err = uvc_control_probe_max_payload_size(data, request, probe))) {
+		return err;
+	}
+
 	LOG_DBG("- bmHint: 0x%04x", sys_le16_to_cpu(probe->bmHint));
 	LOG_DBG("- bFormatIndex: %u", probe->bFormatIndex);
 	LOG_DBG("- bFrameIndex: %u", probe->bFrameIndex);
@@ -349,85 +431,22 @@ static void uvc_probe_dump(char const *name, const struct uvc_probe *probe)
 	LOG_DBG("- bMaxNumberOfRefFramesPlus1: %u", probe->bMaxNumberOfRefFramesPlus1);
 	LOG_DBG("- bmRateControlModes: %u", probe->bmRateControlModes);
 	LOG_DBG("- bmLayoutPerStream: 0x%08llx", probe->bmLayoutPerStream);
-}
-
-static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
-		     struct uvc_probe *probe)
-{
-	int err;
-
-	LOG_DBG("UVC control: probe");
-
-	switch (bRequest) {
-	case GET_DEF:
-		memcpy(probe, &data->default_probe, sizeof(*probe));
-		break;
-	case SET_CUR:
-		uvc_probe_dump("SET_CUR", probe);
-		break;
-	case GET_CUR:
-		uvc_probe_dump("GET_CUR", probe);
-		break;
-	case GET_MIN:
-		uvc_probe_dump("GET_MIN", probe);
-		break;
-	case GET_MAX:
-		uvc_probe_dump("GET_MAX", probe);
-		break;
-	case GET_RES:
-		uvc_probe_dump("SET_RES", probe);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	/* Static or unsupported fields */
-
-	probe->dwClockFrequency = sys_cpu_to_le32(1);
-	/* Include Frame ID and EOF fields in the payload header */
-	probe->bmFramingInfo = BIT(0) | BIT(1);
-	probe->bPreferedVersion = 1;
-	probe->bMinVersion = 1;
-	probe->bMaxVersion = 1;
-	probe->bUsage = 0;
-	probe->bBitDepthLuma = 0;
-	probe->bmSettings = 0;
-	probe->bMaxNumberOfRefFramesPlus1 = 1;
-	probe->bmRateControlModes = 0;
-	probe->bmLayoutPerStream = 0;
-	probe->wKeyFrameRate = sys_cpu_to_le16(0);
-	probe->wPFrameRate = sys_cpu_to_le16(0);
-	probe->wCompQuality = sys_cpu_to_le16(0);
-	probe->wCompWindowSize = sys_cpu_to_le16(0);
-	/* TODO devicetree */
-	probe->wDelay = sys_cpu_to_le16(1);
-
-	/* Dynamic fields */
-
-	/* TODO use bmHint to choose in which order configure the fields */
-	if ((err = uvc_probe_format_index(data, bRequest, probe)) ||
-	    (err = uvc_probe_frame_index(data, bRequest, probe)) ||
-	    (err = uvc_probe_frame_interval(data, bRequest, probe)) ||
-	    (err = uvc_probe_max_video_frame_size(data, bRequest, probe)) ||
-	    (err = uvc_probe_max_payload_size(data, bRequest, probe))) {
-		return err;
-	}
 
 	return 0;
 }
 
-static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
-		      struct uvc_probe *probe)
+static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc_probe *probe)
 {
 	int err;
 
-	switch (bRequest) {
+	switch (request) {
 	case GET_CUR:
-		uvc_probe(data, bRequest, probe);
-		break;
+		return uvc_control_probe(data, request, probe);
 	case SET_CUR:
-		uvc_probe(data, bRequest, probe);
-		LOG_DBG("commit: ready to transfer frames");
+		err = uvc_control_probe(data, request, probe);
+		if (err) {
+			return err;
+		}
 
 		if (data->source_dev != NULL) {
 			const struct device *dev = usbd_class_get_private(data->c_data);
@@ -439,8 +458,7 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 				return err;
 			}
 
-			LOG_DBG("Setting UVC format to %ux%u of the video source and starting it",
-				fmt.width, fmt.height);
+			LOG_DBG("control: setting source format to %ux%u", fmt.width, fmt.height);
 
 			err = video_set_format(data->source_dev, VIDEO_EP_OUT, &fmt);
 			if (err) {
@@ -455,102 +473,70 @@ static int uvc_commit(struct uvc_data *const data, uint16_t bRequest,
 			}
 		}
 
-		/* Now ready to process  */
+		LOG_INF("control: ready to transfer frames");
 		atomic_set_bit(&data->state, UVC_CLASS_READY);
 		k_work_submit(&data->work);
 		break;
 	default:
-		LOG_WRN("commit: invalid bRequest (%u)", bRequest);
+		LOG_WRN("commit: invalid bRequest %u", request);
 		return -EINVAL;
 	}
 	return 0;
 }
 
-static int uvc_control_format(struct uvc_data *const data,
-			      const struct usb_setup_packet *const setup,
-			      struct net_buf *const buf)
+static int uvc_control_format(struct uvc_data *data, const struct usb_setup_packet *setup,
+			      struct net_buf *buf)
 {
 	uint8_t control_selector = setup->wValue >> 8;
-	struct uvc_probe probe = {0};
+	struct uvc_probe *probe = (void *)buf->data;
 
 	switch (setup->bRequest) {
 	case GET_LEN:
+		if (setup->wLength != 2 || buf->size < 2) {
+			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
+			return -EINVAL;
+		}
 		net_buf_add_le16(buf, sizeof(probe));
 		return 0;
-	case GET_INFO:
-		/* As defined by UVC 1.5 Table 4-76 */
-		net_buf_add_u8(buf, BIT(0) | BIT(1));
+	case GET_DEF:
+		LOG_INF("wLength=%u len=%u size=%u probe=%u", setup->wLength, buf->len, buf->size, sizeof(*probe));
+		if (setup->wLength != sizeof(*probe) || buf->size < sizeof(*probe)) {
+			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
+			return -EINVAL;
+		}
+		net_buf_add_mem(buf, &data->default_probe, sizeof(*probe));
 		return 0;
+	case GET_INFO:
+		if (setup->wLength != 1 || buf->size < 1) {
+			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
+			return -EINVAL;
+		}
+		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
 	case GET_MIN:
 	case GET_MAX:
-	case GET_DEF:
 	case GET_RES:
 	case GET_CUR:
-		if (buf->size != sizeof(probe)) {
-			LOG_WRN("probe: invalid size %u, wanted %u", buf->size, sizeof(probe));
+		if (setup->wLength != sizeof(*probe) || buf->size < sizeof(*probe)) {
+			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
 			return -EINVAL;
 		}
-		if (net_buf_add(buf, sizeof(probe)) == NULL) {
-			return -ENOMEM;
-		}
+		net_buf_add(buf, sizeof(*probe));
 		break;
 	case SET_CUR:
-		if (buf->len != sizeof(probe)) {
-			LOG_WRN("probe: invalid size %u, wanted %u", buf->len, sizeof(probe));
+		if (setup->wLength != sizeof(*probe) || buf->len < sizeof(*probe)) {
+			LOG_ERR("control: bad wLength %u or buflen %u", setup->wLength, buf->len);
 			return -EINVAL;
 		}
 		break;
-	default:
-		LOG_WRN("probe: invalid bRequest (%u) for Probe or Commit", setup->bRequest);
-		return -EINVAL;
-	}
-
-	/* All remaining request work on a (struct uvc_probe) */
-	if (setup->wLength != sizeof(probe)) {
-		LOG_WRN("probe: invalid wLength %u, wanted %u", setup->wLength, sizeof(probe));
-		return -EINVAL;
 	}
 
 	switch (control_selector) {
 	case UVC_CONTROL_FORMAT_PROBE:
-		return uvc_probe(data, setup->bRequest, (void *)buf->data);
+		return uvc_control_probe(data, setup->bRequest, probe);
 	case UVC_CONTROL_FORMAT_COMMIT:
-		return uvc_commit(data, setup->bRequest, (void *)buf->data);
+		return uvc_control_commit(data, setup->bRequest, probe);
 	default:
-		LOG_WRN("control: unknown control selector %u", control_selector);
-		return -ENOTSUP;
-	}
-}
-
-static void uvc_buf_add(struct net_buf *buf, uint16_t length, uint32_t value)
-{
-	switch (length) {
-	case 4:
-		net_buf_add_32le(buf, value);
-		break;
-	case 2:
-		net_buf_add_16le(buf, value);
-		break;
-	case 1:
-		net_buf_add_16le(buf, value);
-		break;
-	default:
-		LOG_WRN("control: invalid size %u", length);
-		return -ENOTSUP;
-	}
-}
-
-static uint32_t uvc_buf_remove(struct net_buf *buf, uint16_t length)
-{
-	switch (length) {
-	case 4:
-		return net_buf_remove_32le(buf);
-	case 2:
-		return net_buf_remove_16le(buf);
-	case 1:
-		return net_buf_remove_u8(buf);
-	default:
-		LOG_WRN("control: invalid size %u", length);
+		LOG_WRN("control: unknown selector %u for streaming interface", control_selector);
 		return -ENOTSUP;
 	}
 }
@@ -558,7 +544,7 @@ static uint32_t uvc_buf_remove(struct net_buf *buf, uint16_t length)
 static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net_buf *buf,
 				const struct device *dev, uint32_t cid)
 {
-	uintptr_t value;
+	uint32_t value;
 	int err;
 
 	switch (setup->bRequest) {
@@ -571,7 +557,7 @@ static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net
 	case GET_MAX:
 		return uvc_buf_add(buf, setup->wLength, UINT32_MAX);
 	case GET_INFO:
-		return uvc_buf_add(buf, setup->wLength, info);
+		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
 	case GET_CUR:
 		err = video_get_ctrl(dev, cid, &value);
 		if (err) {
@@ -601,11 +587,16 @@ static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struc
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
-	swtich (control_selector) {
+	LOG_INF("wValue %u, selector %u", setup->wValue, control_selector);
+
+	switch (control_selector) {
 	case UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE:
 		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_EXPOSURE);
 	case UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE:
 		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_ZOOM);
+	default:
+		LOG_WRN("control: unsupported selector %u for camera terminal ", control_selector);
+		return -ENOTSUP;
 	}
 }
 
@@ -625,27 +616,17 @@ static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, s
 		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_SATURATION);
 	case UVC_CONTROL_PROCESSING_WB_TEMPERATURE:
 		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_WHITE_BAL);
+	default:
+		LOG_WRN("control: unsupported selector %u for processing unit", control_selector);
 	}
 }
 
-static int zephyr_uvc_control_output(const struct device *dev, const struct usb_setup_packet *setup,
-				     struct net_buf *const buf)
+static int zephyr_uvc_control_output(const struct usb_setup_packet *setup, struct net_buf *buf,
+				     const struct device *dev)
 {
+	LOG_WRN("control: nothing supported for output terminal");
 	return -ENOTSUP;
 };
-
-static int uvc_control_run(const struct usb_setup_packet *const setup,
-			   struct net_buf *const buf, const struct uvc_cid *cid)
-{
-	uint8_t control_selector = setup->wValue >> 8;
-	uintptr_t value;
-
-	if (buf->size < setup->wLength) {
-		LOG_ERR("control: not enough room for response");
-		return -ENOMEM;
-	}
-	return 0;
-}
 
 static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_packet *const setup,
 		       struct net_buf *const buf)
@@ -655,6 +636,17 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	uint8_t interface = (setup->wIndex >> 0) & 0xff;
 	uint8_t entity_id = (setup->wIndex >> 8) & 0xff;
 
+	switch (setup->bRequest) {
+	case SET_CUR: LOG_DBG("SET_CUR"); break;
+	case GET_CUR: LOG_DBG("GET_CUR"); break;
+	case GET_MIN: LOG_DBG("GET_MIN"); break;
+	case GET_MAX: LOG_DBG("GET_MAX"); break;
+	case GET_RES: LOG_DBG("GET_RES"); break;
+	case GET_LEN: LOG_DBG("GET_LEN"); break;
+	case GET_INFO: LOG_DBG("GET_INFO"); break;
+	case GET_DEF: LOG_DBG("GET_DEF"); break;
+	}
+
 	if (interface == *data->desc_if_vs_ifnum) {
 		return uvc_control_format(data, setup, buf);
 	}
@@ -663,7 +655,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 		for (const struct uvc_control *p = data->controls; p->entity_id != 0; p++) {
 			if (p->entity_id == entity_id) {
 				LOG_DBG("control: found video CIDs for bEntityID %u", entity_id);
-				return uvc_control_run(data, setup, buf, p->cids);
+				return p->fn(setup, buf, p->target);
 			}
 		}
 	}
@@ -719,14 +711,19 @@ static int uvc_init(struct usbd_class_data *const c_data)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	int err;
 
-	/* The default probe is the current probe at startup */
-	uvc_probe(data, GET_CUR, &data->default_probe);
+	/* Get the default probe by querying the current probe at startup */
+	err = uvc_control_probe(data, GET_CUR, &data->default_probe);
+	if (err) {
+		LOG_ERR("init: failed to query the default probe");
+		return err;
+	}
 
 	return 0;
 }
 
-static void uvc_update_desc(struct uvc_data *const data)
+static void uvc_update_desc(struct uvc_data *data)
 {
 	*data->desc_iad_ifnum = *data->desc_if_vc_ifnum;
 	*data->desc_if_vc_header_ifnum = *data->desc_if_vs_ifnum;
