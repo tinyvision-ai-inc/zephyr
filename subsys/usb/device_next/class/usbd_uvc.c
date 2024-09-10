@@ -84,27 +84,11 @@ struct uvc_format {
 	uint32_t frame_interval;	/* see #72254 */
 };
 
-/* Lookup table between the UVC control IDs and Zephyr video CIDs */
-struct uvc_cid {
-	/* USB Video Class standard CID and Zephyr-side CID */
-	uint32_t cid;
-	uint8_t uvc;
-	/* Strategy to pass the UVC value to the Video device */
-	uint8_t type;
-#define CONTROL_TYPE_RELATIVE			0
-#define CONTROL_TYPE_ABSOLUTE			1
-#define CONTROL_TYPE_VOID			2
-	/* Expected size of the control */
-	uint32_t size;
-	/* Scale and offset factor to apply to the control ID */
-	uint32_t scale;
-	uint32_t offset;
-};
-
 /* Lookup table between the interface ID and the control function */
 struct uvc_control {
 	uint8_t entity_id;
-	struct uvc_cid *cids;
+	int (*fn)(const struct usb_setup_packet *const, struct net_buf *, const struct device *);
+	const struct device *target;
 };
 
 struct uvc_data {
@@ -318,8 +302,8 @@ static int uvc_probe_max_video_frame_size(struct uvc_data *const data, uint8_t b
 static int uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequest,
 				       struct uvc_probe *probe)
 {
-	uint32_t max_payload_size = uvc_get_max_frame_size(data, data->format_id) +
-		 CONFIG_USBD_VIDEO_HEADER_SIZE;
+	uint32_t max_payload_size =
+		uvc_get_max_frame_size(data, data->format_id) + CONFIG_USBD_VIDEO_HEADER_SIZE;
 
 	switch (bRequest) {
 	case GET_MIN:
@@ -340,51 +324,31 @@ static int uvc_probe_max_payload_size(struct uvc_data *const data, uint8_t bRequ
 	return 0;
 }
 
-static int uvc_probe_clock_frequency(struct uvc_data *const data, uint8_t bRequest,
-				      struct uvc_probe *probe)
-{
-	switch (bRequest) {
-	case GET_MIN:
-	case GET_MAX:
-	case GET_CUR:
-	case GET_RES:
-		probe->dwClockFrequency = sys_cpu_to_le32(1);
-		break;
-	case SET_CUR:
-		if (sys_le32_to_cpu(probe->dwClockFrequency) > 1) {
-			LOG_WRN("probe: dwClockFrequency is read-only");
-		}
-		break;
-	}
-	return 0;
-}
-
 static void uvc_probe_dump(char const *name, const struct uvc_probe *probe)
 {
-	LOG_DBG("probe: UVC_%s", name);
-	LOG_DBG("probe: - bmHint = 0x%04x", sys_le16_to_cpu(probe->bmHint));
-	LOG_DBG("probe: - bFormatIndex = %u", probe->bFormatIndex);
-	LOG_DBG("probe: - bFrameIndex = %u", probe->bFrameIndex);
-	LOG_DBG("probe: - dwFrameInterval = %u us", sys_le32_to_cpu(probe->dwFrameInterval) / 10);
-	LOG_DBG("probe: - wKeyFrameRate = %u", sys_le16_to_cpu(probe->wKeyFrameRate));
-	LOG_DBG("probe: - wPFrameRate = %u", sys_le16_to_cpu(probe->wPFrameRate));
-	LOG_DBG("probe: - wCompQuality = %u", sys_le16_to_cpu(probe->wCompQuality));
-	LOG_DBG("probe: - wCompWindowSize = %u", sys_le16_to_cpu(probe->wCompWindowSize));
-	LOG_DBG("probe: - wDelay = %u ms", sys_le16_to_cpu(probe->wDelay));
-	LOG_DBG("probe: - dwMaxVideoFrameSize = %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
-	LOG_DBG("probe: - dwMaxPayloadTransferSize = %u",
-		sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
-	LOG_DBG("probe: - dwClockFrequency = %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
-	LOG_DBG("probe: - bmFramingInfo = 0x%02x", probe->bmFramingInfo);
-	LOG_DBG("probe: - bPreferedVersion = %u", probe->bPreferedVersion);
-	LOG_DBG("probe: - bMinVersion = %u", probe->bMinVersion);
-	LOG_DBG("probe: - bMaxVersion = %u", probe->bMaxVersion);
-	LOG_DBG("probe: - bUsage = %u", probe->bUsage);
-	LOG_DBG("probe: - bBitDepthLuma = %u", probe->bBitDepthLuma + 8);
-	LOG_DBG("probe: - bmSettings = %u", probe->bmSettings);
-	LOG_DBG("probe: - bMaxNumberOfRefFramesPlus1 = %u", probe->bMaxNumberOfRefFramesPlus1);
-	LOG_DBG("probe: - bmRateControlModes = %u", probe->bmRateControlModes);
-	LOG_DBG("probe: - bmLayoutPerStream = 0x%08llx", probe->bmLayoutPerStream);
+	LOG_DBG("%s", name);
+	LOG_DBG("- bmHint: 0x%04x", sys_le16_to_cpu(probe->bmHint));
+	LOG_DBG("- bFormatIndex: %u", probe->bFormatIndex);
+	LOG_DBG("- bFrameIndex: %u", probe->bFrameIndex);
+	LOG_DBG("- dwFrameInterval: %u us", sys_le32_to_cpu(probe->dwFrameInterval) / 10);
+	LOG_DBG("- wKeyFrameRate: %u", sys_le16_to_cpu(probe->wKeyFrameRate));
+	LOG_DBG("- wPFrameRate: %u", sys_le16_to_cpu(probe->wPFrameRate));
+	LOG_DBG("- wCompQuality: %u", sys_le16_to_cpu(probe->wCompQuality));
+	LOG_DBG("- wCompWindowSize: %u", sys_le16_to_cpu(probe->wCompWindowSize));
+	LOG_DBG("- wDelay: %u ms", sys_le16_to_cpu(probe->wDelay));
+	LOG_DBG("- dwMaxVideoFrameSize: %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
+	LOG_DBG("- dwMaxPayloadTransferSize: %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
+	LOG_DBG("- dwClockFrequency: %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
+	LOG_DBG("- bmFramingInfo: 0x%02x", probe->bmFramingInfo);
+	LOG_DBG("- bPreferedVersion: %u", probe->bPreferedVersion);
+	LOG_DBG("- bMinVersion: %u", probe->bMinVersion);
+	LOG_DBG("- bMaxVersion: %u", probe->bMaxVersion);
+	LOG_DBG("- bUsage: %u", probe->bUsage);
+	LOG_DBG("- bBitDepthLuma: %u", probe->bBitDepthLuma + 8);
+	LOG_DBG("- bmSettings: %u", probe->bmSettings);
+	LOG_DBG("- bMaxNumberOfRefFramesPlus1: %u", probe->bMaxNumberOfRefFramesPlus1);
+	LOG_DBG("- bmRateControlModes: %u", probe->bmRateControlModes);
+	LOG_DBG("- bmLayoutPerStream: 0x%08llx", probe->bmLayoutPerStream);
 }
 
 static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
@@ -419,6 +383,7 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 
 	/* Static or unsupported fields */
 
+	probe->dwClockFrequency = sys_cpu_to_le32(1);
 	/* Include Frame ID and EOF fields in the payload header */
 	probe->bmFramingInfo = BIT(0) | BIT(1);
 	probe->bPreferedVersion = 1;
@@ -444,8 +409,7 @@ static int uvc_probe(struct uvc_data *const data, uint16_t bRequest,
 	    (err = uvc_probe_frame_index(data, bRequest, probe)) ||
 	    (err = uvc_probe_frame_interval(data, bRequest, probe)) ||
 	    (err = uvc_probe_max_video_frame_size(data, bRequest, probe)) ||
-	    (err = uvc_probe_max_payload_size(data, bRequest, probe)) ||
-	    (err = uvc_probe_clock_frequency(data, bRequest, probe))) {
+	    (err = uvc_probe_max_payload_size(data, bRequest, probe))) {
 		return err;
 	}
 
@@ -506,8 +470,8 @@ static int uvc_control_format(struct uvc_data *const data,
 			      const struct usb_setup_packet *const setup,
 			      struct net_buf *const buf)
 {
-	struct uvc_probe probe = {0};
 	uint8_t control_selector = setup->wValue >> 8;
+	struct uvc_probe probe = {0};
 
 	switch (setup->bRequest) {
 	case GET_LEN:
@@ -558,65 +522,128 @@ static int uvc_control_format(struct uvc_data *const data,
 	}
 }
 
-static int uvc_control_run(struct uvc_data *data, const struct usb_setup_packet *const setup,
+static void uvc_buf_add(struct net_buf *buf, uint16_t length, uint32_t value)
+{
+	switch (length) {
+	case 4:
+		net_buf_add_32le(buf, value);
+		break;
+	case 2:
+		net_buf_add_16le(buf, value);
+		break;
+	case 1:
+		net_buf_add_16le(buf, value);
+		break;
+	default:
+		LOG_WRN("control: invalid size %u", length);
+		return -ENOTSUP;
+	}
+}
+
+static uint32_t uvc_buf_remove(struct net_buf *buf, uint16_t length)
+{
+	switch (length) {
+	case 4:
+		return net_buf_remove_32le(buf);
+	case 2:
+		return net_buf_remove_16le(buf);
+	case 1:
+		return net_buf_remove_u8(buf);
+	default:
+		LOG_WRN("control: invalid size %u", length);
+		return -ENOTSUP;
+	}
+}
+
+static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net_buf *buf,
+				const struct device *dev, uint32_t cid)
+{
+	uintptr_t value;
+	int err;
+
+	switch (setup->bRequest) {
+	case GET_DEF:
+		return uvc_buf_add(buf, setup->wLength, 0);
+	case GET_RES:
+		return uvc_buf_add(buf, setup->wLength, 1);
+	case GET_MIN:
+		return uvc_buf_add(buf, setup->wLength, 0);
+	case GET_MAX:
+		return uvc_buf_add(buf, setup->wLength, UINT32_MAX);
+	case GET_INFO:
+		return uvc_buf_add(buf, setup->wLength, info);
+	case GET_CUR:
+		err = video_get_ctrl(dev, cid, &value);
+		if (err) {
+			LOG_ERR("control: failed to query target video device");
+			return err;
+		}
+		return uvc_buf_add(buf, setup->wValue, value);
+	case SET_CUR:
+		err = uvc_buf_remove(buf, setup->wValue, &value);
+		if (err) {
+			return err;
+		}
+		err = video_set_ctrl(dev, cid, (void *)value);
+		if (err) {
+			LOG_ERR("control: failed to configure target video device");
+			return err;
+		}
+		return 0;
+	default:
+		LOG_WRN("control: unsupported request type %u", setup->bRequest);
+		return -ENOTSUP;
+	}
+}
+
+static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struct net_buf *buf,
+				     const struct device *dev)
+{
+	uint8_t control_selector = setup->wValue >> 8;
+
+	swtich (control_selector) {
+	case UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_EXPOSURE);
+	case UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_ZOOM);
+	}
+}
+
+static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, struct net_buf *buf,
+					 const struct device *dev)
+{
+	uint8_t control_selector = setup->wValue >> 8;
+
+	switch (control_selector) {
+	case UVC_CONTROL_PROCESSING_BRIGHTNESS:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
+	case UVC_CONTROL_PROCESSING_CONTRAST:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_CONTRAST);
+	case UVC_CONTROL_PROCESSING_GAIN:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_GAIN);
+	case UVC_CONTROL_PROCESSING_SATURATION:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_SATURATION);
+	case UVC_CONTROL_PROCESSING_WB_TEMPERATURE:
+		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_WHITE_BAL);
+	}
+}
+
+static int zephyr_uvc_control_output(const struct device *dev, const struct usb_setup_packet *setup,
+				     struct net_buf *const buf)
+{
+	return -ENOTSUP;
+};
+
+static int uvc_control_run(const struct usb_setup_packet *const setup,
 			   struct net_buf *const buf, const struct uvc_cid *cid)
 {
-	uint64_t value;
-	uint8_t control_selector = setup->wValue;
+	uint8_t control_selector = setup->wValue >> 8;
+	uintptr_t value;
 
 	if (buf->size < setup->wLength) {
 		LOG_ERR("control: not enough room for response");
 		return -ENOMEM;
 	}
-
-	for (; cid->uvc != control_selector; cid++) {
-		if (cid->uvc == 0) {
-			LOG_WRN("control: selector %u not found for this interface",
-				control_selector);
-			return -ENOTSUP;
-		}
-	}
-
-	switch (setup->bRequest) {
-	case GET_LEN:
-		value = cid->size;
-		break;
-	case GET_INFO:
-		/* Support GET/SET, no extra feature or reporting for now */
-		value = BIT(0) | BIT(1);
-		break;
-	case GET_DEF:
-		net_buf_add_u8(buf, 0);
-		return 0;
-	case GET_RES:
-		value = cid->scale;
-		break;
-	case GET_CUR:
-		value = 0;
-		break;
-	default:
-		LOG_WRN("control: unsupported request type %u", setup->bRequest);
-		return -ENOTSUP;
-	}
-
-	switch (setup->wLength) {
-	case 8:
-		net_buf_add_le64(buf, value);
-		break;
-	case 4:
-		net_buf_add_le32(buf, value);
-		break;
-	case 2:
-		net_buf_add_le16(buf, value);
-		break;
-	case 1:
-		net_buf_add_u8(buf, value);
-		break;
-	default:
-		LOG_WRN("control: unhandled size");
-		return -ENOTSUP;
-	}
-
 	return 0;
 }
 
@@ -953,48 +980,6 @@ static int uvc_preinit(const struct device *dev)
 	return 0;
 }
 
-struct uvc_cid zephyr_uvc_control_camera[] = {
-	{.uvc = UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE,
-	 .cid = VIDEO_CID_CAMERA_EXPOSURE,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_CAMERA_EXPOSURE_RELATIVE,
-	 .cid = VIDEO_CID_CAMERA_EXPOSURE,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_RELATIVE},
-	{.uvc = UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE,
-	 .cid = VIDEO_CID_CAMERA_ZOOM,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_CAMERA_ZOOM_RELATIVE,
-	 .cid = VIDEO_CID_CAMERA_ZOOM,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_RELATIVE},
-	{0},
-};
-
-struct uvc_cid zephyr_uvc_control_processing[] = {
-	{.uvc = UVC_CONTROL_PROCESSING_BRIGHTNESS,
-	 .cid = VIDEO_CID_CAMERA_BRIGHTNESS,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_PROCESSING_CONTRAST,
-	 .cid = VIDEO_CID_CAMERA_CONTRAST,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_PROCESSING_GAIN,
-	 .cid = VIDEO_CID_CAMERA_GAIN,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_PROCESSING_SATURATION,
-	 .cid = VIDEO_CID_CAMERA_SATURATION,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_PROCESSING_WB_TEMPERATURE,
-	 .cid = VIDEO_CID_CAMERA_WHITE_BAL,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_ABSOLUTE},
-	{.uvc = UVC_CONTROL_PROCESSING_WB_TEMPERATURE_AUTO,
-	 .cid = VIDEO_CID_CAMERA_WHITE_BAL,
-	 .scale = 1, .offset = 0, .type = CONTROL_TYPE_VOID},
-	{0},
-};
-
-struct uvc_cid zephyr_uvc_control_output[] = {
-	{0},
-};
-
 #define UVC_CAP_ENTRY(frame, format)						\
 	{									\
 		.pixelformat = video_fourcc(DT_PROP(format, fourcc)[0],		\
@@ -1030,7 +1015,8 @@ struct uvc_cid zephyr_uvc_control_output[] = {
 #define UVC_CONTROL(node)							\
 	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(node)), ({				\
 		.entity_id = NODE_ID(node),					\
-		.cids = DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
+		.fn = &DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
+		.target = DEVICE_DT_GET(DT_PHANDLE(node, control_target)),	\
 	},))
 
 #define UVC_DEVICE_DEFINE(node)							\
