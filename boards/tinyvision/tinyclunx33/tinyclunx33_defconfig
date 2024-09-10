@@ -15,8 +15,8 @@ CONFIG_CLOCK_CONTROL_SI5351=y
 # Enable the USB silicon core present on-chip
 CONFIG_USB_DEVICE_STACK_NEXT=y
 
-# Enable GPIO
-CONFIG_GPIO=y
+# Disable GPIO
+CONFIG_GPIO=n
 
 # Enable UART console for debug logs and shell
 CONFIG_SERIAL=y

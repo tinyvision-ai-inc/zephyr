@@ -5,9 +5,14 @@ description: UVC Selector Unit controls for choosing one of several sources
 
 compatible: "zephyr,uvc-control-selector"
 
-include: "zephyr,uvc-control.yaml"
+include: "base.yaml"
 
 properties:
+
+  control-target:
+    type: phandle
+    description: |
+      Reference to a video device which controls the source selection.
 
   source-entities:
     type: phandle-array

@@ -15,7 +15,6 @@
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/drivers/video.h>
-#include <zephyr/dt-bindings/usb/video.h>
 #include <zephyr/logging/log.h>
 
 #include "usbd_uvc_macros.h"
@@ -38,7 +37,86 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 /* Flags announcing which controls are supported */
 #define INFO_SUPPORTS_GET			BIT(0)
-#define INFO_SUPPORTS_SET			BIT(0)
+#define INFO_SUPPORTS_SET			BIT(1)
+
+/* Selector Unit Control Selectors */
+#define SU_INPUT_SELECT_CONTROL			0x01
+
+/* Camera Terminal Control Selectors */
+#define CT_SCANNING_MODE_CONTROL		0x01
+#define CT_AE_MODE_CONTROL			0x02
+#define CT_AE_PRIORITY_CONTROL			0x03
+#define CT_EXPOSURE_TIME_ABSOLUTE_CONTROL	0x04
+#define CT_EXPOSURE_TIME_RELATIVE_CONTROL	0x05
+#define CT_FOCUS_ABSOLUTE_CONTROL		0x06
+#define CT_FOCUS_RELATIVE_CONTROL		0x07
+#define CT_FOCUS_AUTO_CONTROL			0x08
+#define CT_IRIS_ABSOLUTE_CONTROL		0x09
+#define CT_IRIS_RELATIVE_CONTROL		0x0A
+#define CT_ZOOM_ABSOLUTE_CONTROL		0x0B
+#define CT_ZOOM_RELATIVE_CONTROL		0x0C
+#define CT_PANTILT_ABSOLUTE_CONTROL		0x0D
+#define CT_PANTILT_RELATIVE_CONTROL		0x0E
+#define CT_ROLL_ABSOLUTE_CONTROL		0x0F
+#define CT_ROLL_RELATIVE_CONTROL		0x10
+#define CT_PRIVACY_CONTROL			0x11
+#define CT_FOCUS_SIMPLE_CONTROL			0x12
+#define CT_WINDOW_CONTROL			0x13
+#define CT_REGION_OF_INTEREST_CONTROL		0x14
+
+/* Processing Unit Control Selectors */
+#define PU_BACKLIGHT_COMPENSATION_CONTROL	0x01
+#define PU_BRIGHTNESS_CONTROL			0x02
+#define PU_CONTRAST_CONTROL			0x03
+#define PU_GAIN_CONTROL				0x04
+#define PU_POWER_LINE_FREQUENCY_CONTROL		0x05
+#define PU_HUE_CONTROL				0x06
+#define PU_SATURATION_CONTROL			0x07
+#define PU_SHARPNESS_CONTROL			0x08
+#define PU_GAMMA_CONTROL			0x09
+#define PU_WHITE_BALANCE_TEMPERATURE_CONTROL	0x0A
+#define PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL 0x0B
+#define PU_WHITE_BALANCE_COMPONENT_CONTROL	0x0C
+#define PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL	0x0D
+#define PU_DIGITAL_MULTIPLIER_CONTROL		0x0E
+#define PU_DIGITAL_MULTIPLIER_LIMIT_CONTROL	0x0F
+#define PU_HUE_AUTO_CONTROL			0x10
+#define PU_ANALOG_VIDEO_STANDARD_CONTROL	0x11
+#define PU_ANALOG_LOCK_STATUS_CONTROL		0x12
+#define PU_CONTRAST_AUTO_CONTROL		0x13
+
+/* Encoding Unit Control Selectors */
+#define EU_SELECT_LAYER_CONTROL			0x01
+#define EU_PROFILE_TOOLSET_CONTROL		0x02
+#define EU_VIDEO_RESOLUTION_CONTROL		0x03
+#define EU_ MIN_FRAME_INTERVAL_CONTROL		0x04
+#define EU_ SLICE_MODE_CONTROL			0x05
+#define EU_RATE_CONTROL_MODE_CONTROL		0x06
+#define EU_AVERAGE_BITRATE_CONTROL		0x07
+#define EU_CPB_SIZE_CONTROL			0x08
+#define EU_PEAK_BIT_RATE_CONTROL		0x09
+#define EU_QUANTIZATION_PARAMS_CONTROL		0x0A
+#define EU_SYNC_REF_FRAME_CONTROL		0x0B
+#define EU_LTR_BUFFER_ CONTROL			0x0C
+#define EU_LTR_PICTURE_CONTROL			0x0D
+#define EU_LTR_VALIDATION_CONTROL		0x0E
+#define EU_LEVEL_IDC_LIMIT_CONTROL		0x0F
+#define EU_SEI_PAYLOADTYPE_CONTROL		0x10
+#define EU_QP_RANGE_CONTROL			0x11
+#define EU_PRIORITY_CONTROL			0x12
+#define EU_START_OR_STOP_LAYER_CONTROL		0x13
+#define EU_ERROR_RESILIENCY_CONTROL		0x14
+
+/* VideoStreaming Interface Control Selectors */
+#define VS_PROBE_CONTROL			0x01
+#define VS_COMMIT_CONTROL			0x02
+#define VS_STILL_PROBE_CONTROL			0x03
+#define VS_STILL_COMMIT_CONTROL			0x04
+#define VS_STILL_IMAGE_TRIGGER_CONTROL		0x05
+#define VS_STREAM_ERROR_CODE_CONTROL		0x06
+#define VS_GENERATE_KEY_FRAME_CONTROL		0x07
+#define VS_UPDATE_FRAME_SEGMENT_CONTROL		0x08
+#define VS_SYNCH_DELAY_CONTROL			0x09
 
 struct uvc_data;
 
@@ -146,9 +224,23 @@ NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPA
 static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt);
 
-static int uvc_buf_add(struct net_buf *buf, uint16_t length, uint32_t value)
+static int uvc_get_control_max(uint16_t size)
 {
-	switch (length) {
+	switch (size) {
+	case 4:
+		return INT32_MAX;
+	case 2:
+		return INT16_MAX;
+	case 1:
+		return INT8_MAX;
+	default:
+		return 0;
+	}
+}
+
+static int uvc_buf_add(struct net_buf *buf, uint16_t size, uint32_t value)
+{
+	switch (size) {
 	case 4:
 		net_buf_add_le32(buf, value);
 		return 0;
@@ -159,14 +251,14 @@ static int uvc_buf_add(struct net_buf *buf, uint16_t length, uint32_t value)
 		net_buf_add_u8(buf, value);
 		return 0;
 	default:
-		LOG_WRN("control: invalid size %u", length);
+		LOG_WRN("control: invalid size %u", size);
 		return -ENOTSUP;
 	}
 }
 
-static int uvc_buf_remove(struct net_buf *buf, uint16_t length, uint32_t *value)
+static int uvc_buf_remove(struct net_buf *buf, uint16_t size, uint32_t *value)
 {
-	switch (length) {
+	switch (size) {
 	case 4:
 		*value = net_buf_remove_le32(buf);
 		return 0;
@@ -177,7 +269,7 @@ static int uvc_buf_remove(struct net_buf *buf, uint16_t length, uint32_t *value)
 		*value = net_buf_remove_u8(buf);
 		return 0;
 	default:
-		LOG_WRN("control: invalid size %u", length);
+		LOG_WRN("control: invalid size %u", size);
 		return -ENOTSUP;
 	}
 }
@@ -484,13 +576,22 @@ static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc
 	return 0;
 }
 
-static int uvc_control_format(struct uvc_data *data, const struct usb_setup_packet *setup,
+static int uvc_control_streaming(struct uvc_data *data, const struct usb_setup_packet *setup,
 			      struct net_buf *buf)
 {
 	uint8_t control_selector = setup->wValue >> 8;
 	struct uvc_probe *probe = (void *)buf->data;
 
+	LOG_DBG("control: streaming interface, selector %u, request %u",
+		control_selector, setup->bRequest);
+
 	switch (setup->bRequest) {
+	case GET_INFO:
+		if (setup->wLength != 1 || buf->size < 1) {
+			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
+			return -EINVAL;
+		}
+		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
 	case GET_LEN:
 		if (setup->wLength != 2 || buf->size < 2) {
 			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
@@ -506,12 +607,6 @@ static int uvc_control_format(struct uvc_data *data, const struct usb_setup_pack
 		}
 		net_buf_add_mem(buf, &data->default_probe, sizeof(*probe));
 		return 0;
-	case GET_INFO:
-		if (setup->wLength != 1 || buf->size < 1) {
-			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
-			return -EINVAL;
-		}
-		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
 	case GET_MIN:
 	case GET_MAX:
 	case GET_RES:
@@ -531,9 +626,9 @@ static int uvc_control_format(struct uvc_data *data, const struct usb_setup_pack
 	}
 
 	switch (control_selector) {
-	case UVC_CONTROL_FORMAT_PROBE:
+	case VS_PROBE_CONTROL:
 		return uvc_control_probe(data, setup->bRequest, probe);
-	case UVC_CONTROL_FORMAT_COMMIT:
+	case VS_COMMIT_CONTROL:
 		return uvc_control_commit(data, setup->bRequest, probe);
 	default:
 		LOG_WRN("control: unknown selector %u for streaming interface", control_selector);
@@ -541,32 +636,60 @@ static int uvc_control_format(struct uvc_data *data, const struct usb_setup_pack
 	}
 }
 
-static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net_buf *buf,
-				const struct device *dev, uint32_t cid)
+static int uvc_control_fix(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size,
+			   uint32_t value)
+{
+	size = MIN(setup->wLength, size);
+	LOG_DBG("control: fixed type control, size %u", size);
+
+	switch (setup->bRequest) {
+	case GET_INFO:
+		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+	case GET_RES:
+		return uvc_buf_add(buf, size, 1);
+	case GET_DEF:
+	case GET_MIN:
+	case GET_MAX:
+	case GET_CUR:
+		return uvc_buf_add(buf, size, value);
+	case SET_CUR:
+		return 0;
+	default:
+		LOG_WRN("control: unsupported request type %u", setup->bRequest);
+		return -ENOTSUP;
+	}
+}
+
+static int uvc_control_int(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size,
+			   const struct device *dev, uint32_t cid)
 {
 	uint32_t value;
 	int err;
 
+	size = MIN(setup->wLength, size);
+	LOG_DBG("control: integer type control, size %u", size);
+
 	switch (setup->bRequest) {
-	case GET_DEF:
-		return uvc_buf_add(buf, setup->wLength, 0);
-	case GET_RES:
-		return uvc_buf_add(buf, setup->wLength, 1);
-	case GET_MIN:
-		return uvc_buf_add(buf, setup->wLength, 0);
-	case GET_MAX:
-		return uvc_buf_add(buf, setup->wLength, UINT32_MAX);
 	case GET_INFO:
-		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+	case GET_RES:
+		return uvc_buf_add(buf, size, 1);
+	case GET_DEF:
+		LOG_DBG("%s GET_DEF size=%u", __func__, size);
+		return uvc_buf_add(buf, size, 1);
+	case GET_MIN:
+		return uvc_buf_add(buf, size, 0);
+	case GET_MAX:
+		return uvc_buf_add(buf, size, uvc_get_control_max(size));
 	case GET_CUR:
 		err = video_get_ctrl(dev, cid, &value);
 		if (err) {
 			LOG_ERR("control: failed to query target video device");
 			return err;
 		}
-		return uvc_buf_add(buf, setup->wValue, value);
+		return uvc_buf_add(buf, size, value);
 	case SET_CUR:
-		err = uvc_buf_remove(buf, setup->wValue, &value);
+		err = uvc_buf_remove(buf, size, &value);
 		if (err) {
 			return err;
 		}
@@ -587,13 +710,18 @@ static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struc
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
-	LOG_INF("wValue %u, selector %u", setup->wValue, control_selector);
+	LOG_DBG("control: camera terminal, selector %u, request %u",
+		control_selector, setup->bRequest);
 
 	switch (control_selector) {
-	case UVC_CONTROL_CAMERA_EXPOSURE_ABSOLUTE:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_EXPOSURE);
-	case UVC_CONTROL_CAMERA_ZOOM_ABSOLUTE:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_ZOOM);
+	case CT_AE_MODE_CONTROL:
+		return uvc_control_fix(setup, buf, 1, BIT(0));
+	case CT_AE_PRIORITY_CONTROL:
+		return uvc_control_fix(setup, buf, 1, 0);
+	case CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_EXPOSURE);
+	case CT_ZOOM_ABSOLUTE_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_ZOOM);
 	default:
 		LOG_WRN("control: unsupported selector %u for camera terminal ", control_selector);
 		return -ENOTSUP;
@@ -605,19 +733,23 @@ static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, s
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
+	LOG_DBG("control: processing unit, selector %u, request %u",
+		control_selector, setup->bRequest);
+
 	switch (control_selector) {
-	case UVC_CONTROL_PROCESSING_BRIGHTNESS:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
-	case UVC_CONTROL_PROCESSING_CONTRAST:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_CONTRAST);
-	case UVC_CONTROL_PROCESSING_GAIN:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_GAIN);
-	case UVC_CONTROL_PROCESSING_SATURATION:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_SATURATION);
-	case UVC_CONTROL_PROCESSING_WB_TEMPERATURE:
-		return uvc_control_defaults(setup, buf, dev, VIDEO_CID_CAMERA_WHITE_BAL);
+	case PU_BRIGHTNESS_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
+	case PU_CONTRAST_CONTROL:
+		return uvc_control_int(setup, buf, 1, dev, VIDEO_CID_CAMERA_CONTRAST);
+	case PU_GAIN_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_GAIN);
+	case PU_SATURATION_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_SATURATION);
+	case PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
+		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_WHITE_BAL);
 	default:
 		LOG_WRN("control: unsupported selector %u for processing unit", control_selector);
+		return -ENOTSUP;
 	}
 }
 
@@ -645,10 +777,11 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	case GET_LEN: LOG_DBG("GET_LEN"); break;
 	case GET_INFO: LOG_DBG("GET_INFO"); break;
 	case GET_DEF: LOG_DBG("GET_DEF"); break;
+	default: LOG_WRN("control: unknown"); break;
 	}
 
 	if (interface == *data->desc_if_vs_ifnum) {
-		return uvc_control_format(data, setup, buf);
+		return uvc_control_streaming(data, setup, buf);
 	}
 
 	if (interface == *data->desc_if_vc_ifnum) {
@@ -660,7 +793,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 		}
 	}
 
-	LOG_WRN("control: no controls found for interface %u", interface);
+	LOG_WRN("control: no entity %u found for interface %u", entity_id, interface);
 	return -ENOTSUP;
 }
 

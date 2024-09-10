@@ -125,14 +125,17 @@
 #define LOOKUP_ID(node, compat) DT_FOREACH_CHILD_VARGS(node, COMPAT_ID, compat)
 
 /* Connect the entities to their source(s) */
-#define VC_PROP_N_ID(entity, prop, n) DT_NODE_ID(DT_PHANDLE_BY_IDX(entity, prop, n)),
-#define VC_SOURCE_ID(entity) DT_FOREACH_PROP_ELEM(entity, source_entity, VC_PROP_N_ID)
+#define VC_PROP_N_ID(entity, prop, n) NODE_ID(DT_PHANDLE_BY_IDX(entity, prop, n))
+#define VC_SOURCE_ID(entity)							\
+	DT_FOREACH_PROP_ELEM_SEP(entity, source_entity, VC_PROP_N_ID, (,))
 #define VC_SOURCE_NUM(entity) DT_PROP_LEN(entity, source_entity)
 
 /* Convert a list of integers to an (uint64_t) bitmap */
-#define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n) - 1)
+#define VC_CONTROL_BIT(entity, prop, n) BIT(DT_PROP_BY_IDX(entity, prop, n)) |
 #define VC_CONTROLS(entity)							\
-	(DT_FOREACH_PROP_ELEM_SEP(entity, control_ids, VC_CONTROL_BIT, (|)))
+	(IF_ENABLED(DT_NODE_HAS_PROP(entity, control_ids), (			\
+		DT_FOREACH_PROP_ELEM(entity, control_ids, VC_CONTROL_BIT)	\
+	)) 0)
 
 /* Estimate the frame buffer size out of other fields */
 #define MAX_VIDEO_FRAME_BUFFER_SIZE(frame)					\
@@ -196,7 +199,7 @@
 	NODE_ID(entity),				/* bTerminalID */	\
 	U16_LE(TT_STREAMING),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
-	0x01,						/* bSourceID */		\
+	VC_SOURCE_ID(entity),				/* bSourceID */		\
 	0x00,						/* iTerminal */
 
 /* 3.7.2.3 Camera Terminal Descriptor */
@@ -230,7 +233,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_PROCESSING_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
-	VC_SOURCES_IDS(entity),				/* bSourceID */		\
+	VC_SOURCE_ID(entity),				/* bSourceID */		\
 	U16_LE(0),					/* wMaxMultiplier */	\
 	0x03,						/* bControlSize */	\
 	U24_LE(VC_CONTROLS(entity)),			/* bmControls */	\

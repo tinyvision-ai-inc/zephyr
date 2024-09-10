@@ -12,12 +12,10 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/kernel.h>
-
-#define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
-#include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(imx219);
-
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(imx219, CONFIG_VIDEO_LOG_LEVEL);
 
 /* Chip ID */
 #define CHIP_ID_REG 0x0000
@@ -429,12 +427,79 @@ static int imx219_get_caps(const struct device *dev, enum video_endpoint_id ep,
 	return 0;
 }
 
+static int imx219_set_ctrl(const struct device *dev, unsigned int cid, void *value)
+{
+	uint32_t u32 = (uintptr_t)value;
+
+	LOG_INF("cid=0x%08x", cid);
+
+	switch (cid) {
+	case VIDEO_CID_CAMERA_EXPOSURE:
+		LOG_INF("VIDEO_CID_CAMERA_EXPOSURE: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_ZOOM:
+		LOG_INF("VIDEO_CID_CAMERA_ZOOM: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_BRIGHTNESS:
+		LOG_INF("VIDEO_CID_CAMERA_BRIGHTNESS: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_CONTRAST:
+		LOG_INF("VIDEO_CID_CAMERA_CONTRAST: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_GAIN:
+		LOG_INF("VIDEO_CID_CAMERA_GAIN: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_SATURATION:
+		LOG_INF("VIDEO_CID_CAMERA_SATURATION: %u", u32);
+		break;
+	case VIDEO_CID_CAMERA_WHITE_BAL:
+		LOG_INF("VIDEO_CID_CAMERA_WHITE_BAL: %u", u32);
+		break;
+	}
+
+	return 0;
+}
+
+static int imx219_get_ctrl(const struct device *dev, unsigned int cid, void *value)
+{
+	LOG_INF("cid=0x%08x", cid);
+
+	switch (cid) {
+	case VIDEO_CID_CAMERA_EXPOSURE:
+		LOG_INF("VIDEO_CID_CAMERA_EXPOSURE");
+		break;
+	case VIDEO_CID_CAMERA_ZOOM:
+		LOG_INF("VIDEO_CID_CAMERA_ZOOM");
+		break;
+	case VIDEO_CID_CAMERA_BRIGHTNESS:
+		LOG_INF("VIDEO_CID_CAMERA_BRIGHTNESS");
+		break;
+	case VIDEO_CID_CAMERA_CONTRAST:
+		LOG_INF("VIDEO_CID_CAMERA_CONTRAST");
+		break;
+	case VIDEO_CID_CAMERA_GAIN:
+		LOG_INF("VIDEO_CID_CAMERA_GAIN");
+		break;
+	case VIDEO_CID_CAMERA_SATURATION:
+		LOG_INF("VIDEO_CID_CAMERA_SATURATION");
+		break;
+	case VIDEO_CID_CAMERA_WHITE_BAL:
+		LOG_INF("VIDEO_CID_CAMERA_WHITE_BAL");
+		break;
+	}
+
+	*(uint32_t *)value = 1234;
+	return 0;
+}
+
 static const struct video_driver_api imx219_driver_api = {
 	.set_format = imx219_set_fmt,
 	.get_format = imx219_get_fmt,
 	.get_caps = imx219_get_caps,
 	.stream_start = imx219_stream_start,
 	.stream_stop = imx219_stream_stop,
+	.set_ctrl = imx219_set_ctrl,
+	.get_ctrl = imx219_get_ctrl,
 };
 
 static int imx219_init(const struct device *dev)
