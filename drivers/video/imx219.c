@@ -12,10 +12,12 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/kernel.h>
-#include <zephyr/sys/byteorder.h>
-#include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(imx219, CONFIG_VIDEO_LOG_LEVEL);
+#define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(imx219);
+
+#include <zephyr/sys/byteorder.h>
 
 /* Chip ID */
 #define CHIP_ID_REG 0x0000
@@ -43,14 +45,20 @@ LOG_MODULE_REGISTER(imx219, CONFIG_VIDEO_LOG_LEVEL);
 /* Analog gain control */
 #define IMX219_REG_ANALOG_GAIN  0x0157
 #define IMX219_ANA_GAIN_DEFAULT 0x80
+#define IMX219_ANA_GAIN_MIN     0
+#define IMX219_ANA_GAIN_MAX     232
 
 /* Digital gain control */
 #define IMX219_REG_DIGITAL_GAIN_MSB 0x0158
 #define IMX219_REG_DIGITAL_GAIN_LSB 0x0159
 #define IMX219_DGTL_GAIN_DEFAULT    0x0100
 
+/* Exposure control */
 #define IMX219_REG_INTEGRATION_TIME_MSB 0x015A
 #define IMX219_REG_INTEGRATION_TIME_LSB 0x015B
+#define IMX219_EXPOSURE_DEFAULT 4
+#define IMX219_EXPOSURE_MIN             0
+#define IMX219_EXPOSURE_MAX             9
 
 /* V_TIMING internal */
 #define IMX219_REG_FRAME_LEN_MSB 0x0160
@@ -170,7 +178,6 @@ static const struct imx219_resolution_config res_params[] = {
 
 static const struct video_format_cap fmts[] = {
 	IMX219_VIDEO_FORMAT_CAP(1920, 1080, VIDEO_PIX_FMT_BGGR8),
-	// IMX219_VIDEO_FORMAT_CAP(1280, 720, VIDEO_PIX_FMT_BGGR8),
 	{0}};
 
 static int imx219_read_reg(const struct i2c_dt_spec *spec, const uint16_t addr, void *val,
@@ -268,8 +275,7 @@ static const struct imx219_reg imx219InitParams[] = {
 	{IMX219_REG_DPHY_CTRL, IMX219_DPHY_CTRL_TIMING_AUTO}, // DPHY timing 0-> auot 1-> manual
 	{IMX219_REG_EXCK_FREQ, 0x18}, // external oscillator frequncy 0x18 -> 24Mhz
 	{IMX219_REG_EXCK_FREQ_LSB, 0x00},
-	{IMX219_REG_FRAME_LEN_MSB,
-	 0x06}, // frame length , Raspberry pi sends this commands continously when recording video
+	{IMX219_REG_FRAME_LEN_MSB, 0x06}, // frame length , Raspberry pi sends this commands continously when recording video
 		// @60fps ,writes come at interval of 32ms , Data 355 for resolution 1280x720
 		// command 162 also comes along with data 0DE7 also 15A with data 0200
 	{IMX219_REG_FRAME_LEN_LSB, 0xE3},
@@ -346,8 +352,57 @@ static const struct imx219_reg imx219InitParams[] = {
 	{IMX219_REG_INTEGRATION_TIME_LSB, 0x51},
 	{IMX219_REG_ORIENTATION,
 	 0x03}, // image_orientation (for both direction) bit[0]: hor bit[1]: vert
-	//{IMX219_REG_MODE_SELECT,			IMX219_MODE_STREAMING},
 };
+
+static int imx219_get_exposure(const struct device *dev, uint32_t *value)
+{
+	const struct imx219_config *cfg = dev->config;
+	uint8_t u8;
+	int ret;
+
+	ret = imx219_read_reg(&cfg->i2c, IMX219_REG_INTEGRATION_TIME_MSB, &u8, 1);
+	*value = u8;
+	return ret;
+}
+
+static int imx219_set_exposure(const struct device *dev, uint32_t value)
+{
+	const struct imx219_config *cfg = dev->config;
+
+	value = MIN(value, IMX219_EXPOSURE_MAX);
+	value = MAX(value, IMX219_EXPOSURE_MIN);
+	return imx219_write_reg(&cfg->i2c, IMX219_REG_INTEGRATION_TIME_MSB, value);
+}
+
+static int imx219_get_gain(const struct device *dev, uint32_t *value)
+{
+	const struct imx219_config *cfg = dev->config;
+	uint8_t u8;
+	int ret;
+
+	ret = imx219_read_reg(&cfg->i2c, IMX219_REG_ANALOG_GAIN, &u8, 1);
+	*value = u8;
+	return ret;
+}
+
+static int imx219_set_gain(const struct device *dev, uint32_t value)
+{
+	const struct imx219_config *cfg = dev->config;
+
+	value = MIN(value, IMX219_ANA_GAIN_MAX);
+	value = MAX(value, IMX219_ANA_GAIN_MIN);
+	return imx219_write_reg(&cfg->i2c, IMX219_REG_ANALOG_GAIN, value);
+}
+
+static int imx219_get_fmt(const struct device *dev, enum video_endpoint_id ep,
+			  struct video_format *fmt)
+{
+	struct imx219_data *drv_data = dev->data;
+
+	*fmt = drv_data->fmt;
+
+	return 0;
+}
 
 static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt)
@@ -378,8 +433,7 @@ static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 
 	/* Set resolution parameters */
 	for (i = 0; i < ARRAY_SIZE(res_params); i++) {
-		if (fmt->width == res_params[i].width &&
-		    fmt->height == res_params[i].height) {
+		if (fmt->width == res_params[i].width && fmt->height == res_params[i].height) {
 			ret = imx219_write_multi_regs(&cfg->i2c, res_params[i].res_params,
 						      IMX219_RESOLUTION_PARAM_NUM);
 			if (ret) {
@@ -397,27 +451,13 @@ static int imx219_set_fmt(const struct device *dev, enum video_endpoint_id ep,
 static int imx219_stream_start(const struct device *dev)
 {
 	const struct imx219_config *cfg = dev->config;
-
-	LOG_INF("Starting the IMX219 sensor");
 	return imx219_write_reg(&cfg->i2c, IMX219_REG_MODE_SELECT, IMX219_MODE_STREAMING);
 }
 
 static int imx219_stream_stop(const struct device *dev)
 {
 	const struct imx219_config *cfg = dev->config;
-
-	LOG_INF("Stopping the IMX219 sensor");
 	return imx219_write_reg(&cfg->i2c, IMX219_REG_MODE_SELECT, IMX219_MODE_STANDBY);
-}
-
-static int imx219_get_fmt(const struct device *dev, enum video_endpoint_id ep,
-			  struct video_format *fmt)
-{
-	struct imx219_data *drv_data = dev->data;
-
-	*fmt = drv_data->fmt;
-
-	return 0;
 }
 
 static int imx219_get_caps(const struct device *dev, enum video_endpoint_id ep,
@@ -429,31 +469,26 @@ static int imx219_get_caps(const struct device *dev, enum video_endpoint_id ep,
 
 static int imx219_set_ctrl(const struct device *dev, unsigned int cid, void *value)
 {
-	uint32_t u32 = (uintptr_t)value;
-
-	LOG_INF("cid=0x%08x", cid);
-
 	switch (cid) {
+	case VIDEO_CID_CAMERA_EXPOSURE:
+		return imx219_set_exposure(dev, (uint32_t)value);
 	case VIDEO_CID_CAMERA_GAIN:
-		LOG_INF("VIDEO_CID_CAMERA_GAIN: %u", u32);
-		break;
+		return imx219_set_gain(dev, (uint32_t)value);
+	default:
+		return -ENOTSUP;
 	}
-
-	return 0;
 }
 
 static int imx219_get_ctrl(const struct device *dev, unsigned int cid, void *value)
 {
-	LOG_INF("cid=0x%08x", cid);
-
 	switch (cid) {
+	case VIDEO_CID_CAMERA_EXPOSURE:
+		return imx219_get_exposure(dev, value);
 	case VIDEO_CID_CAMERA_GAIN:
-		LOG_INF("VIDEO_CID_CAMERA_GAIN");
-		break;
+		return imx219_get_gain(dev, value);
+	default:
+		return -ENOTSUP;
 	}
-
-	*(uint32_t *)value = 1234;
-	return 0;
 }
 
 static const struct video_driver_api imx219_driver_api = {
