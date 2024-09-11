@@ -120,9 +120,12 @@
 #define NODE_ID(entity) UTIL_INC(DT_NODE_CHILD_IDX(entity))
 
 /* Fetch the ID of a child node with the given compat */
-#define COMPAT_ID(node, compat)							\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, compat), (NODE_ID(node)))
-#define LOOKUP_ID(node, compat) DT_FOREACH_CHILD_VARGS(node, COMPAT_ID, compat)
+#define NODE_IF_COMPAT(node, compat)						\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(node, compat), (node))
+#define LOOKUP_NODE(node, compat)						\
+	DT_FOREACH_CHILD_VARGS(node, NODE_IF_COMPAT, compat)
+#define LOOKUP_ID(node, compat)							\
+	NODE_ID(LOOKUP_NODE(node, compat))
 
 /* Connect the entities to their source(s) */
 #define VC_PROP_N_ID(entity, prop, n) NODE_ID(DT_PHANDLE_BY_IDX(entity, prop, n))

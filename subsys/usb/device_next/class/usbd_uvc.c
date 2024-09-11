@@ -204,7 +204,7 @@ struct uvc_data {
 	/* UVC payload header, passed just before the image data */
 	struct uvc_payload_header payload_header;
 	/* Video device controlled by the host via UVC */
-	const struct device *source_dev;
+	const struct device *output_terminal;
 	/* Video FIFOs for submission (in) and completion (out) queue */
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
@@ -540,7 +540,7 @@ static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc
 			return err;
 		}
 
-		if (data->source_dev != NULL) {
+		if (data->output_terminal != NULL) {
 			const struct device *dev = usbd_class_get_private(data->c_data);
 			struct video_format fmt = {0};
 
@@ -552,13 +552,13 @@ static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc
 
 			LOG_DBG("control: setting source format to %ux%u", fmt.width, fmt.height);
 
-			err = video_set_format(data->source_dev, VIDEO_EP_OUT, &fmt);
+			err = video_set_format(data->output_terminal, VIDEO_EP_OUT, &fmt);
 			if (err) {
 				LOG_ERR("Could not set the format of the video source");
 				return err;
 			}
 
-			err = video_stream_start(data->source_dev);
+			err = video_stream_start(data->output_terminal);
 			if (err) {
 				LOG_ERR("Could not start the video source");
 				return err;
@@ -1148,6 +1148,9 @@ static int uvc_preinit(const struct device *dev)
 		.target = DEVICE_DT_GET(DT_PHANDLE(node, control_target)),	\
 	},))
 
+#define OUTPUT_TERMINAL(node)							\
+	DT_PHANDLE(LOOKUP_NODE(node, zephyr_uvc_control_output), control_target)
+
 #define UVC_DEVICE_DEFINE(node)							\
 										\
 	UVC_DESCRIPTOR_ARRAYS(node)						\
@@ -1200,7 +1203,7 @@ static int uvc_preinit(const struct device *dev)
 		.hs_desc_ep_epaddr = node##_hs_desc_ep + 2,			\
 		.ss_desc_ep_epaddr = node##_ss_desc_ep + 2,			\
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
-		.source_dev = DEVICE_DT_GET_OR_NULL(DT_PHANDLE(node, source)),	\
+		.output_terminal = DEVICE_DT_GET_OR_NULL(OUTPUT_TERMINAL(node)),\
 	};									\
 										\
 	BUILD_ASSERT(DT_ON_BUS(node, usb),					\

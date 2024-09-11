@@ -13,7 +13,8 @@ properties:
     type: phandle
     required: true
     description: |
-      Device affected by the UVC controls that start and stop the stream.
+      Device that will receive the start/stop signals from the host, and
+      receives the format negotiated from the host.
 
   source-entity:
     type: phandle
