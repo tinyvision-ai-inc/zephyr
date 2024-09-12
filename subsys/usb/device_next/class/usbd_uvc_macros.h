@@ -179,7 +179,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_HEADER,					/* bDescriptorSubtype */\
 	U16_LE(0x0150),					/* bcdUVC */		\
-	U16_LE(VC_TOTAL_LENGTH(node)),			/* wTotalLength */	\
+	U16_LE(12 + 1 + VC_TOTAL_LENGTH(node)),		/* wTotalLength */	\
 	U32_LE(30000000),				/* dwClockFrequency */	\
 	0x01,						/* bInCollection */	\
 	0x01,						/* baInterfaceNr */
@@ -317,7 +317,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_INPUT_HEADER,				/* bDescriptorSubtype */\
 	VS_NUM_FORMATS(node),				/* bNumFormats */	\
-	U16_LE(VS_TOTAL_LENGTH(node)),			/* wTotalLength */	\
+	U16_LE(14 + VS_TOTAL_LENGTH(node)),		/* wTotalLength */	\
 	0x81,						/* bEndpointAddress */	\
 	0x00,						/* bmInfo */		\
 	LOOKUP_ID(node, zephyr_uvc_control_output),	/* bTerminalLink */	\
