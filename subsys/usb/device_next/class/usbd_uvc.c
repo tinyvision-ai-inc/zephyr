@@ -224,18 +224,19 @@ NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPA
 static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt);
 
-static int uvc_get_control_max(uint16_t size)
+static uint32_t uvc_get_video_cid(const struct usb_setup_packet *setup, uint32_t cid)
 {
-	switch (size) {
-	case 4:
-		return INT32_MAX;
-	case 2:
-		return INT16_MAX;
-	case 1:
-		return INT8_MAX;
+	switch (setup->bRequest) {
+	case GET_CUR:
+		return VIDEO_GET_CUR | cid;
+	case GET_MIN:
+		return VIDEO_GET_MIN | cid;
+	case GET_MAX:
+		return VIDEO_GET_MAX | cid;
 	default:
+		__ASSERT_NO_MSG(false);
 		return 0;
-	}
+	}	
 }
 
 static int uvc_buf_add(struct net_buf *buf, uint16_t size, uint32_t value)
@@ -662,7 +663,7 @@ static int uvc_control_fix(const struct usb_setup_packet *setup, struct net_buf 
 	}
 }
 
-static int uvc_control_int(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size,
+static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size,
 			   const struct device *dev, uint32_t cid)
 {
 	uint32_t value;
@@ -680,21 +681,21 @@ static int uvc_control_int(const struct usb_setup_packet *setup, struct net_buf 
 		LOG_DBG("%s GET_DEF size=%u", __func__, size);
 		return uvc_buf_add(buf, size, 1);
 	case GET_MIN:
-		return uvc_buf_add(buf, size, 0);
 	case GET_MAX:
-		return uvc_buf_add(buf, size, uvc_get_control_max(size));
 	case GET_CUR:
-		err = video_get_ctrl(dev, cid, &value);
+		err = video_get_ctrl(dev, uvc_get_video_cid(setup, cid), &value);
 		if (err) {
 			LOG_ERR("control: failed to query target video device");
 			return err;
 		}
+		LOG_DBG("control: value for CID 0x08%x is %u", cid, value);
 		return uvc_buf_add(buf, size, value);
 	case SET_CUR:
 		err = uvc_buf_remove(buf, size, &value);
 		if (err) {
 			return err;
 		}
+		LOG_DBG("control: setting CID 0x08%x to %u", cid, value);
 		err = video_set_ctrl(dev, cid, (void *)value);
 		if (err) {
 			LOG_ERR("control: failed to configure target video device");
@@ -721,9 +722,9 @@ static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struc
 	case CT_AE_PRIORITY_CONTROL:
 		return uvc_control_fix(setup, buf, 1, 0);
 	case CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
-		return uvc_control_int(setup, buf, 4, dev, VIDEO_CID_CAMERA_EXPOSURE);
+		return uvc_control_uint(setup, buf, 4, dev, VIDEO_CID_CAMERA_EXPOSURE);
 	case CT_ZOOM_ABSOLUTE_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_ZOOM);
+		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_ZOOM);
 	default:
 		LOG_WRN("control: unsupported selector %u for camera terminal ", control_selector);
 		return -ENOTSUP;
@@ -740,15 +741,15 @@ static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, s
 
 	switch (control_selector) {
 	case PU_BRIGHTNESS_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
+		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
 	case PU_CONTRAST_CONTROL:
-		return uvc_control_int(setup, buf, 1, dev, VIDEO_CID_CAMERA_CONTRAST);
+		return uvc_control_uint(setup, buf, 1, dev, VIDEO_CID_CAMERA_CONTRAST);
 	case PU_GAIN_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_GAIN);
+		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_GAIN);
 	case PU_SATURATION_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_SATURATION);
+		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_SATURATION);
 	case PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
-		return uvc_control_int(setup, buf, 2, dev, VIDEO_CID_CAMERA_WHITE_BAL);
+		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_WHITE_BAL);
 	default:
 		LOG_WRN("control: unsupported selector %u for processing unit", control_selector);
 		return -ENOTSUP;
@@ -1072,7 +1073,6 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 
 	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED) ||
 	    !atomic_test_bit(&data->state, UVC_CLASS_READY)) {
-		LOG_DBG("UVC format not chosen by the host yet ");
 		return -EAGAIN;
 	}
 
