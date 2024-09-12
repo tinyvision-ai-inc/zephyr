@@ -204,7 +204,7 @@ struct uvc_data {
 	/* UVC payload header, passed just before the image data */
 	struct uvc_payload_header payload_header;
 	/* Video device controlled by the host via UVC */
-	const struct device *output_terminal;
+	const struct device *output_dev;
 	/* Video FIFOs for submission (in) and completion (out) queue */
 	struct k_fifo fifo_in;
 	struct k_fifo fifo_out;
@@ -529,6 +529,8 @@ static int uvc_control_probe(struct uvc_data *data, uint8_t request, struct uvc_
 
 static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc_probe *probe)
 {
+	const struct device *dev = usbd_class_get_private(data->c_data);
+	struct video_format fmt = {0};
 	int err;
 
 	switch (request) {
@@ -540,34 +542,34 @@ static int uvc_control_commit(struct uvc_data *data, uint8_t request, struct uvc
 			return err;
 		}
 
-		if (data->output_terminal != NULL) {
-			const struct device *dev = usbd_class_get_private(data->c_data);
-			struct video_format fmt = {0};
+		atomic_set_bit(&data->state, UVC_CLASS_READY);
+		k_work_submit(&data->work);
 
-			err = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
-			if (err) {
-				LOG_ERR("Failed to inquire the current UVC format");
-				return err;
-			}
+		err = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
+		if (err) {
+			LOG_ERR("Failed to inquire the current UVC format");
+			return err;
+		}
 
+		LOG_INF("control: ready to transfer %ux%u frames of %u bytes",
+			fmt.width, fmt.height, fmt.height * fmt.pitch);
+
+		if (data->output_dev != NULL) {
 			LOG_DBG("control: setting source format to %ux%u", fmt.width, fmt.height);
 
-			err = video_set_format(data->output_terminal, VIDEO_EP_OUT, &fmt);
+			err = video_set_format(data->output_dev, VIDEO_EP_OUT, &fmt);
 			if (err) {
 				LOG_ERR("Could not set the format of the video source");
 				return err;
 			}
 
-			err = video_stream_start(data->output_terminal);
+			err = video_stream_start(data->output_dev);
 			if (err) {
 				LOG_ERR("Could not start the video source");
 				return err;
 			}
 		}
 
-		LOG_INF("control: ready to transfer frames");
-		atomic_set_bit(&data->state, UVC_CLASS_READY);
-		k_work_submit(&data->work);
 		break;
 	default:
 		LOG_WRN("commit: invalid bRequest %u", request);
@@ -757,6 +759,13 @@ static int zephyr_uvc_control_output(const struct usb_setup_packet *setup, struc
 				     const struct device *dev)
 {
 	LOG_WRN("control: nothing supported for output terminal");
+	return -ENOTSUP;
+};
+
+static int zephyr_uvc_control_input(const struct usb_setup_packet *setup, struct net_buf *buf,
+				     const struct device *dev)
+{
+	LOG_WRN("control: nothing supported for input terminal");
 	return -ENOTSUP;
 };
 
@@ -1061,6 +1070,12 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 		return -EINVAL;
 	}
 
+	if (!atomic_test_bit(&data->state, UVC_CLASS_ENABLED) ||
+	    !atomic_test_bit(&data->state, UVC_CLASS_READY)) {
+		LOG_DBG("UVC format not chosen by the host yet ");
+		return -EAGAIN;
+	}
+
 	memset(fmt, 0, sizeof(*fmt));
 	fmt->pixelformat = cap->pixelformat;
 	fmt->width = cap->width_max;
@@ -1109,6 +1124,9 @@ static int uvc_preinit(const struct device *dev)
 	return 0;
 }
 
+#define TARGET_DEV(node) DEVICE_DT_GET_OR_NULL(DT_PHANDLE(node, control_target))
+#define OUTPUT_DEV(node) TARGET_DEV(LOOKUP_NODE(node, zephyr_uvc_control_output))
+
 #define UVC_CAP_ENTRY(frame, format)						\
 	{									\
 		.pixelformat = video_fourcc(DT_PROP(format, fourcc)[0],		\
@@ -1145,11 +1163,8 @@ static int uvc_preinit(const struct device *dev)
 	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(node)), ({				\
 		.entity_id = NODE_ID(node),					\
 		.fn = &DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
-		.target = DEVICE_DT_GET(DT_PHANDLE(node, control_target)),	\
+		.target = TARGET_DEV(node),					\
 	},))
-
-#define OUTPUT_TERMINAL(node)							\
-	DT_PHANDLE(LOOKUP_NODE(node, zephyr_uvc_control_output), control_target)
 
 #define UVC_DEVICE_DEFINE(node)							\
 										\
@@ -1203,7 +1218,7 @@ static int uvc_preinit(const struct device *dev)
 		.hs_desc_ep_epaddr = node##_hs_desc_ep + 2,			\
 		.ss_desc_ep_epaddr = node##_ss_desc_ep + 2,			\
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
-		.output_terminal = DEVICE_DT_GET_OR_NULL(OUTPUT_TERMINAL(node)),\
+		.output_dev = OUTPUT_DEV(node),					\
 	};									\
 										\
 	BUILD_ASSERT(DT_ON_BUS(node, usb),					\
