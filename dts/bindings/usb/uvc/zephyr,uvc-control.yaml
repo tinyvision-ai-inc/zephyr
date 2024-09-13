@@ -12,9 +12,8 @@ properties:
     description: |
       Reference to a video device which these controls affect.
 
-  control-ids:
-    type: array
+  source-entity:
+    type: phandle
+    required: true
     description: |
-      List of control IDs which marked as supported by the USB device.
-      UVC controls are mapped to entries of video-controls.h when passed to
-      the control target.
+      Points to the entity that controls the data source to the current control.

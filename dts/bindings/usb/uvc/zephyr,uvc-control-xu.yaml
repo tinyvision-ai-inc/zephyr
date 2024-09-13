@@ -3,15 +3,14 @@
 
 description: UVC Extension Unit for custom vendor-specific controls
 
-compatible: "zephyr,uvc-control-extension"
+compatible: "zephyr,uvc-control-xu"
 
 include: "zephyr,uvc-control.yaml"
 
 properties:
 
-  source-entities:
+  control-bitmask:
     type: phandle-array
     required: true
     description: |
-      Entities connected as input to the Extension Unit.
-      The relation between controls and the source(s) is implementation-specific.
+      Bits enabled for the extension control unit.
