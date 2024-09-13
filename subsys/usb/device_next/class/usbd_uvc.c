@@ -39,84 +39,15 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define INFO_SUPPORTS_GET			BIT(0)
 #define INFO_SUPPORTS_SET			BIT(1)
 
-/* Selector Unit Control Selectors */
-#define SU_INPUT_SELECT_CONTROL			0x01
-
-/* Camera Terminal Control Selectors */
-#define CT_SCANNING_MODE_CONTROL		0x01
-#define CT_AE_MODE_CONTROL			0x02
-#define CT_AE_PRIORITY_CONTROL			0x03
-#define CT_EXPOSURE_TIME_ABSOLUTE_CONTROL	0x04
-#define CT_EXPOSURE_TIME_RELATIVE_CONTROL	0x05
-#define CT_FOCUS_ABSOLUTE_CONTROL		0x06
-#define CT_FOCUS_RELATIVE_CONTROL		0x07
-#define CT_FOCUS_AUTO_CONTROL			0x08
-#define CT_IRIS_ABSOLUTE_CONTROL		0x09
-#define CT_IRIS_RELATIVE_CONTROL		0x0A
-#define CT_ZOOM_ABSOLUTE_CONTROL		0x0B
-#define CT_ZOOM_RELATIVE_CONTROL		0x0C
-#define CT_PANTILT_ABSOLUTE_CONTROL		0x0D
-#define CT_PANTILT_RELATIVE_CONTROL		0x0E
-#define CT_ROLL_ABSOLUTE_CONTROL		0x0F
-#define CT_ROLL_RELATIVE_CONTROL		0x10
-#define CT_PRIVACY_CONTROL			0x11
-#define CT_FOCUS_SIMPLE_CONTROL			0x12
-#define CT_WINDOW_CONTROL			0x13
-#define CT_REGION_OF_INTEREST_CONTROL		0x14
-
-/* Processing Unit Control Selectors */
-#define PU_BACKLIGHT_COMPENSATION_CONTROL	0x01
-#define PU_BRIGHTNESS_CONTROL			0x02
-#define PU_CONTRAST_CONTROL			0x03
-#define PU_GAIN_CONTROL				0x04
-#define PU_POWER_LINE_FREQUENCY_CONTROL		0x05
-#define PU_HUE_CONTROL				0x06
-#define PU_SATURATION_CONTROL			0x07
-#define PU_SHARPNESS_CONTROL			0x08
-#define PU_GAMMA_CONTROL			0x09
-#define PU_WHITE_BALANCE_TEMPERATURE_CONTROL	0x0A
-#define PU_WHITE_BALANCE_TEMPERATURE_AUTO_CONTROL 0x0B
-#define PU_WHITE_BALANCE_COMPONENT_CONTROL	0x0C
-#define PU_WHITE_BALANCE_COMPONENT_AUTO_CONTROL	0x0D
-#define PU_DIGITAL_MULTIPLIER_CONTROL		0x0E
-#define PU_DIGITAL_MULTIPLIER_LIMIT_CONTROL	0x0F
-#define PU_HUE_AUTO_CONTROL			0x10
-#define PU_ANALOG_VIDEO_STANDARD_CONTROL	0x11
-#define PU_ANALOG_LOCK_STATUS_CONTROL		0x12
-#define PU_CONTRAST_AUTO_CONTROL		0x13
-
-/* Encoding Unit Control Selectors */
-#define EU_SELECT_LAYER_CONTROL			0x01
-#define EU_PROFILE_TOOLSET_CONTROL		0x02
-#define EU_VIDEO_RESOLUTION_CONTROL		0x03
-#define EU_MIN_FRAME_INTERVAL_CONTROL		0x04
-#define EU_SLICE_MODE_CONTROL			0x05
-#define EU_RATE_CONTROL_MODE_CONTROL		0x06
-#define EU_AVERAGE_BITRATE_CONTROL		0x07
-#define EU_CPB_SIZE_CONTROL			0x08
-#define EU_PEAK_BIT_RATE_CONTROL		0x09
-#define EU_QUANTIZATION_PARAMS_CONTROL		0x0A
-#define EU_SYNC_REF_FRAME_CONTROL		0x0B
-#define EU_LTR_BUFFER_CONTROL			0x0C
-#define EU_LTR_PICTURE_CONTROL			0x0D
-#define EU_LTR_VALIDATION_CONTROL		0x0E
-#define EU_LEVEL_IDC_LIMIT_CONTROL		0x0F
-#define EU_SEI_PAYLOADTYPE_CONTROL		0x10
-#define EU_QP_RANGE_CONTROL			0x11
-#define EU_PRIORITY_CONTROL			0x12
-#define EU_START_OR_STOP_LAYER_CONTROL		0x13
-#define EU_ERROR_RESILIENCY_CONTROL		0x14
-
-/* VideoStreaming Interface Control Selectors */
-#define VS_PROBE_CONTROL			0x01
-#define VS_COMMIT_CONTROL			0x02
-#define VS_STILL_PROBE_CONTROL			0x03
-#define VS_STILL_COMMIT_CONTROL			0x04
-#define VS_STILL_IMAGE_TRIGGER_CONTROL		0x05
-#define VS_STREAM_ERROR_CODE_CONTROL		0x06
-#define VS_GENERATE_KEY_FRAME_CONTROL		0x07
-#define VS_UPDATE_FRAME_SEGMENT_CONTROL		0x08
-#define VS_SYNCH_DELAY_CONTROL			0x09
+/* Video and Still Image Payload Headers */
+#define UVC_BMHEADERINFO_FRAMEID		BIT(0)
+#define UVC_BMHEADERINFO_END_OF_FRAME		BIT(1)
+#define UVC_BMHEADERINFO_HAS_PRESENTATIONTIME	BIT(2)
+#define UVC_BMHEADERINFO_HAS_SOURCECLOCK	BIT(3)
+#define UVC_BMHEADERINFO_PAYLOAD_SPECIFIC_BIT	BIT(4)
+#define UVC_BMHEADERINFO_STILL_IMAGE		BIT(5)
+#define UVC_BMHEADERINFO_ERROR			BIT(6)
+#define UVC_BMHEADERINFO_END_OF_HEADER		BIT(7)
 
 struct uvc_data;
 
@@ -171,6 +102,8 @@ struct uvc_control {
 	uint8_t entity_id;
 	int (*fn)(const struct usb_setup_packet *, struct net_buf *, const struct device *);
 	const struct device *target;
+	uint64_t mask;
+	uint32_t *defaults;
 };
 
 struct uvc_data {
@@ -708,7 +641,7 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 	}
 }
 
-static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struct net_buf *buf,
+static int zephyr_uvc_control_ct(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
 	uint8_t control_selector = setup->wValue >> 8;
@@ -731,7 +664,7 @@ static int zephyr_uvc_control_camera(const struct usb_setup_packet *setup, struc
 	}
 }
 
-static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, struct net_buf *buf,
+static int zephyr_uvc_control_pu(const struct usb_setup_packet *setup, struct net_buf *buf,
 					 const struct device *dev)
 {
 	uint8_t control_selector = setup->wValue >> 8;
@@ -756,14 +689,21 @@ static int zephyr_uvc_control_processing(const struct usb_setup_packet *setup, s
 	}
 }
 
-static int zephyr_uvc_control_output(const struct usb_setup_packet *setup, struct net_buf *buf,
+static int zephyr_uvc_control_xu(const struct usb_setup_packet *setup, struct net_buf *buf,
+				     const struct device *dev)
+{
+	LOG_WRN("control: nothing supported for extension unit");
+	return -ENOTSUP;
+};
+
+static int zephyr_uvc_control_ot(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
 	LOG_WRN("control: nothing supported for output terminal");
 	return -ENOTSUP;
 };
 
-static int zephyr_uvc_control_input(const struct usb_setup_packet *setup, struct net_buf *buf,
+static int zephyr_uvc_control_it(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
 	LOG_WRN("control: nothing supported for input terminal");
@@ -775,8 +715,10 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	const struct uvc_control *controls = data->controls;
 	uint8_t interface = (setup->wIndex >> 0) & 0xff;
 	uint8_t entity_id = (setup->wIndex >> 8) & 0xff;
+	uint8_t control_selector = (setup->wValue) >> 8;
 
 	switch (setup->bRequest) {
 	case SET_CUR: LOG_DBG("SET_CUR"); break;
@@ -795,10 +737,15 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	}
 
 	if (interface == *data->desc_if_vc_ifnum) {
-		for (const struct uvc_control *p = data->controls; p->entity_id != 0; p++) {
-			if (p->entity_id == entity_id) {
+		for (const struct uvc_control *ctrl = controls; ctrl->entity_id != 0; ctrl++) {
+			if (ctrl->entity_id == entity_id) {
 				LOG_DBG("control: found video CIDs for bEntityID %u", entity_id);
-				return p->fn(setup, buf, p->target);
+				if (ctrl->mask & BIT(control_selector)) {
+					return ctrl->fn(setup, buf, ctrl->target);
+				} else {
+					LOG_WRN("control: selector not enabled for this instance");
+					return -ENOTSUP;
+				}
 			}
 		}
 	}
@@ -1125,7 +1072,7 @@ static int uvc_preinit(const struct device *dev)
 }
 
 #define TARGET_DEV(node) DEVICE_DT_GET_OR_NULL(DT_PHANDLE(node, control_target))
-#define OUTPUT_DEV(node) TARGET_DEV(LOOKUP_NODE(node, zephyr_uvc_control_output))
+#define OUTPUT_DEV(node) TARGET_DEV(LOOKUP_NODE(node, zephyr_uvc_control_ot))
 
 #define UVC_CAP_ENTRY(frame, format)						\
 	{									\
@@ -1164,6 +1111,7 @@ static int uvc_preinit(const struct device *dev)
 		.entity_id = NODE_ID(node),					\
 		.fn = &DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
 		.target = TARGET_DEV(node),					\
+		.mask = DT_STRING_UPPER_TOKEN_BY_IDX(node, compatible, 0)(node, CONTROL)\
 	},))
 
 #define UVC_DEVICE_DEFINE(node)							\

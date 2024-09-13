@@ -1,0 +1,40 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: UVC Processing Unit controls for the Image Signal Processor (ISP)
+
+compatible: "zephyr,uvc-control-pu"
+
+include: "zephyr,uvc-control.yaml"
+
+properties:
+  control-backlight-compensation:
+    type: boolean
+  control-brightness:
+    type: boolean
+  control-contrast:
+    type: boolean
+  control-gain:
+    type: boolean
+  control-power-line-frequency:
+    type: boolean
+  control-hue:
+    type: boolean
+  control-saturation:
+    type: boolean
+  control-sharpness:
+    type: boolean
+  control-gamma:
+    type: boolean
+  control-white-balance-temperature:
+    type: boolean
+  control-white-balance-component:
+    type: boolean
+  control-digital-multiplier:
+    type: boolean
+  control-digital-multiplier-limit:
+    type: boolean
+  control-analog-video-standard:
+    type: boolean
+  control-analog-lock-status:
+    type: boolean

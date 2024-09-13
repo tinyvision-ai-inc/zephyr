@@ -3,4 +3,6 @@
 
 description: UVC Input Terminal controls for a custom video input
 
-compatible: "zephyr,uvc-control-input"
+compatible: "zephyr,uvc-control-it"
+
+include: "base.yaml"
