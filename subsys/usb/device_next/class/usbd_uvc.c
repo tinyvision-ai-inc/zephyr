@@ -101,7 +101,7 @@ struct uvc_format {
 struct uvc_control {
 	uint8_t entity_id;
 	int (*fn)(const struct usb_setup_packet *, struct net_buf *, const struct device *);
-	const struct device *target;
+	const struct device *target_dev;
 	uint64_t mask;
 	uint32_t *defaults;
 };
@@ -741,7 +741,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 			if (ctrl->entity_id == entity_id) {
 				LOG_DBG("control: found video CIDs for bEntityID %u", entity_id);
 				if (ctrl->mask & BIT(control_selector)) {
-					return ctrl->fn(setup, buf, ctrl->target);
+					return ctrl->fn(setup, buf, ctrl->target_dev);
 				} else {
 					LOG_WRN("control: selector not enabled for this instance");
 					return -ENOTSUP;
@@ -1074,7 +1074,7 @@ static int uvc_preinit(const struct device *dev)
 #define TARGET_DEV(node) DEVICE_DT_GET_OR_NULL(DT_PHANDLE(node, control_target))
 #define OUTPUT_DEV(node) TARGET_DEV(LOOKUP_NODE(node, zephyr_uvc_control_ot))
 
-#define UVC_CAP_ENTRY(frame, format)						\
+#define UVC_CAP(frame, format)							\
 	{									\
 		.pixelformat = video_fourcc(DT_PROP(format, fourcc)[0],		\
 					    DT_PROP(format, fourcc)[1],		\
@@ -1089,29 +1089,32 @@ static int uvc_preinit(const struct device *dev)
 	},
 
 #define UVC_CAPS(format)							\
-	IF_DISABLED(IS_EMPTY(VS_DESCRIPTOR(format)), (				\
-		DT_FOREACH_CHILD_VARGS(format, UVC_CAP_ENTRY, format)		\
+	IF_NOT_EMPTY(VS_DESCRIPTOR(format), (					\
+		DT_FOREACH_CHILD_SEP_VARGS(format, UVC_CAP, (), format)		\
 	))
 
-#define UVC_FORMAT_ENTRY(frame, format)						\
+#define UVC_FORMAT(frame, format)						\
 	{									\
-		.bFormatIndex = NODE_ID(format),				\
+		.bFormatIndex = VS_FORMAT_ID(format),				\
 		.bFrameIndex = NODE_ID(frame),					\
 		.frame_interval = 0,						\
 		.bits_per_pixel = DT_PROP(format, bits_per_pixel),		\
 	},
 
 #define UVC_FORMATS(format)							\
-	IF_DISABLED(IS_EMPTY(VS_DESCRIPTOR(format)), (				\
-		DT_FOREACH_CHILD_VARGS(format, UVC_FORMAT_ENTRY, format)	\
+	IF_NOT_EMPTY(VS_DESCRIPTOR(format), (					\
+		DT_FOREACH_CHILD_SEP_VARGS(format, UVC_FORMAT, (), format)	\
 	))
 
+#define UVC_CONTROL_MASK(node)							\
+	DT_STRING_UPPER_TOKEN_BY_IDX(node, compatible, 0)(node, CONTROL)
+
 #define UVC_CONTROL(node)							\
-	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(node)), ({				\
+	IF_NOT_EMPTY(VC_DESCRIPTOR(node), ({					\
 		.entity_id = NODE_ID(node),					\
 		.fn = &DT_STRING_TOKEN_BY_IDX(node, compatible, 0),		\
-		.target = TARGET_DEV(node),					\
-		.mask = DT_STRING_UPPER_TOKEN_BY_IDX(node, compatible, 0)(node, CONTROL)\
+		.target_dev = TARGET_DEV(node),					\
+		.mask = UVC_CONTROL_MASK(node),					\
 	},))
 
 #define UVC_DEVICE_DEFINE(node)							\
