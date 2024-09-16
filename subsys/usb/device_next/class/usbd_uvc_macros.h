@@ -241,28 +241,7 @@
 #define VS_UPDATE_FRAME_SEGMENT_CONTROL		0x08
 #define VS_SYNCH_DELAY_CONTROL			0x09
 
-#define ZEPHYR_UVC_CONTROL_CT(node, t)						\
-	DT_PROP(node, control_scanning_mode) << CT_SCANNING_MODE_##t |		\
-	DT_PROP(node, control_ae_mode) << CT_AE_MODE_##t |			\
-	DT_PROP(node, control_ae_priority) << CT_AE_PRIORITY_##t |		\
-	DT_PROP(node, control_exposure_time_absolute) << CT_EXPOSURE_TIME_ABSOLUTE_##t |\
-	DT_PROP(node, control_exposure_time_relative) << CT_EXPOSURE_TIME_RELATIVE_##t |\
-	DT_PROP(node, control_focus_absolute) << CT_FOCUS_ABSOLUTE_##t |	\
-	DT_PROP(node, control_focus_relative) << CT_FOCUS_RELATIVE_##t |	\
-	DT_PROP(node, control_focus_auto) << CT_FOCUS_AUTO_##t |		\
-	DT_PROP(node, control_iris_absolute) << CT_IRIS_ABSOLUTE_##t |		\
-	DT_PROP(node, control_iris_relative) << CT_IRIS_RELATIVE_##t |		\
-	DT_PROP(node, control_zoom_absolute) << CT_ZOOM_ABSOLUTE_##t |		\
-	DT_PROP(node, control_zoom_relative) << CT_ZOOM_RELATIVE_##t |		\
-	DT_PROP(node, control_pantilt_absolute) << CT_PANTILT_ABSOLUTE_##t |	\
-	DT_PROP(node, control_pantilt_relative) << CT_PANTILT_RELATIVE_##t |	\
-	DT_PROP(node, control_roll_absolute) << CT_ROLL_ABSOLUTE_##t |		\
-	DT_PROP(node, control_roll_relative) << CT_ROLL_RELATIVE_##t |		\
-	DT_PROP(node, control_privacy) << CT_PRIVACY_##t |			\
-	DT_PROP(node, control_focus_simple) << CT_FOCUS_SIMPLE_##t |		\
-	DT_PROP(node, control_window) << CT_WINDOW_##t |			\
-	DT_PROP(node, control_region_of_interest) << CT_REGION_OF_INTEREST_##t
-
+/* Map DT_STRING_UPPER_TOKEN(node, compatible) of a node to a bitmap */
 #define ZEPHYR_UVC_CONTROL_EU(node, t)						\
 	DT_PROP(node, control_select_layer) << EU_SELECT_LAYER_##t |		\
 	DT_PROP(node, control_profile_toolset) << EU_PROFILE_TOOLSET_##t |	\
@@ -284,7 +263,6 @@
 	DT_PROP(node, control_priority) << EU_PRIORITY_##t |			\
 	DT_PROP(node, control_start_or_stop_layer) << EU_START_OR_STOP_LAYER_##t |\
 	DT_PROP(node, control_error_resiliency) << EU_ERROR_RESILIENCY_##t
-
 #define ZEPHYR_UVC_CONTROL_PU(node, t)						\
 	DT_PROP(node, control_backlight_compensation) << PU_BACKLIGHT_COMPENSATION_##t |\
 	DT_PROP(node, control_brightness) << PU_BRIGHTNESS_##t |		\
@@ -305,19 +283,43 @@
 	DT_PROP(node, control_digital_multiplier_limit) << PU_DIGITAL_MULTIPLIER_LIMIT_##t |\
 	DT_PROP(node, control_analog_video_standard) << PU_ANALOG_VIDEO_STANDARD_##t |\
 	DT_PROP(node, control_analog_lock_status) << PU_ANALOG_LOCK_STATUS_##t
-
+#define ZEPHYR_UVC_CONTROL_CT(node, t)						\
+	DT_PROP(node, control_scanning_mode) << CT_SCANNING_MODE_##t |		\
+	DT_PROP(node, control_ae_mode) << CT_AE_MODE_##t |			\
+	DT_PROP(node, control_ae_priority) << CT_AE_PRIORITY_##t |		\
+	DT_PROP(node, control_exposure_time_absolute) << CT_EXPOSURE_TIME_ABSOLUTE_##t |\
+	DT_PROP(node, control_exposure_time_relative) << CT_EXPOSURE_TIME_RELATIVE_##t |\
+	DT_PROP(node, control_focus_absolute) << CT_FOCUS_ABSOLUTE_##t |	\
+	DT_PROP(node, control_focus_relative) << CT_FOCUS_RELATIVE_##t |	\
+	DT_PROP(node, control_focus_auto) << CT_FOCUS_AUTO_##t |		\
+	DT_PROP(node, control_iris_absolute) << CT_IRIS_ABSOLUTE_##t |		\
+	DT_PROP(node, control_iris_relative) << CT_IRIS_RELATIVE_##t |		\
+	DT_PROP(node, control_zoom_absolute) << CT_ZOOM_ABSOLUTE_##t |		\
+	DT_PROP(node, control_zoom_relative) << CT_ZOOM_RELATIVE_##t |		\
+	DT_PROP(node, control_pantilt_absolute) << CT_PANTILT_ABSOLUTE_##t |	\
+	DT_PROP(node, control_pantilt_relative) << CT_PANTILT_RELATIVE_##t |	\
+	DT_PROP(node, control_roll_absolute) << CT_ROLL_ABSOLUTE_##t |		\
+	DT_PROP(node, control_roll_relative) << CT_ROLL_RELATIVE_##t |		\
+	DT_PROP(node, control_privacy) << CT_PRIVACY_##t |			\
+	DT_PROP(node, control_focus_simple) << CT_FOCUS_SIMPLE_##t |		\
+	DT_PROP(node, control_window) << CT_WINDOW_##t |			\
+	DT_PROP(node, control_region_of_interest) << CT_REGION_OF_INTEREST_##t
+#define ZEPHYR_UVC_CONTROL_XU(node, t) 0
 #define ZEPHYR_UVC_CONTROL_OT(node, t) 0
 #define ZEPHYR_UVC_CONTROL_IT(node, t) 0
-#define ZEPHYR_UVC_CONTROL_XU(node, t) 0
 
-/* Automatically assign Entity IDs based on entities order in devicetree */
-#define NODE_ID(entity) (DT_NODE_CHILD_IDX(entity) + 1)
-
-/* Fetch the ID of a child node with the given compat */
-#define NODE_IF_COMPAT(node, compat)						\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, compat), (node))
+/* Extra utilities */
+#define IF_NOT_EMPTY(test, expr)						\
+	COND_CODE_0(IS_EMPTY(test), expr, ())
+#define IF_COMPAT(node, compat, expr)						\
+	COND_CODE_1(DT_NODE_HAS_COMPAT(node, compat), expr, ())
+#define NODE_IF_COMPAT(node, compat) IF_COMPAT(node, compat, (node))
 #define LOOKUP_NODE(node, compat)						\
 	DT_FOREACH_CHILD_VARGS(node, NODE_IF_COMPAT, compat)
+
+/* Get the ID of the current node, or a child node given its compat */
+#define NODE_ID(entity)								\
+	UTIL_INC(DT_NODE_CHILD_IDX(entity))
 #define LOOKUP_ID(node, compat)							\
 	NODE_ID(LOOKUP_NODE(node, compat))
 
@@ -374,7 +376,7 @@
 	0x01,						/* baInterfaceNr */
 
 /* 3.7.2.1 Input Terminal Descriptor */
-#define VC_INPUT_TERMINAL_DESCRIPTOR(entity)					\
+#define VC_IT_DESCRIPTOR(entity)						\
 	8,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
@@ -384,7 +386,7 @@
 	0x00,						/* iTerminal */
 
 /* 3.7.2.2 Output Terminal Descriptor */
-#define VC_OUTPUT_TERMINAL_DESCRIPTOR(entity)					\
+#define VC_OT_DESCRIPTOR(entity)						\
 	9,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_OUTPUT_TERMINAL,				/* bDescriptorSubtype */\
@@ -395,7 +397,7 @@
 	0x00,						/* iTerminal */
 
 /* 3.7.2.3 Camera Terminal Descriptor */
-#define VC_CAMERA_TERMINAL_DESCRIPTOR(entity)					\
+#define VC_CT_DESCRIPTOR(entity)						\
 	18,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_INPUT_TERMINAL,				/* bDescriptorSubtype */\
@@ -410,7 +412,7 @@
 	U24_LE(ZEPHYR_UVC_CONTROL_CT(entity, BIT)),	/* bmControls */
 
 /* 3.7.2.4 Selector Unit Descriptor */
-#define VC_SELECTOR_UNIT_DESCRIPTOR(entity)					\
+#define VC_SU_DESCRIPTOR(entity)						\
 	6 + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_SELECTOR_UNIT,				/* bDescriptorSubtype */\
@@ -420,7 +422,7 @@
 	0x00,						/* iSelector */
 
 /* 3.7.2.5 Processing Unit Descriptor */
-#define VC_PROCESSING_UNIT_DESCRIPTOR(entity)					\
+#define VC_PU_DESCRIPTOR(entity)						\
 	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_PROCESSING_UNIT,				/* bDescriptorSubtype */\
@@ -433,7 +435,7 @@
 	0x00,						/* bmVideoStandards */
 
 /* 3.7.2.6 Encoding Unit Descriptor */
-#define VC_ENCODING_UNIT_DESCRIPTOR(entity)					\
+#define VC_EU_DESCRIPTOR(entity)						\
 	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_ENCODING_UNIT,				/* bDescriptorSubtype */\
@@ -444,7 +446,7 @@
 	U48_LE(ZEPHYR_UVC_CONTROL_EU(entity, BIT)),	/* bmControls+Runtime */
 
 /* 3.7.2.7 Extension Unit Descriptor */
-#define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
+#define VC_XU_DESCRIPTOR(entity)						\
 	32x + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
@@ -459,33 +461,19 @@
 
 /* Video Control descriptor content of a node according to its type */
 #define VC_DESCRIPTOR(entity)							\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_it), (		\
-		VC_INPUT_TERMINAL_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_ct), (		\
-		VC_CAMERA_TERMINAL_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_ot), (		\
-		VC_OUTPUT_TERMINAL_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_su), (		\
-		VC_SELECTOR_UNIT_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_pu), (		\
-		VC_PROCESSING_UNIT_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_eu), (		\
-		VC_ENCODING_UNIT_DESCRIPTOR(entity)				\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(entity, zephyr_uvc_control_xu), (		\
-		VC_EXTENSION_UNIT_DESCRIPTOR(entity)				\
-	))
+	IF_COMPAT(entity, zephyr_uvc_control_it, (VC_IT_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_ct, (VC_CT_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_ot, (VC_OT_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_su, (VC_SU_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_pu, (VC_PU_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_eu, (VC_EU_DESCRIPTOR(entity)))	\
+	IF_COMPAT(entity, zephyr_uvc_control_xu, (VC_EU_DESCRIPTOR(entity)))
 
 /* Video Streaming Descriptors */
 
 /* Automatically assign format IDs based on format order in devicetree */
-#define VS_NODE_ID(format)							\
-	(NODE_ID(format) - LOOKUP_ID(DT_PARENT(format), zephyr_uvc_control_ot) + 1)
+#define VS_FORMAT_ID(format)							\
+	(NODE_ID(format) - LOOKUP_ID(DT_PARENT(format), zephyr_uvc_control_ot))
 
 /* 3.9 VideoStreaming Interface Descriptors */
 #define VS_INTERFACE_DESCRIPTOR(node)						\
@@ -500,9 +488,10 @@
 	0x00,						/* iInterface */
 
 /* 3.9.2.1 Input Header Descriptor */
-#define VS_CONTROL(format) IF_DISABLED(IS_EMPTY(VS_DESCRIPTOR(format)), (0x00,))
+#define VS_CONTROL(format) IF_NOT_EMPTY(VS_DESCRIPTOR(format), (0x00,))
 #define VS_CONTROLS(node) DT_FOREACH_CHILD(node, VS_CONTROL)
 #define VS_NUM_FORMATS(node) sizeof((uint8_t []){VS_CONTROLS(node)})
+/* DT_FOREACH_CHILD() cannot be used or it would be nested within itself */
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD_SEP(node, VS_DESCRIPTOR, ())
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
@@ -570,7 +559,7 @@
 	27,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	VS_NODE_ID(format),				/* bFormatIndex */	\
+	VS_FORMAT_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	GUID(format),					/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
@@ -603,7 +592,7 @@
 	11,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_MJPEG,				/* bDescriptorSubtype */\
-	VS_NODE_ID(format),				/* bFormatIndex */	\
+	VS_FORMAT_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	BIT(0),						/* bmFlags */		\
 	0x01,						/* bDefaultFrameIndex */\
@@ -630,11 +619,11 @@
 
 /* Video Streaming descriptor content of a node according to its type */
 #define VS_DESCRIPTOR(format)							\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format_mjpeg), (	\
+	IF_COMPAT(format, zephyr_uvc_format_mjpeg, (				\
 		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
 		DT_FOREACH_CHILD(format, VS_MJPEG_FRAME_DESCRIPTOR)		\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(format, zephyr_uvc_format_uncompressed), (\
+	IF_COMPAT(format, zephyr_uvc_format_uncompressed, (			\
 		VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
 		DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)	\
 	))
@@ -686,10 +675,10 @@
 		VC_DESCRIPTOR(node)						\
 		VS_DESCRIPTOR(node)						\
 	};									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_mjpeg), (		\
+	IF_COMPAT(node, zephyr_uvc_format_mjpeg, (				\
 		DT_FOREACH_CHILD(node, VS_MJPEG_FRAME_DESCRIPTOR_ARRAY)		\
 	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_uncompressed), (	\
+	IF_COMPAT(node, zephyr_uvc_format_uncompressed, (			\
 		DT_FOREACH_CHILD(node, VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY)	\
 	))
 
@@ -699,12 +688,12 @@
 	(struct usb_desc_header *)&node##_desc,
 
 #define VC_DESCRIPTOR_PTRS(entity)						\
-	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(entity)), (				\
+	IF_NOT_EMPTY(VC_DESCRIPTOR(entity), (					\
 		(struct usb_desc_header *) &entity##_desc,			\
 	))
 
 #define VS_DESCRIPTOR_PTRS(format)						\
-	IF_DISABLED(IS_EMPTY(VS_DESCRIPTOR(format)), (				\
+	IF_NOT_EMPTY(VS_DESCRIPTOR(format), (					\
 		(struct usb_desc_header *)&format##_desc,			\
 		DT_FOREACH_CHILD_SEP(format, DESCRIPTOR_PTR, ())		\
 		(struct usb_desc_header *)&color_format_desc,			\
