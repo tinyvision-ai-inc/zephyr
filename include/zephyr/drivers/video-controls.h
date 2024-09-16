@@ -49,6 +49,7 @@ extern "C" {
 #define VIDEO_GET_CUR			0x00000000	/**< Query the current value */
 #define VIDEO_GET_MIN			0x00001000	/**< Query the minimum supported value */
 #define VIDEO_GET_MAX			0x00002000	/**< Query the maximum supported value */
+#define VIDEO_GET_DEF			0x00003000	/**< Query the default value */
 #define VIDEO_GET_MASK			0x0000F000	/**< Mask for the "GET" operations */
 /**
  * @}

@@ -160,6 +160,8 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 static uint32_t uvc_get_video_cid(const struct usb_setup_packet *setup, uint32_t cid)
 {
 	switch (setup->bRequest) {
+	case GET_DEF:
+		return VIDEO_GET_DEF | cid;
 	case GET_CUR:
 		return VIDEO_GET_CUR | cid;
 	case GET_MIN:
@@ -611,11 +613,9 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 	case GET_RES:
 		return uvc_buf_add(buf, size, 1);
 	case GET_DEF:
-		LOG_DBG("%s GET_DEF size=%u", __func__, size);
-		return uvc_buf_add(buf, size, 1);
+	case GET_CUR:
 	case GET_MIN:
 	case GET_MAX:
-	case GET_CUR:
 		err = video_get_ctrl(dev, uvc_get_video_cid(setup, cid), &value);
 		if (err) {
 			LOG_ERR("control: failed to query target video device");
