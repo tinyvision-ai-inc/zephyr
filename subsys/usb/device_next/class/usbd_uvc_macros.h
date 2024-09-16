@@ -311,8 +311,7 @@
 #define ZEPHYR_UVC_CONTROL_XU(node, t) 0
 
 /* Automatically assign Entity IDs based on entities order in devicetree */
-#define NODE_ID(entity)								\
-	UTIL_INC(DT_NODE_CHILD_IDX(entity))
+#define NODE_ID(entity) (DT_NODE_CHILD_IDX(entity) + 1)
 
 /* Fetch the ID of a child node with the given compat */
 #define NODE_IF_COMPAT(node, compat)						\
@@ -369,7 +368,7 @@
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_HEADER,					/* bDescriptorSubtype */\
 	U16_LE(0x0150),					/* bcdUVC */		\
-	U16_LE(VC_TOTAL_LENGTH(node)),			/* wTotalLength */	\
+	U16_LE(12 + 1 + VC_TOTAL_LENGTH(node)),		/* wTotalLength */	\
 	U32_LE(30000000),				/* dwClockFrequency */	\
 	0x01,						/* bInCollection */	\
 	0x01,						/* baInterfaceNr */
@@ -442,7 +441,7 @@
 	VC_SOURCE_ID(entity),				/* bSourceID */		\
 	0x00,						/* iEncoding */		\
 	0x03,						/* bControlSize */	\
-	U48_LE(ZEPHYR_UVC_CONTROL_PU(entity, BIT)),	/* bmControls+Runtime */
+	U48_LE(ZEPHYR_UVC_CONTROL_EU(entity, BIT)),	/* bmControls+Runtime */
 
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_EXTENSION_UNIT_DESCRIPTOR(entity)					\
@@ -484,6 +483,10 @@
 
 /* Video Streaming Descriptors */
 
+/* Automatically assign format IDs based on format order in devicetree */
+#define VS_NODE_ID(format)							\
+	(NODE_ID(format) - LOOKUP_ID(DT_PARENT(format), zephyr_uvc_control_ot) + 1)
+
 /* 3.9 VideoStreaming Interface Descriptors */
 #define VS_INTERFACE_DESCRIPTOR(node)						\
 	9,						/* bLength */		\
@@ -503,11 +506,11 @@
 #define VS_DESCRIPTORS(node) DT_FOREACH_CHILD_SEP(node, VS_DESCRIPTOR, ())
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
-	14,						/* bLength */		\
+	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_INPUT_HEADER,				/* bDescriptorSubtype */\
 	VS_NUM_FORMATS(node),				/* bNumFormats */	\
-	U16_LE(VS_TOTAL_LENGTH(node)),			/* wTotalLength */	\
+	U16_LE(13 + VS_TOTAL_LENGTH(node)),		/* wTotalLength */	\
 	0x81,						/* bEndpointAddress */	\
 	0x00,						/* bmInfo */		\
 	LOOKUP_ID(node, zephyr_uvc_control_ot),		/* bTerminalLink */	\
@@ -515,6 +518,15 @@
 	0x00,						/* bTriggerSupport */	\
 	0x00,						/* bTriggerUsage */	\
 	0x00,						/* bControlSize */	\
+
+/* 3.9.2.6 VideoStreaming Color Matching Descriptor */
+#define VS_COLOR_MATCHING_DESCRIPTOR(node)					\
+	6,						/* bLength */		\
+	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
+	VS_COLORFORMAT,					/* bDescriptorSubtype */\
+	0x01,	/* BT.709, sRGB (default) */		/* bColorPrimaries */	\
+	0x01,	/* BT.709 (default) */			/* bTransferCharacteristics */\
+	0x04,	/* SMPTE 170M, BT.601 (default) */	/* bMatrixCoefficients */
 
 /* 3.10 VideoStreaming Bulk FullSpeed Endpoint Descriptors */
 #define VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)				\
@@ -558,7 +570,7 @@
 	27,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	NODE_ID(format),				/* bFormatIndex */	\
+	VS_NODE_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	GUID(format),					/* guidFormat */	\
 	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
@@ -591,7 +603,7 @@
 	11,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_MJPEG,				/* bDescriptorSubtype */\
-	NODE_ID(format),				/* bFormatIndex */	\
+	VS_NODE_ID(format),				/* bFormatIndex */	\
 	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
 	BIT(0),						/* bmFlags */		\
 	0x01,						/* bDefaultFrameIndex */\
@@ -639,18 +651,6 @@
 		VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)				\
 	};
 
-#define INTERFACE_DESCRIPTOR_ARRAYS(node)					\
-	static uint8_t node##_desc[] = {					\
-		VC_DESCRIPTOR(node)						\
-		VS_DESCRIPTOR(node)						\
-	};									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_mjpeg), (		\
-		DT_FOREACH_CHILD(node, VS_MJPEG_FRAME_DESCRIPTOR_ARRAY)		\
-	))									\
-	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_uncompressed), (	\
-		DT_FOREACH_CHILD(node, VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY)	\
-	))
-
 #define UVC_DESCRIPTOR_ARRAYS(node)						\
 	static uint8_t node##_desc_iad[] = {					\
 		UVC_INTERFACE_ASSOCIATION_DESCRIPTOR(node)			\
@@ -681,10 +681,22 @@
 	};									\
 	DT_FOREACH_CHILD_SEP(node, INTERFACE_DESCRIPTOR_ARRAYS, ())
 
+#define INTERFACE_DESCRIPTOR_ARRAYS(node)					\
+	static uint8_t node##_desc[] = {					\
+		VC_DESCRIPTOR(node)						\
+		VS_DESCRIPTOR(node)						\
+	};									\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_mjpeg), (		\
+		DT_FOREACH_CHILD(node, VS_MJPEG_FRAME_DESCRIPTOR_ARRAY)		\
+	))									\
+	IF_ENABLED(DT_NODE_HAS_COMPAT(node, zephyr_uvc_format_uncompressed), (	\
+		DT_FOREACH_CHILD(node, VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY)	\
+	))
+
 /* Descriptor Pointers */
 
 #define DESCRIPTOR_PTR(node)							\
-	((struct usb_desc_header *)&node##_desc),
+	(struct usb_desc_header *)&node##_desc,
 
 #define VC_DESCRIPTOR_PTRS(entity)						\
 	IF_DISABLED(IS_EMPTY(VC_DESCRIPTOR(entity)), (				\
@@ -693,8 +705,9 @@
 
 #define VS_DESCRIPTOR_PTRS(format)						\
 	IF_DISABLED(IS_EMPTY(VS_DESCRIPTOR(format)), (				\
-		((struct usb_desc_header *)&format##_desc),			\
+		(struct usb_desc_header *)&format##_desc,			\
 		DT_FOREACH_CHILD_SEP(format, DESCRIPTOR_PTR, ())		\
+		(struct usb_desc_header *)&color_format_desc,			\
 	))
 
 #define UVC_DESCRIPTOR_PTRS(node)						\
@@ -722,6 +735,12 @@
 	(struct usb_desc_header *)node##_ss_desc_ep_comp,			\
 	(struct usb_desc_header *)&nil_desc,
 
+/* Descriptors identical for all instances */
+
 static struct usb_desc_header nil_desc;
+
+static uint8_t color_format_desc[] = {
+	VS_COLOR_MATCHING_DESCRIPTOR(unused)
+};
 
 #endif /* ZEPHYR_INCLUDE_USBD_UVC_MACROS_H_ */

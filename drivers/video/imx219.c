@@ -41,18 +41,21 @@ LOG_MODULE_REGISTER(imx219, CONFIG_VIDEO_LOG_LEVEL);
 #define IMX219_REG_EXCK_FREQ_LSB 0x012B
 
 /* Analog gain control */
-#define IMX219_REG_ANALOG_GAIN  0x0157
-#define IMX219_ANALOG_GAIN_MAX  232
+#define IMX219_REG_ANALOG_GAIN     0x0157
+#define IMX219_ANALOG_GAIN_MAX     232
+#define IMX219_ANALOG_GAIN_DEFAULT 0x80
 
 /* Digital gain control */
 #define IMX219_REG_DIGITAL_GAIN_MSB 0x0158
 #define IMX219_REG_DIGITAL_GAIN_LSB 0x0159
-#define IMX219_DIGITAL_GAIN_MAX 0xfff
+#define IMX219_DIGITAL_GAIN_MAX     0xfff
+#define IMX219_DIGITAL_GAIN_DEFAULT 0x100
 
 /* Exposure control */
 #define IMX219_REG_INTEGRATION_TIME_MSB 0x015A
 #define IMX219_REG_INTEGRATION_TIME_LSB 0x015B
 #define IMX219_EXPOSURE_MAX             0x900
+#define IMX219_EXPOSURE_DEFAULT         0x004
 
 /* V_TIMING internal */
 #define IMX219_REG_FRAME_LEN_MSB 0x0160
@@ -356,7 +359,7 @@ static int imx219_get_ctrl_exposure(const struct device *dev, uint32_t op, uint3
 
 	switch (op) {
 	case VIDEO_GET_CUR:
-		ret = imx219_read_reg(&cfg->i2c, IMX219_REG_INTEGRATION_TIME_LSB, &u16, 2);
+		ret = imx219_read_reg(&cfg->i2c, IMX219_REG_INTEGRATION_TIME_MSB, &u16, 2);
 		*value = u16;
 		return ret;
 	case VIDEO_GET_MIN:
@@ -364,6 +367,9 @@ static int imx219_get_ctrl_exposure(const struct device *dev, uint32_t op, uint3
 		return 0;
 	case VIDEO_GET_MAX:
 		*(uint32_t *)value = IMX219_EXPOSURE_MAX;
+		return 0;
+	case VIDEO_GET_DEF:
+		*(uint32_t *)value = IMX219_EXPOSURE_DEFAULT;
 		return 0;
 	default:
 		return -EINVAL;
@@ -392,8 +398,9 @@ static int imx219_set_ctrl_exposure(const struct device *dev, uint32_t value)
 static int imx219_get_ctrl_gain(const struct device *dev, uint32_t op, uint32_t *value)
 {
 	const struct imx219_config *cfg = dev->config;
-	uint16_t analog_gain;
-	uint16_t digital_gain;
+	uint8_t analog_gain;
+	uint8_t digital_gain_lsb;
+	uint8_t digital_gain_msb;
 	int err;
 
 	switch (op) {
@@ -402,17 +409,24 @@ static int imx219_get_ctrl_gain(const struct device *dev, uint32_t op, uint32_t 
 		if (err) {
 			return err;
 		}
-		err = imx219_read_reg(&cfg->i2c, IMX219_REG_DIGITAL_GAIN_MSB, &digital_gain, 2);
+		err = imx219_read_reg(&cfg->i2c, IMX219_REG_DIGITAL_GAIN_MSB, &digital_gain_msb, 1);
 		if (err) {
 			return err;
 		}
-		*value = analog_gain + digital_gain;
+		err = imx219_read_reg(&cfg->i2c, IMX219_REG_DIGITAL_GAIN_LSB, &digital_gain_lsb, 1);
+		if (err) {
+			return err;
+		}
+		*value = analog_gain + (digital_gain_msb << 8) + digital_gain_lsb;
 		return 0;
 	case VIDEO_GET_MIN:
 		*value = 0;
 		return 0;
 	case VIDEO_GET_MAX:
 		*value = IMX219_ANALOG_GAIN_MAX + IMX219_DIGITAL_GAIN_MAX;
+		return 0;
+	case VIDEO_GET_DEF:
+		*value = IMX219_ANALOG_GAIN_DEFAULT + IMX219_DIGITAL_GAIN_DEFAULT;
 		return 0;
 	default:
 		LOG_DBG("Invalid CID operation for gain query");
