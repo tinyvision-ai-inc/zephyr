@@ -176,6 +176,11 @@ static uint32_t uvc_get_video_cid(const struct usb_setup_packet *setup, uint32_t
 
 static int uvc_buf_add(struct net_buf *buf, uint16_t size, uint32_t value)
 {
+	if (buf->size != size) {
+		LOG_ERR("invalid wLength %u, expected %u", buf->size, size);
+		return -EINVAL;
+	}
+
 	switch (size) {
 	case 4:
 		net_buf_add_le32(buf, value);
@@ -306,10 +311,8 @@ static int uvc_control_probe_frame_index(struct uvc_data *data, uint8_t request,
 		for (size_t i = 0; data->formats[i].bFormatIndex; i++) {
 			const struct uvc_format *fmt = &data->formats[i];
 
-			LOG_DBG("fmt->bFormatIndex=%u cur->bFormatIndex=%u",
-				fmt->bFormatIndex, cur->bFormatIndex);
-			LOG_DBG("fmt->bFrameIndex=%u probe->bFrameIndex=%u",
-				fmt->bFrameIndex, probe->bFrameIndex);
+			LOG_DBG("bFormatIndex %u, cur %u", fmt->bFormatIndex, cur->bFormatIndex);
+			LOG_DBG("bFrameIndex %u, want %u", fmt->bFrameIndex, probe->bFrameIndex);
 			if (fmt->bFormatIndex == cur->bFormatIndex &&
 			    fmt->bFrameIndex == probe->bFrameIndex) {
 				data->format_id = i;
@@ -392,8 +395,22 @@ static int uvc_control_probe_max_payload_size(struct uvc_data *data, uint8_t req
 	return 0;
 }
 
+static void uvc_dump_probe(const char *name, uint32_t probe)
+{
+	if (probe > 0) {
+		LOG_DBG(" %s %u", name, probe);
+	}
+}
+
 static int uvc_control_probe(struct uvc_data *data, uint8_t request, struct uvc_probe *probe)
 {
+	static int (*control_fn[])(struct uvc_data *, uint8_t, struct uvc_probe *) = {
+		uvc_control_probe_format_index,
+		uvc_control_probe_frame_index,
+		uvc_control_probe_frame_interval,
+		uvc_control_probe_max_video_frame_size,
+		uvc_control_probe_max_payload_size,
+	};
 	int err;
 
 	switch (request) {
@@ -407,6 +424,39 @@ static int uvc_control_probe(struct uvc_data *data, uint8_t request, struct uvc_
 		LOG_WRN("control: invalid bRequest %u", request);
 		return -EINVAL;
 	}
+
+	/* Dynamic fields */
+	for (size_t i = 0; i < ARRAY_SIZE(control_fn); i++) {
+		err = control_fn[i](data, request, probe);
+		if (err) {
+			return err;
+		}
+	}
+
+#if CONFIG_USBD_UVC_LOG_LEVEL >= LOG_LEVEL_DBG
+	uvc_dump_probe("bmHint", sys_le16_to_cpu(probe->bmHint));
+	uvc_dump_probe("bFormatIndex", probe->bFormatIndex);
+	uvc_dump_probe("bFrameIndex", probe->bFrameIndex);
+	uvc_dump_probe("dwFrameInterval (us)", sys_le32_to_cpu(probe->dwFrameInterval) / 10);
+	uvc_dump_probe("wKeyFrameRate", sys_le16_to_cpu(probe->wKeyFrameRate));
+	uvc_dump_probe("wPFrameRate", sys_le16_to_cpu(probe->wPFrameRate));
+	uvc_dump_probe("wCompQuality", sys_le16_to_cpu(probe->wCompQuality));
+	uvc_dump_probe("wCompWindowSize", sys_le16_to_cpu(probe->wCompWindowSize));
+	uvc_dump_probe("wDelay (ms)", sys_le16_to_cpu(probe->wDelay));
+	uvc_dump_probe("dwMaxVideoFrameSize", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
+	uvc_dump_probe("dwMaxPayloadTransferSize", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
+	uvc_dump_probe("dwClockFrequency (Hz)", sys_le32_to_cpu(probe->dwClockFrequency));
+	uvc_dump_probe("bmFramingInfo", probe->bmFramingInfo);
+	uvc_dump_probe("bPreferedVersion", probe->bPreferedVersion);
+	uvc_dump_probe("bMinVersion", probe->bMinVersion);
+	uvc_dump_probe("bMaxVersion", probe->bMaxVersion);
+	uvc_dump_probe("bUsage", probe->bUsage);
+	uvc_dump_probe("bBitDepthLuma", probe->bBitDepthLuma + 8);
+	uvc_dump_probe("bmSettings", probe->bmSettings);
+	uvc_dump_probe("bMaxNumberOfRefFramesPlus1", probe->bMaxNumberOfRefFramesPlus1);
+	uvc_dump_probe("bmRateControlModes", probe->bmRateControlModes);
+	uvc_dump_probe("bmLayoutPerStream", probe->bmLayoutPerStream);
+#endif
 
 	/* Static or unimplemented fields */
 	probe->dwClockFrequency = sys_cpu_to_le32(1);
@@ -427,38 +477,6 @@ static int uvc_control_probe(struct uvc_data *data, uint8_t request, struct uvc_
 	probe->wCompWindowSize = sys_cpu_to_le16(0);
 	/* TODO devicetree */
 	probe->wDelay = sys_cpu_to_le16(1);
-
-	/* Dynamic fields */
-	if ((err = uvc_control_probe_format_index(data, request, probe)) ||
-	    (err = uvc_control_probe_frame_index(data, request, probe)) ||
-	    (err = uvc_control_probe_frame_interval(data, request, probe)) ||
-	    (err = uvc_control_probe_max_video_frame_size(data, request, probe)) ||
-	    (err = uvc_control_probe_max_payload_size(data, request, probe))) {
-		return err;
-	}
-
-	LOG_DBG("- bmHint: 0x%04x", sys_le16_to_cpu(probe->bmHint));
-	LOG_DBG("- bFormatIndex: %u", probe->bFormatIndex);
-	LOG_DBG("- bFrameIndex: %u", probe->bFrameIndex);
-	LOG_DBG("- dwFrameInterval: %u us", sys_le32_to_cpu(probe->dwFrameInterval) / 10);
-	LOG_DBG("- wKeyFrameRate: %u", sys_le16_to_cpu(probe->wKeyFrameRate));
-	LOG_DBG("- wPFrameRate: %u", sys_le16_to_cpu(probe->wPFrameRate));
-	LOG_DBG("- wCompQuality: %u", sys_le16_to_cpu(probe->wCompQuality));
-	LOG_DBG("- wCompWindowSize: %u", sys_le16_to_cpu(probe->wCompWindowSize));
-	LOG_DBG("- wDelay: %u ms", sys_le16_to_cpu(probe->wDelay));
-	LOG_DBG("- dwMaxVideoFrameSize: %u", sys_le32_to_cpu(probe->dwMaxVideoFrameSize));
-	LOG_DBG("- dwMaxPayloadTransferSize: %u", sys_le32_to_cpu(probe->dwMaxPayloadTransferSize));
-	LOG_DBG("- dwClockFrequency: %u Hz", sys_le32_to_cpu(probe->dwClockFrequency));
-	LOG_DBG("- bmFramingInfo: 0x%02x", probe->bmFramingInfo);
-	LOG_DBG("- bPreferedVersion: %u", probe->bPreferedVersion);
-	LOG_DBG("- bMinVersion: %u", probe->bMinVersion);
-	LOG_DBG("- bMaxVersion: %u", probe->bMaxVersion);
-	LOG_DBG("- bUsage: %u", probe->bUsage);
-	LOG_DBG("- bBitDepthLuma: %u", probe->bBitDepthLuma + 8);
-	LOG_DBG("- bmSettings: %u", probe->bmSettings);
-	LOG_DBG("- bMaxNumberOfRefFramesPlus1: %u", probe->bMaxNumberOfRefFramesPlus1);
-	LOG_DBG("- bmRateControlModes: %u", probe->bmRateControlModes);
-	LOG_DBG("- bmLayoutPerStream: 0x%08llx", probe->bmLayoutPerStream);
 
 	return 0;
 }
@@ -520,23 +538,11 @@ static int uvc_control_streaming(struct uvc_data *data, const struct usb_setup_p
 	uint8_t control_selector = setup->wValue >> 8;
 	struct uvc_probe *probe = (void *)buf->data;
 
-	LOG_DBG("control: streaming interface, selector %u, request %u",
-		control_selector, setup->bRequest);
-
 	switch (setup->bRequest) {
 	case GET_INFO:
-		if (setup->wLength != 1 || buf->size < 1) {
-			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
-			return -EINVAL;
-		}
-		return uvc_buf_add(buf, setup->wLength, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
 	case GET_LEN:
-		if (setup->wLength != 2 || buf->size < 2) {
-			LOG_ERR("control: bad wLength %u or bufsize %u", setup->wLength, buf->size);
-			return -EINVAL;
-		}
-		net_buf_add_le16(buf, sizeof(probe));
-		return 0;
+		return uvc_buf_add(buf, 2, sizeof(probe));
 	case GET_DEF:
 		LOG_INF("wLength=%u len=%u size=%u probe=%u", setup->wLength, buf->len, buf->size, sizeof(*probe));
 		if (setup->wLength != sizeof(*probe) || buf->size < sizeof(*probe)) {
@@ -565,8 +571,10 @@ static int uvc_control_streaming(struct uvc_data *data, const struct usb_setup_p
 
 	switch (control_selector) {
 	case VS_PROBE_CONTROL:
+		LOG_DBG("VS_PROBE_CONTROL");
 		return uvc_control_probe(data, setup->bRequest, probe);
 	case VS_COMMIT_CONTROL:
+		LOG_DBG("VS_COMMIT_CONTROL");
 		return uvc_control_commit(data, setup->bRequest, probe);
 	default:
 		LOG_WRN("control: unknown selector %u for streaming interface", control_selector);
@@ -574,31 +582,36 @@ static int uvc_control_streaming(struct uvc_data *data, const struct usb_setup_p
 	}
 }
 
+static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size)
+{
+	switch (setup->bRequest) {
+	case GET_INFO:
+		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+	case GET_LEN:
+		return uvc_buf_add(buf, setup->wLength, size);
+	case GET_RES:
+		return uvc_buf_add(buf, size, 1);
+	default:
+		LOG_WRN("control: unsupported request type %u", setup->bRequest);
+		return -ENOTSUP;
+	}
+}
+
 static int uvc_control_fix(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size,
 			   uint32_t value)
 {
-	size = MIN(setup->wLength, size);
 	LOG_DBG("control: fixed type control, size %u", size);
 
 	switch (setup->bRequest) {
-	case GET_INFO:
-		net_buf_add_u8(buf, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
-		return 0;
-	case GET_LEN:
-		net_buf_add_le16(buf, size);
-		return 0;
-	case GET_RES:
-		return uvc_buf_add(buf, size, 1);
 	case GET_DEF:
+ 	case GET_CUR:
 	case GET_MIN:
 	case GET_MAX:
-	case GET_CUR:
 		return uvc_buf_add(buf, size, value);
 	case SET_CUR:
 		return 0;
 	default:
-		LOG_WRN("control: unsupported request type %u", setup->bRequest);
-		return -ENOTSUP;
+		return uvc_control_defaults(setup, buf, size);
 	}
 }
 
@@ -608,18 +621,9 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 	uint32_t value;
 	int err;
 
-	size = MIN(setup->wLength, size);
 	LOG_DBG("control: integer type control, size %u", size);
 
 	switch (setup->bRequest) {
-	case GET_INFO:
-		net_buf_add_u8(buf, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
-		return 0;
-	case GET_LEN:
-		net_buf_add_le16(buf, size);
-		return 0;
-	case GET_RES:
-		return uvc_buf_add(buf, size, 1);
 	case GET_DEF:
 	case GET_CUR:
 	case GET_MIN:
@@ -644,8 +648,7 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 		}
 		return 0;
 	default:
-		LOG_WRN("control: unsupported request type %u", setup->bRequest);
-		return -ENOTSUP;
+		return uvc_control_defaults(setup, buf, size);
 	}
 }
 
@@ -654,17 +657,18 @@ static int zephyr_uvc_control_ct(const struct usb_setup_packet *setup, struct ne
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
-	LOG_DBG("control: camera terminal, selector %u, request %u",
-		control_selector, setup->bRequest);
-
 	switch (control_selector) {
 	case CT_AE_MODE_CONTROL:
+		LOG_DBG("CT_AE_MODE_CONTROL -> (none)");
 		return uvc_control_fix(setup, buf, 1, BIT(0));
 	case CT_AE_PRIORITY_CONTROL:
+		LOG_DBG("CT_AE_PRIORITY_CONTROL -> (none)");
 		return uvc_control_fix(setup, buf, 1, 0);
 	case CT_EXPOSURE_TIME_ABSOLUTE_CONTROL:
+		LOG_DBG("CT_EXPOSURE_TIME_ABSOLUTE_CONTROL -> VIDEO_CID_CAMERA_EXPOSURE");
 		return uvc_control_uint(setup, buf, 4, dev, VIDEO_CID_CAMERA_EXPOSURE);
 	case CT_ZOOM_ABSOLUTE_CONTROL:
+		LOG_DBG("CT_ZOOM_ABSOLUTE_CONTROL -> VIDEO_CID_CAMERA_ZOOM");
 		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_ZOOM);
 	default:
 		LOG_WRN("control: unsupported selector %u for camera terminal ", control_selector);
@@ -677,19 +681,21 @@ static int zephyr_uvc_control_pu(const struct usb_setup_packet *setup, struct ne
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
-	LOG_DBG("control: processing unit, selector %u, request %u",
-		control_selector, setup->bRequest);
-
 	switch (control_selector) {
 	case PU_BRIGHTNESS_CONTROL:
+		LOG_DBG("PU_BRIGHTNESS_CONTROL -> VIDEO_CID_CAMERA_BRIGHTNESS");
 		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_BRIGHTNESS);
 	case PU_CONTRAST_CONTROL:
+		LOG_DBG("PU_CONTRAST_CONTROL -> VIDEO_CID_CAMERA_CONTRAST");
 		return uvc_control_uint(setup, buf, 1, dev, VIDEO_CID_CAMERA_CONTRAST);
 	case PU_GAIN_CONTROL:
+		LOG_DBG("PU_GAIN_CONTROL -> VIDEO_CID_CAMERA_GAIN");
 		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_GAIN);
 	case PU_SATURATION_CONTROL:
+		LOG_DBG("PU_SATURATION_CONTROL -> VIDEO_CID_CAMERA_SATURATION");
 		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_SATURATION);
 	case PU_WHITE_BALANCE_TEMPERATURE_CONTROL:
+		LOG_DBG("PU_WHITE_BALANCE_TEMPERATURE_CONTROL -> VIDEO_CID_CAMERA_WHITE_BAL");
 		return uvc_control_uint(setup, buf, 2, dev, VIDEO_CID_CAMERA_WHITE_BAL);
 	default:
 		LOG_WRN("control: unsupported selector %u for processing unit", control_selector);
@@ -735,9 +741,8 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	case GET_MAX: LOG_DBG("GET_MAX"); break;
 	case GET_RES: LOG_DBG("GET_RES"); break;
 	case GET_LEN: LOG_DBG("GET_LEN"); break;
-	case GET_INFO: LOG_DBG("GET_INFO"); break;
 	case GET_DEF: LOG_DBG("GET_DEF"); break;
-	default: LOG_WRN("control: unknown"); break;
+	case GET_INFO: LOG_DBG("GET_INFO"); break;
 	}
 
 	if (interface == *data->desc_if_vs_ifnum) {
@@ -747,15 +752,11 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	if (interface == *data->desc_if_vc_ifnum) {
 		for (const struct uvc_control *ctrl = controls; ctrl->entity_id != 0; ctrl++) {
 			if (ctrl->entity_id == entity_id) {
-				LOG_DBG("control: mask 0x%02llx match against bit 0x%02llx",
-					ctrl->mask, (uint64_t)BIT(control_selector));
 				if (ctrl->mask & BIT(control_selector)) {
-					LOG_DBG("control: mask 0x%02llx contains bit 0x%02llx",
-						ctrl->mask, (uint64_t)BIT(control_selector));
 					return ctrl->fn(setup, buf, ctrl->target_dev);
 				} else {
-					LOG_WRN("control: selector not enabled for bEntityID %u",
-						entity_id);
+					LOG_WRN("control selector %u not enabled for bEntityID %u",
+						control_selector, entity_id);
 					return -ENOTSUP;
 				}
 			}
