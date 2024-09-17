@@ -9,8 +9,14 @@ include: "zephyr,uvc-control.yaml"
 
 properties:
 
-  control-bitmask:
-    type: phandle-array
+  control-num:
+    type: int
     required: true
     description: |
-      Bits enabled for the extension control unit.
+      Number of controls enabled, with control codes 0x00, 0x01, 0x02, 0x03...
+
+  guid:
+    type: uint8-array
+    required: true
+    description: |
+      GUID that identifies the control block

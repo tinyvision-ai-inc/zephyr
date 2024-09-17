@@ -103,10 +103,10 @@
 #define U64_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48), U(n, 56)
 #define GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
 
-/* UVC controls for "zephyr,uvc-control-selector" */
+/* UVC controls for "zephyr,uvc-control-su" */
 #define SU_INPUT_SELECT_CONTROL			0x01
 
-/* UVC controls for "zephyr,uvc-control-camera" */
+/* UVC controls for "zephyr,uvc-control-ct" */
 #define CT_SCANNING_MODE_CONTROL		0x01
 #define CT_SCANNING_MODE_BIT			0
 #define CT_AE_MODE_CONTROL			0x02
@@ -148,7 +148,7 @@
 #define CT_REGION_OF_INTEREST_CONTROL		0x14
 #define CT_REGION_OF_INTEREST_BIT		21
 
-/* UVC controls for "zephyr,uvc-control-processing" */
+/* UVC controls for "zephyr,uvc-control-pu" */
 #define PU_BACKLIGHT_COMPENSATION_CONTROL	0x01
 #define PU_BACKLIGHT_COMPENSATION_BIT		8
 #define PU_BRIGHTNESS_CONTROL			0x02
@@ -188,7 +188,7 @@
 #define PU_CONTRAST_AUTO_CONTROL		0x13
 #define PU_CONTRAST_AUTO_BIT			18
 
-/* UVC controls for "zephyr,uvc-control-encoding" */
+/* UVC controls for "zephyr,uvc-control-eu" */
 #define EU_SELECT_LAYER_CONTROL			0x01
 #define EU_SELECT_LAYER_BIT			0
 #define EU_PROFILE_TOOLSET_CONTROL		0x02
@@ -230,6 +230,10 @@
 #define EU_ERROR_RESILIENCY_CONTROL		0x14
 #define EU_ERROR_RESILIENCY_BIT			19
 
+/* UVC controls for "zephyr,uvc-control-xu" */
+#define XU_BASE_CONTROL				0x00
+#define XU_BASE_BIT				0
+
 /* UVC controls for Video Streaming Interface */
 #define VS_PROBE_CONTROL			0x01
 #define VS_COMMIT_CONTROL			0x02
@@ -243,68 +247,69 @@
 
 /* Map DT_STRING_UPPER_TOKEN(node, compatible) of a node to a bitmap */
 #define ZEPHYR_UVC_CONTROL_EU(node, t)						\
-	DT_PROP(node, control_select_layer) << EU_SELECT_LAYER_##t |		\
-	DT_PROP(node, control_profile_toolset) << EU_PROFILE_TOOLSET_##t |	\
-	DT_PROP(node, control_video_resolution) << EU_VIDEO_RESOLUTION_##t |	\
-	DT_PROP(node, control_min_frame_interval) << EU_MIN_FRAME_INTERVAL_##t |\
-	DT_PROP(node, control_slice_mode) << EU_SLICE_MODE_##t |		\
-	DT_PROP(node, control_rate_control_mode) << EU_RATE_CONTROL_MODE_##t |	\
-	DT_PROP(node, control_average_bitrate) << EU_AVERAGE_BITRATE_##t |	\
-	DT_PROP(node, control_cpb_size) << EU_CPB_SIZE_##t |			\
-	DT_PROP(node, control_peak_bit_rate) << EU_PEAK_BIT_RATE_##t |		\
-	DT_PROP(node, control_quantization_params) << EU_QUANTIZATION_PARAMS_##t |\
-	DT_PROP(node, control_sync_ref_frame) << EU_SYNC_REF_FRAME_##t |	\
-	DT_PROP(node, control_ltr_buffer) << EU_LTR_BUFFER_##t |		\
-	DT_PROP(node, control_ltr_picture) << EU_LTR_PICTURE_##t |		\
-	DT_PROP(node, control_ltr_validation) << EU_LTR_VALIDATION_##t |	\
-	DT_PROP(node, control_level_idc_limit) << EU_LEVEL_IDC_LIMIT_##t |	\
-	DT_PROP(node, control_sei_payloadtype) << EU_SEI_PAYLOADTYPE_##t |	\
-	DT_PROP(node, control_qp_range) << EU_QP_RANGE_##t |			\
-	DT_PROP(node, control_priority) << EU_PRIORITY_##t |			\
-	DT_PROP(node, control_start_or_stop_layer) << EU_START_OR_STOP_LAYER_##t |\
-	DT_PROP(node, control_error_resiliency) << EU_ERROR_RESILIENCY_##t
+	(DT_PROP(node, control_select_layer) << EU_SELECT_LAYER_##t |		\
+	 DT_PROP(node, control_profile_toolset) << EU_PROFILE_TOOLSET_##t |	\
+	 DT_PROP(node, control_video_resolution) << EU_VIDEO_RESOLUTION_##t |	\
+	 DT_PROP(node, control_min_frame_interval) << EU_MIN_FRAME_INTERVAL_##t |\
+	 DT_PROP(node, control_slice_mode) << EU_SLICE_MODE_##t |		\
+	 DT_PROP(node, control_rate_control_mode) << EU_RATE_CONTROL_MODE_##t |	\
+	 DT_PROP(node, control_average_bitrate) << EU_AVERAGE_BITRATE_##t |	\
+	 DT_PROP(node, control_cpb_size) << EU_CPB_SIZE_##t |			\
+	 DT_PROP(node, control_peak_bit_rate) << EU_PEAK_BIT_RATE_##t |		\
+	 DT_PROP(node, control_quantization_params) << EU_QUANTIZATION_PARAMS_##t |\
+	 DT_PROP(node, control_sync_ref_frame) << EU_SYNC_REF_FRAME_##t |	\
+	 DT_PROP(node, control_ltr_buffer) << EU_LTR_BUFFER_##t |		\
+	 DT_PROP(node, control_ltr_picture) << EU_LTR_PICTURE_##t |		\
+	 DT_PROP(node, control_ltr_validation) << EU_LTR_VALIDATION_##t |	\
+	 DT_PROP(node, control_level_idc_limit) << EU_LEVEL_IDC_LIMIT_##t |	\
+	 DT_PROP(node, control_sei_payloadtype) << EU_SEI_PAYLOADTYPE_##t |	\
+	 DT_PROP(node, control_qp_range) << EU_QP_RANGE_##t |			\
+	 DT_PROP(node, control_priority) << EU_PRIORITY_##t |			\
+	 DT_PROP(node, control_start_or_stop_layer) << EU_START_OR_STOP_LAYER_##t |\
+	 DT_PROP(node, control_error_resiliency) << EU_ERROR_RESILIENCY_##t)
 #define ZEPHYR_UVC_CONTROL_PU(node, t)						\
-	DT_PROP(node, control_backlight_compensation) << PU_BACKLIGHT_COMPENSATION_##t |\
-	DT_PROP(node, control_brightness) << PU_BRIGHTNESS_##t |		\
-	DT_PROP(node, control_contrast) << PU_CONTRAST_##t |			\
-	DT_PROP(node, control_contrast) << PU_CONTRAST_AUTO_##t |		\
-	DT_PROP(node, control_gain) << PU_GAIN_##t |				\
-	DT_PROP(node, control_power_line_frequency) << PU_POWER_LINE_FREQUENCY_##t |\
-	DT_PROP(node, control_hue) << PU_HUE_##t |				\
-	DT_PROP(node, control_hue) << PU_HUE_AUTO_##t |				\
-	DT_PROP(node, control_saturation) << PU_SATURATION_##t |		\
-	DT_PROP(node, control_sharpness) << PU_SHARPNESS_##t |			\
-	DT_PROP(node, control_gamma) << PU_GAMMA_##t |				\
-	DT_PROP(node, control_white_balance_temperature) << PU_WHITE_BALANCE_TEMPERATURE_##t |\
-	DT_PROP(node, control_white_balance_temperature) << PU_WHITE_BALANCE_TEMPERATURE_AUTO_##t |\
-	DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_##t |\
-	DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_AUTO_##t |\
-	DT_PROP(node, control_digital_multiplier) << PU_DIGITAL_MULTIPLIER_##t |\
-	DT_PROP(node, control_digital_multiplier_limit) << PU_DIGITAL_MULTIPLIER_LIMIT_##t |\
-	DT_PROP(node, control_analog_video_standard) << PU_ANALOG_VIDEO_STANDARD_##t |\
-	DT_PROP(node, control_analog_lock_status) << PU_ANALOG_LOCK_STATUS_##t
+	(DT_PROP(node, control_backlight_compensation) << PU_BACKLIGHT_COMPENSATION_##t |\
+	 DT_PROP(node, control_brightness) << PU_BRIGHTNESS_##t |		\
+	 DT_PROP(node, control_contrast) << PU_CONTRAST_##t |			\
+	 DT_PROP(node, control_contrast) << PU_CONTRAST_AUTO_##t |		\
+	 DT_PROP(node, control_gain) << PU_GAIN_##t |				\
+	 DT_PROP(node, control_power_line_frequency) << PU_POWER_LINE_FREQUENCY_##t |\
+	 DT_PROP(node, control_hue) << PU_HUE_##t |				\
+	 DT_PROP(node, control_hue) << PU_HUE_AUTO_##t |				\
+	 DT_PROP(node, control_saturation) << PU_SATURATION_##t |		\
+	 DT_PROP(node, control_sharpness) << PU_SHARPNESS_##t |			\
+	 DT_PROP(node, control_gamma) << PU_GAMMA_##t |				\
+	 DT_PROP(node, control_white_balance_temperature) << PU_WHITE_BALANCE_TEMPERATURE_##t |\
+	 DT_PROP(node, control_white_balance_temperature) << PU_WHITE_BALANCE_TEMPERATURE_AUTO_##t |\
+	 DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_##t |\
+	 DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_AUTO_##t |\
+	 DT_PROP(node, control_digital_multiplier) << PU_DIGITAL_MULTIPLIER_##t |\
+	 DT_PROP(node, control_digital_multiplier_limit) << PU_DIGITAL_MULTIPLIER_LIMIT_##t |\
+	 DT_PROP(node, control_analog_video_standard) << PU_ANALOG_VIDEO_STANDARD_##t |\
+	 DT_PROP(node, control_analog_lock_status) << PU_ANALOG_LOCK_STATUS_##t)
 #define ZEPHYR_UVC_CONTROL_CT(node, t)						\
-	DT_PROP(node, control_scanning_mode) << CT_SCANNING_MODE_##t |		\
-	DT_PROP(node, control_ae_mode) << CT_AE_MODE_##t |			\
-	DT_PROP(node, control_ae_priority) << CT_AE_PRIORITY_##t |		\
-	DT_PROP(node, control_exposure_time_absolute) << CT_EXPOSURE_TIME_ABSOLUTE_##t |\
-	DT_PROP(node, control_exposure_time_relative) << CT_EXPOSURE_TIME_RELATIVE_##t |\
-	DT_PROP(node, control_focus_absolute) << CT_FOCUS_ABSOLUTE_##t |	\
-	DT_PROP(node, control_focus_relative) << CT_FOCUS_RELATIVE_##t |	\
-	DT_PROP(node, control_focus_auto) << CT_FOCUS_AUTO_##t |		\
-	DT_PROP(node, control_iris_absolute) << CT_IRIS_ABSOLUTE_##t |		\
-	DT_PROP(node, control_iris_relative) << CT_IRIS_RELATIVE_##t |		\
-	DT_PROP(node, control_zoom_absolute) << CT_ZOOM_ABSOLUTE_##t |		\
-	DT_PROP(node, control_zoom_relative) << CT_ZOOM_RELATIVE_##t |		\
-	DT_PROP(node, control_pantilt_absolute) << CT_PANTILT_ABSOLUTE_##t |	\
-	DT_PROP(node, control_pantilt_relative) << CT_PANTILT_RELATIVE_##t |	\
-	DT_PROP(node, control_roll_absolute) << CT_ROLL_ABSOLUTE_##t |		\
-	DT_PROP(node, control_roll_relative) << CT_ROLL_RELATIVE_##t |		\
-	DT_PROP(node, control_privacy) << CT_PRIVACY_##t |			\
-	DT_PROP(node, control_focus_simple) << CT_FOCUS_SIMPLE_##t |		\
-	DT_PROP(node, control_window) << CT_WINDOW_##t |			\
-	DT_PROP(node, control_region_of_interest) << CT_REGION_OF_INTEREST_##t
-#define ZEPHYR_UVC_CONTROL_XU(node, t) 0
+	(DT_PROP(node, control_scanning_mode) << CT_SCANNING_MODE_##t |		\
+	 DT_PROP(node, control_ae_mode) << CT_AE_MODE_##t |			\
+	 DT_PROP(node, control_ae_priority) << CT_AE_PRIORITY_##t |		\
+	 DT_PROP(node, control_exposure_time_absolute) << CT_EXPOSURE_TIME_ABSOLUTE_##t |\
+	 DT_PROP(node, control_exposure_time_relative) << CT_EXPOSURE_TIME_RELATIVE_##t |\
+	 DT_PROP(node, control_focus_absolute) << CT_FOCUS_ABSOLUTE_##t |	\
+	 DT_PROP(node, control_focus_relative) << CT_FOCUS_RELATIVE_##t |	\
+	 DT_PROP(node, control_focus_auto) << CT_FOCUS_AUTO_##t |		\
+	 DT_PROP(node, control_iris_absolute) << CT_IRIS_ABSOLUTE_##t |		\
+	 DT_PROP(node, control_iris_relative) << CT_IRIS_RELATIVE_##t |		\
+	 DT_PROP(node, control_zoom_absolute) << CT_ZOOM_ABSOLUTE_##t |		\
+	 DT_PROP(node, control_zoom_relative) << CT_ZOOM_RELATIVE_##t |		\
+	 DT_PROP(node, control_pantilt_absolute) << CT_PANTILT_ABSOLUTE_##t |	\
+	 DT_PROP(node, control_pantilt_relative) << CT_PANTILT_RELATIVE_##t |	\
+	 DT_PROP(node, control_roll_absolute) << CT_ROLL_ABSOLUTE_##t |		\
+	 DT_PROP(node, control_roll_relative) << CT_ROLL_RELATIVE_##t |		\
+	 DT_PROP(node, control_privacy) << CT_PRIVACY_##t |			\
+	 DT_PROP(node, control_focus_simple) << CT_FOCUS_SIMPLE_##t |		\
+	 DT_PROP(node, control_window) << CT_WINDOW_##t |			\
+	 DT_PROP(node, control_region_of_interest) << CT_REGION_OF_INTEREST_##t)
+#define ZEPHYR_UVC_CONTROL_XU(node, t)						\
+	(0xffffffffffffffffull >> (64 - DT_PROP(node, control_num)))
 #define ZEPHYR_UVC_CONTROL_OT(node, t) 0
 #define ZEPHYR_UVC_CONTROL_IT(node, t) 0
 
@@ -447,14 +452,14 @@
 
 /* 3.7.2.7 Extension Unit Descriptor */
 #define VC_XU_DESCRIPTOR(entity)						\
-	32x + VC_SOURCE_NUM(entity),			/* bLength */		\
+	24 + 8 + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_EXTENSION_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
 	GUID(entity),					/* guidExtensionCode */	\
-	VC_NUM_CTRL(entity),				/* bNumControls */	\
+	DT_PROP(entity, control_num),			/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
-	VC_SOURCE_ID(entity)				/* baSourceID */	\
+	VC_SOURCE_ID(entity),				/* baSourceID */	\
 	0x08,						/* bControlSize */	\
 	U64_LE(ZEPHYR_UVC_CONTROL_XU(entity, BIT)),	/* bmControls */	\
 	0x00,						/* iExtension */
@@ -467,7 +472,7 @@
 	IF_COMPAT(entity, zephyr_uvc_control_su, (VC_SU_DESCRIPTOR(entity)))	\
 	IF_COMPAT(entity, zephyr_uvc_control_pu, (VC_PU_DESCRIPTOR(entity)))	\
 	IF_COMPAT(entity, zephyr_uvc_control_eu, (VC_EU_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_xu, (VC_EU_DESCRIPTOR(entity)))
+	IF_COMPAT(entity, zephyr_uvc_control_xu, (VC_XU_DESCRIPTOR(entity)))
 
 /* Video Streaming Descriptors */
 
@@ -685,18 +690,18 @@
 /* Descriptor Pointers */
 
 #define DESCRIPTOR_PTR(node)							\
-	(struct usb_desc_header *)&node##_desc,
+	(struct usb_desc_header *)node##_desc,
 
 #define VC_DESCRIPTOR_PTRS(entity)						\
 	IF_NOT_EMPTY(VC_DESCRIPTOR(entity), (					\
-		(struct usb_desc_header *) &entity##_desc,			\
+		(struct usb_desc_header *)entity##_desc,			\
 	))
 
 #define VS_DESCRIPTOR_PTRS(format)						\
 	IF_NOT_EMPTY(VS_DESCRIPTOR(format), (					\
-		(struct usb_desc_header *)&format##_desc,			\
+		(struct usb_desc_header *)format##_desc,			\
 		DT_FOREACH_CHILD_SEP(format, DESCRIPTOR_PTR, ())		\
-		(struct usb_desc_header *)&color_format_desc,			\
+		(struct usb_desc_header *)color_format_desc,			\
 	))
 
 #define UVC_DESCRIPTOR_PTRS(node)						\
