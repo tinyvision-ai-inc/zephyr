@@ -35,6 +35,16 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define GET_INFO				0x86
 #define GET_DEF					0x87
 
+/* 4.2.1.2 Request Error Code Control */
+#define ERR_NOT_READY				0x01
+#define ERR_WRONG_STATE				0x02
+#define ERR_OUT_OF_RANGE			0x04
+#define ERR_INVALID_UNIT			0x05
+#define ERR_INVALID_CONTROL			0x06
+#define ERR_INVALID_REQUEST			0x07
+#define ERR_INVALID_VALUE_WITHIN_RANGE		0x08
+#define ERR_UNKNOWN				0xff
+
 /* Flags announcing which controls are supported */
 #define INFO_SUPPORTS_GET			BIT(0)
 #define INFO_SUPPORTS_SET			BIT(1)
@@ -119,6 +129,8 @@ struct uvc_data {
 	const struct uvc_format *formats;
 	/* UVC control lookup table */
 	const struct uvc_control *controls;
+	/* UVC error from latest request */
+	int err;
 	/* UVC Descriptors */
 	struct usb_desc_header *const *fs_desc;
 	struct usb_desc_header *const *hs_desc;
@@ -156,6 +168,30 @@ NET_BUF_POOL_FIXED_DEFINE(uvc_pool_payload, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPA
 
 static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 			  struct video_format *fmt);
+
+static int uvc_get_errno(int err)
+{
+	switch (err) {
+	case EBUSY:		/* Busy and not ready */
+	case EAGAIN:		/* Try again when the device becomes ready */
+	case EINPROGRESS:	/* Will be ready after this ongoing operation */
+	case EALREADY:		/* Already enqueued, will be ready when done */
+		return ERR_NOT_READY;
+	case EOVERFLOW:		/* Values overflowed the range */
+	case ERANGE:		/* Value not in range */
+	case E2BIG:		/* Value too big for the range */
+		return ERR_OUT_OF_RANGE;
+	case EDOM:		/* Invalid but still in the range */
+	case EINVAL:		/* Invalid argument but not ERANGE */
+		return ERR_INVALID_VALUE_WITHIN_RANGE;
+	case ENODEV:		/* No device supporting this request */
+	case ENOTSUP:		/* Request not supported */
+	case ENOSYS:		/* Request not implemented */
+		return ERR_INVALID_REQUEST;
+	default:
+		return ERR_UNKNOWN;
+	}
+}
 
 static uint32_t uvc_get_video_cid(const struct usb_setup_packet *setup, uint32_t cid)
 {
@@ -582,7 +618,7 @@ static int uvc_control_streaming(struct uvc_data *data, const struct usb_setup_p
 	}
 }
 
-static int uvc_control_defaults(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size)
+static int uvc_control_default(const struct usb_setup_packet *setup, struct net_buf *buf, uint8_t size)
 {
 	switch (setup->bRequest) {
 	case GET_INFO:
@@ -611,7 +647,7 @@ static int uvc_control_fix(const struct usb_setup_packet *setup, struct net_buf 
 	case SET_CUR:
 		return 0;
 	default:
-		return uvc_control_defaults(setup, buf, size);
+		return uvc_control_default(setup, buf, size);
 	}
 }
 
@@ -648,7 +684,7 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 		}
 		return 0;
 	default:
-		return uvc_control_defaults(setup, buf, size);
+		return uvc_control_default(setup, buf, size);
 	}
 }
 
@@ -724,6 +760,19 @@ static int zephyr_uvc_control_it(const struct usb_setup_packet *setup, struct ne
 	return -ENOTSUP;
 };
 
+static int uvc_control_errno(const struct usb_setup_packet *setup, struct net_buf *buf, int err)
+{
+	switch (setup->bRequest) {
+	case GET_INFO:
+		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET);
+	case GET_CUR:
+		return uvc_buf_add(buf, 1, err);
+	default:
+		LOG_WRN("control: unsupported request type %u", setup->bRequest);
+		return -ENOTSUP;
+	}
+}
+
 static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_packet *const setup,
 		       struct net_buf *const buf)
 {
@@ -733,6 +782,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	uint8_t interface = (setup->wIndex >> 0) & 0xff;
 	uint8_t entity_id = (setup->wIndex >> 8) & 0xff;
 	uint8_t control_selector = (setup->wValue) >> 8;
+	int err;
 
 	switch (setup->bRequest) {
 	case SET_CUR: LOG_DBG("SET_CUR"); break;
@@ -750,20 +800,31 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	}
 
 	if (interface == *data->desc_if_vc_ifnum) {
+		if (entity_id == 0) {
+			return uvc_control_errno(setup, buf, data->err);
+		}
+
 		for (const struct uvc_control *ctrl = controls; ctrl->entity_id != 0; ctrl++) {
 			if (ctrl->entity_id == entity_id) {
 				if (ctrl->mask & BIT(control_selector)) {
-					return ctrl->fn(setup, buf, ctrl->target_dev);
+					err = ctrl->fn(setup, buf, ctrl->target_dev);
+					data->err = uvc_get_errno(-err);
+					return err;
 				} else {
 					LOG_WRN("control selector %u not enabled for bEntityID %u",
 						control_selector, entity_id);
+					data->err = ERR_INVALID_CONTROL;
 					return -ENOTSUP;
 				}
 			}
 		}
+		LOG_WRN("control: no unit %u found", entity_id);
+		data->err = ERR_INVALID_UNIT;
+		return -ENOTSUP;
 	}
 
-	LOG_WRN("control: no entity %u found for interface %u", entity_id, interface);
+	LOG_WRN("control: interface %u not found", interface);
+	data->err = ERR_INVALID_UNIT;
 	return -ENOTSUP;
 }
 
