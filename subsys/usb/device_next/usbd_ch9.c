@@ -392,21 +392,27 @@ static int std_request_to_device(struct usbd_context *const uds_ctx,
 
 	switch (setup->bRequest) {
 	case USB_SREQ_SET_ADDRESS:
+		LOG_INF("USB_SREQ_SET_ADDRESS");
 		ret = sreq_set_address(uds_ctx);
 		break;
 	case USB_SREQ_SET_CONFIGURATION:
+		LOG_INF("USB_SREQ_SET_CONFIGURATION");
 		ret = sreq_set_configuration(uds_ctx);
 		break;
 	case USB_SREQ_SET_INTERFACE:
+		LOG_INF("USB_SREQ_SET_INTERFACE");
 		ret = sreq_set_interface(uds_ctx);
 		break;
 	case USB_SREQ_CLEAR_FEATURE:
+		LOG_INF("USB_SREQ_CLEAR_FEATURE");
 		ret = sreq_clear_feature(uds_ctx);
 		break;
 	case USB_SREQ_SET_FEATURE:
+		LOG_INF("USB_SREQ_SET_FEATURE");
 		ret = sreq_set_feature(uds_ctx);
 		break;
 	case USB_SREQ_SET_SEL:
+		LOG_INF("USB_SREQ_SET_SEL");
 		ret = sreq_set_sel(uds_ctx, buf);
 		break;
 	default:
@@ -831,19 +837,29 @@ static int sreq_get_descriptor(struct usbd_context *const uds_ctx,
 
 	switch (desc_type) {
 	case USB_DESC_DEVICE:
+		LOG_INF("USB_DESC_DEVICE");
 		return sreq_get_desc_dev(uds_ctx, buf);
 	case USB_DESC_CONFIGURATION:
+		LOG_INF("USB_DESC_CONFIGURATION");
 		return sreq_get_desc_cfg(uds_ctx, buf, desc_idx, false);
 	case USB_DESC_OTHER_SPEED:
+		LOG_INF("USB_DESC_OTHER_SPEED");
 		return sreq_get_desc_cfg(uds_ctx, buf, desc_idx, true);
 	case USB_DESC_STRING:
+		LOG_INF("USB_DESC_STRING");
 		return sreq_get_desc_str(uds_ctx, buf, desc_idx);
 	case USB_DESC_DEVICE_QUALIFIER:
+		LOG_INF("USB_DESC_DEVICE_QUALIFIER");
 		return sreq_get_dev_qualifier(uds_ctx, buf);
 	case USB_DESC_BOS:
+		LOG_INF("USB_DESC_BOS");
 		return sreq_get_desc_bos(uds_ctx, buf);
 	case USB_DESC_INTERFACE:
+		LOG_INF("USB_DESC_INTERFACE");
+		break;
 	case USB_DESC_ENDPOINT:
+		LOG_INF("USB_DESC_ENDPOINT");
+		break;
 	default:
 		break;
 	}
@@ -933,15 +949,19 @@ static int std_request_to_host(struct usbd_context *const uds_ctx,
 
 	switch (setup->bRequest) {
 	case USB_SREQ_GET_STATUS:
+		LOG_INF("USB_SREQ_GET_STATUS");
 		ret = sreq_get_status(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_DESCRIPTOR:
+		LOG_INF("USB_SREQ_GET_DESCRIPTOR");
 		ret = sreq_get_descriptor(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_CONFIGURATION:
+		LOG_INF("USB_SREQ_GET_CONFIGURATION");
 		ret = sreq_get_configuration(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_INTERFACE:
+		LOG_INF("USB_SREQ_GET_INTERFACE");
 		ret = sreq_get_interface(uds_ctx, buf);
 		break;
 	default:
@@ -962,12 +982,15 @@ static int nonstd_request(struct usbd_context *const uds_ctx,
 
 	switch (setup->RequestType.recipient) {
 	case USB_REQTYPE_RECIPIENT_ENDPOINT:
+		LOG_INF("USB_REQTYPE_RECIPIENT_ENDPOINT");
 		c_nd = usbd_class_get_by_ep(uds_ctx, setup->wIndex);
 		break;
 	case USB_REQTYPE_RECIPIENT_INTERFACE:
+		LOG_INF("USB_REQTYPE_RECIPIENT_INTERFACE");
 		c_nd = usbd_class_get_by_iface(uds_ctx, setup->wIndex);
 		break;
 	case USB_REQTYPE_RECIPIENT_DEVICE:
+		LOG_INF("USB_REQTYPE_RECIPIENT_DEVICE");
 		c_nd = usbd_class_get_by_req(uds_ctx, setup->bRequest);
 		break;
 	default:
@@ -997,6 +1020,7 @@ static int handle_setup_request(struct usbd_context *const uds_ctx,
 
 	switch (setup->RequestType.type) {
 	case USB_REQTYPE_TYPE_STANDARD:
+		LOG_INF("USB_REQTYPE_TYPE_STANDARD");
 		if (reqtype_is_to_device(setup)) {
 			ret = std_request_to_device(uds_ctx, buf);
 		} else {
@@ -1004,7 +1028,11 @@ static int handle_setup_request(struct usbd_context *const uds_ctx,
 		}
 		break;
 	case USB_REQTYPE_TYPE_CLASS:
+		LOG_INF("USB_REQTYPE_TYPE_CLASS");
+		ret = nonstd_request(uds_ctx, buf);
+		break;
 	case USB_REQTYPE_TYPE_VENDOR:
+		LOG_INF("USB_REQTYPE_TYPE_VENDOR");
 		ret = nonstd_request(uds_ctx, buf);
 		break;
 	default:
