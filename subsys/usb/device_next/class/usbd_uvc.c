@@ -582,7 +582,11 @@ static int uvc_control_fix(const struct usb_setup_packet *setup, struct net_buf 
 
 	switch (setup->bRequest) {
 	case GET_INFO:
-		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		net_buf_add_u8(buf, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		return 0;
+	case GET_LEN:
+		net_buf_add_le16(buf, size);
+		return 0;
 	case GET_RES:
 		return uvc_buf_add(buf, size, 1);
 	case GET_DEF:
@@ -609,7 +613,11 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 
 	switch (setup->bRequest) {
 	case GET_INFO:
-		return uvc_buf_add(buf, 1, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		net_buf_add_u8(buf, INFO_SUPPORTS_GET | INFO_SUPPORTS_SET);
+		return 0;
+	case GET_LEN:
+		net_buf_add_le16(buf, size);
+		return 0;
 	case GET_RES:
 		return uvc_buf_add(buf, size, 1);
 	case GET_DEF:
@@ -739,11 +747,15 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	if (interface == *data->desc_if_vc_ifnum) {
 		for (const struct uvc_control *ctrl = controls; ctrl->entity_id != 0; ctrl++) {
 			if (ctrl->entity_id == entity_id) {
-				LOG_DBG("control: found video CIDs for bEntityID %u", entity_id);
+				LOG_DBG("control: mask 0x%02llx match against bit 0x%02llx",
+					ctrl->mask, (uint64_t)BIT(control_selector));
 				if (ctrl->mask & BIT(control_selector)) {
+					LOG_DBG("control: mask 0x%02llx contains bit 0x%02llx",
+						ctrl->mask, (uint64_t)BIT(control_selector));
 					return ctrl->fn(setup, buf, ctrl->target_dev);
 				} else {
-					LOG_WRN("control: selector not enabled for this instance");
+					LOG_WRN("control: selector not enabled for bEntityID %u",
+						entity_id);
 					return -ENOTSUP;
 				}
 			}
