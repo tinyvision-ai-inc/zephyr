@@ -720,6 +720,7 @@ static int zephyr_uvc_control_ct(const struct usb_setup_packet *setup, struct ne
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
+	/* See also zephyr,uvc-control-ct.yaml */
 	switch (control_selector) {
 	case CT_AE_MODE_CONTROL:
 		LOG_DBG("CT_AE_MODE_CONTROL -> (none)");
@@ -745,6 +746,7 @@ static int zephyr_uvc_control_pu(const struct usb_setup_packet *setup, struct ne
 {
 	uint8_t control_selector = setup->wValue >> 8;
 
+	/* See also zephyr,uvc-control-pu.yaml */
 	switch (control_selector) {
 	case PU_BRIGHTNESS_CONTROL:
 		LOG_DBG("PU_BRIGHTNESS_CONTROL -> VIDEO_CID_CAMERA_BRIGHTNESS");

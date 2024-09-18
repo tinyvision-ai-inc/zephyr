@@ -12,22 +12,37 @@ properties:
     type: boolean
   control-brightness:
     type: boolean
+    descrption: |
+      Enable controls for image brightness level tuning.
+      Sent to control-target as VIDEO_CID_CAMERA_BRIGHTNESS
   control-contrast:
     type: boolean
+    descrption: |
+      Enable controls for image contrast tuning.
+      Sent to control-target as VIDEO_CID_CAMERA_CONTRAST
   control-gain:
     type: boolean
+    descrption: |
+      Enable controls for overall gain tuning, combined digital and analog.
+      Sent to control-target as VIDEO_CID_CAMERA_GAIN
   control-power-line-frequency:
     type: boolean
   control-hue:
     type: boolean
   control-saturation:
     type: boolean
+    descrption: |
+      Enable controls for the image color saturation tuning.
+      Sent to control-target as VIDEO_CID_CAMERA_SATURATION
   control-sharpness:
     type: boolean
   control-gamma:
     type: boolean
   control-white-balance-temperature:
     type: boolean
+    descrption: |
+      Enable controls for .
+      Sent to control-target as VIDEO_CID_CAMERA_WHITE_BAL
   control-white-balance-component:
     type: boolean
   control-digital-multiplier:
