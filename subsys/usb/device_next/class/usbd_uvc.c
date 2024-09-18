@@ -431,10 +431,36 @@ static int uvc_control_probe_max_payload_size(struct uvc_data *data, uint8_t req
 	return 0;
 }
 
+#if CONFIG_USBD_UVC_LOG_LEVEL >= LOG_LEVEL_DBG
 static void uvc_dump_probe(const char *name, uint32_t probe)
 {
 	if (probe > 0) {
 		LOG_DBG(" %s %u", name, probe);
+	}
+}
+#endif
+
+static char const *uvc_get_request_str(const struct usb_setup_packet *setup)
+{
+	switch (setup->bRequest) {
+	case SET_CUR:
+		return "SET_CUR";
+	case GET_CUR:
+		return "GET_CUR";
+	case GET_MIN:
+		return "GET_MIN";
+	case GET_MAX:
+		return "GET_MAX";
+	case GET_RES:
+		return "GET_RES";
+	case GET_LEN:
+		return "GET_LEN";
+	case GET_DEF:
+		return "GET_DEF";
+	case GET_INFO:
+		return "GET_INFO";
+	default:
+		return "(unknown)";
 	}
 }
 
@@ -688,6 +714,7 @@ static int uvc_control_uint(const struct usb_setup_packet *setup, struct net_buf
 	}
 }
 
+__unused
 static int zephyr_uvc_control_ct(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
@@ -712,6 +739,7 @@ static int zephyr_uvc_control_ct(const struct usb_setup_packet *setup, struct ne
 	}
 }
 
+__unused
 static int zephyr_uvc_control_pu(const struct usb_setup_packet *setup, struct net_buf *buf,
 					 const struct device *dev)
 {
@@ -739,6 +767,7 @@ static int zephyr_uvc_control_pu(const struct usb_setup_packet *setup, struct ne
 	}
 }
 
+__unused
 static int zephyr_uvc_control_xu(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
@@ -746,17 +775,18 @@ static int zephyr_uvc_control_xu(const struct usb_setup_packet *setup, struct ne
 	return -ENOTSUP;
 };
 
-static int zephyr_uvc_control_ot(const struct usb_setup_packet *setup, struct net_buf *buf,
-				     const struct device *dev)
-{
-	LOG_WRN("control: nothing supported for output terminal");
-	return -ENOTSUP;
-};
-
+__unused
 static int zephyr_uvc_control_it(const struct usb_setup_packet *setup, struct net_buf *buf,
 				     const struct device *dev)
 {
 	LOG_WRN("control: nothing supported for input terminal");
+	return -ENOTSUP;
+};
+
+static int zephyr_uvc_control_ot(const struct usb_setup_packet *setup, struct net_buf *buf,
+				     const struct device *dev)
+{
+	LOG_WRN("control: nothing supported for output terminal");
 	return -ENOTSUP;
 };
 
@@ -784,16 +814,7 @@ static int uvc_control(struct usbd_class_data *c_data, const struct usb_setup_pa
 	uint8_t control_selector = (setup->wValue) >> 8;
 	int err;
 
-	switch (setup->bRequest) {
-	case SET_CUR: LOG_DBG("SET_CUR"); break;
-	case GET_CUR: LOG_DBG("GET_CUR"); break;
-	case GET_MIN: LOG_DBG("GET_MIN"); break;
-	case GET_MAX: LOG_DBG("GET_MAX"); break;
-	case GET_RES: LOG_DBG("GET_RES"); break;
-	case GET_LEN: LOG_DBG("GET_LEN"); break;
-	case GET_DEF: LOG_DBG("GET_DEF"); break;
-	case GET_INFO: LOG_DBG("GET_INFO"); break;
-	}
+	LOG_DBG("%s", uvc_get_request_str(setup));
 
 	if (interface == *data->desc_if_vs_ifnum) {
 		return uvc_control_streaming(data, setup, buf);
