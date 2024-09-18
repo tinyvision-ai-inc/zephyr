@@ -791,24 +791,21 @@ static void usb23_push_trb(const struct device *dev, struct usb23_ep_data *ep_da
 
 static struct net_buf *usb23_pop_trb(const struct device *dev, struct usb23_ep_data *ep_data)
 {
-	struct net_buf *buf = NULL;
+	struct net_buf *buf = ep_data->net_buf[ep_data->tail];
 
-	/* Skip all the buffer left emtpy by the uvcmanager */
-	for (int i = 0;i < ep_data->num_of_trbs && buf == NULL; i++) {
-		/* Collect the buffer and clear it from the list */
-		buf = ep_data->net_buf[ep_data->tail];
-		ep_data->net_buf[ep_data->tail] = NULL;
+	/* Clear the last TRB */
+	ep_data->net_buf[ep_data->tail] = NULL;
 
-		LOG_DBG("POP %u ep=0x%02x buf=%p data=%p", ep_data->tail, ep_data->addr, buf, buf->data);
+	/* Move to the next position in the ring buffer */
+	ep_data->tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
 
-		/* Move to the next position in the ring buffer */
-		ep_data->tail = (ep_data->tail + 1) % (ep_data->num_of_trbs - 1);
-	}
 	if (buf == NULL) {
-		LOG_ERR("pop: trying to pop empty stack");
+		LOG_ERR("pop: the next TRB is emtpy");
 		usb23_dump_all(dev, ep_data, NULL);
 		return NULL;
 	}
+
+	LOG_DBG("POP %u ep=0x%02x buf=%p data=%p", ep_data->tail, ep_data->addr, buf, buf->data);
 
 	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
@@ -1199,7 +1196,6 @@ static int usb23_trb_bulk_manager(const struct device *dev, struct usb23_ep_data
 	 * uvcmanager enqueue until the FIFO is empty */
 	reg = USB23_MANAGER_CONTROLSTATUS_ENABLE;
 	reg |= USB23_MANAGER_CONTROLSTATUS_CONTINUE;
-	reg |= (ep_data->head << USB23_MANAGER_CONTROLSTATUS_TRBID_SHIFT);
 	usb23_manager_write(dev, ep_data, USB23_MANAGER_CONTROLSTATUS, reg);
 
 	/* Keep the buffer of the uvcmanager for later */
@@ -1298,44 +1294,6 @@ void usb23_process_queue(const struct device *dev, struct usb23_ep_data *ep_data
  * hint that an event is available, which we fetch from a ring buffer shared
  * with the hardware.
  */
-
-/**
- * After did run and enqueued a few TRBs, we need to pick-up the ring buffer where the USB23
- * Manager did stop so that we can pursue at the right position.
- */
-static void usb23_on_manager_done(const struct device *dev, struct usb23_ep_data *ep_data)
-{
-	struct net_buf *buf = ep_data->manager_buf;
-	uint32_t reg;
-	uint32_t next;
-	int err;
-
-	/* Check that uvcmanager just ran and that the driver did catch-up */
-	if (buf == NULL) {
-		return;
-	}
-
-	LOG_EVENT(MANAGER_DONE);
-
-	/* Sync the position in the ring buffer with the uvcmanager */
-	reg = usb23_manager_read(dev, ep_data, USB23_MANAGER_CONTROLSTATUS);
-	next = (GETFIELD(reg, USB23_MANAGER_CONTROLSTATUS_TRBID) + 1) % (ep_data->num_of_trbs - 1);
-
-	/* Skip all the TRBs submitted by the uvcmanager */
-	ep_data->head = next;
-
-	/* The uvcmanager buffer was submitted as a normal TRB and will be picked-up later */
-	ep_data->manager_buf = NULL;
-
-	/* Submit the buffer completed by the uvcmanager back to Zephyr */
-	err = udc_submit_ep_event(dev, buf, 0);
-	__ASSERT_NO_MSG(!err);
-
-	/* Walk through the list of buffer to enqueue we might have blocked */
-	k_work_submit(&ep_data->work);
-
-	LOG_EVENT(*);
-}
 
 static void usb23_on_soft_reset(const struct device *dev)
 {
@@ -1875,18 +1833,6 @@ void usb23_on_event(const struct device *dev)
 		/* This is a ring buffer, wrap around */
 		priv->evt_next++;
 		priv->evt_next %= CONFIG_USB23_EVT_NUM;
-	}
-
-	/* Process the uvcmanager events */
-	for (struct usb23_ep_data **ep_data = conf->manager_list; *ep_data != NULL; ep_data++) {
-		uint32_t reg;
-
-		/* Fetch ongoing IRQ flags and acknowledge those we are about to process */
-		reg = usb23_manager_read(dev, *ep_data, USB23_MANAGER_CONTROLSTATUS);
-		switch (reg & USB23_MANAGER_CONTROLSTATUS_FSMSTATE_MASK) {
-		case USB23_MANAGER_CONTROLSTATUS_FSMSTATE_IDLE:
-			usb23_on_manager_done(dev, *ep_data);
-		}
 	}
 }
 
