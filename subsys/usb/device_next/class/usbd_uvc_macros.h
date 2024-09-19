@@ -553,7 +553,7 @@
 #define VS_SUPERSPEED_BULK_ENDPOINT_COMPANION_DESCRIPTOR(node)			\
 	6,						/* bLength */		\
 	USB_DESC_ENDPOINT_COMPANION,			/* bDescriptorType */	\
-	0x00,						/* bMaxBurst */		\
+	15,						/* bMaxBurst */		\
 	0x00,						/* bmAttributes */	\
 	U16_LE(0),					/* wBytesPerInterval */
 
