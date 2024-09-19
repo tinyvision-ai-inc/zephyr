@@ -23,7 +23,7 @@ properties:
     type: boolean
   control-exposure-time-absolute:
     type: boolean
-    descrption: |
+    description: |
       Enable controls for the camera exposure time.
       Sent to control-target as VIDEO_CID_CAMERA_EXPOSURE
   control-exposure-time-relative:
@@ -42,7 +42,7 @@ properties:
     type: boolean
   control-zoom-absolute:
     type: boolean
-    descrption: |
+    description: |
       Enable controls for the camera zoom, assuming a zoom motor present.
       Sent to control-target as VIDEO_CID_CAMERA_ZOOM
   control-zoom-relative:
