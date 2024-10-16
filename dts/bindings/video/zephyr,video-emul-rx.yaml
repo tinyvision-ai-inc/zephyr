@@ -1,0 +1,14 @@
+# Copyright 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Emulated Video DMA engine for testing purpose
+  
+  Endpoint 0 is expected to be connected to a zephyr,video-emul-imager device.
+  Endpoint 1 is optional and is the output to a sink.
+
+compatible: "zephyr,video-emul-rx"
+
+child-binding:
+  child-binding:
+    include: video-interfaces.yaml

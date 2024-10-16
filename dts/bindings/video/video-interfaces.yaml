@@ -66,6 +66,10 @@ properties:
       endpoint and should be replaced by a "remote-endpoint" phandle property when
       Zephyr devicetree supports circular dependency in the future.
 
+  reg:
+    type: array
+    description: register space
+
   bus-type:
     type: int
     enum:
@@ -78,12 +82,35 @@ properties:
     description: |
       Data bus type.
 
-  data-shift:
+  link-frequencies:
+    type: array
+    description: |
+      Allowed data bus frequencies. For MIPI CSI-2, for instance, this is the
+      actual frequency of the bus, not bits per clock per lane value.
+
+# For serial bus only
+
+  clock-lane:
     type: int
     description: |
-      On parallel data busses, if bus-width is used to specify the number of
-      data lines, data-shift can be used to specify which data lines are used,
-      e.g. "bus-width=<8>; data-shift=<2>;" means, that lines 9:2 are used.
+      Physical clock lane index. Position of an entry determines the logical
+      lane number, while the value of an entry indicates physical lane, e.g. for
+      a MIPI CSI-2 bus we could have "clock-lane = <0>;", which places the
+      clock lane on hardware lane 0. This property is valid for serial busses
+      only (e.g. MIPI CSI-2).
+
+  data-lanes:
+    type: array
+    description: |
+      An array of physical data lane indexes. Position of an entry determines
+      the logical lane number, while the value of an entry indicates physical
+      lane, e.g. for 2-lane MIPI CSI-2 bus we could have "data-lanes = <1 2>;",
+      assuming the clock lane is on hardware lane 0. If the hardware does not
+      support lane reordering, monotonically incremented values shall be used
+      from 0 or 1 onwards, depending on whether or not there is also a clock
+      lane. This property is valid for serial busses only (e.g. MIPI CSI-2).
+
+# For parallel bus only
 
   hsync-active:
     type: int
@@ -110,35 +137,14 @@ properties:
     description: |
       Sample data on falling, rising or both edges of the pixel clock signal.
 
-  link-frequencies:
-    type: array
-    description: |
-      Allowed data bus frequencies. For MIPI CSI-2, for instance, this is the
-      actual frequency of the bus, not bits per clock per lane value.
-
-# For serial bus only
-  clock-lane:
-    type: int
-    description: |
-      Physical clock lane index. Position of an entry determines the logical
-      lane number, while the value of an entry indicates physical lane, e.g. for
-      a MIPI CSI-2 bus we could have "clock-lane = <0>;", which places the
-      clock lane on hardware lane 0. This property is valid for serial busses
-      only (e.g. MIPI CSI-2).
-
-  data-lanes:
-    type: array
-    description: |
-      An array of physical data lane indexes. Position of an entry determines
-      the logical lane number, while the value of an entry indicates physical
-      lane, e.g. for 2-lane MIPI CSI-2 bus we could have "data-lanes = <1 2>;",
-      assuming the clock lane is on hardware lane 0. If the hardware does not
-      support lane reordering, monotonically incremented values shall be used
-      from 0 or 1 onwards, depending on whether or not there is also a clock
-      lane. This property is valid for serial busses only (e.g. MIPI CSI-2).
-
-# For parallel bus only
   bus-width:
     type: int
     description: |
       Number of data lines actively used, only valid for parallel busses.
+
+  data-shift:
+    type: int
+    description: |
+      On parallel data busses, if bus-width is used to specify the number of
+      data lines, data-shift can be used to specify which data lines are used,
+      e.g. "bus-width=<8>; data-shift=<2>;" means, that lines 9:2 are used.
