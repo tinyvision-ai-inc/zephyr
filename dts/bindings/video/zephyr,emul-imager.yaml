@@ -1,0 +1,13 @@
+# Copyright 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: Emulated Imager for testing purpose
+
+compatible: "zephyr,emul-imager"
+
+include: video-device.yaml
+
+properties:
+
+  video-controls:
+    default: ["VIDEO_CID_CAMERA_EXPOSURE", "VIDEO_CID_CAMERA_GAIN"]

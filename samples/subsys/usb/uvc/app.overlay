@@ -11,6 +11,40 @@
 		zephyr,console = &usart3;
 		zephyr,shell-uart = &usart3;
 	};
+
+	imager0: emul_imager_0 {
+		compatible = "zephyr,emul-imager";
+		status = "okay";
+
+		port {
+			imager0_out: endpoint {
+				direction = "out";
+				remote-endpoint-label = "mipi0_in";
+			};
+		};
+	};
+
+	mipi0: emul_mipi_rx_0 {
+		compatible = "zephyr,emul-mipi-rx";
+		status = "okay";
+
+		port {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi0_in: endpoint@1 {
+				reg = <1>;
+				direction = "in";
+				remote-endpoint-label = "imager0_out";
+			};
+
+			mipi0_out: endpoint@0 {
+				reg = <0>;
+				direction = "out";
+				remote-endpoint-label = "uvc_in0";
+			};
+		};
+	};
 };
 
 &usb_cdc_acm_uart {
@@ -26,6 +60,12 @@
 &zephyr_udc0 {
 	uvc_0: uvc {
 		compatible = "zephyr,uvc";
+
+		port {
+			uvc_in0: endpoint {
+				remote-endpoint-label = "videmul0_out";
+			};
+		};
 
 		/* This builds a control chain to explain the organization
 		 * of the video system to the host, changing the topology
@@ -48,7 +88,7 @@
 			bits-per-pixel = <16>;
 
 			qVGA {
-				size = <60 60>;
+				size = <64 20>;
 				max-fps = <15>;
 			};
 		};
