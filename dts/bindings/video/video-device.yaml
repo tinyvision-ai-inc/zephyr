@@ -1,0 +1,21 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Common fields for video devices
+
+include: base.yaml
+
+properties:
+
+  video-controls:
+    type: string-array
+    description: |
+      Array of Control IDs (CIDs) that the video device supports. Each
+      element is a string matching a CID entry as listed in the header file
+      <zephyr/drivers/video-controls.h>. This list of CIDs permit protocol to
+      generate list of control capabilities supported by each hardware at
+      build-time.
+
+child-binding:
+  child-binding:
+    include: video-interfaces.yaml

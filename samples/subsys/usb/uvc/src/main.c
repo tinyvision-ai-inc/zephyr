@@ -19,92 +19,90 @@ LOG_MODULE_REGISTER(uvc_sample, LOG_LEVEL_DBG);
 int main(void)
 {
 	const struct device *uvc_dev = DEVICE_DT_GET(DT_NODELABEL(uvc_0));
+	const struct device *mipi_dev = DEVICE_DT_GET(DT_NODELABEL(mipi0));
 	struct usbd_context *sample_usbd;
 	struct video_buffer *vbuf;
 	struct video_format fmt = {0};
-	int err;
+	int ret;
 
 	sample_usbd = sample_usbd_init_device(NULL);
 	if (sample_usbd == NULL) {
 		return -ENODEV;
 	}
 
-	err = usbd_enable(sample_usbd);
-	if (err) {
-		return err;
+	ret = usbd_enable(sample_usbd);
+	if (ret < 0) {
+		return ret;
 	}
 
 	/* Get the video format once it is selected by the host */
 	while (true) {
-		err = video_get_format(uvc_dev, VIDEO_EP_IN, &fmt);
-		if (err == 0) {
+		ret = video_get_format(uvc_dev, VIDEO_EP_IN, &fmt);
+		if (ret == 0) {
 			break;
 		}
-		if (err != -EAGAIN) {
+		if (ret != -EAGAIN) {
 			LOG_ERR("Failed to get the video format");
-			return err;
+			return ret;
 		}
 
 		k_sleep(K_MSEC(10));
+	}
+
+	ret = video_set_format(mipi_dev, VIDEO_EP_OUT, &fmt);
+	if (ret < 0) {
+		LOG_ERR("Failed to set %s format", mipi_dev->name);
+		return ret;
 	}
 
 	LOG_INF("Preparing %u buffers of %u bytes, %ux%u frame",
-		CONFIG_VIDEO_BUFFER_POOL_NUM_MAX, fmt.pitch * fmt.height,
-		fmt.pitch, fmt.height);
+		CONFIG_VIDEO_BUFFER_POOL_NUM_MAX, fmt.pitch * fmt.height, fmt.pitch, fmt.height);
 
-	/* Enqueue initial video frames */
-	for (size_t i = 0; i < CONFIG_VIDEO_BUFFER_POOL_NUM_MAX; i++) {
-		/* If this gets blocked, increase CONFIG_USBD_VIDEO_BUFFER_POOL_SZ_MAX */
-		vbuf = video_buffer_header_alloc(CONFIG_USBD_VIDEO_HEADER_SIZE,
-						 fmt.pitch * fmt.height);
-		if (vbuf == NULL) {
-			LOG_ERR("Could not allocate the video buffer");
-			return -ENOMEM;
-		}
-
-		memset(vbuf->buffer, 0x00, vbuf->size);
-		vbuf->bytesused = vbuf->size;
-		vbuf->flags = VIDEO_BUF_EOF;
-
-		k_sleep(K_MSEC(10));
-
-		LOG_INF("Transferring initial frame with size %ux%u, flags 0x%02x",
-			fmt.width, fmt.height, vbuf->flags);
-
-		err = video_enqueue(uvc_dev, VIDEO_EP_IN, vbuf);
-		if (err != 0) {
-			LOG_ERR("Could not enqueue video buffer");
-			return err;
-		}
+	/* If this gets blocked, increase CONFIG_USBD_VIDEO_BUFFER_POOL_SZ_MAX */
+	vbuf = video_buffer_header_alloc(CONFIG_USBD_VIDEO_HEADER_SIZE, fmt.pitch * fmt.height);
+	if (vbuf == NULL) {
+		LOG_ERR("Could not allocate the video buffer");
+		return -ENOMEM;
 	}
 
-	LOG_DBG("Initial buffers submitted, resubmitting the completed buffers");
+	ret = video_stream_start(mipi_dev);
+	if (ret < 0) {
+		LOG_ERR("Failed to start %s", mipi_dev->name);
+		return ret;
+	}
 
-	/* As soon as a buffer is completed, submit it again */
+	LOG_INF("Starting video transfer");
 	while (true) {
-		err = video_dequeue(uvc_dev, VIDEO_EP_IN, &vbuf, K_FOREVER);
-		if (err != 0) {
-			LOG_ERR("Could not dequeue video buffer");
-			return err;
-		}
-
-		k_sleep(K_MSEC(10));
-
-		/* Toggle the color slightly at every frame */
-		memset(vbuf->buffer, vbuf->buffer[0] + 0x0f, vbuf->size);
-		vbuf->bytesused = vbuf->size;
-		vbuf->flags = VIDEO_BUF_EOF;
-
-		LOG_INF("Transferred one more frame at %ux%u, flags 0x%02x, submitting again",
-		       fmt.width, fmt.height, vbuf->flags);
-
-		err = video_enqueue(uvc_dev, VIDEO_EP_IN, vbuf);
-		if (err != 0) {
+		LOG_DBG("enqueuing to %s", mipi_dev->name);
+		ret = video_enqueue(mipi_dev, VIDEO_EP_OUT, vbuf);
+		if (ret < 0) {
 			LOG_ERR("Could not enqueue video buffer");
-			return err;
+			return ret;
 		}
 
-		LOG_DBG("New buffer submitted, ");
+		LOG_DBG("dequeueing from %s", mipi_dev->name);
+		ret = video_dequeue(mipi_dev, VIDEO_EP_OUT, &vbuf, K_FOREVER);
+		if (ret < 0) {
+			LOG_ERR("Could not dequeue video buffer");
+			return ret;
+		}
+
+		LOG_DBG("enqueuing to %s", uvc_dev->name);
+		ret = video_enqueue(uvc_dev, VIDEO_EP_IN, vbuf);
+		if (ret < 0) {
+			LOG_ERR("Could not dequeue video buffer");
+			return ret;
+		}
+
+		LOG_DBG("dequeueing from %s", uvc_dev->name);
+		ret = video_dequeue(uvc_dev, VIDEO_EP_IN, &vbuf, K_FOREVER);
+		if (ret < 0) {
+			LOG_ERR("Could not enqueue video buffer");
+			return ret;
+		}
+
+		LOG_INF("Transfered one more %ux%u frame, flags 0x%02x",
+		       fmt.width, fmt.height, vbuf->flags);
 	}
 
 	return 0;
