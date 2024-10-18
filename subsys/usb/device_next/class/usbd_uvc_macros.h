@@ -90,19 +90,6 @@
 #define EXT_SVIDEO_CONNECTOR			0x0402
 #define EXT_COMPONENT_CONNECTOR			0x0403
 
-/* Descriptors Content */
-
-/* Turn larger types into list of bytes */
-#define U(value, shift) (((value) >> shift) & 0xFF)
-#define U16_LE(n) U(n, 0), U(n, 8)
-#define U24_LE(n) U(n, 0), U(n, 8), U(n, 16)
-#define U32_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24)
-#define U40_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32)
-#define U48_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40)
-#define U56_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48)
-#define U64_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48), U(n, 56)
-#define GUID(node) DT_FOREACH_PROP_ELEM_SEP(node, guid, DT_PROP_BY_IDX, (,))
-
 /* UVC controls for "zephyr,uvc-control-su" */
 #define SU_INPUT_SELECT_CONTROL			0x01
 
@@ -245,103 +232,80 @@
 #define VS_UPDATE_FRAME_SEGMENT_CONTROL		0x08
 #define VS_SYNCH_DELAY_CONTROL			0x09
 
-/* Map DT_STRING_UPPER_TOKEN(node, compatible) of a node to a bitmap */
-#define ZEPHYR_UVC_CONTROL_EU(node, t)						\
-	(DT_PROP(node, control_select_layer) << EU_SELECT_LAYER_##t |		\
-	 DT_PROP(node, control_profile_toolset) << EU_PROFILE_TOOLSET_##t |	\
-	 DT_PROP(node, control_video_resolution) << EU_VIDEO_RESOLUTION_##t |	\
-	 DT_PROP(node, control_min_frame_interval) << EU_MIN_FRAME_INTERVAL_##t |\
-	 DT_PROP(node, control_slice_mode) << EU_SLICE_MODE_##t |		\
-	 DT_PROP(node, control_rate_control_mode) << EU_RATE_CONTROL_MODE_##t |	\
-	 DT_PROP(node, control_average_bitrate) << EU_AVERAGE_BITRATE_##t |	\
-	 DT_PROP(node, control_cpb_size) << EU_CPB_SIZE_##t |			\
-	 DT_PROP(node, control_peak_bit_rate) << EU_PEAK_BIT_RATE_##t |		\
-	 DT_PROP(node, control_quantization_params) << EU_QUANTIZATION_PARAMS_##t |\
-	 DT_PROP(node, control_sync_ref_frame) << EU_SYNC_REF_FRAME_##t |	\
-	 DT_PROP(node, control_ltr_buffer) << EU_LTR_BUFFER_##t |		\
-	 DT_PROP(node, control_ltr_picture) << EU_LTR_PICTURE_##t |		\
-	 DT_PROP(node, control_ltr_validation) << EU_LTR_VALIDATION_##t |	\
-	 DT_PROP(node, control_level_idc_limit) << EU_LEVEL_IDC_LIMIT_##t |	\
-	 DT_PROP(node, control_sei_payloadtype) << EU_SEI_PAYLOADTYPE_##t |	\
-	 DT_PROP(node, control_qp_range) << EU_QP_RANGE_##t |			\
-	 DT_PROP(node, control_priority) << EU_PRIORITY_##t |			\
-	 DT_PROP(node, control_start_or_stop_layer) << EU_START_OR_STOP_LAYER_##t |\
-	 DT_PROP(node, control_error_resiliency) << EU_ERROR_RESILIENCY_##t)
-#define ZEPHYR_UVC_CONTROL_PU(node, t)						\
-	(DT_PROP(node, control_backlight_compensation) << PU_BACKLIGHT_COMPENSATION_##t |\
-	 DT_PROP(node, control_brightness) << PU_BRIGHTNESS_##t |		\
-	 DT_PROP(node, control_contrast) << PU_CONTRAST_##t |			\
-	 DT_PROP(node, control_contrast) << PU_CONTRAST_AUTO_##t |		\
-	 DT_PROP(node, control_gain) << PU_GAIN_##t |				\
-	 DT_PROP(node, control_power_line_frequency) << PU_POWER_LINE_FREQUENCY_##t |\
-	 DT_PROP(node, control_hue) << PU_HUE_##t |				\
-	 DT_PROP(node, control_hue) << PU_HUE_AUTO_##t |				\
-	 DT_PROP(node, control_saturation) << PU_SATURATION_##t |		\
-	 DT_PROP(node, control_sharpness) << PU_SHARPNESS_##t |			\
-	 DT_PROP(node, control_gamma) << PU_GAMMA_##t |				\
-	 DT_PROP(node, control_white_balance_temperature) << PU_WHITE_BALANCE_TEMPERATURE_##t |\
-	 DT_PROP(node, control_white_balance_temperature)			\
-		<< PU_WHITE_BALANCE_TEMPERATURE_AUTO_##t |			\
-	 DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_##t |\
-	 DT_PROP(node, control_white_balance_component) << PU_WHITE_BALANCE_COMPONENT_AUTO_##t |\
-	 DT_PROP(node, control_digital_multiplier) << PU_DIGITAL_MULTIPLIER_##t |\
-	 DT_PROP(node, control_digital_multiplier_limit) << PU_DIGITAL_MULTIPLIER_LIMIT_##t |\
-	 DT_PROP(node, control_analog_video_standard) << PU_ANALOG_VIDEO_STANDARD_##t |\
-	 DT_PROP(node, control_analog_lock_status) << PU_ANALOG_LOCK_STATUS_##t)
-#define ZEPHYR_UVC_CONTROL_CT(node, t)						\
-	(DT_PROP(node, control_scanning_mode) << CT_SCANNING_MODE_##t |		\
-	 DT_PROP(node, control_ae_mode) << CT_AE_MODE_##t |			\
-	 DT_PROP(node, control_ae_priority) << CT_AE_PRIORITY_##t |		\
-	 DT_PROP(node, control_exposure_time_absolute) << CT_EXPOSURE_TIME_ABSOLUTE_##t |\
-	 DT_PROP(node, control_exposure_time_relative) << CT_EXPOSURE_TIME_RELATIVE_##t |\
-	 DT_PROP(node, control_focus_absolute) << CT_FOCUS_ABSOLUTE_##t |	\
-	 DT_PROP(node, control_focus_relative) << CT_FOCUS_RELATIVE_##t |	\
-	 DT_PROP(node, control_focus_auto) << CT_FOCUS_AUTO_##t |		\
-	 DT_PROP(node, control_iris_absolute) << CT_IRIS_ABSOLUTE_##t |		\
-	 DT_PROP(node, control_iris_relative) << CT_IRIS_RELATIVE_##t |		\
-	 DT_PROP(node, control_zoom_absolute) << CT_ZOOM_ABSOLUTE_##t |		\
-	 DT_PROP(node, control_zoom_relative) << CT_ZOOM_RELATIVE_##t |		\
-	 DT_PROP(node, control_pantilt_absolute) << CT_PANTILT_ABSOLUTE_##t |	\
-	 DT_PROP(node, control_pantilt_relative) << CT_PANTILT_RELATIVE_##t |	\
-	 DT_PROP(node, control_roll_absolute) << CT_ROLL_ABSOLUTE_##t |		\
-	 DT_PROP(node, control_roll_relative) << CT_ROLL_RELATIVE_##t |		\
-	 DT_PROP(node, control_privacy) << CT_PRIVACY_##t |			\
-	 DT_PROP(node, control_focus_simple) << CT_FOCUS_SIMPLE_##t |		\
-	 DT_PROP(node, control_window) << CT_WINDOW_##t |			\
-	 DT_PROP(node, control_region_of_interest) << CT_REGION_OF_INTEREST_##t)
-#define ZEPHYR_UVC_CONTROL_XU(node, t)						\
-	(0xffffffffffffffffull >> (64 - DT_PROP(node, control_num)))
-#define ZEPHYR_UVC_CONTROL_OT(node, t) 0
-#define ZEPHYR_UVC_CONTROL_IT(node, t) 0
-
-/* Extra utilities */
-#define IF_NOT_EMPTY(test, expr)						\
-	COND_CODE_0(IS_EMPTY(test), expr, ())
-#define IF_COMPAT(node, compat, expr)						\
-	COND_CODE_1(DT_NODE_HAS_COMPAT(node, compat), expr, ())
-#define NODE_IF_COMPAT(node, compat) IF_COMPAT(node, compat, (node))
-#define LOOKUP_NODE(node, compat)						\
-	DT_FOREACH_CHILD_VARGS(node, NODE_IF_COMPAT, compat)
+/* Turn larger types into list of bytes */
+#define U(value, shift) (((value) >> shift) & 0xFF)
+#define U16_LE(n) U(n, 0), U(n, 8)
+#define U24_LE(n) U(n, 0), U(n, 8), U(n, 16)
+#define U32_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24)
+#define U40_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32)
+#define U48_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40)
+#define U56_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48)
+#define U64_LE(n) U(n, 0), U(n, 8), U(n, 16), U(n, 24), U(n, 32), U(n, 40), U(n, 48), U(n, 56)
+#define MEDIA_FOUNDATION 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
+#define GUID(fourcc) U32_LE(fourcc), MEDIA_FOUNDATION
 
 /* Get the ID of the current node, or a child node given its compat */
-#define NODE_ID(entity)								\
-	UTIL_INC(DT_NODE_CHILD_IDX(entity))
-#define LOOKUP_ID(node, compat)							\
-	NODE_ID(LOOKUP_NODE(node, compat))
+#define NODE_ID(entity) DT_DEP_ORD(entity)
+
+/* Expand fn(node) whenever the node has the mentioned property */
+#define IF_HAS_PROP(node, prop, fn)						\
+	IF_ENABLED(DT_NODE_HAS_PROP(node, prop), (fn(node)))
 
 /* Connect the entities to their source(s) */
-#define VC_PROP_N_ID(entity, prop, n)						\
-	NODE_ID(DT_PHANDLE_BY_IDX(entity, prop, n))
-#define VC_SOURCE_ID(entity)							\
-	DT_FOREACH_PROP_ELEM_SEP(entity, source_entity, VC_PROP_N_ID, (,))
-#define VC_SOURCE_NUM(entity)							\
-	DT_PROP_LEN(entity, source_entity)
+#define VC_SOURCE_ID(ep)							\
+	IF_ENABLED(DT_ENUM_HAS_VALUE(ep, direction, in),			\
+		   (NODE_ID(DT_GPARENT(DT_REMOTE(ep))),))
+#define VC_SOURCE_IDS(entity)							\
+	DT_FOREACH_CHILD(DT_CHILD(entity, port), VC_SOURCE_ID)
+
+/* Map DT_STRING_UPPER_TOKEN(node, compatible) of a node to a bitmap */
+#define VC_CONTROL_EU(node, t) 0
+#define VC_CONTROL_PU(node, t) 0
+#define VC_CONTROL_CT(node, t) 0
+#define VC_CONTROL_XU(node, t) 0
+#define VC_CONTROL_OT(node, t) 0
+#define VC_CONTROL_IT(node, t) 0
 
 /* Estimate the frame buffer size out of other fields */
-#define MAX_VIDEO_FRAME_BUFFER_SIZE(frame)					\
-	(DT_PROP_BY_IDX(frame, size, 0) * DT_PROP_BY_IDX(frame, size, 1) *	\
-	 DT_PROP(DT_PARENT(frame), bits_per_pixel) / 8 +			\
+#define FRAME_BUFFER_SIZE(node, prop, id)					\
+	(DT_PHA_BY_IDX(node, prop, id, width) *					\
+	 DT_PHA_BY_IDX(node, prop, id, height) *				\
+	 DT_PHA_BY_IDX(node, prop, id, bits_per_pixel) / 8 +			\
 	 CONFIG_USBD_VIDEO_HEADER_SIZE)
+
+/* Helper to turn a frame rate in an UVC frame interval value */
+#define FRMIVAL(fps) U32_LE(10000000 / fps)
+
+/* Count the number of sources or sink for this device */
+#define X(node, dir) IF_ENABLED(DT_ENUM_HAS_VALUE(node, direction, dir), (x,))
+#define VC_SOURCE_NUM(node)							\
+	NUM_VA_ARGS_LESS_1(DT_FOREACH_CHILD_VARGS(DT_CHILD(node, port), X, in) x)
+#define VC_SINK_NUM(node)							\
+	NUM_VA_ARGS_LESS_1(DT_FOREACH_CHILD_VARGS(DT_CHILD(node, port), X, out) x)
+
+/* Helpers for IF_ENABLED() conditions */
+#define GT1(n) COND_CODE_0(n, (0), (COND_CODE_1(n, (0), (1))))
+#define EQ1(n) COND_CODE_1(n, (1), (0))
+
+/* Video Control descriptor content of a node according to its type */
+#define VC_IS_IT(node) UTIL_NOT(VC_SOURCE_NUM(node))
+#define VC_IS_OT(node) UTIL_NOT(VC_SINK_NUM(node))
+#define VC_IS_PU(node) UTIL_AND(VC_SINK_NUM(node), EQ1(VC_SOURCE_NUM(node)))
+#define VC_IS_SU(node) UTIL_AND(VC_SINK_NUM(node), GT1(VC_SOURCE_NUM(node)))
+#define VC_DESCRIPTOR(entity)							\
+	IF_ENABLED(VC_IS_IT(entity), (VC_CT_DESCRIPTOR(entity)))		\
+	IF_ENABLED(VC_IS_OT(entity), (VC_OT_DESCRIPTOR(entity)))		\
+	IF_ENABLED(VC_IS_PU(entity), (VC_PU_DESCRIPTOR(entity)))		\
+	IF_ENABLED(VC_IS_SU(entity), (VC_SU_DESCRIPTOR(entity)))
+
+/* Iterators over VideoControl and VideoStreaming elements */
+#define VC_FOREACH_ENTITY(fn)							\
+	DT_FOREACH_STATUS_OKAY_NODE_VARGS(IF_HAS_PROP, video_controls, fn)
+#define VS_FOREACH_STREAM(fn)							\
+	DT_FOREACH_CHILD(DT_CHILD(DT_DRV_INST(0), port), fn)
+#define VS_FOREACH_UNCOMP(node, fn)						\
+	DT_FOREACH_PROP_ELEM(node, formats, fn)
+#define VS_FOREACH_MJPEG(node, fn)
 
 /* 3.6 Interface Association Descriptor */
 #define INTERFACE_ASSOCIATION_DESCRIPTOR(node)					\
@@ -353,8 +317,6 @@
 	SC_VIDEO_INTERFACE_COLLECITON,			/* bFunctionSubClass */	\
 	PC_PROTOCOL_UNDEFINED,				/* bFunctionProtocol */	\
 	0x00,						/* iFunction */
-
-/* Video Control Descriptors */
 
 /* 3.7 VideoControl Interface Descriptors */
 #define VC_INTERFACE_DESCRIPTOR(node)						\
@@ -369,7 +331,7 @@
 	0x00,						/* iInterface */
 
 /* 3.7.2 Interface Header Descriptor */
-#define VC_DESCRIPTORS(node) DT_FOREACH_CHILD(node, VC_DESCRIPTOR)
+#define VC_DESCRIPTORS(node) VC_FOREACH_ENTITY(VC_DESCRIPTOR)
 #define VC_TOTAL_LENGTH(node) sizeof((uint8_t []){VC_DESCRIPTORS(node)})
 #define VC_INTERFACE_HEADER_DESCRIPTOR(node)					\
 	12 + 1,						/* bLength */		\
@@ -382,6 +344,7 @@
 	0x01,						/* baInterfaceNr */
 
 /* 3.7.2.1 Input Terminal Descriptor */
+#define VC_IT_STRING_OFFSET(n) ((n) - 1)
 #define VC_IT_DESCRIPTOR(entity)						\
 	8,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
@@ -392,6 +355,7 @@
 	0x00,						/* iTerminal */
 
 /* 3.7.2.2 Output Terminal Descriptor */
+#define VC_OT_STRING_OFFSET(n) ((n) - 1)
 #define VC_OT_DESCRIPTOR(entity)						\
 	9,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
@@ -399,10 +363,11 @@
 	NODE_ID(entity),				/* bTerminalID */	\
 	U16_LE(TT_STREAMING),				/* wTerminalType */	\
 	0x00,						/* bAssocTerminal */	\
-	VC_SOURCE_ID(entity),				/* bSourceID */		\
+	VC_SOURCE_IDS(entity)				/* bSourceID */		\
 	0x00,						/* iTerminal */
 
 /* 3.7.2.3 Camera Terminal Descriptor */
+#define VC_CT_STRING_OFFSET(n) (7)
 #define VC_CT_DESCRIPTOR(entity)						\
 	18,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
@@ -415,43 +380,47 @@
 	U16_LE(0),					/* wObjectiveFocalLengthMax */\
 	U16_LE(0),					/* wOcularFocalLength */\
 	0x03,						/* bControlSize */	\
-	U24_LE(ZEPHYR_UVC_CONTROL_CT(entity, BIT)),	/* bmControls */
+	U24_LE(VC_CONTROL_CT(entity, BIT)),		/* bmControls */
 
 /* 3.7.2.4 Selector Unit Descriptor */
+#define VC_SU_STRING_OFFSET(n) ((n) - 1)
 #define VC_SU_DESCRIPTOR(entity)						\
 	6 + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_SELECTOR_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
-	VC_SOURCE_ID(entity),				/* baSourceID */	\
+	VC_SOURCE_IDS(entity)				/* baSourceID */	\
 	0x00,						/* iSelector */
 
 /* 3.7.2.5 Processing Unit Descriptor */
+#define VC_PU_STRING_OFFSET(n) ((n) - 2)
 #define VC_PU_DESCRIPTOR(entity)						\
 	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_PROCESSING_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
-	VC_SOURCE_ID(entity),				/* bSourceID */		\
+	VC_SOURCE_IDS(entity)				/* bSourceID */		\
 	U16_LE(0),					/* wMaxMultiplier */	\
 	0x03,						/* bControlSize */	\
-	U24_LE(ZEPHYR_UVC_CONTROL_PU(entity, BIT)),	/* bmControls */	\
+	U24_LE(VC_CONTROL_PU(entity, BIT)),		/* bmControls */	\
 	0x00,						/* iProcessing */	\
 	0x00,						/* bmVideoStandards */
 
 /* 3.7.2.6 Encoding Unit Descriptor */
+#define VC_EU_STRING_OFFSET(n) (5)
 #define VC_EU_DESCRIPTOR(entity)						\
 	13,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VC_ENCODING_UNIT,				/* bDescriptorSubtype */\
 	NODE_ID(entity),				/* bUnitID */		\
-	VC_SOURCE_ID(entity),				/* bSourceID */		\
+	VC_SOURCE_IDS(entity)				/* bSourceID */		\
 	0x00,						/* iEncoding */		\
 	0x03,						/* bControlSize */	\
-	U48_LE(ZEPHYR_UVC_CONTROL_EU(entity, BIT)),	/* bmControls+Runtime */
+	U48_LE(VC_CONTROL_EU(entity, BIT)),		/* bmControls+Runtime */
 
 /* 3.7.2.7 Extension Unit Descriptor */
+#define VC_XU_STRING_OFFSET(n) ((n) - 1)
 #define VC_XU_DESCRIPTOR(entity)						\
 	24 + 8 + VC_SOURCE_NUM(entity),			/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
@@ -460,26 +429,10 @@
 	GUID(entity),					/* guidExtensionCode */	\
 	DT_PROP(entity, control_num),			/* bNumControls */	\
 	VC_SOURCE_NUM(entity),				/* bNrInPins */		\
-	VC_SOURCE_ID(entity),				/* baSourceID */	\
+	VC_SOURCE_IDS(entity)				/* baSourceID */	\
 	0x08,						/* bControlSize */	\
-	U64_LE(ZEPHYR_UVC_CONTROL_XU(entity, BIT)),	/* bmControls */	\
+	U64_LE(VC_CONTROL_XU(entity, BIT)),		/* bmControls */	\
 	0x00,						/* iExtension */
-
-/* Video Control descriptor content of a node according to its type */
-#define VC_DESCRIPTOR(entity)							\
-	IF_COMPAT(entity, zephyr_uvc_control_it, (VC_IT_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_ct, (VC_CT_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_ot, (VC_OT_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_su, (VC_SU_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_pu, (VC_PU_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_eu, (VC_EU_DESCRIPTOR(entity)))	\
-	IF_COMPAT(entity, zephyr_uvc_control_xu, (VC_XU_DESCRIPTOR(entity)))
-
-/* Video Streaming Descriptors */
-
-/* Automatically assign format IDs based on format order in devicetree */
-#define VS_FORMAT_ID(format)							\
-	(NODE_ID(format) - LOOKUP_ID(DT_PARENT(format), zephyr_uvc_control_ot))
 
 /* 3.9 VideoStreaming Interface Descriptors */
 #define VS_INTERFACE_DESCRIPTOR(node)						\
@@ -494,11 +447,13 @@
 	0x00,						/* iInterface */
 
 /* 3.9.2.1 Input Header Descriptor */
-#define VS_CONTROL(format) IF_NOT_EMPTY(VS_DESCRIPTOR(format), (0x00,))
-#define VS_CONTROLS(node) DT_FOREACH_CHILD(node, VS_CONTROL)
-#define VS_NUM_FORMATS(node) sizeof((uint8_t []){VS_CONTROLS(node)})
-/* DT_FOREACH_CHILD() cannot be used or it would be nested within itself */
-#define VS_DESCRIPTORS(node) DT_FOREACH_CHILD_SEP(node, VS_DESCRIPTOR, ())
+#define VS_NUM_FORMATS(node) DT_PROP_LEN(node, formats)
+#define VS_DESCRIPTORS(node)							\
+	VS_FOREACH_UNCOMP(node, VS_UNCOMPRESSED_FORMAT_DESCRIPTOR)		\
+	VS_FOREACH_UNCOMP(node, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)		\
+	VS_FOREACH_MJPEG(node, VS_MJPEG_FORMAT_DESCRIPTOR)			\
+	VS_FOREACH_MJPEG(node, VS_MJPEG_FRAME_DESCRIPTOR)			\
+	VS_COLOR_MATCHING_DESCRIPTOR(node)
 #define VS_TOTAL_LENGTH(node) sizeof((uint8_t []){VS_DESCRIPTORS(node)})
 #define VS_INPUT_HEADER_DESCRIPTOR(node)					\
 	13,						/* bLength */		\
@@ -508,7 +463,7 @@
 	U16_LE(13 + VS_TOTAL_LENGTH(node)),		/* wTotalLength */	\
 	0x81,						/* bEndpointAddress */	\
 	0x00,						/* bmInfo */		\
-	LOOKUP_ID(node, zephyr_uvc_control_ot),		/* bTerminalLink */	\
+	NODE_ID(DT_GPARENT(node)),			/* bTerminalLink */	\
 	0x00,						/* bStillCaptureMethod */\
 	0x00,						/* bTriggerSupport */	\
 	0x00,						/* bTriggerUsage */	\
@@ -541,17 +496,15 @@
 	U16_LE(512),					/* wMaxPacketSize */	\
 	0x00,						/* bInterval */
 
-/* USB_Video_Payload_Uncompressed_1.5.pdf */
-
 /* 3.1.1 Uncompressed Video Format Descriptor */
-#define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)				\
+#define VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(node, prop, id)			\
 	27,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	VS_FORMAT_ID(format),				/* bFormatIndex */	\
-	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
-	GUID(format),					/* guidFormat */	\
-	DT_PROP(format, bits_per_pixel),		/* bBitsPerPixel */	\
+	UTIL_INC(id),					/* bFormatIndex */	\
+	0x01,						/* bNumFrameDescriptors */\
+	GUID(DT_PHA_BY_IDX(node, prop, id, fourcc)),	/* guidFormat */	\
+	DT_PHA_BY_IDX(node, prop, id, bits_per_pixel),	/* bBitsPerPixel */	\
 	0x01,						/* bDefaultFrameIndex */\
 	0x00,						/* bAspectRatioX */	\
 	0x00,						/* bAspectRatioY */	\
@@ -559,30 +512,28 @@
 	0x00,						/* bCopyProtect */
 
 /* 3.2.1 Uncompressed Video Frame Descriptors (discrete) */
-#define VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)					\
+#define VS_UNCOMPRESSED_FRAME_DESCRIPTOR(node, prop, id)			\
 	26 + 4,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_UNCOMPRESSED,				/* bDescriptorSubtype */\
-	NODE_ID(frame),					/* bFrameIndex */	\
+	0x01,						/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
-	U16_LE(DT_PROP_BY_IDX(frame, size, 0)),		/* wWidth */		\
-	U16_LE(DT_PROP_BY_IDX(frame, size, 1)),		/* wHeight */		\
+	U16_LE(DT_PHA_BY_IDX(node, prop, id, width)),	/* wWidth */		\
+	U16_LE(DT_PHA_BY_IDX(node, prop, id, height)),	/* wHeight */		\
 	U32_LE(15360000),				/* dwMinBitRate */	\
 	U32_LE(15360000),				/* dwMaxBitRate */	\
-	U32_LE(MAX_VIDEO_FRAME_BUFFER_SIZE(frame)),	/* dwMaxVideoFrameBufferSize */\
-	U32_LE(10000000 / DT_PROP(frame, max_fps)),	/* dwDefaultFrameInterval */\
+	U32_LE(FRAME_BUFFER_SIZE(node, prop, id)),	/* dwMaxVideoFrameBufferSize */\
+	FRMIVAL(DT_PHA_BY_IDX(node, prop, id, max_fps)),/* dwDefaultFrameInterval */\
 	0x01,						/* bFrameIntervalType */\
-	U32_LE(10000000 / DT_PROP(frame, max_fps)),	/* dwFrameInterval */
-
-/* USB_Video_Payload_JPEG_1.5.pdf */
+	FRMIVAL(DT_PHA_BY_IDX(node, prop, id, max_fps)),/* dwFrameInterval */
 
 /* 3.1.1 Motion-JPEG Video Format Descriptor */
-#define VS_MJPEG_FORMAT_DESCRIPTOR(format)					\
+#define VS_MJPEG_FORMAT_DESCRIPTOR(node, prop, id)				\
 	11,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FORMAT_MJPEG,				/* bDescriptorSubtype */\
-	VS_FORMAT_ID(format),				/* bFormatIndex */	\
-	DT_CHILD_NUM(format),				/* bNumFrameDescriptors */\
+	id,						/* bFormatIndex */	\
+	0x01,						/* bNumFrameDescriptors */\
 	BIT(0),						/* bmFlags */		\
 	0x01,						/* bDefaultFrameIndex */\
 	0x00,						/* bAspectRatioX */	\
@@ -591,120 +542,19 @@
 	0x00,						/* bCopyProtect */
 
 /* 3.2.1 Motion-JPEG Video Frame Descriptors (discrete) */
-#define VS_MJPEG_FRAME_DESCRIPTOR(frame)					\
+#define VS_MJPEG_FRAME_DESCRIPTOR(node, prop, id)				\
 	29,						/* bLength */		\
 	USB_DESC_CS_INTERFACE,				/* bDescriptorType */	\
 	VS_FRAME_MJPEG,					/* bDescriptorSubtype */\
-	NODE_ID(frame),					/* bFrameIndex */	\
+	0x01,						/* bFrameIndex */	\
 	0x00,						/* bmCapabilities */	\
-	U16_LE(DT_PROP_BY_IDX(frame, size, 0)),		/* wWidth */		\
-	U16_LE(DT_PROP_BY_IDX(frame, size, 1)),		/* wHeight */		\
+	U16_LE(DT_PHA_BY_IDX(node, prop, id, width)),	/* wWidth */		\
+	U16_LE(DT_PHA_BY_IDX(node, prop, id, height)),	/* wHeight */		\
 	U32_LE(15360000),				/* dwMinBitRate */	\
 	U32_LE(15360000),				/* dwMaxBitRate */	\
-	U32_LE(MAX_VIDEO_FRAME_BUFFER_SIZE(frame)),	/* dwMaxVideoFrameBufferSize */\
-	U32_LE(10000000 / DT_PROP(frame, max_fps)),	/* dwDefaultFrameInterval */\
+	U32_LE(FRAME_BUFFER_SIZE(node, prop, id)),	/* dwMaxVideoFrameBufferSize */\
+	FRMIVAL(DT_PHA_BY_IDX(node, prop, id, max_fps)),/* dwDefaultFrameInterval */\
 	0x01,						/* bFrameIntervalType */\
-	U32_LE(10000000 / DT_PROP(frame, max_fps)),	/* dwFrameInterval */
-
-/* Video Streaming descriptor content of a node according to its type */
-#define VS_DESCRIPTOR(format)							\
-	IF_COMPAT(format, zephyr_uvc_format_mjpeg, (				\
-		VS_MJPEG_FORMAT_DESCRIPTOR(format)				\
-		DT_FOREACH_CHILD(format, VS_MJPEG_FRAME_DESCRIPTOR)		\
-	))									\
-	IF_COMPAT(format, zephyr_uvc_format_uncompressed, (			\
-		VS_UNCOMPRESSED_FORMAT_DESCRIPTOR(format)			\
-		DT_FOREACH_CHILD(format, VS_UNCOMPRESSED_FRAME_DESCRIPTOR)	\
-	))
-
-/* Descriptor Arrays */
-
-#define VS_MJPEG_FRAME_DESCRIPTOR_ARRAY(frame)					\
-	static uint8_t frame##_desc[] = {					\
-		VS_MJPEG_FRAME_DESCRIPTOR(frame)				\
-	};
-
-#define VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY(frame)				\
-	static uint8_t frame##_desc[] = {					\
-		VS_UNCOMPRESSED_FRAME_DESCRIPTOR(frame)				\
-	};
-
-#define UVC_DESCRIPTOR_ARRAYS(node)						\
-	static uint8_t node##_desc_iad[] = {					\
-		INTERFACE_ASSOCIATION_DESCRIPTOR(node)				\
-	};									\
-	static uint8_t node##_desc_if_vc[] = {					\
-		VC_INTERFACE_DESCRIPTOR(node)					\
-	};									\
-	static uint8_t node##_desc_if_vc_header[] = {				\
-		VC_INTERFACE_HEADER_DESCRIPTOR(node)				\
-	};									\
-	static uint8_t node##_desc_if_vs[] = {					\
-		VS_INTERFACE_DESCRIPTOR(node)					\
-	};									\
-	static uint8_t node##_desc_if_vs_header[] = {				\
-		VS_INPUT_HEADER_DESCRIPTOR(node)				\
-	};									\
-	static uint8_t node##_fs_desc_ep[] = {					\
-		VS_FULLSPEED_BULK_ENDPOINT_DESCRIPTOR(node)			\
-	};									\
-	static uint8_t node##_hs_desc_ep[] = {					\
-		VS_HIGHSPEED_BULK_ENDPOINT_DESCRIPTOR(node)			\
-	};									\
-	DT_FOREACH_CHILD_SEP(node, INTERFACE_DESCRIPTOR_ARRAYS, ())
-
-#define INTERFACE_DESCRIPTOR_ARRAYS(node)					\
-	static uint8_t node##_desc[] = {					\
-		VC_DESCRIPTOR(node)						\
-		VS_DESCRIPTOR(node)						\
-	};									\
-	IF_COMPAT(node, zephyr_uvc_format_mjpeg, (				\
-		DT_FOREACH_CHILD(node, VS_MJPEG_FRAME_DESCRIPTOR_ARRAY)		\
-	))									\
-	IF_COMPAT(node, zephyr_uvc_format_uncompressed, (			\
-		DT_FOREACH_CHILD(node, VS_UNCOMPRESSED_FRAME_DESCRIPTOR_ARRAY)	\
-	))
-
-/* Descriptor Pointers */
-
-#define DESCRIPTOR_PTR(node)							\
-	(struct usb_desc_header *)node##_desc,
-
-#define VC_DESCRIPTOR_PTRS(entity)						\
-	IF_NOT_EMPTY(VC_DESCRIPTOR(entity), (					\
-		(struct usb_desc_header *)entity##_desc,			\
-	))
-
-#define VS_DESCRIPTOR_PTRS(format)						\
-	IF_NOT_EMPTY(VS_DESCRIPTOR(format), (					\
-		(struct usb_desc_header *)format##_desc,			\
-		DT_FOREACH_CHILD_SEP(format, DESCRIPTOR_PTR, ())		\
-		(struct usb_desc_header *)color_format_desc,			\
-	))
-
-#define UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)node##_desc_iad,				\
-	(struct usb_desc_header *)node##_desc_if_vc,				\
-	(struct usb_desc_header *)node##_desc_if_vc_header,			\
-	DT_FOREACH_CHILD(node, VC_DESCRIPTOR_PTRS)				\
-	(struct usb_desc_header *)node##_desc_if_vs,				\
-	(struct usb_desc_header *)node##_desc_if_vs_header,			\
-	DT_FOREACH_CHILD(node, VS_DESCRIPTOR_PTRS)
-
-#define UVC_FULLSPEED_DESCRIPTOR_PTRS(node)					\
-	UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)node##_fs_desc_ep,				\
-	(struct usb_desc_header *)&nil_desc,
-
-#define UVC_HIGHSPEED_DESCRIPTOR_PTRS(node)					\
-	UVC_DESCRIPTOR_PTRS(node)						\
-	(struct usb_desc_header *)node##_hs_desc_ep,				\
-	(struct usb_desc_header *)&nil_desc,
-
-/* Descriptors identical for all instances */
-
-static struct usb_desc_header nil_desc;
-
-static uint8_t color_format_desc[] = {VS_COLOR_MATCHING_DESCRIPTOR(unused)};
+	FRMIVAL(DT_PHA_BY_IDX(node, prop, id, max_fps)),/* dwFrameInterval */
 
 #endif /* ZEPHYR_INCLUDE_USBD_UVC_MACROS_H_ */
