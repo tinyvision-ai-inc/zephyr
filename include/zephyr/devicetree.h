@@ -3792,6 +3792,92 @@
  */
 
 /**
+ * @defgroup devicetree-generic-endpoint Endpoint helpers
+ * @ingroup devicetree
+ * @{
+ */
+
+/**
+ * @brief Get the remote endpoint node connected to a local endpoint.
+ *
+ * Some devices, such as video devices, can be interconnected through port and endpoints.
+ *
+ * For a selected node's endpoint, the remote endpoint connected to it can be access through
+ * @ref DT_REMOTE_ENDPOINT().
+ * This remote endpoint node can then be accessed using other macros to read its properties.
+ *
+ * Example devicetree overlay:
+ *
+ * @code{.dts}
+ *	&sink {
+ *		port {
+ *			sink_in: endpoint@123 {
+ *				remote-endpoint-label = "source_out";
+ *			};
+ *		};
+ *	};
+ *
+ *	&source {
+ *		port {
+ *			source_out: endpoint {
+ *				remote-endpoint-label = "sink_in";
+ *			};
+ *		};
+ *	};
+ * @endcode
+ *
+ * Example usage: starting from the sink, access the source endpoint connected to @c endpoint@123:
+ *
+ * @code{.c}
+ *	DT_REMOTE_ENDPOINT(DT_NODELABEL(sink_in), port, endpoint_123)
+ * @endcode
+ *
+ * Example usage, starting from the source, to access the sink endpoint connected to @c endpoint:
+ *
+ * @code{.c}
+ *	DT_REMOTE_ENDPOINT(DT_NODELABEL(source_out), port, endpoint)
+ * @endcode
+ *
+ * @note Once circular phandle references are supported, @c remote-endpoint-label (string) may be
+ *       changed into @c remote-endpoint (phandle).
+ *
+ * @param node The local node.
+ * @param port The port to search.
+ * @param ep The endpoint to search.
+ *
+ * @return The remote node of the endpoint connected to @p port, @p ep.
+ */
+#define DT_REMOTE_ENDPOINT(node, port, ep)                                                         \
+	DT_NODELABEL(DT_STRING_TOKEN(DT_CHILD(DT_CHILD(node, port), ep), remote_endpoint_label))
+
+/**
+ * @brief Get the remote device node connected to a local endpoint.
+ *
+ * For a given node, return the remote endpoint node connected to the specified port and endpoint.
+ * This permit accessing the remote device properties.
+ *
+ * Example usage, starting from the sink, to access the source device connected to @c endpoint@123:
+ *
+ * @code{.c}
+ *	DT_REMOTE_ENDPOINT(DT_NODELABEL(sink_in), port, endpoint_123)
+ * @endcode
+ *
+ * @note Once circular phandle references are supported, @c remote-endpoint-label (string) may be
+ *       changed into @c remote-endpoint (phandle).
+ *
+ * @param node The local node.
+ * @param port The port to search.
+ * @param ep The endpoint to search.
+ *
+ * @return The remote node of the device connected to @p port, @p ep.
+ */
+#define DT_REMOTE_DEVICE(node, port, ep) DT_GPARENT(DT_REMOTE_ENDPOINT(node, port, ep))
+
+/**
+ * @}
+ */
+
+/**
  * @defgroup devicetree-inst Instance-based devicetree APIs
  * @ingroup devicetree
  * @{
