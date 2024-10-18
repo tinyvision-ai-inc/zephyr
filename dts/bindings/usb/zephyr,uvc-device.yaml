@@ -1,0 +1,64 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  USB Video Class instance
+
+  The Video Class will scan the devicetree nodes seeking for video
+  devices recognized by the "video-controls" node. Each video device
+  will be represented on the USB by its own descriptor, which will allow
+  the host to tune it according to the entries of "video-controls".
+
+  Depending on the number of input and output, the appropriate USB
+  control block is assigned, which only leaves the format definition
+  to configure.
+
+  Any number of endpoint can be instantiated, leading to several UVC
+  stream within a same instance.
+
+  Example:
+
+    uvc: uvc {
+      compatible = "zephyr,uvc-device";
+      port {
+        endpoint {
+          remote-endpoint-label = "mipi0_in";
+          direction = "in";
+          formats = <&uvc VIDEO_PIX_FMT_YUYV 16 1920 1080 30>,
+                    <&uvc VIDEO_PIX_FMT_YUYV 16 1280 720 60>;
+        };
+      };
+    };
+
+compatible: "zephyr,uvc-device"
+
+include: video-device.yaml
+
+on-bus: usb
+
+properties:
+  video-controls:
+    default: []
+
+  "#format-cells":
+    type: int
+    const: 5
+
+child-binding:
+  child-binding:
+    properties:
+
+      formats:
+        type: phandle-array
+        required: true
+        description: |
+          List of frame formats exposed to the host for this endpoint.
+          Zephyr video drivers support format range (min, max) but UVC supports
+          only discrete values.
+
+format-cells:
+  - fourcc
+  - bits-per-pixel
+  - width
+  - height
+  - max-fps

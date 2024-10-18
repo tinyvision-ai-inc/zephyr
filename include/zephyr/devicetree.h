@@ -3425,6 +3425,23 @@
  *           devicetree compatible and instance number.
  * @param ... Additional arguments to pass to @p fn
  *
+ * @see DT_INST_FOREACH_STATUS_OKAY
+ */
+#define DT_COMPAT_FOREACH_STATUS_OKAY(compat, fn, ...)			\
+	COND_CODE_1(DT_HAS_COMPAT_STATUS_OKAY(compat),			\
+		    (UTIL_CAT(DT_FOREACH_OKAY_INST_, compat)(fn)),	\
+		    ())
+
+/**
+ * @brief Call @p fn on all nodes with compatible `compat`
+ *        and status `okay` with multiple arguments
+ *
+ *
+ * @param compat lowercase-and-underscores devicetree compatible
+ * @param fn Macro to call for each enabled node. Must accept a
+ *           devicetree compatible and instance number.
+ * @param ... Additional arguments to pass to @p fn
+ *
  * @see DT_INST_FOREACH_STATUS_OKAY_VARGS
  */
 #define DT_COMPAT_FOREACH_STATUS_OKAY_VARGS(compat, fn, ...)		\
@@ -3847,8 +3864,9 @@
  *
  * @return The remote node of the endpoint connected to @p port, @p ep.
  */
-#define DT_REMOTE_ENDPOINT(node, port, ep)                                                         \
-	DT_NODELABEL(DT_STRING_TOKEN(DT_CHILD(DT_CHILD(node, port), ep), remote_endpoint_label))
+#define DT_REMOTE_ENDPOINT(node, port, ep) DT_REMOTE(DT_ENDPOINT(node, port, ep))
+#define DT_REMOTE(node) DT_NODELABEL(DT_STRING_TOKEN(node, remote_endpoint_label))
+#define DT_ENDPOINT(node, port, ep) DT_CHILD(DT_CHILD(node, port), ep)
 
 /**
  * @brief Get the remote device node connected to a local endpoint.

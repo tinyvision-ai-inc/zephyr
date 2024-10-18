@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/dt-bindings/usb/video.h>
+#include <zephyr/drivers/video-formats.h>
 
 / {
 	chosen {
@@ -47,6 +47,21 @@
 	};
 };
 
+&zephyr_udc0 {
+	uvc: uvc {
+		compatible = "zephyr,uvc-device";
+		#format-cells = <5>;
+
+		port {
+			uvc_in: endpoint {
+				direction = "in";
+				remote-endpoint-label = "mipi0_out";
+				formats = <&uvc VIDEO_PIX_FMT_YUYV 16 64 20 15>;
+			};
+		};
+	};
+};
+
 &usb_cdc_acm_uart {
 	status = "disabled";
 };
@@ -55,42 +70,4 @@
 	pinctrl-0 = <&usart3_tx_pb10 &usart3_rx_pb11>;
 	pinctrl-names = "default";
 	status = "okay";
-};
-
-&zephyr_udc0 {
-	uvc_0: uvc {
-		compatible = "zephyr,uvc";
-
-		port {
-			uvc_in0: endpoint {
-				remote-endpoint-label = "videmul0_out";
-			};
-		};
-
-		/* This builds a control chain to explain the organization
-		 * of the video system to the host, changing the topology
-		 * here will not affect how the firmware works itself, but
-		 * will affect how it is described to the host, and which
-		 * video device receives the controls.
-		 */
-		uvc0it: input_terminal {
-			compatible = "zephyr,uvc-control-it";
-		};
-		uvc0ot: output_terminal {
-			compatible = "zephyr,uvc-control-ot";
-			source-entity = <&uvc0it>;
-		};
-
-		format_uncompressed {
-			compatible = "zephyr,uvc-format-uncompressed";
-			fourcc = "YUYV";
-			guid = [UVC_GUID_YUY2];
-			bits-per-pixel = <16>;
-
-			qVGA {
-				size = <64 20>;
-				max-fps = <15>;
-			};
-		};
-	};
 };
