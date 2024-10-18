@@ -47,38 +47,15 @@
 	};
 };
 
-&usb_cdc_acm_uart {
-	status = "disabled";
-};
-
-&usart3 {
-	pinctrl-0 = <&usart3_tx_pb10 &usart3_rx_pb11>;
-	pinctrl-names = "default";
-	status = "okay";
-};
-
 &zephyr_udc0 {
-	uvc_0: uvc {
+	uvc: uvc {
 		compatible = "zephyr,uvc";
 
 		port {
-			uvc_in0: endpoint {
-				remote-endpoint-label = "videmul0_out";
+			uvc_in: endpoint {
+				direction = "in";
+				remote-endpoint-label = "mipi0_out";
 			};
-		};
-
-		/* This builds a control chain to explain the organization
-		 * of the video system to the host, changing the topology
-		 * here will not affect how the firmware works itself, but
-		 * will affect how it is described to the host, and which
-		 * video device receives the controls.
-		 */
-		uvc0it: input_terminal {
-			compatible = "zephyr,uvc-control-it";
-		};
-		uvc0ot: output_terminal {
-			compatible = "zephyr,uvc-control-ot";
-			source-entity = <&uvc0it>;
 		};
 
 		format_uncompressed {
@@ -93,4 +70,14 @@
 			};
 		};
 	};
+};
+
+&usb_cdc_acm_uart {
+	status = "disabled";
+};
+
+&usart3 {
+	pinctrl-0 = <&usart3_tx_pb10 &usart3_rx_pb11>;
+	pinctrl-names = "default";
+	status = "okay";
 };

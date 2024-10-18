@@ -81,4 +81,11 @@ description: |
 
 compatible: "zephyr,uvc"
 
+include: video-device.yaml
+
+properties:
+  video-controls:
+    type: string-array
+    default: []
+
 on-bus: usb

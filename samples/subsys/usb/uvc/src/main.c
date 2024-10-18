@@ -18,7 +18,7 @@ LOG_MODULE_REGISTER(uvc_sample, LOG_LEVEL_DBG);
 
 int main(void)
 {
-	const struct device *uvc_dev = DEVICE_DT_GET(DT_NODELABEL(uvc_0));
+	const struct device *uvc_dev = DEVICE_DT_GET(DT_NODELABEL(uvc));
 	const struct device *mipi_dev = DEVICE_DT_GET(DT_NODELABEL(mipi0));
 	struct usbd_context *sample_usbd;
 	struct video_buffer *vbuf;
