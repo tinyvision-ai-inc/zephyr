@@ -21,11 +21,12 @@
  * @{
  */
 
-#include <zephyr/device.h>
 #include <stddef.h>
-#include <zephyr/kernel.h>
 
+#include <zephyr/device.h>
+#include <zephyr/kernel.h>
 #include <zephyr/types.h>
+#include <zephyr/drivers/video-formats.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -791,83 +792,33 @@ static inline struct video_buffer *video_buffer_alloc(size_t size)
  */
 void video_buffer_release(struct video_buffer *buf);
 
-/* fourcc - four-character-code */
-#define video_fourcc(a, b, c, d)                                                                   \
-	((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
-
-/**
- * @defgroup video_pixel_formats Video pixel formats
- * @{
- */
-
-/**
- * @name Bayer formats
- * @{
- */
-
-/** BGGR8 pixel format */
-#define VIDEO_PIX_FMT_BGGR8 video_fourcc('B', 'G', 'G', 'R') /*  8  BGBG.. GRGR.. */
-/** GBRG8 pixel format */
-#define VIDEO_PIX_FMT_GBRG8 video_fourcc('G', 'B', 'R', 'G') /*  8  GBGB.. RGRG.. */
-/** GRBG8 pixel format */
-#define VIDEO_PIX_FMT_GRBG8 video_fourcc('G', 'R', 'B', 'G') /*  8  GRGR.. BGBG.. */
-/** RGGB8 pixel format */
-#define VIDEO_PIX_FMT_RGGB8 video_fourcc('R', 'G', 'G', 'B') /*  8  RGRG.. GBGB.. */
-
-/**
- * @}
- */
-
-/**
- * @name RGB formats
- * @{
- */
-
-/** RGB565 pixel format */
-#define VIDEO_PIX_FMT_RGB565 video_fourcc('R', 'G', 'B', 'P') /* 16  RGB-5-6-5 */
-
-/** XRGB32 pixel format */
-#define VIDEO_PIX_FMT_XRGB32 video_fourcc('B', 'X', '2', '4') /* 32  XRGB-8-8-8-8 */
-
-/**
- * @}
- */
-
-/**
- * @name YUV formats
- * @{
- */
-
-/** YUYV pixel format */
-#define VIDEO_PIX_FMT_YUYV video_fourcc('Y', 'U', 'Y', 'V') /* 16  Y0-Cb0 Y1-Cr0 */
-
-/** XYUV32 pixel format */
-#define VIDEO_PIX_FMT_XYUV32 video_fourcc('X', 'Y', 'U', 'V') /* 32  XYUV-8-8-8-8 */
-
-/**
- *
- * @}
- */
-
-/**
- * @name JPEG formats
- * @{
- */
-
-/** JPEG pixel format */
-#define VIDEO_PIX_FMT_JPEG video_fourcc('J', 'P', 'E', 'G') /*  8  JPEG */
-
-/**
- * @}
- */
-
-/**
- * @}
- */
-
 #ifdef __cplusplus
 }
 #endif
+
+static inline int video_bits_per_pixel(uint32_t pix_fmt)
+{
+	switch (pix_fmt) {
+	case VIDEO_PIX_FMT_BGGR8:
+		return VIDEO_PIX_FMT_BGGR8_BPP;
+	case VIDEO_PIX_FMT_GBRG8:
+		return VIDEO_PIX_FMT_GBRG8_BPP;
+	case VIDEO_PIX_FMT_GRBG8:
+		return VIDEO_PIX_FMT_GRBG8_BPP;
+	case VIDEO_PIX_FMT_RGGB8:
+		return VIDEO_PIX_FMT_RGGB8_BPP;
+	case VIDEO_PIX_FMT_RGB565:
+		return VIDEO_PIX_FMT_RGB565_BPP;
+	case VIDEO_PIX_FMT_XRGB32:
+		return VIDEO_PIX_FMT_XRGB32_BPP;
+	case VIDEO_PIX_FMT_YUYV:
+		return VIDEO_PIX_FMT_YUYV_BPP;
+	case VIDEO_PIX_FMT_XYUV32:
+		return VIDEO_PIX_FMT_XYUV32_BPP;
+	default:
+		return -EINVAL;
+	}
+}
 
 /**
  * @}

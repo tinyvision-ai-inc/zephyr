@@ -3889,7 +3889,7 @@
  *
  * @return The remote node of the device connected to @p port, @p ep.
  */
-#define DT_REMOTE_DEVICE(node, port, ep) DT_GPARENT(DT_REMOTE_ENDPOINT(node, port, ep))
+#define DT_REMOTE_DEVICE(node) DT_GPARENT(DT_REMOTE(node))
 
 /**
  * @}
