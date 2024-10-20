@@ -19,6 +19,36 @@ config USBD_VIDEO_HEADER_SIZE
 	  Sets the size of the video payload header,
 	  to allow custom data to be added at the end of the mandatory fields.
 
+config USBD_VIDEO_MAX_STREAMS
+	int "Maximum number of video output stream per USB Video interface"
+	depends on USBD_VIDEO_CLASS
+	range 1 254
+	default 8
+	help
+	  Each video stream is mapped to a video endpoint on the devicetree.
+	  This limits the number of endpoints that can be declared for each
+	  UVC instance.
+
+config USBD_VIDEO_MAX_SOURCES
+	int "Maximum number of video sources per Selector units"
+	depends on USBD_VIDEO_CLASS
+	range 1 255
+	default 8
+	help
+	  Selector Units permit to switch the image input between multiple
+	  video sources. This limits the number of sources that can be declared
+	  for each Selector Unit.
+
+config USBD_VIDEO_MAX_FRMIVALS
+	int "Maximum number of frame intervals per format definition"
+	depends on USBD_VIDEO_CLASS
+	range 1 1
+	default 1
+	help
+	  Image frame description feature a list of frame interval values.
+	  This limits the number of frame intervals that can be declared
+	  for each USB Frame Descriptor.
+
 module = USBD_UVC
 module-str = usbd uvc
 default-count = 1
