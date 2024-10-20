@@ -14,6 +14,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/drivers/video-controls.h>
+#include <zephyr/drivers/video-formats.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/logging/log.h>
 
@@ -375,7 +376,8 @@ static void emul_imager_fill_framebuffer(const struct device *const dev, struct 
 		}
 		break;
 	default:
-		LOG_WRN("unsupported pixel format %x", fmt->pixelformat);
+		LOG_WRN("Unsupported pixel format %x, supported: %x, %x",
+			fmt->pixelformat, VIDEO_PIX_FMT_YUYV, VIDEO_PIX_FMT_RGB565);
 		memset(fb16, 0, fmt->pitch);
 	}
 
@@ -451,21 +453,6 @@ static int emul_imager_get_caps(const struct device *dev, enum video_endpoint_id
 	return 0;
 }
 
-static int emul_imager_bpp(struct video_format *fmt)
-{
-	switch (fmt->pixelformat) {
-	case VIDEO_PIX_FMT_BGGR8:
-		return 1;
-	case VIDEO_PIX_FMT_RGB565:
-	case VIDEO_PIX_FMT_YUYV:
-		return 2;
-	default:
-		LOG_WRN("querying an unsupported format %x %ux%u",
-			fmt->pixelformat, fmt->width, fmt->height);
-		return 0;
-	}
-}
-
 static int emul_imager_stream_start(const struct device *dev)
 {
 	return emul_imager_write_reg(dev, EMUL_IMAGER_REG_CTRL, 1);
@@ -515,7 +502,7 @@ int emul_imager_init(const struct device *dev)
 	fmt.pixelformat = fmts[0].pixelformat;
 	fmt.width = fmts[0].width_min;
 	fmt.height = fmts[0].height_min;
-	fmt.pitch = fmt.width * emul_imager_bpp(&fmt);
+	fmt.pitch = fmt.width * video_bits_per_pixel(fmt.pixelformat) / 8;
 
 	ret = emul_imager_set_fmt(dev, VIDEO_EP_OUT, &fmt);
 	if (ret < 0) {

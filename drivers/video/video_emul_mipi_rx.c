@@ -310,7 +310,7 @@ int emul_mipi_rx_init(const struct device *dev)
 	fmt.pixelformat = fmts[0].pixelformat;
 	fmt.width = fmts[0].width_max;
 	fmt.height = fmts[0].height_max;
-	fmt.pitch = fmt.width * (fmt.pixelformat == VIDEO_PIX_FMT_BGGR8 ? 1 : 2);
+	fmt.pitch = fmt.width * video_bits_per_pixel(fmt.pixelformat) / 8;
 
 	return emul_mipi_rx_set_fmt(dev, VIDEO_EP_OUT, &fmt);
 }

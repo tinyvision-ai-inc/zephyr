@@ -37,9 +37,6 @@ include: video-device.yaml
 on-bus: usb
 
 properties:
-  video-controls:
-    default: []
-
   "#format-cells":
     type: int
     const: 5
