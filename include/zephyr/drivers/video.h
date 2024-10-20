@@ -21,11 +21,12 @@
  * @{
  */
 
-#include <zephyr/device.h>
 #include <stddef.h>
-#include <zephyr/kernel.h>
 
+#include <zephyr/device.h>
+#include <zephyr/kernel.h>
 #include <zephyr/types.h>
+#include <zephyr/drivers/video-formats.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -892,6 +893,30 @@ static inline unsigned int video_pix_fmt_bpp(uint32_t pixfmt)
 #ifdef __cplusplus
 }
 #endif
+
+static inline int video_bits_per_pixel(uint32_t pix_fmt)
+{
+	switch (pix_fmt) {
+	case VIDEO_PIX_FMT_BGGR8:
+		return VIDEO_PIX_FMT_BGGR8_BPP;
+	case VIDEO_PIX_FMT_GBRG8:
+		return VIDEO_PIX_FMT_GBRG8_BPP;
+	case VIDEO_PIX_FMT_GRBG8:
+		return VIDEO_PIX_FMT_GRBG8_BPP;
+	case VIDEO_PIX_FMT_RGGB8:
+		return VIDEO_PIX_FMT_RGGB8_BPP;
+	case VIDEO_PIX_FMT_RGB565:
+		return VIDEO_PIX_FMT_RGB565_BPP;
+	case VIDEO_PIX_FMT_XRGB32:
+		return VIDEO_PIX_FMT_XRGB32_BPP;
+	case VIDEO_PIX_FMT_YUYV:
+		return VIDEO_PIX_FMT_YUYV_BPP;
+	case VIDEO_PIX_FMT_XYUV32:
+		return VIDEO_PIX_FMT_XYUV32_BPP;
+	default:
+		return -EINVAL;
+	}
+}
 
 /**
  * @}
