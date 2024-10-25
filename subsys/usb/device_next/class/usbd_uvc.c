@@ -578,9 +578,9 @@ struct uvc_probe_msg {
 	uint32_t dwMaxPayloadTransferSize;
 	uint32_t dwClockFrequency;
 	uint8_t bmFramingInfo;
-#define UVC_BMFRAMING_INFO_FID BIT(0)
-#define UVC_BMFRAMING_INFO_EOF BIT(1)
-#define UVC_BMFRAMING_INFO_EOS BIT(2)
+#define UVC_BMFRAMING_INFO_FID			BIT(0)
+#define UVC_BMFRAMING_INFO_EOF			BIT(1)
+#define UVC_BMFRAMING_INFO_EOS			BIT(2)
 	uint8_t bPreferedVersion;
 	uint8_t bMinVersion;
 	uint8_t bMaxVersion;
@@ -613,6 +613,8 @@ struct uvc_control {
 	struct uvc_stream *stream;
 	/* Bitmask of controls enabled for this interface */
 	uint64_t mask;
+	/* 0-terminated list of source IDs */
+	uint16_t *source_ids;
 
 	/* Video API state */
 
@@ -1889,12 +1891,18 @@ static int uvc_preinit(const struct device *dev)
 		.caps = uvc_caps_##n,						\
 	},
 
+#define UVC_CONTROL_SOURCE_ID(n) DEP_ORD(DT_GPARENT(DT_REMOTE_ENDPOINT(n)))
+#define UVC_CONTROL_SOURCE_IDS(n)						\
+	uint16_t uvc_ctrl_source_ids_##n = {					\
+		DT_FOREACH_CHILD(DT_CHILD(n, port), UVC_CONTROL_SOURCE_ID), 0 };
+
 #define UVC_CONTROL(n, t, T)							\
 	{									\
 		.dev = DEVICE_DT_GET(n),					\
 		.fn = &uvc_control_##t,						\
 		.desc =	(void *) &uvc_ctrl_##t##_desc_##n,			\
 		.desc_nd = &uvc_ctrl_##t##_desc_nd_##n,				\
+		.source_ids = uvc_ctrl_source_ids_##n,				\
 	},
 
 #define UVC_DEFINE_CONTROL_IT_DESCRIPTOR(n)					\
@@ -1962,7 +1970,7 @@ struct usbd_uvc_ctrl_pu_desc uvc_ctrl_pu_desc_##n = {				\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_PROCESSING_UNIT,			\
 		.bUnitID = DT_DEP_ORD(n),					\
-		.bSourceID = 0,						\
+		.bSourceID = 0,							\
 		.wMaxMultiplier = sys_cpu_to_le16(0),				\
 		.bControlSize = 3,						\
 		.bmControls = {0},						\
