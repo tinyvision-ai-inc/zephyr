@@ -53,7 +53,7 @@
 		#format-cells = <5>;
 
 		port {
-			uvc_in: endpoint {
+			uvc_in0: endpoint {
 				direction = "in";
 				remote-endpoint-label = "mipi0_out";
 				formats = <&uvc VIDEO_PIX_FMT_YUYV 16 64 20 15>;

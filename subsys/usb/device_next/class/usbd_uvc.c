@@ -22,6 +22,8 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/usb/usb_ch9.h>
 
+#include "usbd_uvc_macros.h"
+
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 /* Video Class-Specific Request Codes */
@@ -269,7 +271,7 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define XU_BASE_CONTROL				0x00
 #define XU_BASE_BIT				0
 
-enum uvc_control_type {
+enum uvc_ctype {
 	/* Camera Terminal control type */
 	CTYPE_CT,
 	/* Input Terminal control type */
@@ -286,9 +288,9 @@ enum uvc_control_type {
 	CTYPE_OT,
 };
 
-enum uvc_status {
-	UVC_CLASS_ENABLED,
-	UVC_CLASS_READY,
+enum uvc_class_status {
+	CLASS_ENABLED,
+	CLASS_READY,
 };
 
 struct uvc_control_header_descriptor {
@@ -610,11 +612,11 @@ struct uvc_control {
 	/* USB string descriptor */
 	struct usbd_desc_node *desc_nd;
 	/* Stream interface affected by this control */
-	struct uvc_stream *stream;
+	struct uvc_stream *strm;
 	/* Bitmask of controls enabled for this interface */
 	uint64_t mask;
-	/* 0-terminated list of source IDs */
-	uint16_t *source_ids;
+	/* Array offsets of the nodes connected to this one */
+	uint8_t *links;
 
 	/* Video API state */
 
@@ -634,12 +636,16 @@ struct uvc_stream {
 	atomic_t state;
 	/* VideoStreaming-specific descriptor collection */
 	struct usbd_uvc_strm_desc *desc;
+	/* USB string descriptor */
+	struct usbd_desc_node *desc_nd;
 	/* UVC probe-commit control default values */
 	struct uvc_probe_msg default_probe;
 	/* UVC payload header, passed just before the image data */
 	struct uvc_payload_header payload_header;
 	/* UVC format currently selected */
 	int format_id;
+	/* VideoControl Unit assotiated with this VideStreaming interface */
+	const struct uvc_control *ctrl;
 
 	/* Video API state */
 
@@ -665,8 +671,8 @@ struct uvc_data {
 	/* USBD class structure */
 	struct usbd_class_data *c_data;
 	/* UVC lookup tables */
-	const struct uvc_control *controls;
-	struct uvc_stream *streams;
+	const struct uvc_control *ctrls;
+	struct uvc_stream *strms;
 	/* UVC Descriptors */
 	struct usbd_uvc_desc *desc;
 	struct usb_desc_header *const *fs_desc;
@@ -698,12 +704,12 @@ int uvc_get_stream(const struct device *dev, enum video_endpoint_id ep, struct u
 	}
 
 	if (ep == VIDEO_EP_IN || ep == VIDEO_EP_ALL) {
-		*result = &data->streams[0];
+		*result = &data->strms[0];
 		return 0;
 	}
 
 	/* Iterate instead of dereference to prevent overflow */
-	for (struct uvc_stream *strm = data->streams; strm->dev != NULL; strm++, ep--) {
+	for (struct uvc_stream *strm = data->strms; strm->dev != NULL; strm++, ep--) {
 		if (ep == 0) {
 			*result = strm;
 			return 0;
@@ -828,7 +834,7 @@ static uint32_t uvc_get_max_frame_size(struct uvc_stream *strm)
 {
 	const struct video_format_cap *cap = &strm->caps[strm->format_id];
 
-	return cap->width_max * cap->height_max * video_bits_per_pixel(cap->pixelformat);
+	return cap->width_max * cap->height_max * video_bits_per_pixel(cap->pixelformat) / 8;
 }
 
 static int uvc_control_probe_format_index(const struct device *dev, struct uvc_stream *strm,
@@ -839,7 +845,7 @@ static int uvc_control_probe_format_index(const struct device *dev, struct uvc_s
 		probe->bFormatIndex = 1;
 		break;
 	case GET_MAX:
-		for (size_t i = 0; strm->caps[i].pixelformat != 0; i++) {
+		for (int i = 0; strm->caps[i].pixelformat != 0; i++) {
 			probe->bFormatIndex = i + 1;
 		}
 		break;
@@ -853,7 +859,7 @@ static int uvc_control_probe_format_index(const struct device *dev, struct uvc_s
 		if (probe->bFormatIndex == 0) {
 			return 0;
 		}
-		for (size_t i = 0; strm->caps[i].pixelformat != 0; i++) {
+		for (int i = 0; strm->caps[i].pixelformat != 0; i++) {
 			if (probe->bFormatIndex == i + 1) {
 				strm->format_id = i;
 				return 0;
@@ -1081,7 +1087,7 @@ static int uvc_control_commit(const struct device *dev, struct uvc_stream *strm,
 			return ret;
 		}
 
-		atomic_set_bit(&strm->state, UVC_CLASS_READY);
+		atomic_set_bit(&strm->state, CLASS_READY);
 		k_work_submit(&strm->work);
 
 		ret = uvc_get_format(dev, VIDEO_EP_IN, &fmt);
@@ -1383,7 +1389,7 @@ static int uvc_control(const struct device *dev, const struct usb_setup_packet *
 
 	/* VideoStreaming requests */
 
-	for (struct uvc_stream *strm = data->streams; strm->dev != NULL; strm++) {
+	for (struct uvc_stream *strm = data->strms; strm->dev != NULL; strm++) {
 		if (strm->desc->ifN.bInterfaceNumber == ifnum) {
 			return uvc_control_vs(dev, strm, setup, buf);
 		}
@@ -1401,7 +1407,7 @@ static int uvc_control(const struct device *dev, const struct usb_setup_packet *
 		return uvc_control_errno(setup, buf, data->err);
 	}
 
-	for (const struct uvc_control *ctrl = data->controls; ctrl->dev != NULL; ctrl++) {
+	for (const struct uvc_control *ctrl = data->ctrls; ctrl->dev != NULL; ctrl++) {
 		if (ctrl->desc->bUnitID == unit_id) {
 			return uvc_control_vc(dev, ctrl, setup, buf);
 		}
@@ -1460,7 +1466,7 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	struct uvc_data *data = dev->data;
 	int ret;
 
-	for (struct uvc_stream *strm = data->streams; strm->dev != NULL; strm++) {
+	for (struct uvc_stream *strm = data->strms; strm->dev != NULL; strm++) {
 		/* Get the default probe by querying the current probe at startup */
 		ret = uvc_control_probe(dev, strm, GET_CUR, &strm->default_probe);
 		if (ret < 0) {
@@ -1469,7 +1475,7 @@ static int uvc_init(struct usbd_class_data *const c_data)
 		}
 	}
 
-	for (const struct uvc_control *ctrl = data->controls; ctrl->dev != NULL; ctrl++) {
+	for (const struct uvc_control *ctrl = data->ctrls; ctrl->dev != NULL; ctrl++) {
 		struct usbd_desc_node *desc_nd = ctrl->desc_nd;
 		struct uvc_unit_descriptor *desc = ctrl->desc;
 
@@ -1522,8 +1528,8 @@ static void uvc_update_desc(const struct device *dev)
 
 	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
 
-	for (size_t i = 0; data->streams[i].dev != NULL; i++) {
-		struct uvc_stream *strm = &data->streams[i];
+	for (int i = 0; data->strms[i].dev != NULL; i++) {
+		struct uvc_stream *strm = &data->strms[i];
 
 		strm->desc->ifN_header.bEndpointAddress = uvc_get_bulk_in(dev, strm);
 		data->desc->if0_header.baInterfaceNr[i] = strm->desc->ifN.bInterfaceNumber;
@@ -1551,8 +1557,8 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 static int uvc_enqueue_usb(const struct device *dev, struct uvc_stream *strm, struct net_buf *buf, struct video_buffer *vbuf)
 {
 	struct uvc_data *data = dev->data;
-	size_t mps = uvc_get_bulk_mps(data->c_data);
 	struct uvc_buf_info *bi = (void *)udc_get_buf_info(buf);
+	size_t mps = uvc_get_bulk_mps(data->c_data);
 	size_t len = buf->len;
 	int ret;
 
@@ -1650,8 +1656,8 @@ static void uvc_worker(struct k_work *work)
 	struct video_buffer *vbuf;
 	int ret;
 
-	if (!atomic_test_bit(&strm->state, UVC_CLASS_ENABLED) ||
-	    !atomic_test_bit(&strm->state, UVC_CLASS_READY)) {
+	if (!atomic_test_bit(&strm->state, CLASS_ENABLED) ||
+	    !atomic_test_bit(&strm->state, CLASS_READY)) {
 		LOG_DBG("Queue not ready");
 		return;
 	}
@@ -1688,9 +1694,9 @@ static void uvc_enable(struct usbd_class_data *const c_data)
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	for (struct uvc_stream *strm = data->streams; strm->dev != NULL; strm++) {
+	for (struct uvc_stream *strm = data->strms; strm->dev != NULL; strm++) {
 		/* Catch-up with buffers that might have been delayed */
-		atomic_set_bit(&strm->state, UVC_CLASS_ENABLED);
+		atomic_set_bit(&strm->state, CLASS_ENABLED);
 		k_work_submit(&strm->work);
 	}
 }
@@ -1700,8 +1706,8 @@ static void uvc_disable(struct usbd_class_data *const c_data)
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	for (struct uvc_stream *strm = data->streams; strm->dev != NULL; strm++) {
-		atomic_clear_bit(&strm->state, UVC_CLASS_ENABLED);
+	for (struct uvc_stream *strm = data->strms; strm->dev != NULL; strm++) {
+		atomic_clear_bit(&strm->state, CLASS_ENABLED);
 	}
 }
 
@@ -1763,8 +1769,8 @@ static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
 		return ret;
 	}
 
-	if (!atomic_test_bit(&strm->state, UVC_CLASS_ENABLED) ||
-	    !atomic_test_bit(&strm->state, UVC_CLASS_READY)) {
+	if (!atomic_test_bit(&strm->state, CLASS_ENABLED) ||
+	    !atomic_test_bit(&strm->state, CLASS_READY)) {
 		return -EAGAIN;
 	}
 
@@ -1814,20 +1820,159 @@ struct video_driver_api uvc_video_api = {
 	.dequeue = uvc_dequeue,
 };
 
+static void uvc_preinit_control(const struct device *dev, const struct uvc_control *ctrl, uint8_t prev_id)
+{
+	struct uvc_data *data = dev->data;
+	int n = 0;
+
+	/* Emtpy the links to the sink and recurse to the source */
+	for (int i = 0; ctrl->links[i] != 0; i++, n++) {
+		uint8_t next_id = ctrl->links[i];
+
+		if (prev_id == next_id) {
+			/* Flag the link as sink */
+			ctrl->links[i] = 0;
+		} else {
+			/* Recurse into the source */
+			uvc_preinit_control(dev, &data->ctrls[next_id - 1], ctrl->desc->bUnitID);
+		}
+	}
+
+	/* Remove the empty links */
+	for (int i = 0, o = 0; i < n; i++) {
+		if (ctrl->links[i] != 0) {
+			uint8_t id = ctrl->links[i];
+
+			ctrl->links[i] = 0;
+			ctrl->links[o] = id;
+			o++;
+		}
+	}
+}
+
 static int uvc_preinit(const struct device *dev)
 {
 	struct uvc_data *data = dev->data;
 
-	for (size_t i = 0; data->streams[i].dev != NULL; i++) {
-		struct uvc_stream *strm = &data->streams[i];
+	for (int i = 0; data->strms[i].dev != NULL; i++) {
+		struct uvc_stream *strm = &data->strms[i];
 
 		k_fifo_init(&strm->fifo_in);
 		k_fifo_init(&strm->fifo_out);
 		k_work_init(&strm->work, &uvc_worker);
+
+		/* Recursively init the assotiated video control chain */
+		uvc_preinit_control(dev, strm->ctrl, 0);
 	}
 
 	return 0;
 }
+
+/* UVC VideoControls are split in several Unit types, each with its own bUnitID.
+ * the video CIDs listed in a devicetree node "video-controls = <...>;" property
+ * are mapped to a VideoControl Unit types (CTYPEs). Each is then getting its
+ * UVC descriptor generated. This builds one group of descriptor for every
+ * devicetree node.
+ *
+ * For a given node, the macro below will therefore generate a list such as this:
+ *
+ *	fn(n, ct, CT) fn(n, pu, PU) fn(n, eu, EU)...
+ *
+ * - If video-controls has at a CID matching CTYPE_CT, "fn(n, ct, CT)" is added
+ * - If video-controls has at a CID matching CTYPE_PU, "fn(n, pu, PU)" is added
+ * - If video-controls has at a CID matching CTYPE_EU, "fn(n, eu, EU)" is added
+ * - Same for each other CTYPE...
+ *
+ * The matching of CIDs to CTYPEs is done via the macros "CTYPE_VIDEO_CID_*".
+ */
+#define PROP_IS_CTYPE(n, prop, i, t)						\
+	IS_EQ(t, DT_CAT(CTYPE_, DT_STRING_TOKEN_BY_IDX(n, prop, i)))
+#define CTYPE_ELEM_IF_EQ(n, prop, i, t)						\
+	COND_CODE_1(PROP_IS_CTYPE(n, prop, i, t), (PLUS_1,), ())
+#define CTYPE_LIST(n, t)							\
+	DT_FOREACH_PROP_ELEM_VARGS(n, video_controls, CTYPE_ELEM_IF_EQ, t)
+#define CTRL_NUM(n, t)								\
+	NUM_VA_ARGS_LESS_1(CTYPE_LIST(n, t) PLUS_1, PLUS_1)
+#define CTRL_NODES(n, fn)							\
+	COND_CODE_1(DT_NODE_HAS_PROP(n, video_controls), (			\
+		/* Note: Output Terminal (OT) are special cases */		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_EU), (), (fn(n, eu, EU)))		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (fn(n, pu, PU)))		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (fn(n, xu, XU)))		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (fn(n, su, SU)))		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (fn(n, ct, CT)))		\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (fn(n, it, IT)))		\
+	), ())
+#define FOREACH_CTRL(fn) 							\
+	DT_FOREACH_STATUS_OKAY_NODE_VARGS(CTRL_NODES, fn)
+
+/* Find source bUnitIDs for every unit by looking inside a same group. This is
+ * based on the fact that we always link the units in the same order within a
+ * group. So for every unit of the group, check with there is also other units
+ * with a type it may depend on.
+ *
+ * The dependency order chosen is (OT) <- EU <- PU <- XU <- SU <- (CT/IT).
+ */
+#define CTRL_IT_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		0 /* No source for Input Terminals */				\
+	)
+#define CTRL_CT_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		0 /* No source for Camera Terminals */				\
+	)
+#define CTRL_SU_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
+		0 /* No source within this group */				\
+	)
+#define CTRL_XU_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
+		0 /* No source within this group */				\
+	)
+#define CTRL_PU_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
+		0 /* No source within this group */				\
+	)
+#define CTRL_EU_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (CTRL_ID(n, pu, PU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
+		0 /* No source within this group */				\
+	)
+#define CTRL_OT_SOURCE_ID(n)							\
+	GET_ARG_N(1,								\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_EU), (), (CTRL_ID(n, eu, EU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (CTRL_ID(n, pu, PU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
+		0 /* No source within this group */				\
+	)
+
+/* Get all the possible source bUnitIDs for a given node, first looking-up in
+ * the same group, then following "remote-endpoint = <&...>;" on devicetree.
+ */
+#define CTRL_REMOTE_ID(n) CTRL_ID(DT_REMOTE_DEVICE(n))
+#define CTRL_SOURCE_ID(n, t, T)							\
+	COND_CODE_0(CTRL_##T##_SOURCE_ID(n),					\
+		    (DT_FOREACH_CHILD(DT_CHILD(n, port), CTRL_REMOTE_ID)),	\
+		    (CTRL_##T##_SOURCE_ID(n)))
+
+#define FOREACH_STRM(n, fn, ...)						\
+	DT_FOREACH_CHILD_VARGS(DT_INST_CHILD(n, port), fn, __VA_ARGS__)
 
 #define FRMIVAL(n, prop, i) sys_cpu_to_le64(DT_PHA_BY_IDX(n, prop, i, max_fps))
 #define BUFSIZE(n, prop, i) sys_cpu_to_le32(0)
@@ -1836,74 +1981,14 @@ static int uvc_preinit(const struct device *dev)
 	((fourcc) >> 16 & 0xff), ((fourcc) >> 24 & 0xff),			\
 	0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
 
-/* This will generate a list such as "fn(n, ct, CT) fn(n, pu, PU)..."
- * with one entry per control entity to add. The control entities are selected
- * according to the video-controls properties of every node:
- *
- * - If video-controls has at a CID matching CTYPE_CT, "fn(n, ct, CT)" is added
- * - If video-controls has at a CID matching CTYPE_PU, "fn(n, pu, PU)" is added
- * - If video-controls has at a CID matching CTYPE_EU, "fn(n, eu, EU)" is added
- * - So forth for all possible "CTYPE_??"
- *
- * The matching of CIDs and CTYPEs is done via the macros "CTYPE_VIDEO_CID_*".
- */
-#define PROP_IS_CTYPE(n, prop, i, t)						\
-	IS_EQ(t, DT_CAT(CTYPE_, DT_STRING_TOKEN_BY_IDX(n, prop, i)))
-#define CTYPE_ELEM_IF_EQ(n, prop, i, t)						\
-	COND_CODE_1(PROP_IS_CTYPE(n, prop, i, t), (ELEM,), ())
-#define CTYPE_LIST(n, t)							\
-	DT_FOREACH_PROP_ELEM_VARGS(n, video_controls, CTYPE_ELEM_IF_EQ, t)
-#define CTYPE_NUM(n, t)								\
-	NUM_VA_ARGS_LESS_1(CTYPE_LIST(n, t) ELEM, ELEM)
-#define VIDEO_CONTROL_NODES(n, fn)						\
-	COND_CODE_1(DT_NODE_HAS_PROP(n, video_controls), (			\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_CT), (), (fn(n, ct, CT)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_IT), (), (fn(n, it, IT)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_PU), (), (fn(n, pu, PU)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_SU), (), (fn(n, su, SU)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_EU), (), (fn(n, eu, EU)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_XU), (), (fn(n, xu, XU)))	\
-		COND_CODE_0(CTYPE_NUM(n, CTYPE_OT), (), (fn(n, ot, OT)))	\
-	), ())
-#define FOREACH_VIDEO_CONTROL(fn) 						\
-	DT_FOREACH_STATUS_OKAY_NODE_VARGS(VIDEO_CONTROL_NODES, fn)
-
-#define FOREACH_VIDEO_STREAM(n, fn, arg)					\
-	DT_FOREACH_CHILD_VARGS(DT_INST_CHILD(n, port), fn, arg)
-
-#define UVC_FORMAT_CAP(n, prop, i)						\
-	{									\
-		.pixelformat = DT_PHA_BY_IDX(n, prop, i, fourcc),		\
-		.width_min = DT_PHA_BY_IDX(n, prop, i, width),			\
-		.width_max = DT_PHA_BY_IDX(n, prop, i, width),			\
-		.width_step = 1,						\
-		.height_min = DT_PHA_BY_IDX(n, prop, i, height),		\
-		.height_max = DT_PHA_BY_IDX(n, prop, i, height),		\
-		.height_step = 1						\
-	},
-
-#define UVC_STREAM(n, _)							\
-	{									\
-		.dev = DEVICE_DT_GET(DT_GPARENT(DT_REMOTE_ENDPOINT(n))),	\
-		.self = DEVICE_DT_GET(DT_GPARENT(n)),				\
-		.desc = &uvc_strm_desc_##n,					\
-		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
-		.caps = uvc_caps_##n,						\
-	},
-
-#define UVC_CONTROL_SOURCE_ID(n) DEP_ORD(DT_GPARENT(DT_REMOTE_ENDPOINT(n)))
-#define UVC_CONTROL_SOURCE_IDS(n)						\
-	uint16_t uvc_ctrl_source_ids_##n = {					\
-		DT_FOREACH_CHILD(DT_CHILD(n, port), UVC_CONTROL_SOURCE_ID), 0 };
-
-#define UVC_CONTROL(n, t, T)							\
-	{									\
-		.dev = DEVICE_DT_GET(n),					\
-		.fn = &uvc_control_##t,						\
-		.desc =	(void *) &uvc_ctrl_##t##_desc_##n,			\
-		.desc_nd = &uvc_ctrl_##t##_desc_nd_##n,				\
-		.source_ids = uvc_ctrl_source_ids_##n,				\
-	},
+#define CTRL_ID(n, t, T) CTRL_##T##_ID_##n,
+enum uvc_ctrl_id {
+	CTRL_ID_RESERVED = 0,
+	/* bUnitIDs for all control units, with a "struct uvc_control" */
+	FOREACH_CTRL(CTRL_ID)
+	/* bUnitIDs for Output Terminals, with a "struct uvc_stream" */
+	DT_INST_FOREACH_STATUS_OKAY_VARGS(FOREACH_STRM, CTRL_ID, ot, OT)
+};
 
 #define UVC_DEFINE_CONTROL_IT_DESCRIPTOR(n)					\
 struct usbd_uvc_ctrl_it_desc uvc_ctrl_it_desc_##n = {				\
@@ -1911,7 +1996,7 @@ struct usbd_uvc_ctrl_it_desc uvc_ctrl_it_desc_##n = {				\
 		.bLength = sizeof(struct uvc_input_terminal_descriptor),	\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_INPUT_TERMINAL,			\
-		.bTerminalID = DT_DEP_ORD(n),					\
+		.bTerminalID = CTRL_IT_ID_##n,					\
 		.wTerminalType = sys_cpu_to_le16(ITT_VENDOR_SPECIFIC),		\
 		.bAssocTerminal = 0,						\
 		.iTerminal = 0,							\
@@ -1924,7 +2009,7 @@ struct usbd_uvc_ctrl_ot_desc uvc_ctrl_ot_desc_##n = {				\
 		.bLength = sizeof(struct uvc_output_terminal_descriptor),	\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_OUTPUT_TERMINAL,			\
-		.bTerminalID = DT_DEP_ORD(n),					\
+		.bTerminalID = CTRL_OT_ID_##n,					\
 		.wTerminalType = sys_cpu_to_le16(TT_STREAMING),			\
 		.bAssocTerminal = 0,						\
 		.bSourceID = 0,							\
@@ -1938,7 +2023,7 @@ struct usbd_uvc_ctrl_ct_desc uvc_ctrl_ct_desc_##n = {				\
 		.bLength = sizeof(struct uvc_camera_terminal_descriptor),	\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_INPUT_TERMINAL,			\
-		.bTerminalID = DT_DEP_ORD(n),					\
+		.bTerminalID = CTRL_CT_ID_##n,					\
 		.wTerminalType = sys_cpu_to_le16(ITT_CAMERA),			\
 		.bAssocTerminal = 0,						\
 		.iTerminal = 0,							\
@@ -1956,7 +2041,7 @@ struct usbd_uvc_ctrl_su_desc uvc_ctrl_su_desc_##n = {				\
 		.bLength = sizeof(struct uvc_selector_unit_descriptor),		\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_SELECTOR_UNIT,				\
-		.bUnitID = DT_DEP_ORD(n),					\
+		.bUnitID = CTRL_SU_ID_##n,					\
 		.bNrInPins = 0,							\
 		.baSourceID = {0},						\
 		.iSelector = 0,							\
@@ -1969,7 +2054,7 @@ struct usbd_uvc_ctrl_pu_desc uvc_ctrl_pu_desc_##n = {				\
 		.bLength = 13,							\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_PROCESSING_UNIT,			\
-		.bUnitID = DT_DEP_ORD(n),					\
+		.bUnitID = CTRL_PU_ID_##n,					\
 		.bSourceID = 0,							\
 		.wMaxMultiplier = sys_cpu_to_le16(0),				\
 		.bControlSize = 3,						\
@@ -1985,7 +2070,7 @@ struct usbd_uvc_ctrl_eu_desc uvc_ctrl_eu_desc_##n = {				\
 		.bLength = sizeof(struct uvc_encoding_unit_descriptor),		\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_ENCODING_UNIT,				\
-		.bUnitID = DT_DEP_ORD(n),					\
+		.bUnitID = CTRL_EU_ID_##n,					\
 		.bSourceID = 0,							\
 		.iEncoding = 0,							\
 		.bControlSize = 3,						\
@@ -1999,7 +2084,7 @@ struct usbd_uvc_ctrl_xu_desc uvc_ctrl_xu_desc_##n = {				\
 		.bLength = sizeof(struct uvc_extension_unit_descriptor),	\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = VC_EXTENSION_UNIT,			\
-		.bUnitID = DT_DEP_ORD(n),					\
+		.bUnitID = CTRL_XU_ID_##n,					\
 		.guidExtensionCode = {0},					\
 		.bNumControls = 0,						\
 		.bNrInPins = 0,							\
@@ -2137,20 +2222,16 @@ struct usbd_uvc_strm_mjpeg_desc uvc_strm_desc_##n##_##i = {			\
 	},									\
 };
 
-#define UVC_DEFINE_FORMAT_CAPS(n, _)						\
-	static const struct video_format_cap uvc_caps_##n[] = {			\
-		DT_FOREACH_PROP_ELEM(n, formats, UVC_FORMAT_CAP)		\
-		{0},								\
-	};
-
 #define UVC_DEFINE_CONTROL_DESCRIPTOR(n, t, T)					\
 	UVC_DEFINE_CONTROL_##T##_DESCRIPTOR(n)					\
 	USBD_DESC_STRING_DEFINE(uvc_ctrl_##t##_desc_nd_##n,			\
 				DT_NODE_FULL_NAME(n),				\
 				USBD_DUT_STRING_INTERFACE);
 
+FOREACH_CTRL(UVC_DEFINE_CONTROL_DESCRIPTOR)
 #define UVC_DEFINE_DESCRIPTOR(n)						\
-FOREACH_VIDEO_STREAM(n, UVC_DEFINE_STREAM_DESCRIPTOR, _)			\
+FOREACH_STRM(n, UVC_DEFINE_CONTROL_DESCRIPTOR, ot, OT)				\
+FOREACH_STRM(n, UVC_DEFINE_STREAM_DESCRIPTOR)					\
 										\
 static struct usbd_uvc_desc uvc_desc_##n = {					\
 	.iad = {								\
@@ -2196,8 +2277,9 @@ static struct usb_desc_header *const uvc_fs_desc_##n[] = {			\
 	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0_header,			\
-	FOREACH_VIDEO_CONTROL(VIDEO_CONTROL_PTRS)				\
-	FOREACH_VIDEO_STREAM(n, VIDEO_STREAM_PTRS, fs)				\
+	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
+	FOREACH_CTRL(CTRL_PTRS)							\
+	FOREACH_STRM(n, STRM_PTRS, fs)						\
 	(struct usb_desc_header *)&uvc_desc_##n.nil_desc,			\
 };										\
 										\
@@ -2205,26 +2287,75 @@ static struct usb_desc_header *const uvc_hs_desc_##n[] = {			\
 	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0_header,			\
-	FOREACH_VIDEO_CONTROL(VIDEO_CONTROL_PTRS)				\
-	FOREACH_VIDEO_STREAM(n, VIDEO_STREAM_PTRS, hs)				\
+	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
+	FOREACH_CTRL(CTRL_PTRS)							\
+	FOREACH_STRM(n, STRM_PTRS, hs)						\
 	(struct usb_desc_header *)&uvc_desc_##n.nil_desc,			\
 };
 
-#define VIDEO_CONTROL_PTRS(n, t, T)						\
+#define CTRL_PTRS(n, t, T)							\
 	(struct usb_desc_header *)&uvc_ctrl_##t##_desc_##n.if0_##t,
 
-#define VIDEO_FORMAT_PTRS(n, prop, i)						\
+#define FORMAT_PTRS(n, prop, i)							\
 	(struct usb_desc_header *)&uvc_strm_desc_##n##_##i.ifN_format,		\
 	(struct usb_desc_header *)&uvc_strm_desc_##n##_##i.ifN_frame,
-	
-#define VIDEO_STREAM_PTRS(n, speed)						\
+
+#define STRM_PTRS(n, speed)							\
 	(struct usb_desc_header *)&uvc_strm_desc_##n.ifN,			\
 	(struct usb_desc_header *)&uvc_strm_desc_##n.ifN_header,		\
-	DT_FOREACH_PROP_ELEM(n, formats, VIDEO_FORMAT_PTRS)			\
+	DT_FOREACH_PROP_ELEM(n, formats, FORMAT_PTRS)				\
 	(struct usb_desc_header *)&uvc_strm_desc_##n.ifN_color,			\
 	(struct usb_desc_header *)&uvc_strm_desc_##n.ifN_ep_##speed,
 
-FOREACH_VIDEO_CONTROL(UVC_DEFINE_CONTROL_DESCRIPTOR)
+#define FORMAT_CAP(n, prop, i)							\
+	{									\
+		.pixelformat = DT_PHA_BY_IDX(n, prop, i, fourcc),		\
+		.width_min = DT_PHA_BY_IDX(n, prop, i, width),			\
+		.width_max = DT_PHA_BY_IDX(n, prop, i, width),			\
+		.width_step = 1,						\
+		.height_min = DT_PHA_BY_IDX(n, prop, i, height),		\
+		.height_max = DT_PHA_BY_IDX(n, prop, i, height),		\
+		.height_step = 1						\
+	},
+
+#define UVC_DEFINE_FORMAT_CAPS(n, _)						\
+	static const struct video_format_cap uvc_caps_##n[] = {			\
+		DT_FOREACH_PROP_ELEM(n, formats, FORMAT_CAP)			\
+		{0},								\
+	};
+
+#define CTRL_LINK(n, T)
+	GET_ARG_N(1, CTRL_NODES(DT_REMOTE_DEVICE(n), CTRL_ID))
+
+#define CTRL_LINKS(n, t, T)							\
+uint8_t uvc_ctrl_##t##_links_##n[] = {						\
+	DT_FOREACH_CHILD_VARGS(DT_CHILD(n, port), CTRL_LINK, T) 0};
+
+FOREACH_CTRL(CTRL_LINKS)
+
+#define CTRL(n, t, T)								\
+	{									\
+		.dev = DEVICE_DT_GET(n),					\
+		.fn = &uvc_control_##t,						\
+		.desc =	(void *) &uvc_ctrl_##t##_desc_##n,			\
+		.desc_nd = &uvc_ctrl_##t##_desc_nd_##n,				\
+		.links = uvc_ctrl_##t##_links_##n,				\
+	},
+
+static const struct uvc_control uvc_ctrls[] = {
+	FOREACH_CTRL(CTRL)
+	{0},
+};
+
+#define STRM(n, _)								\
+	{									\
+		.dev = DEVICE_DT_GET(DT_REMOTE_DEVICE(n)),			\
+		.self = DEVICE_DT_GET(DT_GPARENT(n)),				\
+		.desc = &uvc_strm_desc_##n,					\
+		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
+		.caps = uvc_caps_##n,						\
+		.ctrl = &uvc_ctrls[CTRL_OT_SOURCE_ID(DT_REMOTE_DEVICE(n)) - 1],	\
+	},
 
 #define USBD_UVC_DT_DEVICE_DEFINE(n)						\
 	UVC_DEFINE_DESCRIPTOR(n)						\
@@ -2232,23 +2363,17 @@ FOREACH_VIDEO_CONTROL(UVC_DEFINE_CONTROL_DESCRIPTOR)
 	USBD_DEFINE_CLASS(uvc_c_data_##n, &uvc_class_api,			\
 			  (void *)DEVICE_DT_INST_GET(n), NULL);			\
 										\
+	FOREACH_STRM(n, UVC_DEFINE_FORMAT_CAPS)					\
 										\
-	FOREACH_VIDEO_STREAM(n, UVC_DEFINE_FORMAT_CAPS, _)			\
-										\
-	static struct uvc_stream uvc_streams_##n[] = {				\
-		FOREACH_VIDEO_STREAM(n, UVC_STREAM, _)				\
-		{0},								\
-	};									\
-										\
-	static const struct uvc_control uvc_controls_##n[] = {			\
-		FOREACH_VIDEO_CONTROL(UVC_CONTROL)				\
+	static struct uvc_stream uvc_strms_##n[] = {				\
+		FOREACH_STRM(n, STRM)						\
 		{0},								\
 	};									\
 										\
 	struct uvc_data uvc_data_##n = {					\
 		.c_data = &uvc_c_data_##n,					\
-		.controls = uvc_controls_##n,					\
-		.streams = uvc_streams_##n,					\
+		.ctrls = uvc_ctrls,						\
+		.strms = uvc_strms_##n,						\
 		.desc = &uvc_desc_##n,						\
 		.fs_desc = uvc_fs_desc_##n,					\
 		.hs_desc = uvc_hs_desc_##n,					\

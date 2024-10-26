@@ -792,8 +792,36 @@ static inline struct video_buffer *video_buffer_alloc(size_t size)
  */
 void video_buffer_release(struct video_buffer *buf);
 
-/* fourcc - four-character-code */
-#define video_fourcc(a, b, c, d)                                                                   \
-	((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#ifdef __cplusplus
+}
+#endif
+
+static inline int video_bits_per_pixel(uint32_t pix_fmt)
+{
+	switch (pix_fmt) {
+	case VIDEO_PIX_FMT_BGGR8:
+		return VIDEO_PIX_FMT_BGGR8_BPP;
+	case VIDEO_PIX_FMT_GBRG8:
+		return VIDEO_PIX_FMT_GBRG8_BPP;
+	case VIDEO_PIX_FMT_GRBG8:
+		return VIDEO_PIX_FMT_GRBG8_BPP;
+	case VIDEO_PIX_FMT_RGGB8:
+		return VIDEO_PIX_FMT_RGGB8_BPP;
+	case VIDEO_PIX_FMT_RGB565:
+		return VIDEO_PIX_FMT_RGB565_BPP;
+	case VIDEO_PIX_FMT_XRGB32:
+		return VIDEO_PIX_FMT_XRGB32_BPP;
+	case VIDEO_PIX_FMT_YUYV:
+		return VIDEO_PIX_FMT_YUYV_BPP;
+	case VIDEO_PIX_FMT_XYUV32:
+		return VIDEO_PIX_FMT_XYUV32_BPP;
+	default:
+		return -EINVAL;
+	}
+}
+
+/**
+ * @}
+ */
 
 #endif /* ZEPHYR_INCLUDE_VIDEO_H_ */
