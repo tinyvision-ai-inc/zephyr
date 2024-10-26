@@ -10,4 +10,4 @@ include: video-device.yaml
 properties:
 
   video-controls:
-    default: ["VIDEO_CID_CAMERA_EXPOSURE", "VIDEO_CID_CAMERA_GAIN"]
+    default: ["CID_CAMERA_EXPOSURE", "CID_CAMERA_GAIN"]

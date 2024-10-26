@@ -10,4 +10,4 @@ include: video-device.yaml
 properties:
 
   video-controls:
-    default: ["VIDEO_CID_CAMERA_HUE"]
+    default: ["CID_CAMERA_HUE"]

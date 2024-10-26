@@ -269,20 +269,18 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 #define XU_BASE_CONTROL				0x00
 #define XU_BASE_BIT				0
 
-enum uvc_ctype {
-	/* Camera Terminal control type */
-	CTYPE_CT,
-	/* Processing Unit control type */
-	CTYPE_PU,
-	/* Selector Unit control type */
-	CTYPE_SU,
-	/* Encoding Unit control type */
-	CTYPE_EU,
-	/* Extension Unit control type */
-	CTYPE_XU,
-	/* Output Terminal control type */
-	CTYPE_OT,
-};
+/* Camera Terminal control type */
+#define UVC_CID_CT 1
+/* Processing Unit control type */
+#define UVC_CID_PU 2
+/* Selector Unit control type */
+#define UVC_CID_SU 3
+/* Encoding Unit control type */
+#define UVC_CID_EU 4
+/* Extension Unit control type */
+#define UVC_CID_XU 5
+/* Output Terminal control type */
+#define UVC_CID_OT 6
 
 enum uvc_class_status {
 	CLASS_ENABLED,
@@ -1252,8 +1250,8 @@ __unused static int uvc_control_ct(const struct usb_setup_packet *setup, struct 
 	}
 }
 
-#define CTYPE_VIDEO_CID_CAMERA_EXPOSURE CTYPE_CT
-#define CTYPE_VIDEO_CID_CAMERA_ZOOM     CTYPE_CT
+#define UVC_CID_CAMERA_EXPOSURE UVC_CID_CT
+#define UVC_CID_CAMERA_ZOOM     UVC_CID_CT
 
 __unused static int uvc_control_pu(const struct usb_setup_packet *setup, struct net_buf *buf,
 				   const struct device *dev)
@@ -1283,11 +1281,12 @@ __unused static int uvc_control_pu(const struct usb_setup_packet *setup, struct 
 	}
 }
 
-#define CTYPE_VIDEO_CID_CAMERA_BRIGHTNESS CTYPE_PU
-#define CTYPE_VIDEO_CID_CAMERA_CONTRAST   CTYPE_PU
-#define CTYPE_VIDEO_CID_CAMERA_GAIN       CTYPE_PU
-#define CTYPE_VIDEO_CID_CAMERA_SATURATION CTYPE_PU
-#define CTYPE_VIDEO_CID_CAMERA_WHITE_BAL  CTYPE_PU
+#define UVC_CID_CAMERA_BRIGHTNESS UVC_CID_PU
+#define UVC_CID_CAMERA_CONTRAST   UVC_CID_PU
+#define UVC_CID_CAMERA_GAIN       UVC_CID_PU
+#define UVC_CID_CAMERA_HUE        UVC_CID_PU
+#define UVC_CID_CAMERA_SATURATION UVC_CID_PU
+#define UVC_CID_CAMERA_WHITE_BAL  UVC_CID_PU
 
 __unused static int uvc_control_eu(const struct usb_setup_packet *setup, struct net_buf *buf,
 				   const struct device *dev)
@@ -1303,7 +1302,7 @@ __unused static int uvc_control_su(const struct usb_setup_packet *setup, struct 
 	return -ENOTSUP;
 };
 
-#define CTYPE_VIDEO_CID_TEST_PATTERN CTYPE_SU
+#define UVC_CID_TEST_PATTERN UVC_CID_SU
 
 __unused static int uvc_control_xu(const struct usb_setup_packet *setup, struct net_buf *buf,
 				   const struct device *dev)
@@ -1312,7 +1311,7 @@ __unused static int uvc_control_xu(const struct usb_setup_packet *setup, struct 
 	return -ENOTSUP;
 };
 
-#define CTYPE_VIDEO_CTRL_CLASS_VENDOR CTYPE_XU
+#define UVC_CID_VIDEO_CTRL_CLASS_VENDOR UVC_CID_XU
 
 __unused static int uvc_control_ot(const struct usb_setup_packet *setup, struct net_buf *buf,
 			  const struct device *dev)
@@ -1841,39 +1840,54 @@ static int uvc_preinit(const struct device *dev)
 	return 0;
 }
 
+/* Here is the strategy used for generating the VideoControl descriptors:
+ *
+ * Build-time:
+ * Step 1: Map each supported Video CID to a UVC CID type: CT, SU, XU, PU, EU.
+ * Step 2: Loop through every devicetree node that has a "video-controls" prop.
+ * Step 3: Obtain a list of UVC CID types that this node implements.
+ * Step 4: Generate one group for each node, and one unit for each CID type.
+ * Step 5: Interconnect each unit inside of one group.
+ * Step 6: Interconnect edge units of each group with an unit of other groups.
+ *
+ * Run-time:
+ * Step 7: Remove the sink connections and only keep the source connections.
+ * Step 8: Fill the USB descriptors with the source unit IDs.
+ */
+
 /* UVC VideoControls are split in several Unit types, each with its own bUnitID.
  * the video CIDs listed in a devicetree node "video-controls = <...>;" property
- * are mapped to a VideoControl Unit types (CTYPEs). Each is then getting its
+ * are mapped to a VideoControl Unit types (UVC_CID types). Each is getting its
  * UVC descriptor generated. This builds one group of descriptor for every
  * devicetree node.
  *
  * For a given node, the macro below will therefore generate a list such as this:
- *
  *	fn(n, ct, CT) fn(n, pu, PU) fn(n, eu, EU)...
  *
- * - If video-controls has at a CID matching CTYPE_CT, "fn(n, ct, CT)" is added
- * - If video-controls has at a CID matching CTYPE_PU, "fn(n, pu, PU)" is added
- * - If video-controls has at a CID matching CTYPE_EU, "fn(n, eu, EU)" is added
- * - Same for each other CTYPE...
+ * - If video-controls has a CID matching UVC_CID_CT, "fn(n, ct, CT)" is added
+ * - If video-controls has a CID matching UVC_CID_PU, "fn(n, pu, PU)" is added
+ * - If video-controls has a CID matching UVC_CID_EU, "fn(n, eu, EU)" is added
+ * - Same for each other UVC_CID...
  *
- * The matching of CIDs to CTYPEs is done via the macros "CTYPE_VIDEO_CID_*".
+ * The matching of CIDs to UVC_CIDs is done via the macros "UVC_CID_*".
  */
-#define PROP_IS_CTYPE(n, prop, i, t)						\
-	IS_EQ(t, DT_CAT(CTYPE_, DT_STRING_TOKEN_BY_IDX(n, prop, i)))
-#define CTYPE_ELEM_IF_EQ(n, prop, i, t)						\
-	COND_CODE_1(PROP_IS_CTYPE(n, prop, i, t), (PLUS_1,), ())
-#define CTYPE_LIST(n, t)							\
-	DT_FOREACH_PROP_ELEM_VARGS(n, video_controls, CTYPE_ELEM_IF_EQ, t)
+#define SUFFIX_EQ_UVC_CID(suffix, t) IS_EQ(DT_CAT(UVC_, suffix), t)
+#define PROP_EQ_UVC_CID(n, prop, i, t)						\
+	SUFFIX_EQ_UVC_CID(DT_STRING_TOKEN_BY_IDX(n, prop, i), t)
+#define UVC_CID_ELEM_IF_EQ(n, prop, i, t)					\
+	COND_CODE_1(PROP_EQ_UVC_CID(n, prop, i, t), (PLUS_1,), ())
+#define UVC_CID_LIST(n, t)							\
+	DT_FOREACH_PROP_ELEM_VARGS(n, video_controls, UVC_CID_ELEM_IF_EQ, t)
 #define CTRL_NUM(n, t)								\
-	NUM_VA_ARGS_LESS_1(CTYPE_LIST(n, t) PLUS_1, PLUS_1)
+	NUM_VA_ARGS_LESS_1(UVC_CID_LIST(n, t) PLUS_1)
 #define CTRL_NODES(n, fn)							\
 	COND_CODE_1(DT_NODE_HAS_PROP(n, video_controls), (			\
-		/* Note: Output Terminal (OT) are special cases */		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_EU), (), (fn(n, eu, EU)))		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (fn(n, pu, PU)))		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (fn(n, xu, XU)))		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (fn(n, su, SU)))		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (fn(n, ct, CT)))		\
+		/* Note: Output Terminals (OTs) are handled in STRM() */	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (fn(n, ct, CT)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (fn(n, su, SU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_XU), (), (fn(n, xu, XU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_PU), (), (fn(n, pu, PU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_EU), (), (fn(n, eu, EU)))	\
 	), ())
 #define FOREACH_CTRL(fn) 							\
 	DT_FOREACH_STATUS_OKAY_NODE_VARGS(CTRL_NODES, fn)
@@ -1891,37 +1905,37 @@ static int uvc_preinit(const struct device *dev)
 	)
 #define CTRL_SU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (CTRL_ID(n, ct, CT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_XU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (CTRL_ID(n, ct, CT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_PU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (CTRL_ID(n, ct, CT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_EU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (CTRL_ID(n, pu, PU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_PU), (), (CTRL_ID(n, pu, PU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (CTRL_ID(n, ct, CT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_OT_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_EU), (), (CTRL_ID(n, eu, EU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_PU), (), (CTRL_ID(n, pu, PU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_EU), (), (CTRL_ID(n, eu, EU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_PU), (), (CTRL_ID(n, pu, PU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_XU), (), (CTRL_ID(n, xu, XU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (CTRL_ID(n, su, SU),))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (CTRL_ID(n, ct, CT),))	\
 		0 /* No source within this group */				\
 	)
 
@@ -2102,8 +2116,11 @@ struct usbd_uvc_strm_desc uvc_strm_desc_##n = {					\
 	},									\
 };										\
 										\
-DT_FOREACH_PROP_ELEM(n, formats, UVC_DEFINE_UNCOMP_DESCRIPTOR)
-/* TODO also add support for MJPEG, by comparing the FOURCC integer value */
+DT_FOREACH_PROP_ELEM(n, formats, UVC_DEFINE_UNCOMP_DESCRIPTOR)			\
+/* TODO also add support for MJPEG, by comparing the FOURCC integer value */	\
+										\
+BUILD_ASSERT(CTRL_OT_SOURCE_ID(DT_REMOTE_DEVICE(n)) > 0,			\
+	#n " needs at least one remote-endpoint defined");
 
 #define UVC_DEFINE_UNCOMP_DESCRIPTOR(n, prop, i)				\
 struct usbd_uvc_strm_uncomp_desc uvc_strm_desc_##n##_##i = {			\
