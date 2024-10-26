@@ -272,8 +272,6 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 enum uvc_ctype {
 	/* Camera Terminal control type */
 	CTYPE_CT,
-	/* Input Terminal control type */
-	CTYPE_IT,
 	/* Processing Unit control type */
 	CTYPE_PU,
 	/* Selector Unit control type */
@@ -308,21 +306,6 @@ struct uvc_unit_descriptor {
 	uint8_t bDescriptorSubtype;
 	uint8_t bUnitID;
 };
-
-struct uvc_input_terminal_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bDescriptorSubtype;
-	uint8_t bTerminalID;
-	uint16_t wTerminalType;
-	uint8_t bAssocTerminal;
-	uint8_t iTerminal;
-	uint16_t wObjectiveFocalLengthMin;
-	uint16_t wObjectiveFocalLengthMax;
-	uint16_t wOcularFocalLength;
-	uint8_t bControlSize;
-	uint8_t bmControls[3];
-} __packed;
 
 struct uvc_output_terminal_descriptor {
 	uint8_t bLength;
@@ -518,12 +501,8 @@ struct usbd_uvc_desc {
 	struct usb_desc_header nil_desc;
 };
 
-struct usbd_uvc_ctrl_it_desc {
-	struct uvc_input_terminal_descriptor if0_it;
-};
-
 struct usbd_uvc_ctrl_ct_desc {
-	struct uvc_input_terminal_descriptor if0_ct;
+	struct uvc_camera_terminal_descriptor if0_ct;
 };
 
 struct usbd_uvc_ctrl_pu_desc {
@@ -1486,10 +1465,6 @@ static int uvc_init(struct usbd_class_data *const c_data)
 		}
 
 		switch (desc->bDescriptorSubtype) {
-		case VC_INPUT_TERMINAL:
-			((struct uvc_camera_terminal_descriptor *)desc)->iTerminal =
-				desc_nd->str.idx;
-			break;
 		case VC_OUTPUT_TERMINAL:
 			((struct uvc_output_terminal_descriptor *)desc)->iTerminal =
 				desc_nd->str.idx;
@@ -1899,7 +1874,6 @@ static int uvc_preinit(const struct device *dev)
 		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (fn(n, xu, XU)))		\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (fn(n, su, SU)))		\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (fn(n, ct, CT)))		\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (fn(n, it, IT)))		\
 	), ())
 #define FOREACH_CTRL(fn) 							\
 	DT_FOREACH_STATUS_OKAY_NODE_VARGS(CTRL_NODES, fn)
@@ -1911,10 +1885,6 @@ static int uvc_preinit(const struct device *dev)
  *
  * The dependency order chosen is (OT) <- EU <- PU <- XU <- SU <- (CT/IT).
  */
-#define CTRL_IT_SOURCE_ID(n)							\
-	GET_ARG_N(1,								\
-		0 /* No source for Input Terminals */				\
-	)
 #define CTRL_CT_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
 		0 /* No source for Camera Terminals */				\
@@ -1922,14 +1892,12 @@ static int uvc_preinit(const struct device *dev)
 #define CTRL_SU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_XU_SOURCE_ID(n)							\
 	GET_ARG_N(1,								\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_PU_SOURCE_ID(n)							\
@@ -1937,7 +1905,6 @@ static int uvc_preinit(const struct device *dev)
 		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_EU_SOURCE_ID(n)							\
@@ -1946,7 +1913,6 @@ static int uvc_preinit(const struct device *dev)
 		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
 		0 /* No source within this group */				\
 	)
 #define CTRL_OT_SOURCE_ID(n)							\
@@ -1956,7 +1922,6 @@ static int uvc_preinit(const struct device *dev)
 		COND_CODE_0(CTRL_NUM(n, CTYPE_XU), (), (CTRL_ID(n, xu, XU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_SU), (), (CTRL_ID(n, su, SU),))	\
 		COND_CODE_0(CTRL_NUM(n, CTYPE_CT), (), (CTRL_ID(n, ct, CT),))	\
-		COND_CODE_0(CTRL_NUM(n, CTYPE_IT), (), (CTRL_ID(n, it, IT),))	\
 		0 /* No source within this group */				\
 	)
 
@@ -1986,19 +1951,6 @@ enum uvc_ctrl_id {
 	FOREACH_CTRL(CTRL_ID)
 	/* bUnitIDs for Output Terminals, with a "struct uvc_stream" */
 	DT_INST_FOREACH_STATUS_OKAY_VARGS(FOREACH_STRM, CTRL_ID, ot, OT)
-};
-
-#define UVC_DEFINE_CONTROL_IT_DESCRIPTOR(n)					\
-struct usbd_uvc_ctrl_it_desc uvc_ctrl_it_desc_##n = {				\
-	.if0_it = {								\
-		.bLength = sizeof(struct uvc_input_terminal_descriptor),	\
-		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
-		.bDescriptorSubtype = VC_INPUT_TERMINAL,			\
-		.bTerminalID = CTRL_IT_ID_##n,					\
-		.wTerminalType = sys_cpu_to_le16(ITT_VENDOR_SPECIFIC),		\
-		.bAssocTerminal = 0,						\
-		.iTerminal = 0,							\
-	},									\
 };
 
 #define UVC_DEFINE_CONTROL_OT_DESCRIPTOR(n)					\
@@ -2275,8 +2227,8 @@ static struct usb_desc_header *const uvc_fs_desc_##n[] = {			\
 	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0_header,			\
-	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
 	FOREACH_CTRL(CTRL_PTRS)							\
+	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
 	FOREACH_STRM(n, STRM_PTRS, fs)						\
 	(struct usb_desc_header *)&uvc_desc_##n.nil_desc,			\
 };										\
@@ -2285,8 +2237,8 @@ static struct usb_desc_header *const uvc_hs_desc_##n[] = {			\
 	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0,				\
 	(struct usb_desc_header *)&uvc_desc_##n.if0_header,			\
-	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
 	FOREACH_CTRL(CTRL_PTRS)							\
+	FOREACH_STRM(n, CTRL_PTRS, ot, OT)					\
 	FOREACH_STRM(n, STRM_PTRS, hs)						\
 	(struct usb_desc_header *)&uvc_desc_##n.nil_desc,			\
 };
