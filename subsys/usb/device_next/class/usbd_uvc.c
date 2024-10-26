@@ -22,8 +22,6 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/usb/usb_ch9.h>
 
-#include "usbd_uvc_macros.h"
-
 LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_UVC_LOG_LEVEL);
 
 /* Video Class-Specific Request Codes */
@@ -2352,6 +2350,7 @@ static const struct uvc_control uvc_ctrls[] = {
 		.dev = DEVICE_DT_GET(DT_REMOTE_DEVICE(n)),			\
 		.self = DEVICE_DT_GET(DT_GPARENT(n)),				\
 		.desc = &uvc_strm_desc_##n,					\
+		.desc_nd = &uvc_ctrl_ot_desc_nd_##n,				\
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
 		.caps = uvc_caps_##n,						\
 		.ctrl = &uvc_ctrls[CTRL_OT_SOURCE_ID(DT_REMOTE_DEVICE(n)) - 1],	\
