@@ -298,13 +298,6 @@ struct uvc_control_header_descriptor {
 	uint8_t baInterfaceNr[CONFIG_USBD_VIDEO_MAX_STREAMS];
 } __packed;
 
-struct uvc_unit_descriptor {
-	uint8_t bLength;
-	uint8_t bDescriptorType;
-	uint8_t bDescriptorSubtype;
-	uint8_t bUnitID;
-};
-
 struct uvc_output_terminal_descriptor {
 	uint8_t bLength;
 	uint8_t bDescriptorType;
@@ -379,6 +372,21 @@ struct uvc_extension_unit_descriptor {
 	uint8_t bmControls;
 	uint8_t iExtension;
 } __packed;
+
+union uvc_unit_descriptor {
+	struct {
+		uint8_t bLength;
+		uint8_t bDescriptorType;
+		uint8_t bDescriptorSubtype;
+		uint8_t bUnitID;
+	};
+	struct uvc_output_terminal_descriptor ot;
+	struct uvc_camera_terminal_descriptor ct;
+	struct uvc_selector_unit_descriptor su;
+	struct uvc_processing_unit_descriptor pu;
+	struct uvc_encoding_unit_descriptor eu;
+	struct uvc_extension_unit_descriptor xu;
+};
 
 struct uvc_stream_header_descriptor {
 	uint8_t bLength;
@@ -583,7 +591,7 @@ struct uvc_control {
 	/* UVC protocol state */
 
 	/* USB descriptors */
-	struct uvc_unit_descriptor *desc;
+	union uvc_unit_descriptor *desc;
 	/* USB string descriptor */
 	struct usbd_desc_node *desc_nd;
 	/* Stream interface affected by this control */
@@ -1453,7 +1461,7 @@ static int uvc_init(struct usbd_class_data *const c_data)
 
 	for (const struct uvc_control *ctrl = data->ctrls; ctrl->dev != NULL; ctrl++) {
 		struct usbd_desc_node *desc_nd = ctrl->desc_nd;
-		struct uvc_unit_descriptor *desc = ctrl->desc;
+		union uvc_unit_descriptor *desc = ctrl->desc;
 
 		LOG_DBG("Adding string descriptor '%s'", (char *)desc_nd->ptr);
 
@@ -1465,24 +1473,19 @@ static int uvc_init(struct usbd_class_data *const c_data)
 
 		switch (desc->bDescriptorSubtype) {
 		case VC_OUTPUT_TERMINAL:
-			((struct uvc_output_terminal_descriptor *)desc)->iTerminal =
-				desc_nd->str.idx;
+			desc->ot.iTerminal = desc_nd->str.idx;
 			break;
 		case VC_SELECTOR_UNIT:
-			((uint8_t *)desc)[desc->bLength - 1] =
-				desc_nd->str.idx;
+			((uint8_t *)desc)[desc->bLength - 1] = desc_nd->str.idx;
 			break;
 		case VC_PROCESSING_UNIT:
-			((struct uvc_processing_unit_descriptor *)desc)->iProcessing =
-				desc_nd->str.idx;
+			desc->pu.iProcessing = desc_nd->str.idx;
 			break;
 		case VC_ENCODING_UNIT:
-			((struct uvc_encoding_unit_descriptor *)desc)->iEncoding =
-				desc_nd->str.idx;
+			desc->eu.iEncoding = desc_nd->str.idx;
 			break;
 		case VC_EXTENSION_UNIT:
-			((struct uvc_extension_unit_descriptor *)desc)->iExtension =
-				desc_nd->str.idx;
+			desc->xu.iExtension = desc_nd->str.idx;
 			break;
 		default:
 			LOG_WRN("Not adding '%s' to unknown subtype %u",
@@ -1797,6 +1800,7 @@ static void uvc_preinit_control(const struct device *dev, const struct uvc_contr
 	struct uvc_data *data = dev->data;
 	int n = 0;
 
+	return;
 	/* Emtpy the links to the sink and recurse to the source */
 	for (int i = 0; ctrl->links[i] != 0; i++, n++) {
 		uint8_t next_id = ctrl->links[i];
@@ -1835,6 +1839,35 @@ static int uvc_preinit(const struct device *dev)
 
 		/* Recursively init the assotiated video control chain */
 		uvc_preinit_control(dev, strm->ctrl, 0);
+	}
+
+	for (int i = 0; data->ctrls[i].dev != NULL; i++) {
+		const struct uvc_control *ctrl = &data->ctrls[i];
+
+		__ASSERT_NO_MSG(ctrl->desc->bUnitID == i + 1);
+		switch (ctrl->desc->bDescriptorSubtype) {
+		case VC_INPUT_TERMINAL:
+			//ctrl->desc->ct.bSourceID = ctrl->links[0];
+			break;
+		case VC_OUTPUT_TERMINAL:
+			ctrl->desc->ot.bSourceID = ctrl->links[0];
+			break;
+		case VC_SELECTOR_UNIT:
+			ctrl->desc->su.baSourceID[0] = ctrl->links[0];
+			break;
+		case VC_PROCESSING_UNIT:
+			ctrl->desc->pu.bSourceID = ctrl->links[0];
+			break;
+		case VC_EXTENSION_UNIT:
+			ctrl->desc->xu.baSourceID[0] = ctrl->links[0];
+			break;
+		case VC_ENCODING_UNIT:
+			ctrl->desc->eu.bSourceID = ctrl->links[0];
+			break;
+		default:
+			__ASSERT_NO_MSG(false);
+			break;
+		}
 	}
 
 	return 0;
@@ -1948,9 +1981,15 @@ static int uvc_preinit(const struct device *dev)
 		    (DT_FOREACH_CHILD(DT_CHILD(n, port), CTRL_REMOTE_ID)),	\
 		    (CTRL_##T##_SOURCE_ID(n)))
 
+/* The devicetree node for UVC has, like all video devices, a list of endpoints
+ * that are interconnected to other video devices. Each endpoint represents an
+ * UVC VideoStreaming interface. Run the macro on each of the interface.
+ */
 #define FOREACH_STRM(n, fn, ...)						\
 	DT_FOREACH_CHILD_VARGS(DT_INST_CHILD(n, port), fn, __VA_ARGS__)
 
+/* Helpers for fields that are present inside the USB descriptors.
+ */
 #define FRMIVAL(n, prop, i) sys_cpu_to_le64(DT_PHA_BY_IDX(n, prop, i, max_fps))
 #define BUFSIZE(n, prop, i) sys_cpu_to_le32(0)
 #define GUID(fourcc)								\
@@ -1958,6 +1997,11 @@ static int uvc_preinit(const struct device *dev)
 	((fourcc) >> 16 & 0xff), ((fourcc) >> 24 & 0xff),			\
 	0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
 
+/* VideoControl interfaces need to use IDs that fit in an uint8_t, which does not
+ * allow to use Zephyr devicetree ORD numbers as IDs, as it quickly grows beyond
+ * 100 devicetree nodes. Combine a loop and an enum to devicetree nodes to their
+ * local VideoControl ID.
+ */
 #define CTRL_ID(n, t, T) CTRL_##T##_ID_##n,
 enum uvc_ctrl_id {
 	CTRL_ID_RESERVED = 0,
@@ -2294,12 +2338,18 @@ static struct usb_desc_header *const uvc_hs_desc_##n[] = {			\
 #define CTRL_LINK(n, T)
 	GET_ARG_N(1, CTRL_NODES(DT_REMOTE_DEVICE(n), CTRL_ID))
 
+/* Zero-terminated array of 2-ways (sink and sources) connections between
+ * control nodes. The sink will have to be removed at runtime so that this
+ * becomes a list of source links, to fill into the "bSourceID" field.
+ */
 #define CTRL_LINKS(n, t, T)							\
 uint8_t uvc_ctrl_##t##_links_##n[] = {						\
 	DT_FOREACH_CHILD_VARGS(DT_CHILD(n, port), CTRL_LINK, T) 0};
-
 FOREACH_CTRL(CTRL_LINKS)
 
+/* Zero-terminated array of control interfaces, one per VideoControl Unit
+ * except for the Output Terminals, bundled inside the VideoStreaming structs.
+ */
 #define CTRL(n, t, T)								\
 	{									\
 		.dev = DEVICE_DT_GET(n),					\
@@ -2308,12 +2358,15 @@ FOREACH_CTRL(CTRL_LINKS)
 		.desc_nd = &uvc_ctrl_##t##_desc_nd_##n,				\
 		.links = uvc_ctrl_##t##_links_##n,				\
 	},
-
 static const struct uvc_control uvc_ctrls[] = {
 	FOREACH_CTRL(CTRL)
 	{0},
 };
 
+/* Zero-terminated array of stream interfaces, one per VideoStreaming Unit.
+ * These carry most of the runtime accessible data of UVC, and are mapped to
+ * Video Endpoints IDs.
+ */
 #define STRM(n, _)								\
 	{									\
 		.dev = DEVICE_DT_GET(DT_REMOTE_DEVICE(n)),			\
