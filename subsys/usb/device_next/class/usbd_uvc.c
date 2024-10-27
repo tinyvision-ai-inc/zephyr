@@ -629,6 +629,8 @@ struct uvc_stream {
 	int format_id;
 	/* VideoControl Unit assotiated with this VideStreaming interface */
 	const struct uvc_control *ctrl;
+	/* VideoControl Output Terminal descriptor */
+	struct uvc_output_terminal_descriptor *ctrl_desc;
 
 	/* Video API state */
 
@@ -1800,17 +1802,23 @@ static void uvc_preinit_control(const struct device *dev, const struct uvc_contr
 	struct uvc_data *data = dev->data;
 	int n = 0;
 
-	return;
+	LOG_DBG("CTRL (%d) %p %s", prev_id, ctrl, (char *)ctrl->desc_nd->ptr);
+
 	/* Emtpy the links to the sink and recurse to the source */
 	for (int i = 0; ctrl->links[i] != 0; i++, n++) {
 		uint8_t next_id = ctrl->links[i];
+
+		LOG_DBG("LINK (%d) %d", prev_id, next_id);
 
 		if (prev_id == next_id) {
 			/* Flag the link as sink */
 			ctrl->links[i] = 0;
 		} else {
-			/* Recurse into the source */
-			uvc_preinit_control(dev, &data->ctrls[next_id - 1], ctrl->desc->bUnitID);
+			if (ctrl->desc->bDescriptorSubtype != VC_INPUT_TERMINAL) {
+				LOG_DBG("Following data->ctrls[%d - 1] from %d", next_id, ctrl->desc->bUnitID);
+				/* Recurse into the source */
+				uvc_preinit_control(dev, &data->ctrls[next_id - 1], ctrl->desc->bUnitID);
+			}
 		}
 	}
 
@@ -1839,6 +1847,7 @@ static int uvc_preinit(const struct device *dev)
 
 		/* Recursively init the assotiated video control chain */
 		uvc_preinit_control(dev, strm->ctrl, 0);
+		strm->ctrl_desc->bSourceID = strm->ctrl->desc->bUnitID;
 	}
 
 	for (int i = 0; data->ctrls[i].dev != NULL; i++) {
@@ -1922,6 +1931,15 @@ static int uvc_preinit(const struct device *dev)
 		COND_CODE_0(CTRL_NUM(n, UVC_CID_PU), (), (fn(n, pu, PU)))	\
 		COND_CODE_0(CTRL_NUM(n, UVC_CID_EU), (), (fn(n, eu, EU)))	\
 	), ())
+#define CTRL_IDS(n, fn)								\
+	COND_CODE_1(DT_NODE_HAS_PROP(n, video_controls), (			\
+		/* Note: Output Terminals (OTs) are handled in STRM() */	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_CT), (), (fn(n, ct, CT)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_SU), (), (fn(n, su, SU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_XU), (), (fn(n, xu, XU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_PU), (), (fn(n, pu, PU)))	\
+		COND_CODE_0(CTRL_NUM(n, UVC_CID_EU), (), (fn(n, eu, EU)))	\
+	), ())
 #define FOREACH_CTRL(fn) 							\
 	DT_FOREACH_STATUS_OKAY_NODE_VARGS(CTRL_NODES, fn)
 
@@ -1975,11 +1993,11 @@ static int uvc_preinit(const struct device *dev)
 /* Get all the possible source bUnitIDs for a given node, first looking-up in
  * the same group, then following "remote-endpoint = <&...>;" on devicetree.
  */
-#define CTRL_REMOTE_ID(n) CTRL_ID(DT_REMOTE_DEVICE(n))
+#define CTRL_REMOTE_ID(n) CTRL_OT_SOURCE_ID(DT_REMOTE_DEVICE(n)),
 #define CTRL_SOURCE_ID(n, t, T)							\
 	COND_CODE_0(CTRL_##T##_SOURCE_ID(n),					\
 		    (DT_FOREACH_CHILD(DT_CHILD(n, port), CTRL_REMOTE_ID)),	\
-		    (CTRL_##T##_SOURCE_ID(n)))
+		    (CTRL_##T##_SOURCE_ID(n),))
 
 /* The devicetree node for UVC has, like all video devices, a list of endpoints
  * that are interconnected to other video devices. Each endpoint represents an
@@ -2125,7 +2143,7 @@ struct usbd_uvc_strm_desc uvc_strm_desc_##n = {					\
 		.wTotalLength = 0,						\
 		.bEndpointAddress = 0x81,					\
 		.bmInfo = 0,							\
-		.bTerminalLink = DT_DEP_ORD(n),					\
+		.bTerminalLink = CTRL_OT_ID_##n,				\
 		.bStillCaptureMethod = 0,					\
 		.bTriggerSupport = 0,						\
 		.bTriggerUsage = 0,						\
@@ -2236,7 +2254,7 @@ struct usbd_uvc_strm_mjpeg_desc uvc_strm_desc_##n##_##i = {			\
 #define UVC_DEFINE_CONTROL_DESCRIPTOR(n, t, T)					\
 	UVC_DEFINE_CONTROL_##T##_DESCRIPTOR(n)					\
 	USBD_DESC_STRING_DEFINE(uvc_ctrl_##t##_desc_nd_##n,			\
-				DT_NODE_FULL_NAME(n),				\
+				DT_NODE_FULL_NAME(n) " (" #T ")",		\
 				USBD_DUT_STRING_INTERFACE);
 
 FOREACH_CTRL(UVC_DEFINE_CONTROL_DESCRIPTOR)
@@ -2335,16 +2353,11 @@ static struct usb_desc_header *const uvc_hs_desc_##n[] = {			\
 		{0},								\
 	};
 
-#define CTRL_LINK(n, T)
-	GET_ARG_N(1, CTRL_NODES(DT_REMOTE_DEVICE(n), CTRL_ID))
-
-/* Zero-terminated array of 2-ways (sink and sources) connections between
- * control nodes. The sink will have to be removed at runtime so that this
- * becomes a list of source links, to fill into the "bSourceID" field.
- */
 #define CTRL_LINKS(n, t, T)							\
-uint8_t uvc_ctrl_##t##_links_##n[] = {						\
-	DT_FOREACH_CHILD_VARGS(DT_CHILD(n, port), CTRL_LINK, T) 0};
+	uint8_t uvc_ctrl_##t##_links_##n[] = {					\
+		CTRL_SOURCE_ID(n, t, T)						\
+		0								\
+	};
 FOREACH_CTRL(CTRL_LINKS)
 
 /* Zero-terminated array of control interfaces, one per VideoControl Unit
@@ -2376,6 +2389,7 @@ static const struct uvc_control uvc_ctrls[] = {
 		.payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE,	\
 		.caps = uvc_caps_##n,						\
 		.ctrl = &uvc_ctrls[CTRL_OT_SOURCE_ID(DT_REMOTE_DEVICE(n)) - 1],	\
+		.ctrl_desc = &uvc_ctrl_ot_desc_##n.if0_ot,			\
 	},
 
 #define USBD_UVC_DT_DEVICE_DEFINE(n)						\
