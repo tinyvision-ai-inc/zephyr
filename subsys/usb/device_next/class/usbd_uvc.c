@@ -588,6 +588,8 @@ struct uvc_buf_info {
 typedef int uvc_control_fn_t(struct uvc_stream *strm, uint8_t selector, uint8_t request,
 			     struct net_buf *buf);
 
+BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0, "no UVC instance defined");
+
 NET_BUF_POOL_VAR_DEFINE(uvc_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 16,
 			512 * DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 16,
 			sizeof(struct uvc_buf_info), NULL);
@@ -970,6 +972,8 @@ static int uvc_control_probe(struct uvc_stream *strm, uint8_t request, struct uv
 	fmt->width = frame_desc->frame_discrete.wWidth;
 	fmt->height = frame_desc->frame_discrete.wHeight;
 	fmt->pitch = fmt->width * video_pix_fmt_bpp(fmt->pixelformat);
+	/* TODO: how to handle MJPEG pitch? */
+	fmt->pitch = (fmt->pitch == 0) ? fmt->width : fmt->pitch;
 
 	ret = uvc_control_probe_frame_interval(strm, request, probe);
 	if (ret < 0) {
@@ -1055,14 +1059,12 @@ static int uvc_control_commit(struct uvc_stream *strm, uint8_t request, struct u
 
 		ret = video_set_format(strm->video_dev, VIDEO_EP_OUT, fmt);
 		if (ret < 0) {
-			LOG_ERR("Could not set the format of the video source");
-			return ret;
+			LOG_WRN("Could not set '%s' format", strm->video_dev->name);
 		}
 
 		ret = video_set_frmival(strm->video_dev, VIDEO_EP_OUT, &strm->video_frmival);
 		if (ret < 0) {
-			LOG_ERR("Could not set the format of the video source");
-			return ret;
+			LOG_WRN("Could not set '%s' frame interval", strm->video_dev->name);
 		}
 
 		ret = video_stream_start(strm->video_dev);
@@ -1394,7 +1396,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	net_buf_unref(buf);
 
 	if (bi.udc.ep == uvc_get_bulk_in(bi.stream)) {
-		LOG_DBG("Request completed for ubuf %p, vbuf %p", buf, bi.vbuf);
+		LOG_INF("Request completed for ubuf %p, vbuf %p", buf, bi.vbuf);
 		if (bi.vbuf != NULL) {
 			k_fifo_put(&strm->fifo_out, bi.vbuf);
 		}
@@ -1511,7 +1513,7 @@ static int uvc_queue_vbuf(struct uvc_stream *strm, struct video_buffer *vbuf)
 		net_buf_add_mem(buf, vbuf->buffer, next_vbuf_offset);
 
 		/* End-of-Frame condition */
-		if (fmt->pitch * vbuf->line_offset + vbuf->bytesused >= fmt->pitch * fmt->height) {
+		if (fmt->pitch * vbuf->line_offset + vbuf->bytesused >= vbuf->size) {
 			/* mark the current buffer as EoF */
 			((struct uvc_payload_header *)buf->data)->bmHeaderInfo |=
 				UVC_BMHEADERINFO_END_OF_FRAME;
@@ -1524,7 +1526,7 @@ static int uvc_queue_vbuf(struct uvc_stream *strm, struct video_buffer *vbuf)
 					      MIN(vbuf->bytesused - strm->vbuf_offset, mps),
 					      K_NO_WAIT);
 		if (buf == NULL) {
-			LOG_INF("queue: Cannot allocate continuation USB buffer for now");
+			LOG_DBG("queue: Cannot allocate continuation USB buffer for now");
 			return -ENOMEM;
 		}
 		next_vbuf_offset = strm->vbuf_offset + mps;
@@ -1574,7 +1576,7 @@ static void uvc_worker(struct k_work *work)
 	while ((vbuf = k_fifo_peek_head(&strm->fifo_in)) != NULL) {
 		ret = uvc_queue_vbuf(strm, vbuf);
 		if (ret < 0) {
-			LOG_INF("queue: could not transfer %p for now", vbuf);
+			LOG_DBG("queue: could not transfer %p for now", vbuf);
 			break;
 		}
 		if (ret == 1) {
@@ -1783,6 +1785,7 @@ static void uvc_preinit_control(struct uvc_stream *strm, uvc_control_fn_t *fn, u
 	int ret;
 
 	buf = net_buf_alloc_with_data(&uvc_pool, data, sizeof(data), K_NO_WAIT);
+	__ASSERT_NO_MSG(buf != NULL);
 
 	LOG_DBG("init: Asking '%s' what controls supports", strm->video_dev->name);
 
@@ -1859,6 +1862,7 @@ static int uvc_add_frame_desc(struct uvc_stream *strm, int *id,
 	struct video_format fmt = {.pixelformat = cap->pixelformat, .width = w, .height = h};
 	struct video_frmival_enum fie = {.format = &fmt};
 	union uvc_stream_descriptor *desc;
+	uint32_t bpp = video_pix_fmt_bpp(cap->pixelformat);
 
 	if (*id >= strm->desc->ifN_format_num) {
 		return -ENOMEM;
@@ -1866,20 +1870,22 @@ static int uvc_add_frame_desc(struct uvc_stream *strm, int *id,
 	desc = &strm->desc->ifN_formats[*id];
 	(*id)++;
 
+	/* TODO: how to estimate the wMaxVideoFrameBufferSize for JPEG? */
+	bpp = (bpp == 0) ? 1 : bpp;
+
 	desc->frame_discrete.bLength = sizeof(desc->frame_discrete);
 	desc->frame_discrete.bDescriptorType = USB_DESC_CS_INTERFACE;
 	desc->frame_discrete.bDescriptorSubtype =
-		format_desc->frame_discrete.bDescriptorSubtype == VS_FORMAT_UNCOMPRESSED
+		(format_desc->frame_discrete.bDescriptorSubtype == VS_FORMAT_UNCOMPRESSED)
 			? VS_FRAME_UNCOMPRESSED
 			: VS_FRAME_MJPEG;
 	desc->frame_discrete.bFrameIndex = ++format_desc->format.bNumFrameDescriptors;
 	desc->frame_discrete.bmCapabilities = 0;
-	desc->frame_discrete.wWidth = w;
-	desc->frame_discrete.wHeight = h;
+	desc->frame_discrete.wWidth = sys_cpu_to_le16(w);
+	desc->frame_discrete.wHeight = sys_cpu_to_le16(h);
 	desc->frame_discrete.dwMinBitRate = 0;
 	desc->frame_discrete.dwMaxBitRate = 0;
-	desc->frame_discrete.dwMaxVideoFrameBufferSize =
-		w * h * video_pix_fmt_bpp(cap->pixelformat) * 8;
+	desc->frame_discrete.dwMaxVideoFrameBufferSize = sys_cpu_to_le32(w * h * bpp * 8);
 	desc->frame_discrete.bFrameIntervalType = 0;
 
 	LOG_DBG("bFrameIndex = %u", desc->frame_continuous.bFrameIndex);
@@ -1997,18 +2003,6 @@ static int uvc_preinit(const struct device *dev)
 
 	return 0;
 }
-
-/* Helpers for fields that are present inside the USB descriptors. */
-#define FRMIVAL(n, prop, i)							\
-	sys_cpu_to_le64(DT_PHA_BY_IDX(n, prop, i, max_fps))
-#define BUFSIZE(n, prop, i)							\
-	sys_cpu_to_le32(DT_PHA_BY_IDX(n, prop, i, bits_per_pixel) *		\
-			DT_PHA_BY_IDX(n, prop, i, width) *			\
-			DT_PHA_BY_IDX(n, prop, i, height))
-#define GUID(fourcc)								\
-	((fourcc) >> 0 & 0xff), ((fourcc) >> 8 & 0xff),				\
-	((fourcc) >> 16 & 0xff), ((fourcc) >> 24 & 0xff),			\
-	0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
 
 enum uvc_unit_id {
 	UVC_UNIT_ID_ZERO = 0,

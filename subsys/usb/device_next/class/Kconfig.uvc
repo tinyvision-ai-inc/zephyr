@@ -12,8 +12,8 @@ if USBD_VIDEO_CLASS
 
 config USBD_VIDEO_HEADER_SIZE
 	int "USB Video payload header size"
-	range 2 255
-	default 8
+	range 12 64
+	default 12
 	help
 	  Sets the size of the video payload header,
 	  to allow custom data to be added at the end of the mandatory fields.
