@@ -1,0 +1,38 @@
+# Copyright (c) 2024, tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+config SOC_SERIES_TINYCLUNX33
+	bool
+	help
+	  tinyCLUNX33 FPGA-based SoC series.
+	  Each SoC under this series is a release of an FPGA RTL ("gateware")
+	  that implements the virtual SoC loaded onto the FPGA. They are
+	  published by tinyVision.ai.
+
+config SOC_TINYCLUNX33V008
+	bool
+	help
+	  The tinyCLUNX33 RTLv0.8 release. This SoC lacks MIPI support, but
+	  features a test pattern generator that permits to test the USB
+	  bandwidth.
+	select SOC_SERIES_TINYCLUNX33
+
+config SOC_TINYCLUNX33V009
+	bool
+	help
+	  The tinyCLUNX33 RTLv0.9 release. This SoC introduces MIPI support.
+	select SOC_SERIES_TINYCLUNX33
+
+config SOC_TINYCLUNX33V010
+	bool
+	help
+	  The tinyCLUNX33 RTLv0.10 release.
+	select SOC_SERIES_TINYCLUNX33
+
+config SOC_SERIES
+	default "tinyclunx33" if SOC_SERIES_TINYCLUNX33
+
+config SOC
+	default "tinyclunx33v008" if SOC_TINYCLUNX33V008
+	default "tinyclunx33v009" if SOC_TINYCLUNX33V009
+	default "tinyclunx33v010" if SOC_TINYCLUNX33V010

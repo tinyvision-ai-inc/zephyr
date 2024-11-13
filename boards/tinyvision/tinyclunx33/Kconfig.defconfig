@@ -1,0 +1,45 @@
+# Copyright (c) 2024 tinyVision.ai Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_TINYCLUNX33_SOM || BOARD_TINYCLUNX33_DEVKIT
+
+# Workaround for not being able to have commas in macro arguments
+DT_CHOSEN_Z_CODE_PARTITION := zephyr,code-partition
+
+config FLASH_LOAD_SIZE
+	default $(dt_chosen_reg_size_hex,$(DT_CHOSEN_Z_CODE_PARTITION))
+
+config FLASH_LOAD_OFFSET
+	default $(dt_chosen_reg_addr_hex,$(DT_CHOSEN_Z_CODE_PARTITION))
+
+config XIP
+	default y
+
+# Si5351 PLL over I2C is required to set the UART clock, initialize it early
+
+config I2C
+	default y
+
+config I2C_INIT_PRIORITY
+	default 0
+
+config CLOCK_CONTROL
+	default y
+
+endif # BOARD_TINYCLUNX33_SOM || BOARD_TINYCLUNX33_DEVKIT
+
+if BOARD_TINYCLUNX33_DEVKIT
+
+config SERIAL
+	default y
+
+config CONSOLE
+	default y
+
+config UART_CONSOLE
+	default y
+
+config UART_LINE_CTRL
+	default y
+
+endif # BOARD_TINYCLUNX33_DEVKIT

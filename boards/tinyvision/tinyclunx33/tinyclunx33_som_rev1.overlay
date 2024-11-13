@@ -1,0 +1,149 @@
+/*
+ * Copyright (c) 2024 tinyVision.ai Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+#include <riscv32-litex-vexriscv.dtsi>
+
+/ {
+	chosen {
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		lattice,usb23-dma = &ram1;
+	};
+
+	soc {
+		flash0: flash@20000000 {
+			compatible = "soc-nv-flash";
+
+			reg = <0x20000000 0x100000>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				boot_partition: partition@0 {
+					label = "fpga";
+					reg = <0x000000 0x100000>;
+				};
+
+				slot0_partition: partition@100000 {
+					label = "image-0";
+					reg = <0x100000 0x100000>;
+				};
+
+				slot1_partition: partition@300000 {
+					label = "image-1";
+					reg = <0x300000 0x100000>;
+				};
+			};
+		};
+
+		ram0: memory@40000000 {
+			compatible = "zephyr,memory-region";
+			device_type = "memory";
+			reg = <0x40000000 0x10000>;
+			zephyr,memory-region = "RAM";
+		};
+
+		ram1: memory@b1000000 {
+			compatible = "zephyr,memory-region";
+			device_type = "memory";
+			reg = <0xb1000000 0x2000>;
+			zephyr,memory-region = "USB23_DMA";
+		};
+
+		uvcmanager0: uvcmanager@b4000000 {
+			compatible = "tinyvision,uvcmanager";
+			status = "disabled";
+			reg = <	0xb4000000 0x400
+				0xb1200000 0x10000>;
+			reg-names =
+				"base",
+				"fifo";
+		};
+
+		uvcmanager1: uvcmanager@b4000400 {
+			compatible = "tinyvision,uvcmanager";
+			status = "disabled";
+			reg = <	0xb4000400 0x400
+				0xb1300000 0x10000>;
+			reg-names =
+				"base",
+				"fifo";
+		};
+
+		zephyr_udc0: usb@b0000000 {
+			compatible = "lattice,usb23";
+			reg = <	0xb0000000 0x1000000
+				0xe0005800 0x4
+				0xe0005804 0x4
+				0xe0005808 0x4>;
+			reg-names =
+				"base",
+				"ev_status",
+				"ev_pending",
+				"ev_enable";
+			maximum-speed = "super-speed";
+			num-bidir-endpoints = <16>;
+			interrupts = <0x0 0>;
+			interrupt-names = "usb";
+			interrupt-parent = <&intc0>;
+			status = "okay";
+
+			endpoints {
+				compatible = "lattice,usb23-endpoints";
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				ep@0 {
+					reg = <0x00>;
+					num-trbs = <1>;
+				};
+
+				ep@80 {
+					reg = <0x80>;
+					num-trbs = <1>;
+				};
+
+				/* Only define a small number of endpoints to
+				 * save memory. The application can choose
+				 * exacly how many endpoints and TRB they wish
+				 * to use.
+				 */
+			};
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	pll0: si5351@60 {
+		reg = <0x60>;
+		compatible = "skyworks,si5351";
+		#clock-cells = <0>;
+		status = "okay";
+	};
+};
+
+&uart0 {
+	/* Turned off to let the board start when ther is no PLL */
+	clocks = <&pll0>;
+
+	/* Value for RTL Reference Design v0.5 */
+	current-speed = <192000>;
+
+	status = "okay";
+};
+
+&timer0 {
+	status = "okay";
+};
+
+#include "tinyclunx33_litex.dtsi"

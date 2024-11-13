@@ -1,0 +1,6 @@
+series:
+- name: tinyclunx33
+  socs:
+  - name: tinyclunx33v008
+  - name: tinyclunx33v009
+  - name: tinyclunx33v010

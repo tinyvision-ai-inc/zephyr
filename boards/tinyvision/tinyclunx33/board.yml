@@ -1,0 +1,27 @@
+board:
+  name: tinyclunx33_som
+  vendor: tinyvision
+  revision:
+    format: custom
+    default: "rev2"
+    revisions:
+      - name: "rev1"
+      - name: "rev2"
+  socs:
+  - name: tinyclunx33v008
+  - name: tinyclunx33v009
+  - name: tinyclunx33v010
+
+board:
+  name: tinyclunx33_devkit
+  vendor: tinyvision
+  revision:
+    format: custom
+    default: "rev2"
+    revisions:
+      - name: "rev1"
+      - name: "rev2"
+  socs:
+  - name: tinyclunx33v008
+  - name: tinyclunx33v009
+  - name: tinyclunx33v010
