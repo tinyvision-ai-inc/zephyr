@@ -18,16 +18,23 @@ source "subsys/logging/Kconfig.template.log_config"
 
 choice USBD_MAX_SPEED_CHOICE
 	prompt "Max supported connection speed"
+	default USBD_MAX_SPEED_SUPER if UDC_DRIVER_HAS_SUPER_SPEED_SUPPORT
 	default USBD_MAX_SPEED_HIGH if UDC_DRIVER_HAS_HIGH_SPEED_SUPPORT
 	default USBD_MAX_SPEED_FULL
+
+config USBD_MAX_SPEED_SUPER
+	bool "Super-Speed (Gen 1)"
+	depends on UDC_DRIVER_HAS_SUPER_SPEED_SUPPORT
 
 config USBD_MAX_SPEED_HIGH
 	bool "High-Speed"
 	depends on UDC_DRIVER_HAS_HIGH_SPEED_SUPPORT
+	depends on !UDC_DRIVER_SUPER_SPEED_SUPPORT_ENABLED
 
 config USBD_MAX_SPEED_FULL
 	bool "Full-Speed"
 	depends on !UDC_DRIVER_HIGH_SPEED_SUPPORT_ENABLED
+	depends on !UDC_DRIVER_SUPER_SPEED_SUPPORT_ENABLED
 
 endchoice
 
@@ -35,6 +42,7 @@ config USBD_MAX_SPEED
 	int
 	default 0 if USBD_MAX_SPEED_FULL
 	default 1 if USBD_MAX_SPEED_HIGH
+	default 2 if USBD_MAX_SPEED_SUPER
 
 config USBD_SHELL
 	bool "USB device shell"
