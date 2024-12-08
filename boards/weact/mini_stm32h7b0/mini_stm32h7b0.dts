@@ -54,7 +54,6 @@
 			width = <160>;
 			height = <80>;
 			inversion-on;
-			rgb-is-inverted;
 			x-offset = <1>;
 			y-offset = <26>;
 			pwctr1 = [A2 02 84];
