@@ -1,0 +1,2290 @@
+/*
+ * Copyright (c) 2025 tinyVision.ai Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define DT_DRV_COMPAT zephyr_uvc_device
+
+#include <stdlib.h>
+
+#include <zephyr/init.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/usb/usbd.h>
+#include <zephyr/usb/usb_ch9.h>
+#include <zephyr/drivers/usb/udc.h>
+#include <zephyr/drivers/video.h>
+#include <zephyr/drivers/video-controls.h>
+#include <zephyr/logging/log.h>
+
+#include <zephyr/devicetree.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/usb/usb_ch9.h>
+#include <zephyr/usb/class/usbd_uvc.h>
+#include "usbd_uvc.h"
+
+LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_VIDEO_LOG_LEVEL);
+
+enum uvc_op {
+	UVC_OP_GET_ERRNO,
+	UVC_OP_VC_EXT,
+	UVC_OP_VC_INT,
+	UVC_OP_VC_FIXED,
+	UVC_OP_VS_PROBE,
+	UVC_OP_VS_COMMIT,
+	UVC_OP_RETURN_ERROR,
+	UVC_OP_INVALID,
+};
+
+enum uvc_class_status {
+	UVC_STATE_INITIALIZED,
+	UVC_STATE_ENABLED,
+	UVC_STATE_STREAM_READY,
+	UVC_STATE_STREAM_RESTART,
+	UVC_STATE_PAUSED,
+};
+
+enum uvc_idx_vs {
+	UVC_IDX_VS_IF,
+	UVC_IDX_VS_HDR,
+	UVC_IDX_VS_FMT,
+};
+
+#define UVC_VBUF_DONE 1
+
+/* Global information */
+struct uvc_data {
+	atomic_t state;
+	struct usbd_class_data *c_data;
+	struct usbd_uvc_desc *desc;
+	struct usb_desc_header **fs_desc;
+	struct usb_desc_header **hs_desc;
+	size_t fs_desc_idx;
+	size_t hs_desc_idx;
+	/* UVC error from latest request */
+	uint8_t err;
+};
+
+/* Specialized version of UDC net_buf metadata with extra fields */
+struct uvc_buf_info {
+	/* Regular UDC buf info so that it can be passed to USBD directly */
+	struct udc_buf_info udc;
+	/* Extra field at the end */
+	struct video_buffer *vbuf;
+	/* UVC stream this buffer belongs to */
+	const struct uvc_stream *stream;
+} __packed;
+
+/* Mapping between UVC controls and Video controls */
+struct uvc_control_map {
+	uint32_t param;
+	enum uvc_op op;
+	uint8_t selector;
+	uint8_t size;
+	uint8_t bit;
+};
+
+struct uvc_guid_quirk {
+	uint32_t fourcc;
+	/* GUIDs are 16-bytes long, with the first four bytes being the Four Character Code of the
+	 * format and the rest constant, except for some exceptions listed in this table.
+	 */
+	uint8_t guid[16];
+};
+
+NET_BUF_POOL_VAR_DEFINE(uvc_buf_pool, DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 16,
+			512 * DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 16,
+			sizeof(struct uvc_buf_info), NULL);
+
+uint8_t uvc_desc_pool[CONFIG_USBD_VIDEO_DESC_POOL_SIZE];
+size_t uvc_desc_pos;
+
+static void uvc_flush_queue(const struct device *dev, const struct uvc_stream *strm);
+
+/* UVC helper functions */
+
+static void *uvc_pool_alloc(size_t size)
+{
+	void *ptr;
+
+	if (uvc_desc_pos + size > CONFIG_USBD_VIDEO_DESC_POOL_SIZE) {
+		return NULL;
+	}
+
+	ptr = &uvc_desc_pool[uvc_desc_pos];
+	uvc_desc_pos += size;
+
+	/* Align the buffer to CPU native word size */
+	BUILD_ASSERT(CONFIG_USBD_VIDEO_DESC_POOL_SIZE % sizeof(int) == 0);
+	BUILD_ASSERT(sizeof(int) < CONFIG_USBD_VIDEO_DESC_POOL_SIZE);
+	while (uvc_desc_pos % sizeof(int) != 0) {
+		uvc_desc_pos++;
+	}
+
+	return ptr;
+}
+
+static const struct uvc_guid_quirk uvc_guid_quirks[] = {
+	{VIDEO_PIX_FMT_YUYV,  UVC_FORMAT_GUID("YUY2")},
+};
+
+static void uvc_fourcc_to_guid(uint8_t guid[16], uint32_t fourcc)
+{
+	for (int i = 0; i < ARRAY_SIZE(uvc_guid_quirks); i++) {
+		if (uvc_guid_quirks[i].fourcc == fourcc) {
+			memcpy(guid, uvc_guid_quirks[i].guid, 16);
+			return;
+		}
+	}
+	fourcc = sys_cpu_to_le32(fourcc);
+	memcpy(guid, UVC_FORMAT_GUID("...."), 16);
+	memcpy(guid, &fourcc, 4);
+}
+
+static uint32_t uvc_guid_to_fourcc(uint8_t guid[16])
+{
+	uint32_t fourcc;
+
+	for (int i = 0; i < ARRAY_SIZE(uvc_guid_quirks); i++) {
+		if (memcmp(guid, uvc_guid_quirks[i].guid, 16) == 0) {
+			return uvc_guid_quirks[i].fourcc;
+		}
+	}
+
+	memcpy(&fourcc, guid, 4);
+
+	return sys_le32_to_cpu(fourcc);
+}
+
+static inline bool uvc_is_vs_desc(struct usb_desc_header *desc_in)
+{
+	struct uvc_format_descriptor *desc = (void *)desc_in;
+
+	return desc->bDescriptorType == USB_DESC_CS_INTERFACE &&
+	       (desc->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG ||
+		desc->bDescriptorSubtype == UVC_VS_FRAME_MJPEG ||
+		desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+		desc->bDescriptorSubtype == UVC_VS_FRAME_UNCOMPRESSED ||
+		desc->bDescriptorSubtype == UVC_VS_COLORFORMAT);
+	/* UVC_VS_COLORFORMAT is present at the end of every format declaration */
+}
+
+static inline bool uvc_is_vc_unit_desc(struct usb_desc_header *desc_in)
+{
+	struct uvc_unit_descriptor *desc = (void *)desc_in;
+
+	return desc->bDescriptorType == USB_DESC_CS_INTERFACE &&
+	       (desc->bDescriptorSubtype == UVC_VC_INPUT_TERMINAL ||
+		desc->bDescriptorSubtype == UVC_VC_ENCODING_UNIT ||
+		desc->bDescriptorSubtype == UVC_VC_SELECTOR_UNIT ||
+		desc->bDescriptorSubtype == UVC_VC_EXTENSION_UNIT ||
+		desc->bDescriptorSubtype == UVC_VC_PROCESSING_UNIT);
+	/* UVC_VC_OUTPUT_TERMINAL is used as a separator between the streams: return false. */
+}
+
+static inline uint8_t uvc_get_terminal_link(const struct uvc_stream *strm)
+{
+	struct uvc_unit_descriptor **list = (void *)strm->data->desc_vc;
+
+	/* Seek until the last descriptor of all the units: the Output Terminal */
+	while (uvc_is_vc_unit_desc((struct usb_desc_header *)*list)) {
+		list++;
+	}
+
+	return (*list)->bUnitID;
+}
+
+static inline struct usb_desc_header **uvc_get_desc_by_type(struct usb_desc_header **list,
+							    uint8_t type)
+{
+	for (int i = 0; list[i]->bLength != 0; i++) {
+		struct uvc_if_descriptor *desc = (void *)list[i];
+
+		if (desc->bDescriptorType == type) {
+			return &list[i];
+		}
+	}
+
+	return NULL;
+}
+
+static inline struct usb_desc_header **uvc_get_desc_by_subtype(struct usb_desc_header **list,
+							       uint8_t type, uint8_t subtype)
+{
+	while ((list = uvc_get_desc_by_type(list, type)) != NULL) {
+		struct uvc_if_descriptor *desc = (void *)list[0];
+
+		if (desc->bDescriptorSubtype == subtype) {
+			return &list[0];
+		}
+	}
+
+	return NULL;
+}
+
+const struct uvc_stream *uvc_get_stream_by_ep(const struct device *dev, enum video_endpoint_id ep)
+{
+	if (ep == VIDEO_EP_OUT) {
+		LOG_ERR("Streaming from the host to the device not yet supported.");
+		return NULL;
+	}
+
+	if (ep == VIDEO_EP_IN || ep == VIDEO_EP_ALL) {
+		STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+			if (strm->dev == dev) {
+				return strm;
+			}
+		}
+	}
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+		if (ep == 0) {
+			return strm;
+		}
+		ep--;
+	}
+
+	LOG_ERR("Could not find any streamfor ep %u", ep);
+	return NULL;
+}
+
+/* UVC control handling */
+
+static const struct uvc_control_map uvc_control_map_ct[] = {
+	{
+		.size = 1,
+		.bit = 1,
+		.selector = UVC_CT_AE_MODE_CONTROL,
+		.op = UVC_OP_VC_FIXED,
+		.param = BIT(0)
+	},
+	{
+		.size = 1,
+		.bit = 2,
+		.selector = UVC_CT_AE_PRIORITY_CONTROL,
+		.op = UVC_OP_VC_FIXED,
+		.param = 0
+	},
+	{
+		.size = 4,
+		.bit = 3,
+		.selector = UVC_CT_EXPOSURE_TIME_ABS_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_EXPOSURE
+	},
+	{
+		.size = 2,
+		.bit = 9,
+		.selector = UVC_CT_ZOOM_ABS_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_ZOOM_ABSOLUTE
+	},
+	{0},
+};
+
+static const struct uvc_control_map uvc_control_map_pu[] = {
+	{
+		.size = 2,
+		.bit = 0,
+		.selector = UVC_PU_BRIGHTNESS_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_BRIGHTNESS
+	},
+	{
+		.size = 1,
+		.bit = 1,
+		.selector = UVC_PU_CONTRAST_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_CONTRAST
+	},
+	{
+		.size = 2,
+		.bit = 9,
+		.selector = UVC_PU_GAIN_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_GAIN
+	},
+	{
+		.size = 2,
+		.bit = 3,
+		.selector = UVC_PU_SATURATION_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_SATURATION
+	},
+	{
+		.size = 2,
+		.bit = 6,
+		.selector = UVC_PU_WHITE_BALANCE_TEMP_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_WHITE_BALANCE_TEMPERATURE,
+	},
+	{0},
+};
+
+static const struct uvc_control_map uvc_control_map_su[] = {
+	{
+		.size = 1,
+		.bit = 0,
+		.selector = UVC_SU_INPUT_SELECT_CONTROL,
+		.op = UVC_OP_VC_INT,
+		.param = VIDEO_CID_TEST_PATTERN,
+	},
+	{0},
+};
+
+static const struct uvc_control_map uvc_control_map_xu[] = {
+	{
+		.size = 4,
+		.bit = 0,
+		.selector = UVC_XU_BASE_CONTROL + 0,
+		.op = UVC_OP_VC_EXT,
+		.param = VIDEO_CID_PRIVATE_BASE + 0,
+	},
+	{
+		.size = 4,
+		.bit = 1,
+		.selector = UVC_XU_BASE_CONTROL + 1,
+		.op = UVC_OP_VC_EXT,
+		.param = VIDEO_CID_PRIVATE_BASE + 1,
+	},
+	{
+		.size = 4,
+		.bit = 2,
+		.selector = UVC_XU_BASE_CONTROL + 2,
+		.op = UVC_OP_VC_EXT,
+		.param = VIDEO_CID_PRIVATE_BASE + 2,
+	},
+	{
+		.size = 4,
+		.bit = 3,
+		.selector = UVC_XU_BASE_CONTROL + 3,
+		.op = UVC_OP_VC_EXT,
+		.param = VIDEO_CID_PRIVATE_BASE + 3,
+	},
+	{0},
+};
+
+/* Get the format and frame descriptors selected for the given VideoStreaming interface. */
+static void uvc_get_vs_fmtfrm_desc(const struct uvc_stream *strm,
+				      struct uvc_format_descriptor **format_desc,
+				      struct uvc_frame_discrete_descriptor **frame_desc)
+{
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	int i;
+
+	*format_desc = NULL;
+	for (i = UVC_IDX_VS_FMT; uvc_is_vs_desc(desc_vs[i]); i++) {
+		struct uvc_format_descriptor *desc = (void *)desc_vs[i];
+
+		if ((desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+		     desc->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG) &&
+		    desc->bFormatIndex == strm->data->format_id) {
+			*format_desc = desc;
+			break;
+		}
+	}
+
+	*frame_desc = NULL;
+	for (i++; uvc_is_vs_desc(desc_vs[i]); i++) {
+		struct uvc_frame_discrete_descriptor *desc = (void *)desc_vs[i];
+
+		if (desc->bDescriptorSubtype != UVC_VS_FRAME_UNCOMPRESSED &&
+		    desc->bDescriptorSubtype != UVC_VS_FRAME_MJPEG) {
+			break;
+		}
+
+		if (desc->bFrameIndex == strm->data->frame_id) {
+			*frame_desc = desc;
+			break;
+		}
+	}
+}
+
+static inline int uvc_buf_add_int(struct net_buf *buf, uint16_t size, uint32_t value)
+{
+	if (buf->size != size) {
+		LOG_ERR("invalid wLength %u, expected %u", buf->size, size);
+		return -EINVAL;
+	}
+
+	switch (size) {
+	case 4:
+		net_buf_add_le32(buf, value);
+		return 0;
+	case 2:
+		net_buf_add_le16(buf, value);
+		return 0;
+	case 1:
+		net_buf_add_u8(buf, value);
+		return 0;
+	default:
+		LOG_WRN("Invalid size %u", size);
+		return -ENOTSUP;
+	}
+}
+
+static uint8_t uvc_get_bulk_in(const struct uvc_stream *strm)
+{
+	struct uvc_data *data = strm->dev->data;
+
+	switch (usbd_bus_speed(usbd_class_get_ctx(data->c_data))) {
+	case USBD_SPEED_FS:
+		return strm->data->desc_vs_ep_fs->bEndpointAddress;
+	case USBD_SPEED_HS:
+		return strm->data->desc_vs_ep_hs->bEndpointAddress;
+	default:
+		CODE_UNREACHABLE;
+	}
+}
+
+static size_t uvc_get_bulk_mps(struct usbd_class_data *const c_data)
+{
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+
+	switch (usbd_bus_speed(uds_ctx)) {
+	case USBD_SPEED_FS:
+		return 64;
+	case USBD_SPEED_HS:
+		return 512;
+	default:
+		CODE_UNREACHABLE;
+	}
+}
+
+static int uvc_get_vs_probe_format_index(const struct uvc_stream *strm, struct uvc_probe *probe,
+					 uint8_t request)
+{
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	uint8_t max = 0;
+
+	for (int i = UVC_IDX_VS_FMT; uvc_is_vs_desc(desc_vs[i]); i++) {
+		struct uvc_format_descriptor *desc = (void *)desc_vs[i];
+
+		max += desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+		       desc->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG;
+	}
+
+	switch (request) {
+	case UVC_GET_RES:
+	case UVC_GET_MIN:
+		probe->bFormatIndex = 1;
+		break;
+	case UVC_GET_MAX:
+		probe->bFormatIndex = max;
+		break;
+	case UVC_GET_CUR:
+		probe->bFormatIndex = strm->data->format_id;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int uvc_get_vs_probe_frame_index(const struct uvc_stream *strm, struct uvc_probe *probe,
+					uint8_t request)
+{
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	uint8_t max = 0;
+	int i;
+
+	/* Search the current format */
+	for (i = UVC_IDX_VS_FMT; uvc_is_vs_desc(desc_vs[i]); i++) {
+		struct uvc_format_descriptor *desc = (void *)desc_vs[i];
+
+		if ((desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED ||
+		     desc->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG) &&
+		    desc->bFormatIndex == strm->data->format_id) {
+			break;
+		}
+	}
+
+	/* Seek until the next format */
+	for (i++; uvc_is_vs_desc(desc_vs[i]); i++) {
+		struct uvc_frame_descriptor *desc = (void *)desc_vs[i];
+
+		if (desc->bDescriptorSubtype != UVC_VS_FRAME_UNCOMPRESSED &&
+		    desc->bDescriptorSubtype != UVC_VS_FRAME_MJPEG) {
+			break;
+		}
+		max++;
+	}
+
+	switch (request) {
+	case UVC_GET_RES:
+	case UVC_GET_MIN:
+		probe->bFrameIndex = 1;
+		break;
+	case UVC_GET_MAX:
+		probe->bFrameIndex = max;
+		break;
+	case UVC_GET_CUR:
+		probe->bFrameIndex = strm->data->frame_id;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int uvc_get_vs_probe_frame_interval(const struct uvc_stream *strm, struct uvc_probe *probe,
+					   uint8_t request)
+{
+	struct uvc_format_descriptor *format_desc;
+	struct uvc_frame_discrete_descriptor *frame_desc;
+	int max;
+
+	uvc_get_vs_fmtfrm_desc(strm, &format_desc, &frame_desc);
+	if (format_desc == NULL || frame_desc == NULL) {
+		LOG_DBG("Selected format ID or frame ID not found");
+		return -EINVAL;
+	}
+
+	switch (request) {
+	case UVC_GET_MIN:
+		probe->dwFrameInterval = sys_cpu_to_le32(frame_desc->dwFrameInterval[0]);
+		break;
+	case UVC_GET_MAX:
+		max = frame_desc->bFrameIntervalType - 1;
+		probe->dwFrameInterval = sys_cpu_to_le32(frame_desc->dwFrameInterval[max]);
+		break;
+	case UVC_GET_RES:
+		probe->dwFrameInterval = sys_cpu_to_le32(1);
+		break;
+	case UVC_GET_CUR:
+		probe->dwFrameInterval = sys_cpu_to_le32(strm->data->video_frmival.numerator);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int uvc_get_vs_probe_max_size(const struct uvc_stream *strm, struct uvc_probe *probe,
+				     uint8_t request)
+{
+	struct video_format *fmt = &strm->data->video_fmt;
+	uint32_t max_frame_size = MAX(fmt->pitch, fmt->width) * fmt->height;
+	uint32_t max_payload_size = max_frame_size + CONFIG_USBD_VIDEO_HEADER_SIZE;
+
+	switch (request) {
+	case UVC_GET_MIN:
+	case UVC_GET_MAX:
+	case UVC_GET_CUR:
+		probe->dwMaxPayloadTransferSize = sys_cpu_to_le32(max_payload_size);
+		probe->dwMaxVideoFrameSize = sys_cpu_to_le32(max_frame_size);
+		break;
+	case UVC_GET_RES:
+		probe->dwMaxPayloadTransferSize = sys_cpu_to_le32(1);
+		probe->dwMaxVideoFrameSize = sys_cpu_to_le32(1);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int uvc_get_vs_format_from_desc(const struct uvc_stream *strm, struct video_format *fmt)
+{
+	struct uvc_format_descriptor *format_desc = NULL;
+	struct uvc_frame_discrete_descriptor *frame_desc;
+
+	/* Update the format based on the probe message from the host */
+	uvc_get_vs_fmtfrm_desc(strm, &format_desc, &frame_desc);
+	if (format_desc == NULL || frame_desc == NULL) {
+		LOG_ERR("Invalid format ID (%u) and/or frame ID (%u)",
+			strm->data->format_id, strm->data->frame_id);
+		return -EINVAL;
+	}
+
+	/* Translate between UVC pixel formats and Video pixel formats */
+	if (format_desc->bDescriptorSubtype == UVC_VS_FORMAT_MJPEG) {
+		fmt->pixelformat = VIDEO_PIX_FMT_JPEG;
+
+		LOG_DBG("Found descriptor for format %u, frame %u, MJPEG",
+			format_desc->bFormatIndex, frame_desc->bFrameIndex);
+	} else {
+		struct uvc_format_uncomp_descriptor *format_uncomp_desc = (void *)format_desc;
+
+		fmt->pixelformat = uvc_guid_to_fourcc(format_uncomp_desc->guidFormat);
+
+		LOG_DBG("Found descriptor for format %u, frame %u, GUID '%.4s', pixfmt %04x",
+			format_uncomp_desc->bFormatIndex, frame_desc->bFrameIndex,
+			format_uncomp_desc->guidFormat, fmt->pixelformat);
+	}
+
+	/* Fill the format according to what the host selected */
+	fmt->width = frame_desc->wWidth;
+	fmt->height = frame_desc->wHeight;
+	fmt->pitch = fmt->width * video_bits_per_pixel(fmt->pixelformat) / BITS_PER_BYTE;
+
+	return 0;
+}
+
+static int uvc_get_vs_probe_struct(const struct uvc_stream *strm, struct uvc_probe *probe,
+				   uint8_t request)
+{
+	struct video_format *fmt = &strm->data->video_fmt;
+	int ret;
+
+	ret = uvc_get_vs_probe_format_index(strm, probe, request);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = uvc_get_vs_probe_frame_index(strm, probe, request);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = uvc_get_vs_format_from_desc(strm, fmt);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = uvc_get_vs_probe_frame_interval(strm, probe, request);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = uvc_get_vs_probe_max_size(strm, probe, request);
+	if (ret != 0) {
+		return ret;
+	}
+
+	probe->dwClockFrequency = sys_cpu_to_le32(1);
+	probe->bmFramingInfo = UVC_BMFRAMING_INFO_FID | UVC_BMFRAMING_INFO_EOF;
+	probe->bPreferedVersion = 1;
+	probe->bMinVersion = 1;
+	probe->bMaxVersion = 1;
+	probe->bUsage = 0;
+	probe->bBitDepthLuma = 0;
+	probe->bmSettings = 0;
+	probe->bMaxNumberOfRefFramesPlus1 = 1;
+	probe->bmRateControlModes = 0;
+	probe->bmLayoutPerStream = 0;
+	probe->wKeyFrameRate = sys_cpu_to_le16(0);
+	probe->wPFrameRate = sys_cpu_to_le16(0);
+	probe->wCompQuality = sys_cpu_to_le16(0);
+	probe->wCompWindowSize = sys_cpu_to_le16(0);
+	probe->wDelay = sys_cpu_to_le16(1);
+
+	return 0;
+}
+
+static int uvc_get_vs_probe(const struct uvc_stream *strm, struct net_buf *buf, uint8_t request)
+{
+	size_t size = MIN(sizeof(struct uvc_probe), buf->size);
+	struct uvc_probe *probe;
+
+	switch (request) {
+	case UVC_GET_INFO:
+		return uvc_buf_add_int(buf, 1, UVC_INFO_SUPPORTS_GET | UVC_INFO_SUPPORTS_SET);
+	case UVC_GET_LEN:
+		return uvc_buf_add_int(buf, 2, sizeof(struct uvc_probe));
+	case UVC_GET_DEF:
+		net_buf_add_mem(buf, &strm->data->default_probe, size);
+		return 0;
+	case UVC_GET_MIN:
+	case UVC_GET_RES:
+	case UVC_GET_MAX:
+	case UVC_GET_CUR:
+		net_buf_add(buf, size);
+		probe = (void *)buf->data;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return uvc_get_vs_probe_struct(strm, probe, request);
+}
+
+static int uvc_set_vs_probe(const struct uvc_stream *strm, const struct net_buf *buf)
+{
+	struct uvc_probe *probe;
+	struct uvc_probe max = {0};
+	int ret;
+
+	if (buf->len != sizeof(*probe)) {
+		LOG_ERR("Expected probe message of %u bytes got %u", sizeof(*probe), buf->len);
+		return -EINVAL;
+	}
+
+	probe = (struct uvc_probe *)buf->data;
+
+	ret = uvc_get_vs_probe_struct(strm, &max, UVC_GET_MAX);
+	if (ret != 0) {
+		return ret;
+	}
+
+	if (probe->bFrameIndex > max.bFrameIndex) {
+		LOG_WRN("The bFrameIndex %u requested is beyond the max %u",
+			probe->bFrameIndex, max.bFrameIndex);
+		return -ERANGE;
+	}
+
+	if (probe->bFormatIndex > max.bFormatIndex) {
+		LOG_WRN("The bFormatIndex %u requested is beyond the max %u",
+			probe->bFormatIndex, max.bFormatIndex);
+		return -ERANGE;
+	}
+
+	if (probe->dwFrameInterval != 0) {
+		strm->data->video_frmival.numerator = sys_le32_to_cpu(probe->dwFrameInterval);
+		strm->data->video_frmival.denominator = NSEC_PER_SEC / 100;
+	}
+	if (probe->bFrameIndex != 0) {
+		strm->data->frame_id = probe->bFrameIndex;
+	}
+	if (probe->bFormatIndex != 0) {
+		strm->data->format_id = probe->bFormatIndex;
+	}
+
+	return 0;
+}
+
+static int uvc_get_vs_commit(const struct uvc_stream *strm, struct net_buf *buf, uint8_t request)
+{
+	if (request != UVC_GET_CUR) {
+		LOG_WRN("commit: invalid bRequest %u", request);
+		return -EINVAL;
+	}
+
+	return uvc_get_vs_probe(strm, buf, UVC_GET_CUR);
+}
+
+
+static int uvc_set_vs_commit(const struct uvc_stream *strm, const struct net_buf *buf)
+{
+	struct video_format *fmt = &strm->data->video_fmt;
+	struct video_frmival frmival = strm->data->video_frmival;
+	int ret;
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	ret = uvc_set_vs_probe(strm, buf);
+	if (ret != 0) {
+		return ret;
+	}
+
+	LOG_INF("Ready to transfer, setting source format to %c%c%c%c %ux%u",
+		fmt->pixelformat >> 0 & 0xff, fmt->pixelformat >> 8 & 0xff,
+		fmt->pixelformat >> 16 & 0xff, fmt->pixelformat >> 24 & 0xff,
+		fmt->width, fmt->height);
+
+	ret = video_set_format(strm->data->video_dev, VIDEO_EP_OUT, fmt);
+	if (ret != 0) {
+		LOG_ERR("Could not set the format of %s", strm->data->video_dev->name);
+		return ret;
+	}
+
+	LOG_DBG("Setting frame interval of %s to %u/%u",
+		strm->data->video_dev->name,
+		strm->data->video_frmival.numerator, strm->data->video_frmival.denominator);
+
+	ret = video_set_frmival(strm->data->video_dev, VIDEO_EP_OUT, &frmival);
+	if (ret != 0) {
+		LOG_WRN("Could not set the framerate of %s", strm->data->video_dev->name);
+	}
+
+	LOG_DBG("Starting %s", strm->data->video_dev->name);
+
+	ret = video_stream_start(strm->data->video_dev);
+	if (ret != 0) {
+		LOG_ERR("Could not start %s", strm->data->video_dev->name);
+		return ret;
+	}
+
+	if (atomic_test_bit(&strm->data->state, UVC_STATE_STREAM_READY)) {
+		atomic_set_bit(&strm->data->state, UVC_STATE_STREAM_RESTART);
+	}
+
+	atomic_set_bit(&strm->data->state, UVC_STATE_STREAM_READY);
+	uvc_flush_queue(strm->dev, strm);
+
+	LOG_DBG("Started the video stream");
+
+	return 0;
+}
+
+static int uvc_get_vc_default(uint8_t request, struct net_buf *buf, uint8_t size)
+{
+	switch (request) {
+	case UVC_GET_INFO:
+		return uvc_buf_add_int(buf, 1, UVC_INFO_SUPPORTS_GET | UVC_INFO_SUPPORTS_SET);
+	case UVC_GET_LEN:
+		return uvc_buf_add_int(buf, buf->size, size);
+	case UVC_GET_RES:
+		return uvc_buf_add_int(buf, size, 1);
+	default:
+		LOG_WRN("Unsupported request type %u", request);
+		return -ENOTSUP;
+	}
+}
+
+static int uvc_get_vc_fixed(struct net_buf *buf, uint8_t size, uint32_t value, uint8_t request)
+{
+	LOG_DBG("Control type 'fixed', size %u", size);
+
+	switch (request) {
+	case UVC_GET_DEF:
+	case UVC_GET_CUR:
+	case UVC_GET_MIN:
+	case UVC_GET_MAX:
+		return uvc_buf_add_int(buf, size, value);
+	default:
+		return uvc_get_vc_default(request, buf, size);
+	}
+}
+
+static int uvc_get_vc_int(const struct uvc_stream *strm, struct net_buf *buf, uint8_t size,
+			  unsigned int cid, uint8_t request)
+{
+	const struct device *video_dev = strm->data->video_dev;
+	int value;
+	int ret;
+
+	__ASSERT_NO_MSG(video_dev != NULL);
+
+	LOG_DBG("Responding to GET control of type 'integer', size %u", size);
+
+	switch (request) {
+	case UVC_GET_DEF:
+	case UVC_GET_MIN:
+		return uvc_buf_add_int(buf, size, 0);
+	case UVC_GET_MAX:
+		return uvc_buf_add_int(buf, size, INT16_MAX);
+	case UVC_GET_CUR:
+		ret = video_get_ctrl(video_dev, cid, &value);
+		if (ret != 0) {
+			LOG_INF("Failed to query '%s'", video_dev->name);
+			return ret;
+		}
+
+		LOG_DBG("Value for CID 0x08%x is %u", cid, value);
+
+		return uvc_buf_add_int(buf, size, value);
+	default:
+		return uvc_get_vc_default(request, buf, size);
+	}
+}
+
+static int uvc_set_vc_int(const struct uvc_stream *strm, const struct net_buf *buf, uint8_t size,
+			  unsigned int cid)
+{
+	const struct device *video_dev = strm->data->video_dev;
+	int value;
+	int ret;
+
+	__ASSERT_NO_MSG(video_dev != NULL);
+
+	if (buf->len != size) {
+		LOG_ERR("Host sent an invalid size %u for this control %u", size, cid);
+		return -EINVAL;
+	}
+
+	switch (size) {
+	case 1:
+		value = *(uint8_t *)buf->data;
+		break;
+	case 2:
+		value = sys_le16_to_cpu(*(uint16_t *)buf->data);
+		break;
+	case 4:
+		value = sys_le32_to_cpu(*(uint32_t *)buf->data);
+		break;
+	default:
+		LOG_ERR("Unsupported size, cannot convert");
+		return -EINVAL;
+	}
+
+	LOG_DBG("Setting CID 0x08%x to %u", cid, value);
+
+	ret = video_set_ctrl(video_dev, cid, (void *)value);
+	if (ret != 0) {
+		LOG_ERR("Failed to configure target video device");
+		return ret;
+	}
+
+	return 0;
+}
+
+static int uvc_get_errno(const struct device *dev, struct net_buf *buf, uint8_t request)
+{
+	struct uvc_data *data = dev->data;
+
+	switch (request) {
+	case UVC_GET_INFO:
+		return uvc_buf_add_int(buf, 1, UVC_INFO_SUPPORTS_GET);
+	case UVC_GET_CUR:
+		return uvc_buf_add_int(buf, 1, data->err);
+	default:
+		LOG_WRN("Unsupported request type %u", request);
+		return -ENOTSUP;
+	}
+}
+
+static void uvc_set_errno(const struct device *dev, int ret)
+{
+	struct uvc_data *data = dev->data;
+
+	switch (ret) {
+	case 0:
+		data->err = 0;
+		break;
+	case EBUSY:
+	case EAGAIN:
+	case EINPROGRESS:
+	case EALREADY:
+		data->err = UVC_ERR_NOT_READY;
+		break;
+	case EOVERFLOW:
+	case ERANGE:
+	case E2BIG:
+		data->err = UVC_ERR_OUT_OF_RANGE;
+		break;
+	case EDOM:
+	case EINVAL:
+		data->err = UVC_ERR_INVALID_VALUE_WITHIN_RANGE;
+		break;
+	case ENODEV:
+	case ENOTSUP:
+	case ENOSYS:
+		data->err = UVC_ERR_INVALID_REQUEST;
+		break;
+	default:
+		data->err = UVC_ERR_UNKNOWN;
+		break;
+	}
+}
+
+static int uvc_get_control_op(const struct device *dev, const struct usb_setup_packet *setup,
+			      const struct uvc_stream **strm_p,
+			      const struct uvc_control_map **map_p)
+{
+	struct uvc_data *data = dev->data;
+	uint8_t ifnum = (setup->wIndex >> 0) & 0xff;
+	uint8_t unit_id = (setup->wIndex >> 8) & 0xff;
+	uint8_t selector = setup->wValue >> 8;
+	uint8_t subtype = 0;
+	const struct uvc_control_map *list = NULL;
+	const struct uvc_control_map *map = NULL;
+
+	/* VideoStreaming operation */
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		struct usb_desc_header **desc_vs = strm->data->desc_vs;
+		struct usb_if_descriptor *desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
+
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		if (ifnum == desc_vs_if->bInterfaceNumber) {
+			switch (selector) {
+			case UVC_VS_PROBE_CONTROL:
+				LOG_INF("Host sent a VideoStreaming PROBE control");
+				*strm_p = strm;
+				return UVC_OP_VS_PROBE;
+			case UVC_VS_COMMIT_CONTROL:
+				LOG_INF("Host sent a VideoStreaming COMMIT control");
+				*strm_p = strm;
+				return UVC_OP_VS_COMMIT;
+			default:
+				LOG_ERR("Invalid probe/commit operation for bInterfaceNumber %u",
+					ifnum);
+				return UVC_OP_INVALID;
+			}
+		}
+	}
+
+	/* VideoControl operation */
+
+	if (ifnum != data->desc->if_vc.bInterfaceNumber) {
+		LOG_WRN("Interface %u not found", ifnum);
+		data->err = UVC_ERR_INVALID_UNIT;
+		return UVC_OP_RETURN_ERROR;
+	}
+
+	if (unit_id == 0) {
+		return UVC_OP_GET_ERRNO;
+	}
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+		for (int i = 0; uvc_is_vc_unit_desc(strm->data->desc_vc[i]); i++) {
+			struct uvc_unit_descriptor *desc = (void *)strm->data->desc_vc[i];
+
+			if (unit_id == desc->bUnitID) {
+				*strm_p = strm;
+				subtype = desc->bDescriptorSubtype;
+				goto out;
+			}
+		}
+	}
+out:
+	if (*strm_p == NULL) {
+		goto err;
+	}
+
+	switch (subtype) {
+	case UVC_VC_INPUT_TERMINAL:
+		list = uvc_control_map_ct;
+		break;
+	case UVC_VC_SELECTOR_UNIT:
+		list = uvc_control_map_su;
+		break;
+	case UVC_VC_PROCESSING_UNIT:
+		list = uvc_control_map_pu;
+		break;
+	case UVC_VC_EXTENSION_UNIT:
+		list = uvc_control_map_xu;
+		break;
+	default:
+		CODE_UNREACHABLE;
+	}
+
+	for (int i = 0; list[i].size != 0; i++) {
+		if (list[i].selector == selector) {
+			map = &list[i];
+			break;
+		}
+	}
+
+	if (map == NULL) {
+		goto err;
+	}
+
+	*map_p = map;
+
+	return map->op;
+err:
+	LOG_WRN("No control matches selector %u and bUnitID %u", selector, unit_id);
+	data->err = UVC_ERR_INVALID_UNIT;
+	return UVC_OP_RETURN_ERROR;
+}
+
+static int uvc_control_to_host(struct usbd_class_data *const c_data,
+			       const struct usb_setup_packet *const setup,
+			       struct net_buf *const buf)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	const struct uvc_stream *strm = NULL;
+	const struct uvc_control_map *map = NULL;
+	uint8_t request = setup->bRequest;
+
+	LOG_INF("Host sent a %s request, wValue 0x%04x, wIndex 0x%02x",
+		request == UVC_GET_CUR ? "GET_CUR" : request == UVC_GET_MIN ? "GET_MIN" :
+		request == UVC_GET_MAX ? "GET_MAX" : request == UVC_GET_RES ? "GET_RES" :
+		request == UVC_GET_LEN ? "GET_LEN" : request == UVC_GET_DEF ? "GET_DEF" :
+		request == UVC_GET_INFO ? "GET_INFO" : "bad", setup->wValue, setup->wIndex);
+
+	if (setup->wLength > buf->size) {
+		LOG_ERR("wLength %u larger than %u bytes", setup->wLength, buf->size);
+		errno = ENOMEM;
+		goto end;
+	}
+
+	buf->size = setup->wLength;
+
+	switch (uvc_get_control_op(dev, setup, &strm, &map)) {
+	case UVC_OP_VS_PROBE:
+		errno = -uvc_get_vs_probe(strm, buf, setup->bRequest);
+		break;
+	case UVC_OP_VS_COMMIT:
+		errno = -uvc_get_vs_commit(strm, buf, setup->bRequest);
+		break;
+	case UVC_OP_VC_EXT:
+		errno = -uvc_get_vc_int(strm, buf, map->size, map->param, setup->bRequest);
+		break;
+	case UVC_OP_VC_INT:
+		errno = -uvc_get_vc_int(strm, buf, map->size, map->param, setup->bRequest);
+		break;
+	case UVC_OP_VC_FIXED:
+		errno = -uvc_get_vc_fixed(buf, map->size, map->param, setup->bRequest);
+		break;
+	case UVC_OP_GET_ERRNO:
+		errno = -uvc_get_errno(dev, buf, setup->bRequest);
+		break;
+	case UVC_OP_RETURN_ERROR:
+		errno = EINVAL;
+		return 0;
+	default:
+		LOG_WRN("Unhandled operation, stalling control command");
+		errno = EINVAL;
+	}
+end:
+	uvc_set_errno(dev, errno);
+
+	return 0;
+}
+
+static int uvc_control_to_dev(struct usbd_class_data *const c_data,
+			      const struct usb_setup_packet *const setup,
+			      const struct net_buf *const buf)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	const struct uvc_stream *strm = NULL;
+	const struct uvc_control_map *map = NULL;
+
+	if (setup->bRequest != UVC_SET_CUR) {
+		LOG_WRN("Host issued a control write message but the bRequest is not SET_CUR");
+		errno = ENOMEM;
+		goto end;
+	}
+
+	LOG_INF("Host sent a SET_CUR request, wValue 0x%04x, wIndex 0x%02x",
+		setup->wValue, setup->wIndex);
+
+	switch (uvc_get_control_op(dev, setup, &strm, &map)) {
+	case UVC_OP_VS_PROBE:
+		errno = -uvc_set_vs_probe(strm, buf);
+		break;
+	case UVC_OP_VS_COMMIT:
+		errno = -uvc_set_vs_commit(strm, buf);
+		break;
+	case UVC_OP_VC_EXT:
+		errno = -uvc_set_vc_int(strm, buf, map->size, map->param);
+		break;
+	case UVC_OP_VC_INT:
+		errno = -uvc_set_vc_int(strm, buf, map->size, map->param);
+		break;
+	case UVC_OP_VC_FIXED:
+		errno = ENOTSUP;
+		return 0;
+	case UVC_OP_RETURN_ERROR:
+		errno = EINVAL;
+		return 0;
+	default:
+		LOG_WRN("Unhandled operation, stalling control command");
+		errno = EINVAL;
+	}
+end:
+	uvc_set_errno(dev, errno);
+
+	LOG_DBG("%s done", __func__);
+
+	return 0;
+}
+
+/* UVC descriptor handling */
+
+static void *uvc_new_desc(const struct device *dev, size_t size, bool add_to_fs, bool add_to_hs)
+{
+	static const struct usb_desc_header nil_desc;
+	struct uvc_data *data = dev->data;
+	void *ptr;
+
+	LOG_DBG("Allocating %u bytes for a new %s descriptor (%u allocated in total)",
+		size, dev->name, uvc_desc_pos);
+
+	ptr = uvc_pool_alloc(size);
+	if (ptr == NULL) {
+		LOG_ERR("Cannot allocate one more descriptor of size %u", size);
+		LOG_ERR("Consider raising CONFIG_USBD_VIDEO_DESC_POOL_SIZE above %u",
+			CONFIG_USBD_VIDEO_DESC_POOL_SIZE);
+		return NULL;
+	}
+
+	memset(ptr, 0, size);
+
+	if (add_to_fs) {
+		if (data->fs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
+			goto err;
+		}
+		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)ptr;
+		data->fs_desc_idx++;
+		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)&nil_desc;
+	}
+
+	if (add_to_hs) {
+		if (data->hs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
+			goto err;
+		}
+		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)ptr;
+		data->hs_desc_idx++;
+		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)&nil_desc;
+	}
+
+	return ptr;
+err:
+	LOG_ERR("Out of descriptor pointers.");
+	LOG_ERR("Consider raising CONFIG_USBD_VIDEO_MAX_DESC above %u",
+		CONFIG_USBD_VIDEO_MAX_DESC);
+	return NULL;
+}
+
+static int uvc_add_vs_format_desc(const struct uvc_stream *strm,
+				  struct uvc_format_descriptor **format_desc,
+				  const struct video_format_cap *cap)
+{
+	const struct device *dev = strm->dev;
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
+
+	__ASSERT_NO_MSG(format_desc != NULL);
+
+	if (cap->pixelformat == VIDEO_PIX_FMT_JPEG) {
+		struct uvc_format_mjpeg_descriptor *desc;
+
+		LOG_INF("Adding format descriptor #%u for MJPEG",
+			desc_vs_hdr->bNumFormats + 1);
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bFormatIndex = desc_vs_hdr->bNumFormats + 1;
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorSubtype = UVC_VS_FORMAT_MJPEG;
+		desc->bDefaultFrameIndex = 1;
+		desc_vs_hdr->bNumFormats++;
+		desc_vs_hdr->wTotalLength += desc->bLength;
+		*format_desc = (struct uvc_format_descriptor *)desc;
+	} else {
+		struct uvc_format_uncomp_descriptor *desc;
+
+		LOG_INF("Adding format descriptor #%u for %c%c%c%c",
+			desc_vs_hdr->bNumFormats + 1,
+			cap->pixelformat >> 0 & 0xff, cap->pixelformat >> 8 & 0xff,
+			cap->pixelformat >> 16 & 0xff, cap->pixelformat >> 24 & 0xff);
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bFormatIndex = desc_vs_hdr->bNumFormats + 1;
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorSubtype = UVC_VS_FORMAT_UNCOMPRESSED;
+		uvc_fourcc_to_guid(desc->guidFormat, cap->pixelformat);
+		desc->bBitsPerPixel = video_bits_per_pixel(cap->pixelformat);
+		desc->bDefaultFrameIndex = 1;
+		desc_vs_hdr->bNumFormats++;
+		desc_vs_hdr->wTotalLength += desc->bLength;
+		*format_desc = (struct uvc_format_descriptor *)desc;
+	}
+
+	__ASSERT_NO_MSG(*format_desc != NULL);
+
+	return 0;
+}
+
+static int uvc_compare_frmival_desc(const void *a, const void *b)
+{
+	uint32_t ia, ib;
+
+	/* Copy in case a and b are not 32-bit aligned */
+	memcpy(&ia, a, sizeof(uint32_t));
+	memcpy(&ib, b, sizeof(uint32_t));
+
+	return ib - ia;
+}
+
+static int uvc_add_vs_frame_interval(struct uvc_frame_discrete_descriptor *desc,
+				     const struct video_frmival *frmival,
+				     struct video_format *fmt)
+{
+	int i = desc->bFrameIntervalType;
+	uint32_t bitrate;
+
+	if (i >= CONFIG_USBD_VIDEO_MAX_FRMIVAL) {
+		LOG_WRN("Out of frame interval fields");
+		return -ENOSPC;
+	}
+
+	desc->dwFrameInterval[i] = sys_cpu_to_le32(video_frmival_nsec(frmival) / 100);
+	desc->bFrameIntervalType++;
+	desc->bLength += sizeof(uint32_t);
+
+	desc->dwMinBitRate = sys_le32_to_cpu(desc->dwMinBitRate);
+	desc->dwMaxBitRate = sys_le32_to_cpu(desc->dwMinBitRate);
+	bitrate = MAX(fmt->pitch, fmt->width) * fmt->height *
+		frmival->denominator / frmival->denominator;
+	desc->dwMinBitRate = MIN(desc->dwMinBitRate, bitrate);
+	desc->dwMaxBitRate = MAX(desc->dwMaxBitRate, bitrate);
+
+	if (desc->dwMinBitRate > desc->dwMaxBitRate) {
+		LOG_WRN("The minimum bitrate is above the maximum bitrate");
+	}
+
+	if (desc->dwMaxBitRate == 0) {
+		LOG_WRN("maximum bitrate is zero");
+	}
+
+	desc->dwMinBitRate = sys_cpu_to_le32(desc->dwMinBitRate);
+	desc->dwMaxBitRate = sys_cpu_to_le32(desc->dwMinBitRate);
+
+	return 0;
+}
+
+static int uvc_add_vs_frame_desc(const struct uvc_stream *strm,
+				 struct uvc_format_descriptor *format_desc,
+				 const struct video_format_cap *cap, bool min)
+{
+	const struct device *dev = strm->dev;
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
+	struct uvc_frame_discrete_descriptor *desc;
+	uint16_t w = min ? cap->width_min : cap->width_max;
+	uint16_t h = min ? cap->height_min : cap->height_max;
+	uint16_t p = MAX(video_bits_per_pixel(cap->pixelformat), 8) * w / BITS_PER_BYTE;
+	struct video_format fmt = {.pixelformat = cap->pixelformat,
+				   .width = w, .height = h, .pitch = p};
+	struct video_frmival_enum fie = {.format = &fmt};
+	uint32_t max_size = MAX(p, w) * h;
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	LOG_INF("Adding frame descriptor #%u for %ux%u",
+		format_desc->bNumFrameDescriptors + 1, w, h);
+
+	desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+	if (desc == NULL) {
+		return -ENOMEM;
+	}
+
+	desc->bLength = sizeof(*desc) - CONFIG_USBD_VIDEO_MAX_FRMIVAL * sizeof(uint32_t);
+	desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+	desc->bFrameIndex = format_desc->bNumFrameDescriptors + 1;
+	desc->wWidth = sys_cpu_to_le16(w);
+	desc->wHeight = sys_cpu_to_le16(h);
+	desc->dwMaxVideoFrameBufferSize = sys_cpu_to_le32(max_size);
+	desc->bDescriptorSubtype = (format_desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED)
+		? UVC_VS_FRAME_UNCOMPRESSED : UVC_VS_FRAME_MJPEG;
+	desc->dwMinBitRate = UINT32_MAX;
+	desc->dwMaxBitRate = 0;
+
+	/* Add the adwFrameInterval fields at the end of this descriptor */
+	while (video_enum_frmival(strm->data->video_dev, VIDEO_EP_OUT, &fie) == 0) {
+		switch (fie.type) {
+		case VIDEO_FRMIVAL_TYPE_DISCRETE:
+			LOG_DBG("Adding discrete frame interval %u", fie.index);
+			uvc_add_vs_frame_interval(desc, &fie.discrete, &fmt);
+			break;
+		case VIDEO_FRMIVAL_TYPE_STEPWISE:
+			LOG_DBG("Adding stepwise frame interval %u", fie.index);
+			uvc_add_vs_frame_interval(desc, &fie.stepwise.min, &fmt);
+			uvc_add_vs_frame_interval(desc, &fie.stepwise.max, &fmt);
+			break;
+		}
+		fie.index++;
+	}
+
+	/* UVC requires the frame intervals to be sorted, but not Zephyr */
+	qsort(desc->dwFrameInterval, desc->bFrameIntervalType,
+		sizeof(*desc->dwFrameInterval), uvc_compare_frmival_desc);
+
+	__ASSERT_NO_MSG(format_desc != NULL);
+
+	desc->dwDefaultFrameInterval = desc->dwFrameInterval[0];
+	format_desc->bNumFrameDescriptors++;
+	desc_vs_hdr->wTotalLength += desc->bLength;
+
+	return 0;
+}
+
+static uint32_t uvc_get_mask(const struct device *video_dev, const struct uvc_control_map *list)
+{
+	uint32_t mask = 0;
+	bool ok;
+	int value;
+
+	__ASSERT_NO_MSG(video_dev != NULL);
+
+	LOG_DBG("Testing all supported controls to see which are supported");
+
+	for (int i = 0; list[i].size != 0; i++) {
+		if (list[i].op == UVC_OP_VC_FIXED) {
+			ok = true;
+		} else {
+			ok = video_get_ctrl(video_dev, list[i].param, &value) == 0;
+		}
+
+		LOG_DBG("%s supports control 0x%02x: %s",
+			video_dev->name, list[i].selector, ok ? "yes" : "no");
+
+		mask |= ok << list[i].bit;
+	}
+
+	return mask;
+}
+
+static int uvc_add_vc_desc(const struct device *dev,
+			   const struct uvc_stream *strm, uint8_t *unit_id)
+{
+	struct uvc_data *data = dev->data;
+	uint32_t mask = 0;
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	strm->data->desc_vc = &data->fs_desc[data->fs_desc_idx];
+	data->desc->if_vc_hdr.bInCollection++;
+
+	mask = uvc_get_mask(strm->data->video_dev, uvc_control_map_ct);
+	{
+		struct uvc_camera_terminal_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VC_INPUT_TERMINAL;
+		desc->bTerminalID = *unit_id;
+		desc->wTerminalType = sys_cpu_to_le16(UVC_ITT_CAMERA);
+		desc->bAssocTerminal = 0;
+		desc->iTerminal = 0;
+		desc->wObjectiveFocalLengthMin = sys_cpu_to_le16(0);
+		desc->wObjectiveFocalLengthMax = sys_cpu_to_le16(0);
+		desc->wOcularFocalLength = sys_cpu_to_le16(0);
+		desc->bControlSize = 3;
+		desc->bmControls[0] = mask >> 0;
+		desc->bmControls[1] = mask >> 8;
+		desc->bmControls[2] = mask >> 16;
+		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		(*unit_id)++;
+	}
+
+	mask = uvc_get_mask(strm->data->video_dev, uvc_control_map_su);
+	if (mask != 0) {
+		struct uvc_selector_unit_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VC_SELECTOR_UNIT;
+		desc->bUnitID = *unit_id;
+		desc->bNrInPins = 1;
+		desc->baSourceID[0] = *unit_id - 1;
+		desc->iSelector = 0;
+		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		(*unit_id)++;
+	}
+
+	mask = uvc_get_mask(strm->data->video_dev, uvc_control_map_pu);
+	if (mask != 0) {
+		struct uvc_processing_unit_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VC_PROCESSING_UNIT;
+		desc->bUnitID = *unit_id;
+		desc->bSourceID = *unit_id - 1;
+		desc->wMaxMultiplier = sys_cpu_to_le16(0);
+		desc->bControlSize = 3;
+		desc->bmControls[0] = mask >> 0;
+		desc->bmControls[1] = mask >> 8;
+		desc->bmControls[2] = mask >> 16;
+		desc->iProcessing = 0;
+		desc->bmVideoStandards = 0;
+		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		(*unit_id)++;
+	}
+
+	mask = uvc_get_mask(strm->data->video_dev, uvc_control_map_xu);
+	if (mask != 0) {
+		struct uvc_extension_unit_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VC_EXTENSION_UNIT;
+		desc->bUnitID = *unit_id;
+		memset(desc->guidExtensionCode, 0, sizeof(desc->guidExtensionCode));
+		desc->bNumControls = 0;
+		desc->bNrInPins = 1;
+		desc->baSourceID[0] = *unit_id - 1;
+		desc->bControlSize = 4;
+		desc->bmControls[0] = mask >> 0;
+		desc->bmControls[1] = mask >> 8;
+		desc->bmControls[2] = mask >> 16;
+		desc->bmControls[3] = mask >> 24;
+		desc->iExtension = 0;
+		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		(*unit_id)++;
+	}
+
+	{
+		struct uvc_output_terminal_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VC_OUTPUT_TERMINAL;
+		desc->bTerminalID = *unit_id;
+		desc->wTerminalType = sys_cpu_to_le16(UVC_TT_STREAMING);
+		desc->bAssocTerminal = 0;
+		desc->bSourceID = *unit_id - 1;
+		desc->iTerminal = 0;
+		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		(*unit_id)++;
+	}
+
+	return 0;
+}
+
+static int uvc_add_vs_color_desc(const struct device *dev, const struct uvc_stream *strm)
+{
+	struct usb_desc_header **desc_vs = strm->data->desc_vs;
+	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
+	struct uvc_color_descriptor *desc;
+
+	desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+	if (desc == NULL) {
+		return -ENOMEM;
+	}
+	desc->bLength = sizeof(*desc);
+	desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+	desc->bDescriptorSubtype = UVC_VS_COLORFORMAT;
+	desc->bColorPrimaries = 1; /* BT.709, sRGB (default) */
+	desc->bTransferCharacteristics = 1; /* BT.709 (default) */
+	desc->bMatrixCoefficients = 4; /* SMPTE 170M, BT.601 (default) */
+	desc_vs_hdr->wTotalLength += desc->bLength;
+
+	return 0;
+}
+
+static int uvc_add_vs_desc(const struct device *dev, const struct uvc_stream *strm)
+{
+	struct uvc_data *data = dev->data;
+	struct uvc_format_descriptor *format_desc = NULL;
+	struct uvc_stream_header_descriptor *desc_vs_hdr;
+	struct video_caps caps;
+	uint32_t prev_pixfmt = 0;
+	int ret;
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	strm->data->desc_vs = &data->fs_desc[data->fs_desc_idx];
+
+	{
+		struct usb_if_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_INTERFACE;
+		desc->bInterfaceNumber = data->desc->iad.bInterfaceCount;
+		desc->bAlternateSetting = 0;
+		desc->bNumEndpoints = 1;
+		desc->bInterfaceClass = USB_BCC_VIDEO;
+		desc->bInterfaceSubClass = UVC_SC_VIDEOSTREAMING;
+		desc->bInterfaceProtocol = 0;
+		desc->iInterface = 0;
+		data->desc->iad.bInterfaceCount++;
+	}
+
+	{
+		struct uvc_stream_header_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
+		desc->bDescriptorSubtype = UVC_VS_INPUT_HEADER;
+		desc->bNumFormats = 0;
+		desc->wTotalLength = 0;
+		desc->bEndpointAddress = 0x81;
+		desc->bmInfo = 0;
+		desc->bTerminalLink = uvc_get_terminal_link(strm);
+		desc->bStillCaptureMethod = 0;
+		desc->bTriggerSupport = 0;
+		desc->bTriggerUsage = 0;
+		desc->bControlSize = 0;
+		desc_vs_hdr = desc;
+		desc_vs_hdr->wTotalLength += desc->bLength;
+	}
+
+	ret = video_get_caps(strm->data->video_dev, VIDEO_EP_OUT, &caps);
+	if (ret != 0) {
+		LOG_DBG("Could not load %s video format list", strm->data->video_dev->name);
+		return ret;
+	}
+
+	/* Generate the list of format descriptors according to the video capabilities */
+	for (int i = 0; caps.format_caps[i].pixelformat != 0; i++) {
+		const struct video_format_cap *cap = &caps.format_caps[i];
+
+		/* Convert the flat capability structure into an UVC nested structure */
+		if (prev_pixfmt != cap->pixelformat) {
+			if (prev_pixfmt != 0) {
+				uvc_add_vs_color_desc(dev, strm);
+			}
+
+			ret = uvc_add_vs_format_desc(strm, &format_desc, cap);
+			if (ret != 0) {
+				return ret;
+			}
+		}
+
+		/* Always add the minimum value */
+		ret = uvc_add_vs_frame_desc(strm, format_desc, cap, true);
+		if (ret != 0) {
+			return ret;
+		}
+
+		/* If min and max differs, also add the max */
+		if (cap->width_min != cap->width_max || cap->height_min != cap->height_max) {
+			ret = uvc_add_vs_frame_desc(strm, format_desc, cap, false);
+			if (ret != 0) {
+				return ret;
+			}
+		}
+
+		prev_pixfmt = cap->pixelformat;
+	}
+
+	/* After all the formats were added */
+	uvc_add_vs_color_desc(dev, strm);
+
+	{
+		struct usb_ep_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), true, false);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_ENDPOINT;
+		desc->bEndpointAddress = 0x81;
+		desc->bmAttributes = USB_EP_TYPE_BULK;
+		desc->wMaxPacketSize = sys_cpu_to_le16(64);
+		desc->bInterval = 0;
+		desc_vs_hdr->wTotalLength += desc->bLength;
+		strm->data->desc_vs_ep_fs = desc;
+	}
+
+	{
+		struct usb_ep_descriptor *desc;
+
+		desc = uvc_new_desc(dev, sizeof(*desc), false, true);
+		if (desc == NULL) {
+			return -ENOMEM;
+		}
+		desc->bLength = sizeof(*desc);
+		desc->bDescriptorType = USB_DESC_ENDPOINT;
+		desc->bEndpointAddress = 0x81;
+		desc->bmAttributes = USB_EP_TYPE_BULK;
+		desc->wMaxPacketSize = sys_cpu_to_le16(512);
+		desc->bInterval = 0;
+		desc_vs_hdr->wTotalLength += desc->bLength;
+		strm->data->desc_vs_ep_hs = desc;
+	}
+
+	desc_vs_hdr->wTotalLength = sys_cpu_to_le16(desc_vs_hdr->wTotalLength);
+
+	return 0;
+}
+
+static int uvc_init(struct usbd_class_data *const c_data);
+
+static void uvc_update_desc(const struct device *dev, struct usbd_class_data *const c_data)
+{
+	struct uvc_data *data = dev->data;
+	int i = 0;
+
+	LOG_DBG("Updating USB descriptors");
+
+	uvc_init(c_data);
+
+	data->desc->iad.bFirstInterface = data->desc->if_vc.bInterfaceNumber;
+
+	if (!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
+		LOG_DBG("UVC not initialized yet, descriptors list not available yet");
+		return;
+	}
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		struct usb_desc_header **desc_vs = strm->data->desc_vs;
+		struct usb_if_descriptor *desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
+		struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
+
+		if (strm->dev != dev) {
+			continue;
+		}
+		desc_vs_hdr->bEndpointAddress = uvc_get_bulk_in(strm);
+		data->desc->if_vc_hdr.baInterfaceNr[i] = desc_vs_if->bInterfaceNumber;
+		i++;
+	}
+}
+
+static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	/* The descriptor pointer list is generated out of the video runtime API,
+	 * it must be done before they are scanned by the USB device stack
+	 */
+
+	uvc_update_desc(dev, c_data);
+
+	switch (speed) {
+	case USBD_SPEED_FS:
+		return (void *)data->fs_desc;
+	case USBD_SPEED_HS:
+		return (void *)data->hs_desc;
+	default:
+		CODE_UNREACHABLE;
+	}
+}
+
+static int uvc_init(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+	uint8_t unit_id = 1;
+	int ret;
+
+	if (atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
+		return 0;
+	}
+
+	LOG_DBG("Initializing USB Video Class (%s)", dev->name);
+
+	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
+
+	/* Generating VideoControl descriptors */
+
+	data->desc->if_vc_hdr.bLength = 12;
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		ret = uvc_add_vc_desc(dev, strm, &unit_id);
+		if (ret != 0) {
+			return ret;
+		}
+
+		data->desc->if_vc_hdr.bLength++;
+		data->desc->if_vc_hdr.wTotalLength++;
+	}
+
+	data->desc->if_vc_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if_vc_hdr.wTotalLength);
+
+	/* Generating VideoStreaming descriptors */
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		ret = uvc_add_vs_desc(dev, strm);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	/* Generating the default probe message */
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		ret = uvc_get_vs_probe_struct(strm, &strm->data->default_probe, UVC_GET_CUR);
+		if (ret != 0) {
+			LOG_ERR("init: failed to query the default probe");
+			return ret;
+		}
+	}
+
+	atomic_set_bit(&data->state, UVC_STATE_INITIALIZED);
+
+	return 0;
+}
+
+/* UVC data handling */
+
+static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf, int err)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_buf_info bi = *(struct uvc_buf_info *)udc_get_buf_info(buf);
+	const struct uvc_stream *strm = bi.stream;
+
+	net_buf_unref(buf);
+
+	if (bi.udc.ep == uvc_get_bulk_in(bi.stream)) {
+		LOG_DBG("Request completed for USB buffer %p, video buffer %p", buf, bi.vbuf);
+		if (bi.vbuf != NULL) {
+			k_fifo_put(&strm->data->fifo_out, bi.vbuf);
+
+			if (IS_ENABLED(CONFIG_POLL) && strm->data->signal != NULL) {
+				LOG_DBG("Raising VIDEO_BUF_DONE signal");
+				k_poll_signal_raise(strm->data->signal, VIDEO_BUF_DONE);
+			}
+		}
+
+		/* There is now one more net_buff buffer available */
+		uvc_flush_queue(dev, strm);
+	} else {
+		LOG_WRN("Request on unknown endpoint 0x%02x", bi.udc.ep);
+	}
+
+	return 0;
+}
+
+/* The queue of video frame fragments (vbuf) is processed, each fragment (data)
+ * is prepended by the UVC header (h). The result is cut into USB packets (pkt)
+ * submitted to the USB:
+ *
+ * [h+data] [data::]...[data::] [data] ... [h+data] [data::]...[data::] [data] ...
+ * [pkt:::] [pkt:::]...[pkt:::] [pkt:] ... [pkt:::] [pkt:::]...[pkt:::] [pkt:] ...
+ * [vbuf:::::::::::::::::::::::::::::] ... [vbuf:::::::::::::::::::::::::::::] ...
+ * [frame::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::] ...
+ * +-------------------------------------------------------------------------> time
+ *
+ * This function uvc_flush_vbuf() is called once per usb packet (pkt).
+ *
+ * @retval 0 if vbuf was partially transferred.
+ * @retval 1 if vbuf was fully transferred and can be released.
+ * @return Negative error code on failure.
+ */
+static int uvc_flush_vbuf(const struct uvc_stream *strm, struct video_buffer *vbuf)
+{
+	struct uvc_data *data = strm->dev->data;
+	struct video_format *fmt = &strm->data->video_fmt;
+	struct net_buf *buf;
+	struct uvc_buf_info *bi;
+	size_t mps = uvc_get_bulk_mps(data->c_data);
+	size_t next_vbuf_offset = strm->data->vbuf_offset;
+	size_t next_line_offset = vbuf->line_offset;
+	int ret;
+
+	/* Transfer reset condition */
+	if (atomic_test_bit(&strm->data->state, UVC_STATE_STREAM_RESTART)) {
+		LOG_DBG("Stream restarted, terminating the ongoing transfer");
+		LOG_DBG("vbuf offset %u, line_offset %u",
+			strm->data->vbuf_offset, vbuf->line_offset);
+
+		buf = net_buf_alloc_with_data(&uvc_buf_pool, "",  1, K_NO_WAIT);
+		if (buf == NULL) {
+			LOG_DBG("Cannot allocate ZLP USB buffer for now");
+			return -ENOMEM;
+		}
+
+		bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
+		bi->udc.ep = uvc_get_bulk_in(strm);
+		bi->stream = strm;
+		bi->vbuf = NULL;
+		bi->udc.zlp = true;
+		strm->data->vbuf_offset = 0;
+
+		ret = usbd_ep_enqueue(data->c_data, buf);
+		if (ret != 0) {
+			net_buf_unref(buf);
+			return ret;
+		}
+
+		atomic_clear_bit(&strm->data->state, UVC_STATE_STREAM_RESTART);
+
+		return 0;
+	}
+
+	/* Start-of-Transfer condition */
+	if (strm->data->vbuf_offset == 0) {
+		buf = net_buf_alloc_len(&uvc_buf_pool, mps, K_NO_WAIT);
+		if (buf == NULL) {
+			LOG_DBG("Cannot allocate first USB buffer for now");
+			return -ENOMEM;
+		}
+
+		if (fmt->pitch > 0) {
+			next_line_offset += vbuf->bytesused / fmt->pitch;
+		}
+
+		LOG_INF("New USB transfer, bmHeaderInfo 0x%02x, bytes used %u, lines %u to %u",
+			strm->data->payload_header.bmHeaderInfo, vbuf->bytesused,
+			vbuf->line_offset, next_line_offset);
+
+		/* Only the first 2 fields supported for now, the rest is padded with 0x00 */
+		net_buf_add_mem(buf, &strm->data->payload_header, 2);
+		net_buf_add(buf, CONFIG_USBD_VIDEO_HEADER_SIZE - buf->len);
+
+		/* Copy the bytes, needed for the first packet only */
+		next_vbuf_offset = MIN(vbuf->bytesused, net_buf_tailroom(buf));
+		net_buf_add_mem(buf, vbuf->buffer, next_vbuf_offset);
+
+		if (fmt->pitch == 0 || next_line_offset >= fmt->height) {
+			LOG_DBG("End of frame");
+
+			/* Flag that this current transfer is the last */
+			((struct uvc_payload_header *)buf->data)->bmHeaderInfo |=
+				UVC_BMHEADERINFO_END_OF_FRAME;
+
+			/* Toggle the Frame ID of the next vbuf */
+			strm->data->payload_header.bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
+
+			next_line_offset = 0;
+		}
+	} else {
+		buf = net_buf_alloc_with_data(&uvc_buf_pool, vbuf->buffer + strm->data->vbuf_offset,
+					      MIN(vbuf->bytesused - strm->data->vbuf_offset, mps),
+					      K_NO_WAIT);
+		if (buf == NULL) {
+			LOG_DBG("Cannot allocate continuation USB buffer for now");
+			return -ENOMEM;
+		}
+		next_vbuf_offset = strm->data->vbuf_offset + mps;
+	}
+
+	bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
+	bi->udc.ep = uvc_get_bulk_in(strm);
+	bi->stream = strm;
+
+	LOG_DBG("Video buffer %p, offset %u/%u, size %u",
+		vbuf, strm->data->vbuf_offset, vbuf->bytesused, buf->len);
+
+	/* End-of-Transfer condition */
+	if (next_vbuf_offset >= vbuf->bytesused) {
+		bi->vbuf = vbuf;
+		bi->udc.zlp = (buf->len == mps);
+		strm->data->vbuf_offset = 0;
+	}
+
+	ret = usbd_ep_enqueue(data->c_data, buf);
+	if (ret != 0) {
+		net_buf_unref(buf);
+		return ret;
+	}
+
+	/* End-of-Transfer condition */
+	if (next_vbuf_offset >= vbuf->bytesused) {
+		return UVC_VBUF_DONE;
+	}
+
+	strm->data->vbuf_offset = next_vbuf_offset;
+	vbuf->line_offset = next_line_offset;
+	return 0;
+}
+
+static void uvc_flush_queue(const struct device *dev, const struct uvc_stream *strm)
+{
+	struct uvc_data *data = dev->data;
+	struct video_buffer *vbuf;
+	int ret;
+
+	__ASSERT_NO_MSG(atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
+
+	if (!atomic_test_bit(&data->state, UVC_STATE_ENABLED) ||
+	    !atomic_test_bit(&strm->data->state, UVC_STATE_STREAM_READY)) {
+		LOG_DBG("UVC not ready yet");
+		return;
+	}
+
+	/* Lock the access to the FIFO to make sure to only process one buffer at a time.
+	 * K_FOREVER is not expected to take long, as uvc_flush_vbuf() never blocks.
+	 */
+	LOG_DBG("Locking the UVC stream");
+	k_mutex_lock(&strm->data->mutex, K_FOREVER);
+
+	while ((vbuf = k_fifo_peek_head(&strm->data->fifo_in)) != NULL) {
+		/* Pausing the UVC driver will accumulate buffers in the input queue */
+		if (atomic_test_bit(&data->state, UVC_STATE_PAUSED)) {
+			break;
+		}
+
+		ret = uvc_flush_vbuf(strm, vbuf);
+		if (ret == UVC_VBUF_DONE) {
+			LOG_DBG("Video buffer %p transferred, removing from the queue", vbuf);
+			k_fifo_get(&strm->data->fifo_in, K_NO_WAIT);
+		} else if (ret != 0) {
+			LOG_DBG("Could not transfer video buffer %p for now", vbuf);
+			break;
+		}
+	}
+
+	/* Now the other contexts calling this function can access the fifo safely. */
+	LOG_DBG("Unlocking the UVC stream");
+	k_mutex_unlock(&strm->data->mutex);
+}
+
+static void uvc_enable(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	__ASSERT_NO_MSG(atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
+
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		/* Catch-up with buffers that might have been delayed */
+		uvc_flush_queue(dev, strm);
+	}
+
+	atomic_set_bit(&data->state, UVC_STATE_ENABLED);
+}
+
+static void uvc_disable(struct usbd_class_data *const c_data)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	__ASSERT_NO_MSG(atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
+
+	atomic_clear_bit(&data->state, UVC_STATE_ENABLED);
+}
+
+static void uvc_update(struct usbd_class_data *const c_data, uint8_t iface, uint8_t alternate)
+{
+	LOG_DBG("Select alternate %u for interface %u", alternate, iface);
+}
+
+static const struct usbd_class_api uvc_class_api = {
+	.enable = uvc_enable,
+	.disable = uvc_disable,
+	.request = uvc_request,
+	.update = uvc_update,
+	.control_to_host = uvc_control_to_host,
+	.control_to_dev = uvc_control_to_dev,
+	.init = uvc_init,
+	.get_desc = uvc_get_desc,
+};
+
+/* UVC video API */
+
+static int uvc_enqueue(const struct device *dev, enum video_endpoint_id ep,
+		       struct video_buffer *vbuf)
+{
+	const struct uvc_stream *strm;
+
+	strm = uvc_get_stream_by_ep(dev, ep);
+	if (strm == NULL) {
+		return -ENODEV;
+	}
+
+	k_fifo_put(&strm->data->fifo_in, vbuf);
+	uvc_flush_queue(dev, strm);
+
+	return 0;
+}
+
+static int uvc_dequeue(const struct device *dev, enum video_endpoint_id ep,
+		       struct video_buffer **vbuf, k_timeout_t timeout)
+{
+	const struct uvc_stream *strm;
+
+	strm = uvc_get_stream_by_ep(dev, ep);
+	if (strm == NULL) {
+		return -ENODEV;
+	}
+
+	*vbuf = k_fifo_get(&strm->data->fifo_out, timeout);
+	if (*vbuf == NULL) {
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
+static int uvc_get_format(const struct device *dev, enum video_endpoint_id ep,
+			  struct video_format *fmt)
+{
+	const struct uvc_stream *strm;
+	struct uvc_data *data = dev->data;
+
+	strm = uvc_get_stream_by_ep(dev, ep);
+	if (strm == NULL) {
+		return -ENODEV;
+	}
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	if (!atomic_test_bit(&data->state, UVC_STATE_ENABLED) ||
+	    !atomic_test_bit(&strm->data->state, UVC_STATE_STREAM_READY)) {
+		return -EAGAIN;
+	}
+
+	LOG_DBG("Querying the format from %s", strm->data->video_dev->name);
+	return video_get_format(strm->data->video_dev, VIDEO_EP_OUT, fmt);
+}
+
+static int uvc_set_stream(const struct device *dev, bool enable)
+{
+	struct uvc_data *data = dev->data;
+
+	if (enable) {
+		atomic_clear_bit(&data->state, UVC_STATE_PAUSED);
+
+		STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+			if (strm->dev != dev) {
+				continue;
+			}
+			uvc_flush_queue(dev, strm);
+		}
+	} else {
+		atomic_set_bit(&data->state, UVC_STATE_PAUSED);
+	}
+
+	return 0;
+}
+
+static int uvc_get_caps(const struct device *dev, enum video_endpoint_id ep,
+			struct video_caps *caps)
+{
+	const struct uvc_stream *strm;
+
+	strm = uvc_get_stream_by_ep(dev, ep);
+	if (strm == NULL) {
+		return -ENODEV;
+	}
+
+	__ASSERT_NO_MSG(strm->data->video_dev != NULL);
+
+	return video_get_caps(strm->data->video_dev, VIDEO_EP_OUT, caps);
+}
+
+#ifdef CONFIG_POLL
+static int uvc_set_signal(const struct device *dev, enum video_endpoint_id ep,
+			  struct k_poll_signal *sig)
+{
+	const struct uvc_stream *strm;
+
+	strm = uvc_get_stream_by_ep(dev, ep);
+	if (strm == NULL) {
+		return -ENODEV;
+	}
+
+	strm->data->signal = sig;
+
+	return 0;
+}
+#endif
+
+static DEVICE_API(video, uvc_video_api) = {
+	.get_format = uvc_get_format,
+	.set_stream = uvc_set_stream,
+	.get_caps = uvc_get_caps,
+	.enqueue = uvc_enqueue,
+	.dequeue = uvc_dequeue,
+#if CONFIG_POLL
+	.set_signal = uvc_set_signal,
+#endif
+};
+
+static int uvc_preinit(const struct device *dev)
+{
+	STRUCT_SECTION_FOREACH(uvc_stream, strm) {
+		if (strm->dev != dev) {
+			continue;
+		}
+
+		strm->data->payload_header.bHeaderLength = CONFIG_USBD_VIDEO_HEADER_SIZE;
+		strm->data->format_id = 1;
+		strm->data->frame_id = 1;
+
+		k_fifo_init(&strm->data->fifo_in);
+		k_fifo_init(&strm->data->fifo_out);
+		k_mutex_init(&strm->data->mutex);
+	}
+
+	return 0;
+}
+
+#define UVC_DEFINE_DESCRIPTOR(n)						\
+static struct usbd_uvc_desc uvc_desc_##n = {					\
+	.iad = {								\
+		.bLength = sizeof(struct usb_association_descriptor),		\
+		.bDescriptorType = USB_DESC_INTERFACE_ASSOC,			\
+		.bFirstInterface = 0,						\
+		.bInterfaceCount = 1,						\
+		.bFunctionClass = USB_BCC_VIDEO,				\
+		.bFunctionSubClass = UVC_SC_VIDEO_INTERFACE_COLLECTION,		\
+		.bFunctionProtocol = 0,						\
+		.iFunction = 0,							\
+	},									\
+										\
+	.if_vc = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 0,						\
+		.bAlternateSetting = 0,						\
+		.bNumEndpoints = 0,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOCONTROL,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
+	},									\
+										\
+	.if_vc_hdr = {								\
+		.bLength = 12,							\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_HEADER,				\
+		.bcdUVC = sys_cpu_to_le16(0x0150),				\
+		.wTotalLength = sys_cpu_to_le16(12),				\
+		.dwClockFrequency = sys_cpu_to_le32(30000000),			\
+		.bInCollection = 0,						\
+		.baInterfaceNr = {0},						\
+	},									\
+};										\
+										\
+struct usb_desc_header *uvc_desc_fs_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
+	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
+	(struct usb_desc_header *)&uvc_desc_##n.if_vc,				\
+	(struct usb_desc_header *)&uvc_desc_##n.if_vc_hdr,			\
+	/* Other descriptor pointers are added at runtime */			\
+};										\
+										\
+struct usb_desc_header *uvc_desc_hs_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
+	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
+	(struct usb_desc_header *)&uvc_desc_##n.if_vc,				\
+	(struct usb_desc_header *)&uvc_desc_##n.if_vc_hdr,			\
+	/* Other descriptor pointers are added at runtime */			\
+};
+
+#define USBD_VIDEO_DT_DEVICE_DEFINE(n)						\
+	UVC_DEFINE_DESCRIPTOR(n)						\
+										\
+	USBD_DEFINE_CLASS(uvc_c_data_##n, &uvc_class_api,			\
+			  (void *)DEVICE_DT_INST_GET(n), NULL);			\
+										\
+	struct uvc_data uvc_data_##n = {					\
+		.c_data = &uvc_c_data_##n,					\
+		.desc = &uvc_desc_##n,						\
+		.fs_desc = uvc_desc_fs_##n,					\
+		.hs_desc = uvc_desc_hs_##n,					\
+		.fs_desc_idx = 3,						\
+		.hs_desc_idx = 3,						\
+	};									\
+										\
+	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL,	\
+		POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY, &uvc_video_api);
+
+DT_INST_FOREACH_STATUS_OKAY(USBD_VIDEO_DT_DEVICE_DEFINE)

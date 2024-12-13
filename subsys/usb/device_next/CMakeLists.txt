@@ -79,6 +79,16 @@ zephyr_library_sources_ifdef(
 )
 
 zephyr_library_sources_ifdef(
+	CONFIG_USBD_VIDEO_CLASS
+	class/usbd_uvc.c
+)
+
+zephyr_linker_sources_ifdef(
+  CONFIG_USBD_VIDEO_CLASS
+  SECTIONS class/usbd_uvc.ld
+)
+
+zephyr_library_sources_ifdef(
 	CONFIG_USBD_HID_SUPPORT
 	class/usbd_hid.c
 	class/usbd_hid_api.c
