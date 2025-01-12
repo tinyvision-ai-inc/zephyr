@@ -213,6 +213,20 @@ LOG_MODULE_REGISTER(usbd_uvc, CONFIG_USBD_VIDEO_LOG_LEVEL);
 /* Base GUID string present at the end of most GUID formats, preceded by the FourCC code */
 #define UVC_GUID_TAIL "\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
 
+/* GUID <base>-f3c2-b8dc-25c7-8f6adf9bea40 initializer, randomlly generated for this UVC driver */
+#define UVC_ZEPHYR_XU_GUID(base)						\
+	{base >> 24 & 0xff, base >> 16 & 0xff, base >> 8 & 0xff, base & 0xff,	\
+	 0xf3, 0xc2, 0xb8, 0xdc, 0x25, 0xc7, 0x8f, 0x6a, 0xdf, 0x9b, 0xea, 0x40}
+
+/* GUID <base>-f3c2-b8dc-25c7-8f6adf9bea40 constant variable */
+#define UVC_DEFINE_ZEPHYR_XU_GUID(base)						\
+	static const uint8_t uvc_xu_guid_##base[16] = XU_ZEPHYR_GUID(base);
+
+/* GUID <base>-f3c2-b8dc-25c7-8f6adf9bea40 reference and UVC control map entry */
+#define UVC_ZEPHYR_XU_CTRL(base, cid)						\
+	{XU_BASE_CONTROL + ((cid) - (base)), 4, 0, uvc_control_int, (cid),	\
+	 uvc_xu_guid_##base}
+
 enum uvc_class_status {
 	CLASS_INITIALIZED,
 	CLASS_ENABLED,
@@ -529,7 +543,8 @@ struct uvc_control_map {
 	uint8_t bit;
 	int (*fn)(uint8_t request, struct net_buf *buf, uint8_t size,
 		  const struct device *video_dev, unsigned int cid);
-	uint32_t param;
+	uint32_t cid;
+	uint8_t *guid;
 };
 
 struct uvc_guid_quirk {
@@ -1156,13 +1171,24 @@ static const struct uvc_control_map uvc_control_map_su[] = {
 	{0},
 };
 
-static const struct uvc_control_map uvc_control_map_xu[] = {
-	{XU_BASE_CONTROL + 0,		4, 0, uvc_control_int, VIDEO_CID_PRIVATE_BASE + 0},
-	{XU_BASE_CONTROL + 1,		4, 1, uvc_control_int, VIDEO_CID_PRIVATE_BASE + 1},
-	{XU_BASE_CONTROL + 2,		4, 2, uvc_control_int, VIDEO_CID_PRIVATE_BASE + 2},
-	{XU_BASE_CONTROL + 3,		4, 3, uvc_control_int, VIDEO_CID_PRIVATE_BASE + 3},
+#ifdef CONFIG_USBD_VIDEO_ZEPHYR_EXTENSIONS
+DEFINE_ZEPHYR_XU_GUID(VIDEO_CID_BASE);
+#endif
+
+static const struct uvc_control_map uvc_control_map_zephyr[] = {
+#ifdef CONFIG_USBD_VIDEO_ZEPHYR_EXTENSIONS
+	UVC_ZEPHYR_XU_CTRL(VIDEO_CID_BASE, VIDEO_CID_HFLIP),
+	UVC_ZEPHYR_XU_CTRL(VIDEO_CID_BASE, VIDEO_CID_VFLIP),
+#endif
 	{0},
 };
+
+static const struct uvc_control_map *uvc_control_map_xu = uvc_control_map_zephyr;
+
+void usbd_uvc_set_xu_controls(struct uvc_control_map *map)
+{
+	uvc_control_map_xu = map;
+}
 
 static int uvc_control_call(const struct device *dev, struct uvc_stream *strm,
 			    const struct usb_setup_packet *const setup, struct net_buf *buf,
@@ -1174,8 +1200,8 @@ static int uvc_control_call(const struct device *dev, struct uvc_stream *strm,
 	int ret = -ENOTSUP;
 
 	for (int i = 0; map[i].size != 0; i++) {
-		if (map[i].selector == selector) {
-			ret = map[i].fn(request, buf, map[i].size, strm->video_dev, map[i].param);
+		if (map[i].selector == selector) .cid
+			ret = map[i].fn(request, buf, map[i].size, strm->video_dev, map[i].cid);
 			break;
 		}
 	}
@@ -1474,7 +1500,7 @@ static uint32_t uvc_get_mask(const struct device *video_dev, const struct uvc_co
 	LOG_DBG("Testing all supported controls to see which are supported");
 	for (int i = 0; map[i].size != 0; i++) {
 		ok = (map[i].fn == uvc_control_fixed) ||
-		     (video_get_ctrl(video_dev, map[i].param, &value) == 0);
+		     (video_get_ctrl(video_dev, map[i].cid, &value) == 0);
 		mask |= ok << map[i].bit;
 		LOG_DBG("video device %s support for control 0x%02x: %s",
 			video_dev->name, map[i].selector, ok ? "yes" : "no");
