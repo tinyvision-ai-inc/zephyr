@@ -834,6 +834,17 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
 #define VIDEO_FOURCC_FROM_STR(str) VIDEO_FOURCC((str)[0], (str)[1], (str)[2], (str)[3])
 
 /**
+ * @brief Convert a four-character-code to a four-character-string
+ *
+ * Convert a string literal or variable into a four-character-string
+ * as defined by @ref VIDEO_FOURCC.
+ *
+ * @param fcc 32-bit integer to be converted
+ * @return Four-character-string built out of this fourcc.
+ */
+#define VIDEO_FOURCC_TO_STR(fcc) (char []){(fcc) >> 0, (fcc) >> 8, (fcc) >> 16, (fcc) >> 24, '\0'}
+
+/**
  * @name Bayer formats (R, G, B channels).
  *
  * The full color information is spread over multiple pixels.
