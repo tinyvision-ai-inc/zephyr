@@ -51,6 +51,12 @@ extern "C" {
 /** Shift in the tint of every colors, clockwise in a RGB color wheel */
 #define VIDEO_CID_HUE (VIDEO_CID_BASE + 3)
 
+/** Red chroma balance */
+#define VIDEO_CID_RED_BALANCE (VIDEO_CID_BASE + 14)
+
+/** Blue chroma balance */
+#define VIDEO_CID_BLUE_BALANCE (VIDEO_CID_BASE + 15)
+
 /** Amount of time an image sensor is exposed to light, affecting the brightness */
 #define VIDEO_CID_EXPOSURE (VIDEO_CID_BASE + 17)
 
