@@ -923,6 +923,27 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
 			   struct video_frmival_enum *match);
 
 /**
+ * @brief Prepare a video device output endpoint to make it ready to dequeue buffers from.
+ *
+ * This will perform the following Video API calls in this order:
+ *
+ * - video_set_format()
+ * - video_buffer_alloc() or video_buffer_alloc_aligned()
+ * - video_ep_enqueue()
+ * - video_stream_start()
+ *
+ * This function only supports pixel formats where the pitch is correct.
+ *
+ * @param dev The video device for which the output endpoint is initalized.
+ * @param fmt The video format to configure for this device, also affecting the allocation size
+ * @param num_buf The number of buffers to allocate and enqueue to the output endpoint.
+ * @param align The alignment for these buffers, or no alignment if set to zero.
+ * @return 0 if the device is ready to dequeue frames from the output, or an error otherwise.
+ */
+int video_prepare_output(const struct device *dev, struct video_format *fmt, int num_buf,
+			 int align);
+
+/**
  * @defgroup video_pixel_formats Video pixel formats
  * The @c | characters separate the pixels, and spaces separate the bytes.
  * The uppercase letter represents the most significant bit.

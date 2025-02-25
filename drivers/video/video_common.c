@@ -9,6 +9,9 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/video.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(video_common, CONFIG_VIDEO_LOG_LEVEL);
 
 #if defined(CONFIG_VIDEO_BUFFER_USE_SHARED_MULTI_HEAP)
 #include <zephyr/multi_heap/shared_multi_heap.h>
@@ -163,4 +166,59 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
 			match->index = fie.index - 1;
 		}
 	}
+}
+
+int video_prepare_output(const struct device *dev, struct video_format *fmt, int num_buf, int align)
+{
+	struct video_buffer *vbuf;
+	int ret;
+
+	__ASSERT_NO_MSG(dev != NULL);
+
+	if (!device_is_ready(dev)) {
+		LOG_ERR("Device '%s' is not initialized successfully", dev->name);
+		return -ENODEV;
+	}
+
+	if (fmt->pitch == 0) {
+		LOG_ERR("Formats '%s' is unknown or has variable pitch",
+			VIDEO_FOURCC_TO_STR(fmt->pixelformat));
+		return -ENOTSUP;
+	}
+
+	ret = video_set_format(dev, VIDEO_EP_OUT, fmt);
+	if (ret != 0) {
+		LOG_ERR("Could not set %s format to '%s' %ux%u",
+			dev->name, VIDEO_FOURCC_TO_STR(fmt->pixelformat), fmt->width, fmt->height);
+		return ret;
+	}
+
+	for (int i = 0; i < num_buf; i++) {
+		if (align == 0) {
+			vbuf = video_buffer_alloc(fmt->height * fmt->pitch, K_NO_WAIT);
+		} else {
+			vbuf = video_buffer_aligned_alloc(fmt->height * fmt->pitch, align,
+							  K_NO_WAIT);
+		}
+		if (vbuf == NULL) {
+			LOG_ERR("Failed to allocate a video buffer of %u bytes for %s",
+				fmt->height * fmt->pitch, dev->name);
+			return -ENOMEM;
+		}
+
+		ret = video_enqueue(dev, VIDEO_EP_OUT, vbuf);
+		if (ret != 0) {
+			LOG_ERR("Failed to enqueue a buffer of %u bytes to %s",
+				vbuf->size, dev->name);
+			return ret;
+		}
+	}
+
+	ret = video_stream_start(dev);
+	if (ret != 0) {
+		LOG_ERR("Failed to start device %s", dev->name);
+		return ret;
+	}
+
+	return 0;
 }
