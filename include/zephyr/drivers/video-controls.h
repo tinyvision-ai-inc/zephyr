@@ -57,6 +57,9 @@ extern "C" {
 /** Blue chroma balance */
 #define VIDEO_CID_BLUE_BALANCE (VIDEO_CID_BASE + 15)
 
+/** Gamma correction level */
+#define VIDEO_CID_GAMMA (VIDEO_CID_BASE + 16)
+
 /** Amount of time an image sensor is exposed to light, affecting the brightness */
 #define VIDEO_CID_EXPOSURE (VIDEO_CID_BASE + 17)
 
