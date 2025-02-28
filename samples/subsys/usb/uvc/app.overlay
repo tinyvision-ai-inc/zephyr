@@ -5,6 +5,7 @@
  */
 
 / {
+	chosen { zephyr,console = &uart0; };
 	uvc: uvc {
 		compatible = "zephyr,uvc-device";
 	};
