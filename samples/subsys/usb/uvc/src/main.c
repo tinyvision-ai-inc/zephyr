@@ -19,8 +19,6 @@ LOG_MODULE_REGISTER(uvc_sample, LOG_LEVEL_INF);
 
 const struct device *const uvc_dev = DEVICE_DT_GET(DT_NODELABEL(uvc));
 
-USBD_UVC_DEFINE_STREAM(uvc_stream, uvc_dev, "UVC Sample");
-
 int main(void)
 {
 	const struct device *video_dev;
@@ -45,7 +43,7 @@ int main(void)
 	}
 
 	/* Must be done before initializing USB */
-	uvc_set_video_dev(&uvc_stream, video_dev);
+	uvc_set_video_dev(uvc_dev, video_dev);
 
 	sample_usbd = sample_usbd_init_device(NULL);
 	if (sample_usbd == NULL) {

@@ -21,15 +21,13 @@ config USBD_VIDEO_HEADER_SIZE
 	  The default value is arbitrary, made to fit situations, preserving a
 	  64-bit alignment of the payload data for ease of debugging.
 
-config USBD_VIDEO_MAX_STREAMS
-	int "Max number of video output stream per USB Video interface"
+config USBD_VIDEO_MAX_FORMATS
+	int "Max number of video formats and video frame descriptors per UVC instance"
 	range 1 254
 	default 8
 	help
-	  Each video stream is mapped to a video endpoint on the devicetree.
-	  This limits the number of endpoints that can be declared for each
-	  UVC instance. The default value is made to be large enough to fit
-	  most situations.
+	  The video devices are queried for the format capabilities at runtime. This option
+	  configures how much storage is planned in advance to store these formats.
 
 config USBD_VIDEO_MAX_FRMIVAL
 	int "Max number of video output stream per USB Video interface"
@@ -39,26 +37,6 @@ config USBD_VIDEO_MAX_FRMIVAL
 	  Max number of Frame Interval listed on a frame descriptor. The
 	  default value is selected arbitrarily to fit most situations without
 	  requiring too much RAM.
-
-config USBD_VIDEO_MAX_DESC
-	int "Max number of descriptors generated per VideoStreaming interface"
-	default 32
-	help
-	  Sets the maximum number of Format and Frame descriptors that can be
-	  generated at runtime per VideoStreaming interface; an array size.
-	  This may only need to be increased if you encounter a warning
-	  at init time saying there are not enough descriptors available.
-	  The default value is selected arbitrarily to fit most situations
-	  without requiring too much RAM.
-
-config USBD_VIDEO_DESC_POOL_SIZE
-	int "Size of the heap memory allocated for the descriptor storage"
-	default 512
-	help
-	  Sets the storage shared between all UVC instances for storing the
-	  descriptors. The default value is enough in practice for most cases
-	  with a single stream and several formats, without too much overhead
-	  to reduce RAM footprint.
 
 module = USBD_VIDEO
 module-str = usbd uvc
