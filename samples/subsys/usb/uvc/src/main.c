@@ -43,6 +43,7 @@ int main(void)
 	}
 
 	/* Must be done before initializing USB */
+	LOG_INF("uvc_set_video_dev(%p %p)", uvc_dev, video_dev);
 	uvc_set_video_dev(uvc_dev, video_dev);
 
 	sample_usbd = sample_usbd_init_device(NULL);

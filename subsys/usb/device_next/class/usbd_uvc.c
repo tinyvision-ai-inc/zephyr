@@ -1725,6 +1725,9 @@ static int uvc_init(struct usbd_class_data *const c_data);
 static void uvc_update_desc(const struct device *dev, struct usbd_class_data *const c_data)
 {
 	struct uvc_data *data = dev->data;
+	struct usb_desc_header **desc_vs = data->desc_vs;
+	struct usb_if_descriptor *desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
+	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
 
 	LOG_DBG("Updating USB descriptors");
 
@@ -1736,10 +1739,6 @@ static void uvc_update_desc(const struct device *dev, struct usbd_class_data *co
 		LOG_DBG("UVC not initialized yet, descriptors list not available yet");
 		return;
 	}
-
-	struct usb_desc_header **desc_vs = data->desc_vs;
-	struct usb_if_descriptor *desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
-	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
 
 	desc_vs_hdr->bEndpointAddress = uvc_get_bulk_in(dev);
 	data->desc->if_vc_hdr.baInterfaceNr[0] = desc_vs_if->bInterfaceNumber;
@@ -1768,15 +1767,19 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 
 static int uvc_init(struct usbd_class_data *const c_data)
 {
+	LOG_DBG("UVC INIT");;
+
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 	uint8_t unit_id = 1;
 	int ret;
 
+
 	if (atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
 		return 0;
 	}
 
+	LOG_DBG("Initializing USB Video Class (%p)", dev);
 	LOG_DBG("Initializing USB Video Class (%s)", dev->name);
 
 	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
@@ -1792,7 +1795,6 @@ static int uvc_init(struct usbd_class_data *const c_data)
 
 	data->desc->if_vc_hdr.bLength++;
 	data->desc->if_vc_hdr.wTotalLength++;
-
 	data->desc->if_vc_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if_vc_hdr.wTotalLength);
 
 	/* Generating VideoStreaming descriptors */
