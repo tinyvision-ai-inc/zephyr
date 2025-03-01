@@ -485,6 +485,9 @@ static uint8_t uvc_get_bulk_in(const struct device *dev)
 {
 	struct uvc_data *data = dev->data;
 
+#warning TODO replace workaround by bugfix
+	return 0x83;
+
 	switch (usbd_bus_speed(usbd_class_get_ctx(data->c_data))) {
 	case USBD_SPEED_FS:
 		return data->desc_vs_ep_fs->bEndpointAddress;
@@ -1226,11 +1229,41 @@ end:
 
 /* UVC descriptor handling */
 
-static void *uvc_new_desc(const struct device *dev, size_t size, bool add_to_fs, bool add_to_hs)
+static int uvc_add_desc(const struct device *dev, void *desc, bool add_to_fs, bool add_to_hs)
 {
 	static const struct usb_desc_header nil_desc;
 	struct uvc_data *data = dev->data;
+
+	if (add_to_fs) {
+		if (data->fs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
+			goto err;
+		}
+		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)desc;
+		data->fs_desc_idx++;
+		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)&nil_desc;
+	}
+
+	if (add_to_hs) {
+		if (data->hs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
+			goto err;
+		}
+		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)desc;
+		data->hs_desc_idx++;
+		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)&nil_desc;
+	}
+
+	return 0;
+err:
+	LOG_ERR("Out of descriptor pointers.");
+	LOG_ERR("Consider raising CONFIG_USBD_VIDEO_MAX_DESC above %u",
+		CONFIG_USBD_VIDEO_MAX_DESC);
+	return -ENOMEM;
+}
+
+static void *uvc_new_desc(const struct device *dev, size_t size, bool add_to_fs, bool add_to_hs)
+{
 	void *ptr;
+	int ret;
 
 	LOG_DBG("Allocating %u bytes for a new %s descriptor (%u allocated in total)",
 		size, dev->name, uvc_desc_pos);
@@ -1245,30 +1278,12 @@ static void *uvc_new_desc(const struct device *dev, size_t size, bool add_to_fs,
 
 	memset(ptr, 0, size);
 
-	if (add_to_fs) {
-		if (data->fs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
-			goto err;
-		}
-		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)ptr;
-		data->fs_desc_idx++;
-		data->fs_desc[data->fs_desc_idx] = (struct usb_desc_header *)&nil_desc;
-	}
-
-	if (add_to_hs) {
-		if (data->hs_desc_idx + 1 >= CONFIG_USBD_VIDEO_MAX_DESC) {
-			goto err;
-		}
-		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)ptr;
-		data->hs_desc_idx++;
-		data->hs_desc[data->hs_desc_idx] = (struct usb_desc_header *)&nil_desc;
+	ret = uvc_add_desc(dev, ptr, add_to_fs, add_to_hs);
+	if (ret < 0) {
+		return NULL;
 	}
 
 	return ptr;
-err:
-	LOG_ERR("Out of descriptor pointers.");
-	LOG_ERR("Consider raising CONFIG_USBD_VIDEO_MAX_DESC above %u",
-		CONFIG_USBD_VIDEO_MAX_DESC);
-	return NULL;
 }
 
 static int uvc_add_vs_format_desc(const struct device *dev,
@@ -1492,26 +1507,6 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 	return 0;
 }
 
-static int uvc_add_vs_color_desc(const struct device *dev)
-{
-	struct uvc_data *data = dev->data;
-	struct uvc_color_descriptor *desc;
-
-	desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-	if (desc == NULL) {
-		return -ENOMEM;
-	}
-	desc->bLength = sizeof(*desc);
-	desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-	desc->bDescriptorSubtype = UVC_VS_COLORFORMAT;
-	desc->bColorPrimaries = 1; /* BT.709, sRGB (default) */
-	desc->bTransferCharacteristics = 1; /* BT.709 (default) */
-	desc->bMatrixCoefficients = 4; /* SMPTE 170M, BT.601 (default) */
-	data->desc->if1_0_hdr.wTotalLength += desc->bLength;
-
-	return 0;
-}
-
 static int uvc_add_vs_desc(const struct device *dev)
 {
 	struct uvc_data *data = dev->data;
@@ -1535,7 +1530,7 @@ static int uvc_add_vs_desc(const struct device *dev)
 		/* Convert the flat capability structure into an UVC nested structure */
 		if (prev_pixfmt != cap->pixelformat) {
 			if (prev_pixfmt != 0) {
-				uvc_add_vs_color_desc(dev);
+				uvc_add_desc(dev, &data->desc->if1_0_color, true, true);
 			}
 
 			ret = uvc_add_vs_format_desc(dev, &format_desc, cap);
@@ -1562,41 +1557,9 @@ static int uvc_add_vs_desc(const struct device *dev)
 	}
 
 	/* After all the formats were added */
-	uvc_add_vs_color_desc(dev);
-
-	{
-		struct usb_ep_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, false);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_ENDPOINT;
-		desc->bEndpointAddress = 0x81;
-		desc->bmAttributes = USB_EP_TYPE_BULK;
-		desc->wMaxPacketSize = sys_cpu_to_le16(64);
-		desc->bInterval = 0;
-		data->desc->if1_0_hdr.wTotalLength += desc->bLength;
-		data->desc_vs_ep_fs = desc;
-	}
-
-	{
-		struct usb_ep_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), false, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_ENDPOINT;
-		desc->bEndpointAddress = 0x81;
-		desc->bmAttributes = USB_EP_TYPE_BULK;
-		desc->wMaxPacketSize = sys_cpu_to_le16(512);
-		desc->bInterval = 0;
-		data->desc->if1_0_hdr.wTotalLength += desc->bLength;
-		data->desc_vs_ep_hs = desc;
-	}
+	uvc_add_desc(dev, &data->desc->if1_0_color, true, true);
+	uvc_add_desc(dev, &data->desc->if1_1_ep_fs, true, false);
+	uvc_add_desc(dev, &data->desc->if1_1_ep_hs, false, true);
 
 	data->desc->if1_0_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if1_0_hdr.wTotalLength);
 
@@ -2161,7 +2124,8 @@ static struct uvc_desc uvc_desc_##n = {						\
 		.bDescriptorSubtype = UVC_VS_INPUT_HEADER,			\
 		.bNumFormats = 0,						\
 		.wTotalLength = sys_cpu_to_le16(				\
-			sizeof(struct uvc_stream_header_descriptor)),		\
+			sizeof(struct uvc_stream_header_descriptor) +		\
+			sizeof(struct usb_ep_descriptor)),			\
 		.bEndpointAddress = 0x81,					\
 		.bmInfo = 0,							\
 		.bTerminalLink = UVC_UNIT_ID_OT,				\
@@ -2222,7 +2186,8 @@ struct usb_desc_header *uvc_fs_desc_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
 	(struct usb_desc_header *) &uvc_desc_##n.if0_ot,			\
 	(struct usb_desc_header *) &uvc_desc_##n.if1_0,				\
 	(struct usb_desc_header *) &uvc_desc_##n.if1_0_hdr,			\
-	/* More pointers are generated at runtime */				\
+	/* More pointers are generated here at runtime */			\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_1_ep_fs,			\
 	(struct usb_desc_header *) NULL,					\
 };										\
 										\
@@ -2237,7 +2202,8 @@ struct usb_desc_header *uvc_hs_desc_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
 	(struct usb_desc_header *) &uvc_desc_##n.if0_ot,			\
 	(struct usb_desc_header *) &uvc_desc_##n.if1_0,				\
 	(struct usb_desc_header *) &uvc_desc_##n.if1_0_hdr,			\
-	/* More pointers are generated at runtime */				\
+	/* More pointers are generated here at runtime */			\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_1_ep_hs,			\
 	(struct usb_desc_header *) NULL,					\
 };
 
