@@ -5085,7 +5085,7 @@ struct k_pipe {
  * @retval 0 on success
  * @retval -EAGAIN nothing to cleanup
  */
-__deprecated int k_pipe_cleanup(struct k_pipe *pipe);
+int k_pipe_cleanup(struct k_pipe *pipe);
 
 /**
  * @deprecated Dynamic allocation of pipe buffers will be removed in the new k_pipe API.
@@ -5103,7 +5103,7 @@ __deprecated int k_pipe_cleanup(struct k_pipe *pipe);
  * @retval 0 on success
  * @retval -ENOMEM if memory couldn't be allocated
  */
-__deprecated __syscall int k_pipe_alloc_init(struct k_pipe *pipe, size_t size);
+__syscall int k_pipe_alloc_init(struct k_pipe *pipe, size_t size);
 
 /**
  * @deprecated k_pipe_put() is replaced by k_pipe_write(...) in the new k_pipe API.
@@ -5124,7 +5124,7 @@ __deprecated __syscall int k_pipe_alloc_init(struct k_pipe *pipe, size_t size);
  * @retval -EAGAIN Waiting period timed out; between zero and @a min_xfer
  *                 minus one data bytes were written.
  */
-__deprecated __syscall int k_pipe_put(struct k_pipe *pipe, const void *data,
+__syscall int k_pipe_put(struct k_pipe *pipe, const void *data,
 			 size_t bytes_to_write, size_t *bytes_written,
 			 size_t min_xfer, k_timeout_t timeout);
 
@@ -5148,7 +5148,7 @@ __deprecated __syscall int k_pipe_put(struct k_pipe *pipe, const void *data,
  * @retval -EAGAIN Waiting period timed out; between zero and @a min_xfer
  *                 minus one data bytes were read.
  */
-__deprecated  __syscall int k_pipe_get(struct k_pipe *pipe, void *data,
+__syscall int k_pipe_get(struct k_pipe *pipe, void *data,
 			 size_t bytes_to_read, size_t *bytes_read,
 			 size_t min_xfer, k_timeout_t timeout);
 
@@ -5161,7 +5161,7 @@ __deprecated  __syscall int k_pipe_get(struct k_pipe *pipe, void *data,
  * @retval a number n such that 0 <= n <= @ref k_pipe.size; the
  *         result is zero for unbuffered pipes.
  */
-__deprecated  __syscall size_t k_pipe_read_avail(struct k_pipe *pipe);
+__syscall size_t k_pipe_read_avail(struct k_pipe *pipe);
 
 /**
  * @deprecated k_pipe_write_avail() will be removed in the new k_pipe API.
@@ -5172,7 +5172,7 @@ __deprecated  __syscall size_t k_pipe_read_avail(struct k_pipe *pipe);
  * @retval a number n such that 0 <= n <= @ref k_pipe.size; the
  *         result is zero for unbuffered pipes.
  */
-__deprecated __syscall size_t k_pipe_write_avail(struct k_pipe *pipe);
+__syscall size_t k_pipe_write_avail(struct k_pipe *pipe);
 
 /**
  * @deprecated k_pipe_flush() will be removed in the new k_pipe API.
@@ -5185,7 +5185,7 @@ __deprecated __syscall size_t k_pipe_write_avail(struct k_pipe *pipe);
  *
  * @param pipe Address of the pipe.
  */
-__deprecated __syscall void k_pipe_flush(struct k_pipe *pipe);
+__syscall void k_pipe_flush(struct k_pipe *pipe);
 
 /**
  * @deprecated k_pipe_buffer_flush will be removed in the new k_pipe API.
@@ -5199,7 +5199,7 @@ __deprecated __syscall void k_pipe_flush(struct k_pipe *pipe);
  *
  * @param pipe Address of the pipe.
  */
-__deprecated __syscall void k_pipe_buffer_flush(struct k_pipe *pipe);
+__syscall void k_pipe_buffer_flush(struct k_pipe *pipe);
 
 #else /* CONFIG_PIPES */
 
