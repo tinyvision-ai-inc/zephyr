@@ -1484,118 +1484,20 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 	data->desc->if0_hdr.bInCollection++;
 
 	mask = uvc_get_mask(data->video_dev, uvc_control_map_ct);
-	{
-		struct uvc_camera_terminal_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-		desc->bDescriptorSubtype = UVC_VC_INPUT_TERMINAL;
-		desc->bTerminalID = *unit_id;
-		desc->wTerminalType = sys_cpu_to_le16(UVC_ITT_CAMERA);
-		desc->bAssocTerminal = 0;
-		desc->iTerminal = 0;
-		desc->wObjectiveFocalLengthMin = sys_cpu_to_le16(0);
-		desc->wObjectiveFocalLengthMax = sys_cpu_to_le16(0);
-		desc->wOcularFocalLength = sys_cpu_to_le16(0);
-		desc->bControlSize = 3;
-		desc->bmControls[0] = mask >> 0;
-		desc->bmControls[1] = mask >> 8;
-		desc->bmControls[2] = mask >> 16;
-		data->desc->if0_hdr.wTotalLength += desc->bLength;
-		(*unit_id)++;
-	}
-
-	mask = uvc_get_mask(data->video_dev, uvc_control_map_su);
-	if (mask != 0) {
-		struct uvc_selector_unit_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-		desc->bDescriptorSubtype = UVC_VC_SELECTOR_UNIT;
-		desc->bUnitID = *unit_id;
-		desc->bNrInPins = 1;
-		desc->baSourceID[0] = *unit_id - 1;
-		desc->iSelector = 0;
-		data->desc->if0_hdr.wTotalLength += desc->bLength;
-		(*unit_id)++;
-	}
+	data->desc->if0_ct.bmControls[0] = mask >> 0;
+	data->desc->if0_ct.bmControls[1] = mask >> 8;
+	data->desc->if0_ct.bmControls[2] = mask >> 16;
 
 	mask = uvc_get_mask(data->video_dev, uvc_control_map_pu);
-	if (mask != 0) {
-		struct uvc_processing_unit_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-		desc->bDescriptorSubtype = UVC_VC_PROCESSING_UNIT;
-		desc->bUnitID = *unit_id;
-		desc->bSourceID = *unit_id - 1;
-		desc->wMaxMultiplier = sys_cpu_to_le16(0);
-		desc->bControlSize = 3;
-		desc->bmControls[0] = mask >> 0;
-		desc->bmControls[1] = mask >> 8;
-		desc->bmControls[2] = mask >> 16;
-		desc->iProcessing = 0;
-		desc->bmVideoStandards = 0;
-		data->desc->if0_hdr.wTotalLength += desc->bLength;
-		(*unit_id)++;
-	}
+	data->desc->if0_pu.bmControls[0] = mask >> 0;
+	data->desc->if0_pu.bmControls[1] = mask >> 8;
+	data->desc->if0_pu.bmControls[2] = mask >> 16;
 
 	mask = uvc_get_mask(data->video_dev, uvc_control_map_xu);
-	if (mask != 0) {
-		struct uvc_extension_unit_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-		desc->bDescriptorSubtype = UVC_VC_EXTENSION_UNIT;
-		desc->bUnitID = *unit_id;
-		memset(desc->guidExtensionCode, 0, sizeof(desc->guidExtensionCode));
-		desc->bNumControls = 0;
-		desc->bNrInPins = 1;
-		desc->baSourceID[0] = *unit_id - 1;
-		desc->bControlSize = 4;
-		desc->bmControls[0] = mask >> 0;
-		desc->bmControls[1] = mask >> 8;
-		desc->bmControls[2] = mask >> 16;
-		desc->bmControls[3] = mask >> 24;
-		desc->iExtension = 0;
-		data->desc->if0_hdr.wTotalLength += desc->bLength;
-		(*unit_id)++;
-	}
-
-	{
-		struct uvc_output_terminal_descriptor *desc;
-
-		desc = uvc_new_desc(dev, sizeof(*desc), true, true);
-		if (desc == NULL) {
-			return -ENOMEM;
-		}
-		desc->bLength = sizeof(*desc);
-		desc->bDescriptorType = USB_DESC_CS_INTERFACE;
-		desc->bDescriptorSubtype = UVC_VC_OUTPUT_TERMINAL;
-		desc->bTerminalID = *unit_id;
-		desc->wTerminalType = sys_cpu_to_le16(UVC_TT_STREAMING);
-		desc->bAssocTerminal = 0;
-		desc->bSourceID = *unit_id - 1;
-		desc->iTerminal = 0;
-		data->desc->if0_hdr.wTotalLength += desc->bLength;
-		(*unit_id)++;
-	}
+	data->desc->if0_xu.bmControls[0] = mask >> 0;
+	data->desc->if0_xu.bmControls[1] = mask >> 8;
+	data->desc->if0_xu.bmControls[2] = mask >> 16;
+	data->desc->if0_xu.bmControls[3] = mask >> 24;
 
 	return 0;
 }
@@ -1668,7 +1570,7 @@ static int uvc_add_vs_desc(const struct device *dev)
 		desc->wTotalLength = 0;
 		desc->bEndpointAddress = 0x81;
 		desc->bmInfo = 0;
-		desc->bTerminalLink = uvc_get_terminal_link(dev);
+		desc->bTerminalLink = UVC_UNIT_ID_OT;
 		desc->bStillCaptureMethod = 0;
 		desc->bTriggerSupport = 0;
 		desc->bTriggerUsage = 0;
@@ -2297,7 +2199,7 @@ static struct uvc_desc uvc_desc_##n = {						\
 		.bDescriptorSubtype = UVC_VC_OUTPUT_TERMINAL,			\
 		.bTerminalID = UVC_UNIT_ID_OT,					\
 		.wTerminalType = sys_cpu_to_le16(UVC_TT_STREAMING),		\
-		.bAssocTerminal = 0,						\
+		.bAssocTerminal = UVC_UNIT_ID_CT,				\
 		.bSourceID = UVC_UNIT_ID_XU,					\
 		.iTerminal = 0,							\
 	},									\
@@ -2411,8 +2313,8 @@ struct usb_desc_header *uvc_hs_desc_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
 		.desc = &uvc_desc_##n,						\
 		.fs_desc = uvc_fs_desc_##n,					\
 		.hs_desc = uvc_hs_desc_##n,					\
-		.fs_desc_idx = 3,						\
-		.hs_desc_idx = 3,						\
+		.fs_desc_idx = 9,						\
+		.hs_desc_idx = 9,						\
 	};									\
 										\
 	DEVICE_DT_INST_DEFINE(n, uvc_preinit, NULL, &uvc_data_##n, NULL,	\
