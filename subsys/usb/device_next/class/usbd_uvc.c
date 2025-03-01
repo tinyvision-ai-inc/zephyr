@@ -53,13 +53,51 @@ enum uvc_idx_vs {
 	UVC_IDX_VS_FMT,
 };
 
+enum uvc_unit_id {
+	UVC_UNIT_ID_CT = 1,
+	UVC_UNIT_ID_SU,
+	UVC_UNIT_ID_PU,
+	UVC_UNIT_ID_XU,
+	UVC_UNIT_ID_OT,
+};
+
 #define UVC_VBUF_DONE 1
+
+/* Any VideoStreaming interface format or frame descriptor type */
+union uvc_fmt_desc {
+	struct usb_desc_header hdr;
+	struct uvc_format_descriptor fmt;
+	struct uvc_format_uncomp_descriptor fmt_uncomp;
+	struct uvc_format_mjpeg_descriptor fmt_mjpeg;
+	struct uvc_frame_descriptor frm;
+	struct uvc_frame_continuous_descriptor frm_cont;
+	struct uvc_frame_discrete_descriptor frm_disc;
+};
+
+/* List of all descriptors known at compile-time. */
+struct uvc_desc {
+	struct usb_association_descriptor iad;
+	struct usb_if_descriptor if0;
+	struct uvc_control_header_descriptor if0_hdr;
+	struct uvc_camera_terminal_descriptor if0_ct;
+	struct uvc_selector_unit_descriptor if0_su;
+	struct uvc_processing_unit_descriptor if0_pu;
+	struct uvc_extension_unit_descriptor if0_xu;
+	struct uvc_output_terminal_descriptor if0_ot;
+	struct usb_if_descriptor if1_0;
+	struct uvc_stream_header_descriptor if1_0_hdr;
+	union uvc_fmt_desc if1_0_fmts[1 /* CONFIG_USBD_VIDEO_MAX_FORMATS */];
+	struct uvc_color_descriptor if1_0_color;
+	struct usb_if_descriptor if1_1;
+	struct usb_ep_descriptor if1_1_ep_fs;
+	struct usb_ep_descriptor if1_1_ep_hs;
+};
 
 /* Global information */
 struct uvc_data {
 	atomic_t state;
 	struct usbd_class_data *c_data;
-	struct usbd_uvc_desc *desc;
+	struct uvc_desc *desc;
 	struct usb_desc_header **fs_desc;
 	struct usb_desc_header **hs_desc;
 	size_t fs_desc_idx;
@@ -1029,7 +1067,7 @@ static int uvc_get_control_op(const struct device *dev, const struct usb_setup_p
 
 	/* VideoControl operation */
 
-	if (ifnum != data->desc->if_vc.bInterfaceNumber) {
+	if (ifnum != data->desc->if0.bInterfaceNumber) {
 		LOG_WRN("Interface %u not found", ifnum);
 		data->err = UVC_ERR_INVALID_UNIT;
 		return UVC_OP_RETURN_ERROR;
@@ -1443,7 +1481,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 	__ASSERT_NO_MSG(data->video_dev != NULL);
 
 	data->desc_vc = &data->fs_desc[data->fs_desc_idx];
-	data->desc->if_vc_hdr.bInCollection++;
+	data->desc->if0_hdr.bInCollection++;
 
 	mask = uvc_get_mask(data->video_dev, uvc_control_map_ct);
 	{
@@ -1467,7 +1505,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 		desc->bmControls[0] = mask >> 0;
 		desc->bmControls[1] = mask >> 8;
 		desc->bmControls[2] = mask >> 16;
-		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		data->desc->if0_hdr.wTotalLength += desc->bLength;
 		(*unit_id)++;
 	}
 
@@ -1486,7 +1524,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 		desc->bNrInPins = 1;
 		desc->baSourceID[0] = *unit_id - 1;
 		desc->iSelector = 0;
-		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		data->desc->if0_hdr.wTotalLength += desc->bLength;
 		(*unit_id)++;
 	}
 
@@ -1510,7 +1548,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 		desc->bmControls[2] = mask >> 16;
 		desc->iProcessing = 0;
 		desc->bmVideoStandards = 0;
-		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		data->desc->if0_hdr.wTotalLength += desc->bLength;
 		(*unit_id)++;
 	}
 
@@ -1536,7 +1574,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 		desc->bmControls[2] = mask >> 16;
 		desc->bmControls[3] = mask >> 24;
 		desc->iExtension = 0;
-		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		data->desc->if0_hdr.wTotalLength += desc->bLength;
 		(*unit_id)++;
 	}
 
@@ -1555,7 +1593,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 		desc->bAssocTerminal = 0;
 		desc->bSourceID = *unit_id - 1;
 		desc->iTerminal = 0;
-		data->desc->if_vc_hdr.wTotalLength += desc->bLength;
+		data->desc->if0_hdr.wTotalLength += desc->bLength;
 		(*unit_id)++;
 	}
 
@@ -1735,7 +1773,7 @@ static void uvc_update_desc(const struct device *dev, struct usbd_class_data *co
 	desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
 	desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
 
-	data->desc->iad.bFirstInterface = data->desc->if_vc.bInterfaceNumber;
+	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
 
 	if (!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
 		LOG_DBG("UVC not initialized yet, descriptors list not available yet");
@@ -1743,7 +1781,7 @@ static void uvc_update_desc(const struct device *dev, struct usbd_class_data *co
 	}
 
 	desc_vs_hdr->bEndpointAddress = uvc_get_bulk_in(dev);
-	data->desc->if_vc_hdr.baInterfaceNr[0] = desc_vs_if->bInterfaceNumber;
+	data->desc->if0_hdr.baInterfaceNr[0] = desc_vs_if->bInterfaceNumber;
 }
 
 static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
@@ -1782,16 +1820,16 @@ static int uvc_init(struct usbd_class_data *const c_data)
 
 	/* Generating VideoControl descriptors */
 
-	data->desc->if_vc_hdr.bLength = 12;
+	data->desc->if0_hdr.bLength = 12;
 
 	ret = uvc_add_vc_desc(dev, &unit_id);
 	if (ret != 0) {
 		return ret;
 	}
 
-	data->desc->if_vc_hdr.bLength++;
-	data->desc->if_vc_hdr.wTotalLength++;
-	data->desc->if_vc_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if_vc_hdr.wTotalLength);
+	data->desc->if0_hdr.bLength++;
+	data->desc->if0_hdr.wTotalLength++;
+	data->desc->if0_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if0_hdr.wTotalLength);
 
 	/* Generating VideoStreaming descriptors */
 
@@ -2161,19 +2199,19 @@ static int uvc_preinit(const struct device *dev)
 }
 
 #define UVC_DEFINE_DESCRIPTOR(n)						\
-static struct usbd_uvc_desc uvc_desc_##n = {					\
+static struct uvc_desc uvc_desc_##n = {						\
 	.iad = {								\
 		.bLength = sizeof(struct usb_association_descriptor),		\
 		.bDescriptorType = USB_DESC_INTERFACE_ASSOC,			\
 		.bFirstInterface = 0,						\
-		.bInterfaceCount = 1,						\
+		.bInterfaceCount = 2,						\
 		.bFunctionClass = USB_BCC_VIDEO,				\
 		.bFunctionSubClass = UVC_SC_VIDEO_INTERFACE_COLLECTION,		\
 		.bFunctionProtocol = 0,						\
 		.iFunction = 0,							\
 	},									\
 										\
-	.if_vc = {								\
+	.if0 = {								\
 		.bLength = sizeof(struct usb_if_descriptor),			\
 		.bDescriptorType = USB_DESC_INTERFACE,				\
 		.bInterfaceNumber = 0,						\
@@ -2185,30 +2223,181 @@ static struct usbd_uvc_desc uvc_desc_##n = {					\
 		.iInterface = 0,						\
 	},									\
 										\
-	.if_vc_hdr = {								\
-		.bLength = 12,							\
+	.if0_hdr = {								\
+		.bLength = sizeof(struct uvc_control_header_descriptor),	\
 		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
 		.bDescriptorSubtype = UVC_VC_HEADER,				\
 		.bcdUVC = sys_cpu_to_le16(0x0150),				\
-		.wTotalLength = sys_cpu_to_le16(12),				\
+		.wTotalLength = sys_cpu_to_le16(				\
+			sizeof(struct uvc_control_header_descriptor) +		\
+			sizeof(struct uvc_camera_terminal_descriptor) +		\
+			sizeof(struct uvc_selector_unit_descriptor) +		\
+			sizeof(struct uvc_processing_unit_descriptor) +		\
+			sizeof(struct uvc_output_terminal_descriptor)),		\
 		.dwClockFrequency = sys_cpu_to_le32(30000000),			\
-		.bInCollection = 0,						\
+		.bInCollection = 1,						\
 		.baInterfaceNr = {0},						\
+	},									\
+										\
+	.if0_ct = {								\
+		.bLength = sizeof(struct uvc_camera_terminal_descriptor),	\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_INPUT_TERMINAL,			\
+		.bTerminalID = UVC_UNIT_ID_CT,					\
+		.wTerminalType = sys_cpu_to_le16(UVC_ITT_CAMERA),		\
+		.bAssocTerminal = 0,						\
+		.iTerminal = 0,							\
+		.wObjectiveFocalLengthMin = sys_cpu_to_le16(0),			\
+		.wObjectiveFocalLengthMax = sys_cpu_to_le16(0),			\
+		.wOcularFocalLength = sys_cpu_to_le16(0),			\
+		.bControlSize = 3,						\
+		.bmControls = {0},						\
+	},									\
+										\
+	.if0_su = {								\
+		.bLength = sizeof(struct uvc_selector_unit_descriptor),		\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_SELECTOR_UNIT,			\
+		.bUnitID = UVC_UNIT_ID_SU,					\
+		.bNrInPins = 1,							\
+		.baSourceID = {UVC_UNIT_ID_CT},					\
+		.iSelector = 0,							\
+	},									\
+										\
+	.if0_pu = {								\
+		.bLength = sizeof(struct uvc_processing_unit_descriptor),	\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_PROCESSING_UNIT,			\
+		.bUnitID = UVC_UNIT_ID_PU,					\
+		.bSourceID = UVC_UNIT_ID_SU,					\
+		.wMaxMultiplier = sys_cpu_to_le16(0),				\
+		.bControlSize = 3,						\
+		.bmControls = {0},						\
+		.iProcessing = 0,						\
+		.bmVideoStandards = 0,						\
+	},									\
+										\
+	.if0_xu = {								\
+		.bLength = sizeof(struct uvc_extension_unit_descriptor),	\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_EXTENSION_UNIT,			\
+		.bUnitID = UVC_UNIT_ID_XU,					\
+		.guidExtensionCode = {0},					\
+		.bNumControls = 0,						\
+		.bNrInPins = 1,							\
+		.baSourceID = {UVC_UNIT_ID_PU},					\
+		.bControlSize = 4,						\
+		.bmControls = {0},						\
+		.iExtension = 0,						\
+	},									\
+										\
+	.if0_ot = {								\
+		.bLength = sizeof(struct uvc_output_terminal_descriptor),	\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VC_OUTPUT_TERMINAL,			\
+		.bTerminalID = UVC_UNIT_ID_OT,					\
+		.wTerminalType = sys_cpu_to_le16(UVC_TT_STREAMING),		\
+		.bAssocTerminal = 0,						\
+		.bSourceID = UVC_UNIT_ID_XU,					\
+		.iTerminal = 0,							\
+	},									\
+										\
+	.if1_0 = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 0,						\
+		.bAlternateSetting = 0,						\
+		.bNumEndpoints = 0,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
+	},									\
+										\
+	.if1_0_hdr = {								\
+		.bLength = sizeof(struct uvc_stream_header_descriptor),		\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VS_INPUT_HEADER,			\
+		.bNumFormats = 0,						\
+		.wTotalLength = sys_cpu_to_le16(				\
+			sizeof(struct uvc_stream_header_descriptor)),		\
+		.bEndpointAddress = 0x81,					\
+		.bmInfo = 0,							\
+		.bTerminalLink = UVC_UNIT_ID_OT,				\
+		.bStillCaptureMethod = 0,					\
+		.bTriggerSupport = 0,						\
+		.bTriggerUsage = 0,						\
+		.bControlSize = 0,						\
+	},									\
+										\
+	.if1_0_color = {							\
+		.bLength = sizeof(struct uvc_color_descriptor),			\
+		.bDescriptorType = USB_DESC_CS_INTERFACE,			\
+		.bDescriptorSubtype = UVC_VS_COLORFORMAT,			\
+		.bColorPrimaries = UVC_COLOR_BT709,				\
+		.bTransferCharacteristics = UVC_COLOR_BT709,			\
+		.bMatrixCoefficients = UVC_COLOR_BT601,				\
+	},									\
+										\
+	.if1_1 = {								\
+		.bLength = sizeof(struct usb_if_descriptor),			\
+		.bDescriptorType = USB_DESC_INTERFACE,				\
+		.bInterfaceNumber = 0,						\
+		.bAlternateSetting = 1,						\
+		.bNumEndpoints = 1,						\
+		.bInterfaceClass = USB_BCC_VIDEO,				\
+		.bInterfaceSubClass = UVC_SC_VIDEOSTREAMING,			\
+		.bInterfaceProtocol = 0,					\
+		.iInterface = 0,						\
+	},									\
+										\
+	.if1_1_ep_fs = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x81,					\
+		.bmAttributes = USB_EP_TYPE_BULK,				\
+		.wMaxPacketSize = sys_cpu_to_le16(64),				\
+		.bInterval = 0,							\
+	},									\
+										\
+	.if1_1_ep_hs = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x81,					\
+		.bmAttributes = USB_EP_TYPE_BULK,				\
+		.wMaxPacketSize = sys_cpu_to_le16(512),				\
+		.bInterval = 0,							\
 	},									\
 };										\
 										\
-struct usb_desc_header *uvc_desc_fs_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
-	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
-	(struct usb_desc_header *)&uvc_desc_##n.if_vc,				\
-	(struct usb_desc_header *)&uvc_desc_##n.if_vc_hdr,			\
-	/* Other descriptor pointers are added at runtime */			\
+struct usb_desc_header *uvc_fs_desc_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
+	(struct usb_desc_header *) &uvc_desc_##n.iad,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if0,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_hdr,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_ct,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_su,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_pu,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_xu,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_ot,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_0,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_0_hdr,			\
+	/* More pointers are generated at runtime */				\
+	(struct usb_desc_header *) NULL,					\
 };										\
 										\
-struct usb_desc_header *uvc_desc_hs_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
-	(struct usb_desc_header *)&uvc_desc_##n.iad,				\
-	(struct usb_desc_header *)&uvc_desc_##n.if_vc,				\
-	(struct usb_desc_header *)&uvc_desc_##n.if_vc_hdr,			\
-	/* Other descriptor pointers are added at runtime */			\
+struct usb_desc_header *uvc_hs_desc_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
+	(struct usb_desc_header *) &uvc_desc_##n.iad,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if0,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_hdr,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_ct,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_su,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_pu,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_xu,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if0_ot,			\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_0,				\
+	(struct usb_desc_header *) &uvc_desc_##n.if1_0_hdr,			\
+	/* More pointers are generated at runtime */				\
+	(struct usb_desc_header *) NULL,					\
 };
 
 #define USBD_VIDEO_DT_DEVICE_DEFINE(n)						\
@@ -2220,8 +2409,8 @@ struct usb_desc_header *uvc_desc_hs_##n[CONFIG_USBD_VIDEO_MAX_DESC] = {		\
 	struct uvc_data uvc_data_##n = {					\
 		.c_data = &uvc_c_data_##n,					\
 		.desc = &uvc_desc_##n,						\
-		.fs_desc = uvc_desc_fs_##n,					\
-		.hs_desc = uvc_desc_hs_##n,					\
+		.fs_desc = uvc_fs_desc_##n,					\
+		.hs_desc = uvc_hs_desc_##n,					\
 		.fs_desc_idx = 3,						\
 		.hs_desc_idx = 3,						\
 	};									\
