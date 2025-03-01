@@ -108,9 +108,6 @@ struct uvc_data {
 	struct k_fifo fifo_in;
 	/* Output buffers from which dequeued buffers are picked */
 	struct k_fifo fifo_out;
-	/* Pointer to the endpoint descriptor of this stream */
-	struct usb_ep_descriptor *desc_vs_ep_fs;
-	struct usb_ep_descriptor *desc_vs_ep_hs;
 	/* Default video probe stored at boot time and sent back to the host when requested. */
 	struct uvc_probe default_probe;
 	/* Video payload header content sent before every frame, updated between every frame */
@@ -257,47 +254,6 @@ static inline bool uvc_is_vc_unit_desc(struct usb_desc_header *desc_in)
 		desc->bDescriptorSubtype == UVC_VC_EXTENSION_UNIT ||
 		desc->bDescriptorSubtype == UVC_VC_PROCESSING_UNIT);
 	/* UVC_VC_OUTPUT_TERMINAL is used as a separator between the streams: return false. */
-}
-
-static inline uint8_t uvc_get_terminal_link(const struct device *dev)
-{
-	struct uvc_data *data = dev->data;
-	struct uvc_unit_descriptor **list = (void *)&data->fs_desc[UVC_IDX_VC_UNIT];
-
-	/* Seek until the last descriptor of all the units: the Output Terminal */
-	while (uvc_is_vc_unit_desc((struct usb_desc_header *)*list)) {
-		list++;
-	}
-
-	return (*list)->bUnitID;
-}
-
-static inline struct usb_desc_header **uvc_get_desc_by_type(struct usb_desc_header **list,
-							    uint8_t type)
-{
-	for (int i = 0; list[i]->bLength != 0; i++) {
-		struct uvc_if_descriptor *desc = (void *)list[i];
-
-		if (desc->bDescriptorType == type) {
-			return &list[i];
-		}
-	}
-
-	return NULL;
-}
-
-static inline struct usb_desc_header **uvc_get_desc_by_subtype(struct usb_desc_header **list,
-							       uint8_t type, uint8_t subtype)
-{
-	while ((list = uvc_get_desc_by_type(list, type)) != NULL) {
-		struct uvc_if_descriptor *desc = (void *)list[0];
-
-		if (desc->bDescriptorSubtype == subtype) {
-			return &list[0];
-		}
-	}
-
-	return NULL;
 }
 
 /* UVC control handling */
@@ -485,14 +441,11 @@ static uint8_t uvc_get_bulk_in(const struct device *dev)
 {
 	struct uvc_data *data = dev->data;
 
-#warning TODO replace workaround by bugfix
-	return 0x83;
-
 	switch (usbd_bus_speed(usbd_class_get_ctx(data->c_data))) {
 	case USBD_SPEED_FS:
-		return data->desc_vs_ep_fs->bEndpointAddress;
+		return data->desc->if1_1_ep_fs.bEndpointAddress;
 	case USBD_SPEED_HS:
-		return data->desc_vs_ep_hs->bEndpointAddress;
+		return data->desc->if1_1_ep_hs.bEndpointAddress;
 	default:
 		CODE_UNREACHABLE;
 	}
@@ -1566,43 +1519,20 @@ static int uvc_add_vs_desc(const struct device *dev)
 	return 0;
 }
 
-static int uvc_init(struct usbd_class_data *const c_data);
-
-static void uvc_update_desc(const struct device *dev, struct usbd_class_data *const c_data)
-{
-	struct uvc_data *data = dev->data;
-	struct usb_desc_header **desc_vs;
-
-	uvc_init(c_data);
-
-	desc_vs = &data->fs_desc[UVC_IDX_VS_FMT];
-
-	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
-
-	if (!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
-		LOG_DBG("UVC not initialized yet, descriptors list not available yet");
-		return;
-	}
-
-	data->desc->if1_0_hdr.bEndpointAddress = uvc_get_bulk_in(dev);
-	data->desc->if0_hdr.baInterfaceNr[0] = data->desc->if1_0.bInterfaceNumber;
-}
-
 static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
 {
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 
-	/* The descriptor pointer list is generated out of the video runtime API,
-	 * it must be done before they are scanned by the USB device stack
-	 */
-
-	uvc_update_desc(dev, c_data);
+	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
+	data->desc->if0_hdr.baInterfaceNr[0] = data->desc->if1_0.bInterfaceNumber;
 
 	switch (speed) {
 	case USBD_SPEED_FS:
+		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_fs.bEndpointAddress;
 		return (void *)data->fs_desc;
 	case USBD_SPEED_HS:
+		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_hs.bEndpointAddress;
 		return (void *)data->hs_desc;
 	default:
 		CODE_UNREACHABLE;
@@ -1615,10 +1545,6 @@ static int uvc_init(struct usbd_class_data *const c_data)
 	struct uvc_data *data = dev->data;
 	uint8_t unit_id = 1;
 	int ret;
-
-	if (atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
-		return 0;
-	}
 
 	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
 
@@ -1665,7 +1591,7 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 
 	net_buf_unref(buf);
 
-	if (bi.udc.ep == uvc_get_bulk_in(bi.stream)) {
+	if (bi.udc.ep == uvc_get_bulk_in(dev)) {
 		LOG_DBG("Request completed for USB buffer %p, video buffer %p", buf, bi.vbuf);
 		if (bi.vbuf != NULL) {
 			k_fifo_put(&data->fifo_out, bi.vbuf);
@@ -1866,10 +1792,10 @@ static void uvc_enable(struct usbd_class_data *const c_data)
 
 	__ASSERT_NO_MSG(atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
 
+	atomic_set_bit(&data->state, UVC_STATE_ENABLED);
+
 	/* Catch-up with buffers that might have been delayed */
 	uvc_flush_queue(dev);
-
-	atomic_set_bit(&data->state, UVC_STATE_ENABLED);
 }
 
 static void uvc_disable(struct usbd_class_data *const c_data)
