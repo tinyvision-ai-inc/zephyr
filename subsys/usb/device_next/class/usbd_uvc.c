@@ -1150,6 +1150,26 @@ end:
 
 /* UVC descriptor handling */
 
+static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
+{
+	const struct device *dev = usbd_class_get_private(c_data);
+	struct uvc_data *data = dev->data;
+
+	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
+	data->desc->if0_hdr.baInterfaceNr[0] = data->desc->if1_0.bInterfaceNumber;
+
+	switch (speed) {
+	case USBD_SPEED_FS:
+		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_fs.bEndpointAddress;
+		return (void *)data->fs_desc;
+	case USBD_SPEED_HS:
+		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_hs.bEndpointAddress;
+		return (void *)data->hs_desc;
+	default:
+		CODE_UNREACHABLE;
+	}
+}
+
 static int uvc_add_desc(const struct device *dev, void *desc, bool add_to_fs, bool add_to_hs)
 {
 	static const struct usb_desc_header nil_desc;
@@ -1400,14 +1420,20 @@ static uint32_t uvc_get_mask(const struct device *video_dev, const struct uvc_co
 	return mask;
 }
 
-static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
+static int uvc_init(struct usbd_class_data *const c_data)
 {
+	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
+	struct uvc_format_descriptor *format_desc = NULL;
+	struct video_caps caps;
+	uint32_t prev_pixfmt = 0;
 	uint32_t mask = 0;
+	int ret;
 
+	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
 	__ASSERT_NO_MSG(data->video_dev != NULL);
 
-	data->desc->if0_hdr.bInCollection++;
+	/* Generating VideoControl descriptors (interface 0) */
 
 	mask = uvc_get_mask(data->video_dev, uvc_control_map_ct);
 	data->desc->if0_ct.bmControls[0] = mask >> 0;
@@ -1425,18 +1451,7 @@ static int uvc_add_vc_desc(const struct device *dev, uint8_t *unit_id)
 	data->desc->if0_xu.bmControls[2] = mask >> 16;
 	data->desc->if0_xu.bmControls[3] = mask >> 24;
 
-	return 0;
-}
-
-static int uvc_add_vs_desc(const struct device *dev)
-{
-	struct uvc_data *data = dev->data;
-	struct uvc_format_descriptor *format_desc = NULL;
-	struct video_caps caps;
-	uint32_t prev_pixfmt = 0;
-	int ret;
-
-	__ASSERT_NO_MSG(data->video_dev != NULL);
+	/* Generating VideoStreaming descriptors (interface 1) */
 
 	ret = video_get_caps(data->video_dev, VIDEO_EP_OUT, &caps);
 	if (ret != 0) {
@@ -1444,11 +1459,11 @@ static int uvc_add_vs_desc(const struct device *dev)
 		return ret;
 	}
 
-	/* Generate the list of format descriptors according to the video capabilities */
+	data->desc->if1_0_hdr.wTotalLength = sys_le16_to_cpu(data->desc->if1_0_hdr.wTotalLength);
+
 	for (int i = 0; caps.format_caps[i].pixelformat != 0; i++) {
 		const struct video_format_cap *cap = &caps.format_caps[i];
 
-		/* Convert the flat capability structure into an UVC nested structure */
 		if (prev_pixfmt != cap->pixelformat) {
 			if (prev_pixfmt != 0) {
 				uvc_add_desc(dev, &data->desc->if1_0_color, true, true);
@@ -1460,13 +1475,11 @@ static int uvc_add_vs_desc(const struct device *dev)
 			}
 		}
 
-		/* Always add the minimum value */
 		ret = uvc_add_vs_frame_desc(dev, format_desc, cap, true);
 		if (ret != 0) {
 			return ret;
 		}
 
-		/* If min and max differs, also add the max */
 		if (cap->width_min != cap->width_max || cap->height_min != cap->height_max) {
 			ret = uvc_add_vs_frame_desc(dev, format_desc, cap, false);
 			if (ret != 0) {
@@ -1477,66 +1490,13 @@ static int uvc_add_vs_desc(const struct device *dev)
 		prev_pixfmt = cap->pixelformat;
 	}
 
-	/* After all the formats were added */
 	uvc_add_desc(dev, &data->desc->if1_0_color, true, true);
 	uvc_add_desc(dev, &data->desc->if1_1_ep_fs, true, false);
 	uvc_add_desc(dev, &data->desc->if1_1_ep_hs, false, true);
 
 	data->desc->if1_0_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if1_0_hdr.wTotalLength);
 
-	return 0;
-}
-
-static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed)
-{
-	const struct device *dev = usbd_class_get_private(c_data);
-	struct uvc_data *data = dev->data;
-
-	data->desc->iad.bFirstInterface = data->desc->if0.bInterfaceNumber;
-	data->desc->if0_hdr.baInterfaceNr[0] = data->desc->if1_0.bInterfaceNumber;
-
-	switch (speed) {
-	case USBD_SPEED_FS:
-		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_fs.bEndpointAddress;
-		return (void *)data->fs_desc;
-	case USBD_SPEED_HS:
-		data->desc->if1_0_hdr.bEndpointAddress = data->desc->if1_1_ep_hs.bEndpointAddress;
-		return (void *)data->hs_desc;
-	default:
-		CODE_UNREACHABLE;
-	}
-}
-
-static int uvc_init(struct usbd_class_data *const c_data)
-{
-	const struct device *dev = usbd_class_get_private(c_data);
-	struct uvc_data *data = dev->data;
-	uint8_t unit_id = 1;
-	int ret;
-
-	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
-
-	/* Generating VideoControl descriptors */
-
-	data->desc->if0_hdr.bLength = 12;
-
-	ret = uvc_add_vc_desc(dev, &unit_id);
-	if (ret != 0) {
-		return ret;
-	}
-
-	data->desc->if0_hdr.bLength++;
-	data->desc->if0_hdr.wTotalLength++;
-	data->desc->if0_hdr.wTotalLength = sys_cpu_to_le16(data->desc->if0_hdr.wTotalLength);
-
-	/* Generating VideoStreaming descriptors */
-
-	ret = uvc_add_vs_desc(dev);
-	if (ret != 0) {
-		return ret;
-	}
-
-	/* Generating the default probe message */
+	/* Generating the default probe message now that descriptors are complete */
 
 	ret = uvc_get_vs_probe_struct(dev, &data->default_probe, UVC_GET_CUR);
 	if (ret != 0) {
