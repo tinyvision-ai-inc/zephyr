@@ -142,7 +142,7 @@ void uvc_set_video_dev(const struct device *const dev, const struct device *cons
 {
 	struct uvc_data *data = dev->data;
 
-	data->video_dev = dev;
+	data->video_dev = video_dev;
 }
 
 /* UVC helper functions */
@@ -1641,7 +1641,7 @@ static int uvc_add_vs_desc(const struct device *dev)
 
 	ret = video_get_caps(data->video_dev, VIDEO_EP_OUT, &caps);
 	if (ret != 0) {
-		LOG_DBG("Could not load %s video format list", data->video_dev->name);
+		LOG_ERR("Could not load %s video format list", data->video_dev->name);
 		return ret;
 	}
 
@@ -1725,13 +1725,15 @@ static int uvc_init(struct usbd_class_data *const c_data);
 static void uvc_update_desc(const struct device *dev, struct usbd_class_data *const c_data)
 {
 	struct uvc_data *data = dev->data;
-	struct usb_desc_header **desc_vs = data->desc_vs;
-	struct usb_if_descriptor *desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
-	struct uvc_stream_header_descriptor *desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
-
-	LOG_DBG("Updating USB descriptors");
+	struct usb_desc_header **desc_vs;
+	struct usb_if_descriptor *desc_vs_if;
+	struct uvc_stream_header_descriptor *desc_vs_hdr;
 
 	uvc_init(c_data);
+
+	desc_vs = data->desc_vs;
+	desc_vs_if = (void *)desc_vs[UVC_IDX_VS_IF];
+	desc_vs_hdr = (void *)desc_vs[UVC_IDX_VS_HDR];
 
 	data->desc->iad.bFirstInterface = data->desc->if_vc.bInterfaceNumber;
 
@@ -1767,20 +1769,14 @@ static void *uvc_get_desc(struct usbd_class_data *const c_data, const enum usbd_
 
 static int uvc_init(struct usbd_class_data *const c_data)
 {
-	LOG_DBG("UVC INIT");;
-
 	const struct device *dev = usbd_class_get_private(c_data);
 	struct uvc_data *data = dev->data;
 	uint8_t unit_id = 1;
 	int ret;
 
-
 	if (atomic_test_bit(&data->state, UVC_STATE_INITIALIZED)) {
 		return 0;
 	}
-
-	LOG_DBG("Initializing USB Video Class (%p)", dev);
-	LOG_DBG("Initializing USB Video Class (%s)", dev->name);
 
 	__ASSERT_NO_MSG(!atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
 
@@ -1877,8 +1873,7 @@ static int uvc_flush_vbuf(const struct device *dev, struct video_buffer *vbuf)
 	/* Transfer reset condition */
 	if (atomic_test_bit(&data->state, UVC_STATE_STREAM_RESTART)) {
 		LOG_DBG("Stream restarted, terminating the ongoing transfer");
-		LOG_DBG("vbuf offset %u, line_offset %u",
-			data->vbuf_offset, vbuf->line_offset);
+		LOG_DBG("vbuf offset %u, line_offset %u", data->vbuf_offset, vbuf->line_offset);
 
 		buf = net_buf_alloc_with_data(&uvc_buf_pool, "",  1, K_NO_WAIT);
 		if (buf == NULL) {
