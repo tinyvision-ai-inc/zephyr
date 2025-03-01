@@ -35,7 +35,7 @@
 #define UVC_INFO_SUPPORTS_GET				BIT(0)
 #define UVC_INFO_SUPPORTS_SET				BIT(1)
 
-/* 4.2.1.2 Request Error Code Control */
+/* Request Error Code Control */
 #define UVC_ERR_NOT_READY				0x01
 #define UVC_ERR_WRONG_STATE				0x02
 #define UVC_ERR_OUT_OF_RANGE				0x04
@@ -222,7 +222,7 @@ struct uvc_control_header_descriptor {
 	uint16_t wTotalLength;
 	uint32_t dwClockFrequency;
 	uint8_t bInCollection;
-	uint8_t baInterfaceNr[CONFIG_USBD_VIDEO_MAX_STREAMS];
+	uint8_t baInterfaceNr[1];
 } __packed;
 
 struct uvc_unit_descriptor {
@@ -432,12 +432,53 @@ struct uvc_color_descriptor {
 	uint8_t bColorPrimaries;
 	uint8_t bTransferCharacteristics;
 	uint8_t bMatrixCoefficients;
+#define UVC_COLOR_BT709		1
+#define UVC_COLOR_BT470M	2
+#define UVC_COLOR_BT470BG	3
+#define UVC_COLOR_BT601		4
+#define UVC_COLOR_SMPTE170M	4
+#define UVC_COLOR_SMPTE240M	5
+#define UVC_COLOR_LINEAR	6
+#define UVC_COLOR_SRGB		7
 } __packed;
 
-struct usbd_uvc_desc {
-	struct usb_association_descriptor iad;
-	struct usb_if_descriptor if_vc;
-	struct uvc_control_header_descriptor if_vc_hdr;
-};
+struct uvc_probe {
+	uint16_t bmHint;
+	uint8_t bFormatIndex;
+	uint8_t bFrameIndex;
+	uint32_t dwFrameInterval;
+	uint16_t wKeyFrameRate;
+	uint16_t wPFrameRate;
+	uint16_t wCompQuality;
+	uint16_t wCompWindowSize;
+	uint16_t wDelay;
+	uint32_t dwMaxVideoFrameSize;
+	uint32_t dwMaxPayloadTransferSize;
+	uint32_t dwClockFrequency;
+	uint8_t bmFramingInfo;
+#define UVC_BMFRAMING_INFO_FID BIT(0)
+#define UVC_BMFRAMING_INFO_EOF BIT(1)
+#define UVC_BMFRAMING_INFO_EOS BIT(2)
+	uint8_t bPreferedVersion;
+	uint8_t bMinVersion;
+	uint8_t bMaxVersion;
+	uint8_t bUsage;
+	uint8_t bBitDepthLuma;
+	uint8_t bmSettings;
+	uint8_t bMaxNumberOfRefFramesPlus1;
+	uint16_t bmRateControlModes;
+	uint64_t bmLayoutPerStream;
+} __packed;
+
+/* This is a particular variant of this struct that is used by the Zephyr implementation. Other
+ * organization of the fields are allowed by the standard.
+ */
+struct uvc_payload_header {
+	uint8_t bHeaderLength;
+	uint8_t bmHeaderInfo;
+	uint32_t dwPresentationTime; /* optional */
+	uint32_t scrSourceClockSTC;  /* optional */
+	uint16_t scrSourceClockSOF;  /* optional */
+} __packed;
 
 #endif /* ZEPHYR_INCLUDE_USBD_CLASS_UVC_H_ */
