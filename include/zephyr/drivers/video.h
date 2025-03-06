@@ -957,6 +957,19 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
  */
 #define VIDEO_PIX_FMT_JPEG VIDEO_FOURCC('J', 'P', 'E', 'G')
 
+
+/**
+ * @brief 8-bit grayscale format
+ *
+ * Each pixel is represented by a single byte containing grayscale intensity.
+ *
+ * @verbatim
+ * | Gggggggg | ...
+ * @endverbatim
+
+ */
+#define VIDEO_PIX_FMT_Y800 VIDEO_FOURCC('Y', '8', '0', '0')
+
 /**
  * @}
  */
@@ -976,6 +989,7 @@ static inline unsigned int video_bits_per_pixel(uint32_t pixfmt)
 	case VIDEO_PIX_FMT_GBRG8:
 	case VIDEO_PIX_FMT_GRBG8:
 	case VIDEO_PIX_FMT_RGGB8:
+	case VIDEO_PIX_FMT_Y800:
 		return 8;
 	case VIDEO_PIX_FMT_RGB565:
 	case VIDEO_PIX_FMT_YUYV:
