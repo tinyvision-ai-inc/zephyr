@@ -135,7 +135,7 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
 	__ASSERT(match->type != VIDEO_FRMIVAL_TYPE_STEPWISE,
 		 "cannot find range matching the range, only a value matching the range");
 
-	while (video_enum_frmival(dev, ep, &fie) == 0) {
+	for (fie.index = 0; video_enum_frmival(dev, ep, &fie) == 0; fie.index++) {
 		struct video_frmival tmp = {0};
 		uint64_t diff_nsec = 0, a, b;
 
