@@ -485,6 +485,29 @@ int emul_imager_init(const struct device *dev)
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(inst, &emul_imager_init, NULL, &emul_imager_data_##inst,             \
 			      &emul_imager_cfg_##inst, POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,    \
-			      &emul_imager_driver_api);
+			      &emul_imager_api);
 
 DT_INST_FOREACH_STATUS_OKAY(EMUL_IMAGER_DEFINE)
+
+/* Emulation API, absent from real drvice drivers */
+
+static int emul_imager_transfer_i2c(const struct emul *target, struct i2c_msg msgs[], int num_msgs,
+				    int addr)
+{
+	return 0;
+}
+
+static const struct i2c_emul_api emul_imager_api_i2c = {
+	.transfer = emul_imager_transfer_i2c,
+};
+
+static int emul_imager_init_i2c(const struct emul *target, const struct device *dev)
+{
+	return 0;
+}
+
+#define EMUL_I2C_DEFINE(inst)                                                                      \
+	EMUL_DT_INST_DEFINE(inst, emul_imager_init_i2c, NULL, NULL, &emul_imager_api_i2c,          \
+			    &emul_imager_api);
+
+DT_INST_FOREACH_STATUS_OKAY(EMUL_I2C_DEFINE)
