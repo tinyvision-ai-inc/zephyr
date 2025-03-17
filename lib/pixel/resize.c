@@ -53,8 +53,25 @@ void pixel_subsample_rgb565frame(const uint8_t *src_buf, size_t src_width, size_
 	pixel_subsample_frame(src_buf, src_width, src_height, dst_buf, dst_width, dst_height, 16);
 }
 
-void pixel_subsample_yuyvframe(const uint8_t *src_buf, size_t src_width, size_t src_height,
-			       uint8_t *dst_buf, size_t dst_width, size_t dst_height)
+static inline void pixel_subsample_stream(struct pixel_stream *strm, uint8_t bits_per_pixel)
 {
-	pixel_subsample_frame(src_buf, src_width, src_height, dst_buf, dst_width, dst_height, 16);
+	uint16_t prev_offset = (strm->line_offset + 1) * strm->next->height / strm->height;
+	const uint8_t *line_in = pixel_stream_get_input_line(strm);
+	uint16_t next_offset = (strm->line_offset + 1) * strm->next->height / strm->height;
+
+	for (uint16_t i = 0; prev_offset + i < next_offset; i++) {
+		pixel_subsample_line(line_in, strm->width, pixel_stream_get_output_line(strm),
+				     strm->next->width, bits_per_pixel);
+		pixel_stream_done(strm);
+	}
+}
+
+void pixel_subsample_rgb24stream(struct pixel_stream *strm)
+{
+	pixel_subsample_stream(strm, 24);
+}
+
+void pixel_subsample_rgb565stream(struct pixel_stream *strm)
+{
+	pixel_subsample_stream(strm, 16);
 }

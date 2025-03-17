@@ -12,7 +12,11 @@
 #include <zephyr/pixel/stream.h>
 
 /**
- * Pixel streams definitions.
+ * @defgroup Convert pixel streams from bayer formats to RGB24.
+ *
+ * Bayer formats are the native color format of image sensors. Some image sensors emmit bayer data
+ * directly that can be converted to other pixel formats such as RGB24 or RGB565.
+ *
  * @{
  */
 

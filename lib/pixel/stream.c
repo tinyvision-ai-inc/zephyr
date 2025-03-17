@@ -36,6 +36,7 @@ static void _assert_complete(struct pixel_stream *strm, bool begin)
 void pixel_stream_load(struct pixel_stream *strm, const uint8_t *buf, size_t size)
 {
 	struct pixel_stream prev = {.next = strm};
+	struct pixel_stream *step;
 
 	__ASSERT_NO_MSG(strm != NULL);
 	__ASSERT_NO_MSG(buf != NULL);
@@ -44,10 +45,10 @@ void pixel_stream_load(struct pixel_stream *strm, const uint8_t *buf, size_t siz
 
 	LOG_DBG("Loading %zu bytes into this pipeline:", size);
 
-	for (struct pixel_stream *x = strm; x != NULL; x = x->next) {
-		LOG_DBG("- %s", x->name);
-		x->line_offset = 0;
-		x->total_time = 0;
+	for (step = strm; step != NULL; step = step->next) {
+		LOG_DBG("- %s", step->name);
+		step->line_offset = 0;
+		step->total_time = 0;
 	}
 
 	for (size_t i = 0; i + strm->pitch <= size; i += strm->pitch) {

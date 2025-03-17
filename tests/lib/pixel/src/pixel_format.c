@@ -9,6 +9,11 @@
 #include <zephyr/pixel/formats.h>
 #include <zephyr/pixel/print.h>
 
+#define WIDTH 16
+#define HEIGHT 16
+
+#define ERROR_MARGIN 10
+
 /*
  * To get YUV BT.709 test data:
  *
@@ -50,10 +55,8 @@ const struct color_ref {
 	{{0xaf, 0x7f, 0xe4}, {0xb3, 0xfc}, {0x8c, 0xa8, 0x91}, {0x93, 0xa6, 0x8d}},
 };
 
-#define WIDTH 16
-
-uint8_t line_in[WIDTH * 4];
-uint8_t line_out[WIDTH * 4];
+static uint8_t line_in[WIDTH * 4];
+static uint8_t line_out[WIDTH * 4];
 
 void test_conversion(const uint8_t *pix_in, size_t pix_in_size, size_t pix_in_step,
 		     const uint8_t *pix_out, size_t pix_out_size, size_t pix_out_step,
@@ -159,6 +162,58 @@ ZTEST(lib_pixel_format, test_pixel_format_line)
 		pixel_print_yuyvframe_bt709_truecolor(line_in, sizeof(line_in), WIDTH / 2, 2);
 		printf("rgb24 out |");
 		pixel_print_rgb24frame_truecolor(line_out, sizeof(line_out), WIDTH / 2, 2);
+	}
+}
+
+/* From RGB24 */
+static PIXEL_STREAM_RGB24_TO_RGB565BE(step_rgb24_to_rgb565be, WIDTH, HEIGHT);
+static PIXEL_STREAM_RGB24_TO_RGB565LE(step_rgb24_to_rgb565le, WIDTH, HEIGHT);
+static PIXEL_STREAM_RGB24_TO_YUYV_BT709(step_rgb24_to_yuyv, WIDTH, HEIGHT);
+
+/* To RGB24 */
+static PIXEL_STREAM_RGB565BE_TO_RGB24(step_rgb565be_to_rgb24, WIDTH, HEIGHT);
+static PIXEL_STREAM_RGB565LE_TO_RGB24(step_rgb565le_to_rgb24, WIDTH, HEIGHT);
+static PIXEL_STREAM_YUYV_TO_RGB24_BT709(step_yuyv_to_rgb24, WIDTH, HEIGHT);
+
+static uint8_t rgb24frame_in[WIDTH * HEIGHT * 3];
+static uint8_t rgb24frame_out[WIDTH * HEIGHT * 3];
+
+ZTEST(lib_pixel_format, test_pixel_format_stream)
+{
+	struct pixel_stream root = {0};
+	struct pixel_stream *step = &root;
+	struct pixel_stream step_export = {
+		.ring = RING_BUF_INIT(rgb24frame_out, sizeof(rgb24frame_out)),
+		.pitch = WIDTH * 3,
+		.height = HEIGHT,
+		.name = "[export]",
+	};
+
+	/* Generate test input data */
+	for (size_t i = 0; i < sizeof(rgb24frame_in); i++) {
+		rgb24frame_in[i] = i / 3;
+	}
+
+	/* Build and run the pipeline */
+	step = step->next = &step_rgb24_to_rgb565le;
+	step = step->next = &step_rgb565le_to_rgb24;
+	step = step->next = &step_rgb24_to_rgb565be;
+	step = step->next = &step_rgb565be_to_rgb24;
+	step = step->next = &step_rgb24_to_yuyv;
+	step = step->next = &step_yuyv_to_rgb24;
+	step = step->next = &step_export;
+	pixel_stream_load(root.next, rgb24frame_in, sizeof(rgb24frame_in));
+
+	printf("input:\n");
+	pixel_print_rgb24frame_truecolor(rgb24frame_in, sizeof(rgb24frame_in), WIDTH, HEIGHT);
+
+	printf("output:\n");
+	pixel_print_rgb24frame_truecolor(rgb24frame_out, sizeof(rgb24frame_out), WIDTH, HEIGHT);
+
+	for (int i = 0; i < sizeof(rgb24frame_out); i++) {
+		/* Precision is not 100% as some conversions steps are lossy */
+		zassert_within(rgb24frame_in[i], rgb24frame_out[i], ERROR_MARGIN,
+			       "Testing position %u", i);
 	}
 }
 

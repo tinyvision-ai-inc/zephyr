@@ -9,6 +9,34 @@
 
 #include <stdint.h>
 
+#include <zephyr/pixel/stream.h>
+
+/**
+ * @defgroup Resize streams by subsampling the pixels.
+ *
+ * @note the "width" and "height" macro parameters are for the input like any stream element.
+ *       The output size is configured implicitly by connecting this block to another one of a
+ *       different size.
+ *
+ * @{
+ */
+
+void pixel_subsample_rgb24stream(struct pixel_stream *strm);
+
+#define PIXEL_STREAM_SUBSAMPLE_RGB24(name, width, height)                                          \
+	PIXEL_STREAM_DEFINE(name, pixel_subsample_rgb24stream,                                     \
+			    (width), (height), (width) * 3, 1 * (width) * 3)
+
+void pixel_subsample_rgb565stream(struct pixel_stream *strm);
+
+#define PIXEL_STREAM_SUBSAMPLE_RGB565(name, width, height)                                         \
+	PIXEL_STREAM_DEFINE(name, pixel_subsample_rgb565stream,                                    \
+			    (width), (height), (width) * 3, 1 * (width) * 3)
+
+/**
+ * @}
+ */
+
 /**
  * @brief Step-by-step increment two indexes preserving their proportion.
  *
@@ -40,9 +68,6 @@ void pixel_subsample_rgb24line(const uint8_t *src_buf, size_t src_width, uint8_t
 /** RGB565 variant */
 void pixel_subsample_rgb565line(const uint8_t *src_buf, size_t src_width, uint8_t *dst_buf,
 				size_t dst_width);
-/** YUYV variant */
-void pixel_subsample_yuyvline(const uint8_t *src_buf, size_t src_width, uint8_t *dst_buf,
-			      size_t dst_width);
 /** @} */
 
 /**
@@ -67,9 +92,6 @@ void pixel_subsample_rgb24frame(const uint8_t *src_buf, size_t src_width, size_t
 /* RGB565 variant */
 void pixel_subsample_rgb565frame(const uint8_t *src_buf, size_t src_width, size_t src_height,
 				 uint8_t *dst_buf, size_t dst_width, size_t dst_height);
-/* YUYV variant */
-void pixel_subsample_yuyvframe(const uint8_t *src_buf, size_t src_width, size_t src_height,
-			       uint8_t *dst_buf, size_t dst_width, size_t dst_height);
 /** @} */
 
 #endif /* ZEPHYR_INCLUDE_PIXEL_RESIZE_H */

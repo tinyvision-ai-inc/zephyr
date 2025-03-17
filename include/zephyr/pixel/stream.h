@@ -22,6 +22,8 @@ struct pixel_stream {
 	/* Current position within the frame */
 	uint16_t line_offset;
 	/* Total number of lines in the frame */
+	uint16_t width;
+	/* Total number of lines in the frame */
 	uint16_t height;
 	/* Connection to the next element of the stream */
 	struct pixel_stream *next;
@@ -38,6 +40,7 @@ struct pixel_stream {
 		.name = "[" #_name " " #_run " " STRINGIFY(_width) "x" STRINGIFY(_height) "]",     \
 		.ring = RING_BUF_INIT((uint8_t [_bufsize]) {0}, _bufsize),                         \
 		.pitch = (_pitch),                                                                 \
+		.width = (_width),                                                                 \
 		.height = (_height),                                                               \
 		.run = (_run),                                                                     \
 	}
@@ -48,11 +51,11 @@ struct pixel_stream {
  * The parameters such as line pitch or image height are to be configured inside each individual
  * strm before calling this function.
  *
- * @param strm Pipeline strm into which load the buffer one pitch worth of data at a time.
+ * @param first Pipeline stream into which load the buffer one pitch worth of data at a time.
  * @param buf Buffer of data to load into the stream.
- * @param size Total of bytes in this buffer.
+ * @param size Total of bytes in this source buffer.
  */
-void pixel_stream_load(struct pixel_stream *strm, const uint8_t *buf, size_t size);
+void pixel_stream_load(struct pixel_stream *first, const uint8_t *buf, size_t size);
 
 static inline uint8_t *pixel_stream_peek_input_line(struct pixel_stream *strm)
 {
