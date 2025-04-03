@@ -856,40 +856,107 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
  *
  * The full color information is spread over multiple pixels.
  *
+ * When the format includes more than 8-bit per pixel, a strategy becomes needed to pack
+ * the bits over multiple bytes, as illustrated for each format.
+ *
  * @{
  */
 
 /**
  * @verbatim
- * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ...
- * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | ...
+ * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ...
+ * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | ...
  * @endverbatim
  */
 #define VIDEO_PIX_FMT_BGGR8 VIDEO_FOURCC('B', 'A', '8', '1')
 
 /**
  * @verbatim
- * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | ...
- * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ...
+ * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | ...
+ * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ...
  * @endverbatim
  */
 #define VIDEO_PIX_FMT_GBRG8 VIDEO_FOURCC('G', 'B', 'R', 'G')
 
 /**
  * @verbatim
- * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | ...
- * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ...
+ * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | ...
+ * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ...
  * @endverbatim
  */
 #define VIDEO_PIX_FMT_GRBG8 VIDEO_FOURCC('G', 'R', 'B', 'G')
 
 /**
  * @verbatim
- * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ...
- * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | ...
+ * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ...
+ * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | ...
  * @endverbatim
  */
 #define VIDEO_PIX_FMT_RGGB8 VIDEO_FOURCC('R', 'G', 'G', 'B')
+
+/**
+ * @verbatim
+ * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ggbbggbb | ...
+ * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | rrggrrgg | ...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SBGGR10P VIDEO_FOURCC('B', 'A', '8', '1')
+
+/**
+ * @verbatim
+ * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | bbggbbgg | ...
+ * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ggrrggrr | ...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SGBRG10P VIDEO_FOURCC('G', 'B', 'R', 'G')
+
+/**
+ * @verbatim
+ * | Gggggggg | Rrrrrrrr | Gggggggg | Rrrrrrrr | rrggrrgg | ...
+ * | Bbbbbbbb | Gggggggg | Bbbbbbbb | Gggggggg | ggbbggbb | ...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SGRBG10P VIDEO_FOURCC('G', 'R', 'B', 'G')
+
+/**
+ * @verbatim
+ * | Rrrrrrrr | Gggggggg | Rrrrrrrr | Gggggggg | ggrrggrr | ...
+ * | Gggggggg | Bbbbbbbb | Gggggggg | Bbbbbbbb | bbggbbgg | ...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SRGGB10P VIDEO_FOURCC('R', 'G', 'G', 'B')
+
+/**
+ * @verbatim
+ * | Bbbbbbbb | Gggggggg | ggggbbbb | Bbbbbbbb | Gggggggg | ggggbbbb | ...
+ * | Gggggggg | Rrrrrrrr | rrrrgggg | Gggggggg | Rrrrrrrr | rrrrgggg |...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SBGGR12P VIDEO_FOURCC('B', 'A', '8', '1')
+
+/**
+ * @verbatim
+ * | Gggggggg | Bbbbbbbb | bbbbgggg | Gggggggg | Bbbbbbbb | bbbbgggg | ...
+ * | Rrrrrrrr | Gggggggg | ggggrrrr | Rrrrrrrr | Gggggggg | ggggrrrr |...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SGBRG12P VIDEO_FOURCC('G', 'B', 'R', 'G')
+
+/**
+ * @verbatim
+ * | Gggggggg | Rrrrrrrr | rrrrgggg | Gggggggg | Rrrrrrrr | rrrrgggg | ...
+ * | Bbbbbbbb | Gggggggg | ggggbbbb | Bbbbbbbb | Gggggggg | ggggbbbb |...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SGRBG12P VIDEO_FOURCC('G', 'R', 'B', 'G')
+
+/**
+ * @verbatim
+ * | Rrrrrrrr | Gggggggg | ggggrrrr | Rrrrrrrr | Gggggggg | ggggrrrr | ...
+ * | Gggggggg | Bbbbbbbb | bbbbgggg | Gggggggg | Bbbbbbbb | bbbbgggg |...
+ * @endverbatim
+ */
+#define VIDEO_PIX_FMT_SRGGB12P VIDEO_FOURCC('R', 'G', 'G', 'B')
 
 /**
  * @}
