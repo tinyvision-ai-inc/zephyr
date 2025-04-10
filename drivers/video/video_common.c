@@ -9,6 +9,9 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/video.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(zephyr_video_common, CONFIG_VIDEO_LOG_LEVEL);
 
 #if defined(CONFIG_VIDEO_BUFFER_USE_SHARED_MULTI_HEAP)
 #include <zephyr/multi_heap/shared_multi_heap.h>
@@ -156,11 +159,7 @@ void video_closest_frmival(const struct device *dev, enum video_endpoint_id ep,
 		if (diff_nsec < best_diff_nsec) {
 			best_diff_nsec = diff_nsec;
 			memcpy(&match->discrete, &tmp, sizeof(tmp));
-
-			/* The video_enum_frmival() function will increment fie.index every time.
-			 * Compensate for it to get the current index, not the next index.
-			 */
-			match->index = fie.index - 1;
+			match->index = fie.index;
 		}
 	}
 }
