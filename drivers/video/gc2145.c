@@ -1085,7 +1085,10 @@ static int gc2145_init(const struct device *dev)
 		return ret;
 	}
 
-	gc2145_soft_reset(dev);
+	ret = gc2145_soft_reset(dev);
+	if (ret) {
+		return ret;
+	}
 
 	ret = video_write_cci_multiregs8(&cfg->i2c, default_regs, ARRAY_SIZE(default_regs));
 	if (ret) {
