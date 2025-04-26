@@ -1,0 +1,39 @@
+/*
+ * Copyright (c) 2025 tinyVision.ai Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/dt-bindings/video/video-interfaces.h>
+
+/ {
+	chosen {
+		zephyr,camera = &dvp_20pin_interface;
+	};
+};
+
+&dvp_20pin_i2c {
+	ov5640: ov5640@3c {
+		compatible = "ovti,ov5640";
+		reset-gpios = <&dvp_20pin_gpio DVP_20PIN_PEN GPIO_ACTIVE_HIGH>;
+		powerdown-gpios  = <&dvp_20pin_gpio DVP_20PIN_PDN GPIO_ACTIVE_HIGH>;
+		reg = <0x3c>;
+
+		port {
+			ov5640_ep_out: endpoint {
+				remote-endpoint-label = "dvp_20pin_ep_in";
+				bus-type = <VIDEO_BUS_TYPE_PARALLEL>;
+			};
+		};
+	};
+};
+
+&dvp_20pin_interface {
+	status = "okay";
+
+	port {
+		dvp_20pin_ep_in: endpoint {
+			remote-endpoint-label = "ov5640_ep_out";
+		};
+	};
+};
