@@ -7,6 +7,7 @@
 #include "frdm_mcxn947-pinctrl.dtsi"
 #include <zephyr/dt-bindings/i2c/i2c.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/gpio/dvp-20pin-connector.h>
 
 / {
 	aliases{
@@ -66,6 +67,15 @@
 				<10  0 &gpio4 5 0>,	/* Pin 10, LCD backlight control */
 				<11  0 &gpio4 7 0>;	/* Pin 11, LCD and touch reset */
 	};
+
+	dvp_20pin_gpio: dvp-20pin-connector {
+		compatible = "arducam,dvp-20pin-connector";
+		#gpio-cells = <2>;
+		gpio-map-mask = <DVP_20PIN_MASK 0x0>;
+		gpio-map-pass-thru = <0x0 GPIO_DT_FLAGS_MASK>;
+		gpio-map =	<DVP_20PIN_PEN 0 &gpio1 19 0>,
+				<DVP_20PIN_PDN 0 &gpio1 18 0>;
+	};
 };
 
 &flexcomm1_lpspi1 {
@@ -91,30 +101,19 @@ nxp_8080_touch_panel_i2c: &flexcomm2_lpi2c2 {
 	pinctrl-names = "default";
 };
 
-&flexcomm7_lpi2c7 {
+dvp_20pin_i2c: &flexcomm7_lpi2c7 {
 	pinctrl-0 = <&pinmux_flexcomm7_lpi2c>;
 	pinctrl-names = "default";
 	clock-frequency = <I2C_BITRATE_STANDARD>;
-	ov7670: ov7670@21 {
-		compatible = "ovti,ov7670";
-		reset-gpios = <&gpio1 19 GPIO_ACTIVE_HIGH>;
-		pwdn-gpios = <&gpio1 18 GPIO_ACTIVE_HIGH>;
-		reg = <0x21>;
-
-		port {
-			ov7670_ep_out: endpoint {
-				remote-endpoint-label = "sdma_ep_in";
-			};
-		};
-	};
 };
 
 /* SmartDMA is used for video driver on this board */
 &smartdma {
-	status = "okay";
 	program-mem = <0x4000000>;
-	video_sdma: video-sdma {
-		status = "okay";
+	/* Shields do not enable video-sdma parent node */
+	status = "okay";
+
+	dvp_20pin_interface: video_sdma: video-sdma {
 		compatible = "nxp,video-smartdma";
 		pinctrl-0 = <&pinmux_smartdma_camera>;
 		pinctrl-names = "default";
@@ -123,8 +122,8 @@ nxp_8080_touch_panel_i2c: &flexcomm2_lpi2c2 {
 		pclk-pin = <5>;
 
 		port {
-			sdma_ep_in: endpoint {
-				remote-endpoint-label = "ov7670_ep_out";
+			dvp_20pin_ep_in: endpoint {
+				remote-endpoint-label = "dvp_20pin_ep_out";
 			};
 		};
 	};
