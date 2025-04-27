@@ -145,8 +145,6 @@ struct uvc_buf_info {
 	struct udc_buf_info udc;
 	/* Extra field at the end */
 	struct video_buffer *vbuf;
-	/* UVC stream this buffer belongs to */
-	const struct device *stream;
 } __packed;
 
 /* Mapping between UVC controls and Video controls */
@@ -1675,17 +1673,129 @@ static int uvc_request(struct usbd_class_data *const c_data, struct net_buf *buf
 	return 0;
 }
 
-/* The queue of video frame fragments (vbuf) is processed, each fragment (data)
+/*
+ * Handling the start of USB transfers marked by 'v' below:
+ * v                                         v
+ * [h+data:][data:::][data:::]...[data:::]...[h+data:][data:::][data:::]...[data:::]...
+ * [vbuf:::::::::::::::::::::::::::::::::]...[vbuf:::::::::::::::::::::::::::::::::]...
+ * [frame::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::]...
+ */
+static struct net_buf *uvc_initiate_transfer(const struct device *dev, struct video_buffer *vbuf,
+					     size_t *next_line_offset, size_t *next_vbuf_offset)
+{
+	const struct uvc_config *cfg = dev->config;
+	struct uvc_data *data = dev->data;
+	struct video_format *fmt = &data->video_fmt;
+	size_t mps = uvc_get_bulk_mps(cfg->c_data);
+	struct net_buf *buf;
+
+	buf = net_buf_alloc_len(&uvc_buf_pool, mps, K_NO_WAIT);
+	if (buf == NULL) {
+		LOG_DBG("Cannot allocate first USB buffer for now");
+		return NULL;
+	}
+
+	if (fmt->pitch > 0) {
+		*next_line_offset += vbuf->bytesused / fmt->pitch;
+	}
+
+	LOG_INF("Start of transfer, bytes used %u, sending lines %u to %u out of %u",
+		vbuf->bytesused, vbuf->line_offset, *next_line_offset, fmt->height);
+
+	/* Copy the header into the buffer (first 2 fields only) */
+	net_buf_add_mem(buf, &data->payload_header, 2);
+	net_buf_add(buf, CONFIG_USBD_VIDEO_HEADER_SIZE - buf->len);
+
+	/* Copy the payload into the buffer */
+	*next_vbuf_offset = MIN(vbuf->bytesused, net_buf_tailroom(buf));
+	net_buf_add_mem(buf, vbuf->buffer, *next_vbuf_offset);
+
+	/* If this new USB transfer will complete this frame */
+	if (fmt->pitch == 0 || *next_line_offset >= fmt->height) {
+		LOG_DBG("Last USB transfer for this buffer");
+
+		/* Flag that this current transfer is the last */
+		((struct uvc_payload_header *)buf->data)->bmHeaderInfo |=
+			UVC_BMHEADERINFO_END_OF_FRAME;
+
+		/* Toggle the Frame ID of the next vbuf */
+		data->payload_header.bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
+
+		*next_line_offset = 0;
+	}
+
+	return buf;
+}
+
+/*
+ * Handling the start of USB transfers marked by 'v' below:
+ *          v        v           v                    v        v           v
+ * [h+data:][data:::][data:::]...[data:::]...[h+data:][data:::][data:::]...[data:::]...
+ * [vbuf:::::::::::::::::::::::::::::::::]...[vbuf:::::::::::::::::::::::::::::::::]...
+ * [frame::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::]...
+ */
+static struct net_buf *uvc_continue_transfer(const struct device *dev, struct video_buffer *vbuf,
+					     size_t *next_line_offset, size_t *next_vbuf_offset)
+{
+	const struct uvc_config *cfg = dev->config;
+	struct uvc_data *data = dev->data;
+	size_t mps = uvc_get_bulk_mps(cfg->c_data);
+	struct net_buf *buf;
+
+	/* Directly pass the vbuf content with zero-copy */
+	buf = net_buf_alloc_with_data(&uvc_buf_pool, vbuf->buffer + data->vbuf_offset,
+				      MIN(vbuf->bytesused - data->vbuf_offset, mps), K_NO_WAIT);
+	if (buf == NULL) {
+		LOG_DBG("Cannot allocate continuation USB buffer for now");
+		return NULL;
+	}
+
+	*next_vbuf_offset = data->vbuf_offset + buf->len;
+
+	return buf;
+}
+
+static int uvc_reset_transfer(const struct device *dev)
+{
+	const struct uvc_config *cfg = dev->config;
+	struct uvc_data *data = dev->data;
+	struct uvc_buf_info *bi;
+	struct net_buf *buf;
+	int ret;
+
+	LOG_DBG("Stream restarted, terminating the transfer after %u bytes", data->vbuf_offset);
+
+	buf = net_buf_alloc_with_data(&uvc_buf_pool, "",  1, K_NO_WAIT);
+	if (buf == NULL) {
+		LOG_DBG("Cannot allocate ZLP USB buffer for now");
+		return -ENOMEM;
+	}
+
+	bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
+	bi->udc.ep = uvc_get_bulk_in(dev);
+	bi->vbuf = NULL;
+	bi->udc.zlp = true;
+	data->vbuf_offset = 0;
+
+	ret = usbd_ep_enqueue(cfg->c_data, buf);
+	if (ret != 0) {
+		net_buf_unref(buf);
+		return ret;
+	}
+
+	atomic_clear_bit(&data->state, UVC_STATE_STREAM_RESTART);
+
+	return 0;
+}
+
+/*
+ * The queue of video frame fragments (vbuf) is processed, each fragment (data)
  * is prepended by the UVC header (h). The result is cut into USB packets (pkt)
- * submitted to the USB:
+ * submitted to the USB. One vbuf per USB transfer
  *
- * [h+data] [data::]...[data::] [data] ... [h+data] [data::]...[data::] [data] ...
- * [pkt:::] [pkt:::]...[pkt:::] [pkt:] ... [pkt:::] [pkt:::]...[pkt:::] [pkt:] ...
- * [vbuf:::::::::::::::::::::::::::::] ... [vbuf:::::::::::::::::::::::::::::] ...
- * [frame::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::] ...
- * +-------------------------------------------------------------------------> time
- *
- * This function uvc_flush_vbuf() is called once per usb packet (pkt).
+ * [h+data:][data:::][data:::]...[data:::]...[h+data:][data:::][data:::]...[data:::]...
+ * [vbuf:::::::::::::::::::::::::::::::::]...[vbuf:::::::::::::::::::::::::::::::::]...
+ * [frame::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::]...
  *
  * @retval 0 if vbuf was partially transferred.
  * @retval 1 if vbuf was fully transferred and can be released.
@@ -1695,93 +1805,25 @@ static int uvc_flush_vbuf(const struct device *dev, struct video_buffer *vbuf)
 {
 	const struct uvc_config *cfg = dev->config;
 	struct uvc_data *data = dev->data;
-	struct video_format *fmt = &data->video_fmt;
-	struct net_buf *buf;
-	struct uvc_buf_info *bi;
-	size_t mps = uvc_get_bulk_mps(cfg->c_data);
 	size_t next_vbuf_offset = data->vbuf_offset;
 	size_t next_line_offset = vbuf->line_offset;
+	struct net_buf *buf;
+	struct uvc_buf_info *bi;
 	int ret;
 
-	/* Transfer reset condition */
 	if (atomic_test_bit(&data->state, UVC_STATE_STREAM_RESTART)) {
-		LOG_DBG("Stream restarted, terminating the ongoing transfer");
-		LOG_DBG("vbuf offset %u, line_offset %u", data->vbuf_offset, vbuf->line_offset);
-
-		buf = net_buf_alloc_with_data(&uvc_buf_pool, "",  1, K_NO_WAIT);
-		if (buf == NULL) {
-			LOG_DBG("Cannot allocate ZLP USB buffer for now");
-			return -ENOMEM;
-		}
-
-		bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
-		bi->udc.ep = uvc_get_bulk_in(dev);
-		bi->stream = dev;
-		bi->vbuf = NULL;
-		bi->udc.zlp = true;
-		data->vbuf_offset = 0;
-
-		ret = usbd_ep_enqueue(cfg->c_data, buf);
-		if (ret != 0) {
-			net_buf_unref(buf);
-			return ret;
-		}
-
-		atomic_clear_bit(&data->state, UVC_STATE_STREAM_RESTART);
-
-		return 0;
+		return uvc_reset_transfer(dev);
 	}
 
-	/* Start-of-Transfer condition */
-	if (data->vbuf_offset == 0) {
-		buf = net_buf_alloc_len(&uvc_buf_pool, mps, K_NO_WAIT);
-		if (buf == NULL) {
-			LOG_DBG("Cannot allocate first USB buffer for now");
-			return -ENOMEM;
-		}
-
-		if (fmt->pitch > 0) {
-			next_line_offset += vbuf->bytesused / fmt->pitch;
-		}
-
-		LOG_INF("New USB transfer, bmHeaderInfo 0x%02x, bytes used %u, lines %u to %u",
-			data->payload_header.bmHeaderInfo, vbuf->bytesused,
-			vbuf->line_offset, next_line_offset);
-
-		/* Only the first 2 fields supported for now, the rest is padded with 0x00 */
-		net_buf_add_mem(buf, &data->payload_header, 2);
-		net_buf_add(buf, CONFIG_USBD_VIDEO_HEADER_SIZE - buf->len);
-
-		/* Copy the bytes, needed for the first packet only */
-		next_vbuf_offset = MIN(vbuf->bytesused, net_buf_tailroom(buf));
-		net_buf_add_mem(buf, vbuf->buffer, next_vbuf_offset);
-
-		if (fmt->pitch == 0 || next_line_offset >= fmt->height) {
-			LOG_DBG("End of frame");
-
-			/* Flag that this current transfer is the last */
-			((struct uvc_payload_header *)buf->data)->bmHeaderInfo |=
-				UVC_BMHEADERINFO_END_OF_FRAME;
-
-			/* Toggle the Frame ID of the next vbuf */
-			data->payload_header.bmHeaderInfo ^= UVC_BMHEADERINFO_FRAMEID;
-
-			next_line_offset = 0;
-		}
-	} else {
-		buf = net_buf_alloc_with_data(&uvc_buf_pool, vbuf->buffer + data->vbuf_offset,
-					      MIN(vbuf->bytesused - data->vbuf_offset, mps),
-					      K_NO_WAIT);
-		if (buf == NULL) {
-			LOG_DBG("Cannot allocate continuation USB buffer for now");
-			return -ENOMEM;
-		}
-		next_vbuf_offset = data->vbuf_offset + mps;
+	buf = (data->vbuf_offset == 0)
+		? uvc_initiate_transfer(dev, vbuf, &next_line_offset, &next_vbuf_offset)
+		: uvc_continue_transfer(dev, vbuf, &next_line_offset, &next_vbuf_offset);
+	if (buf == NULL) {
+		return -ENOMEM;
 	}
 
 	bi = (struct uvc_buf_info *)udc_get_buf_info(buf);
 	bi->udc.ep = uvc_get_bulk_in(dev);
-	bi->stream = dev;
 
 	LOG_DBG("Video buffer %p, offset %u/%u, size %u",
 		vbuf, data->vbuf_offset, vbuf->bytesused, buf->len);
@@ -1789,8 +1831,7 @@ static int uvc_flush_vbuf(const struct device *dev, struct video_buffer *vbuf)
 	/* End-of-Transfer condition */
 	if (next_vbuf_offset >= vbuf->bytesused) {
 		bi->vbuf = vbuf;
-		bi->udc.zlp = (buf->len == mps);
-		data->vbuf_offset = 0;
+		bi->udc.zlp = (buf->len == uvc_get_bulk_mps(cfg->c_data));
 	}
 
 	ret = usbd_ep_enqueue(cfg->c_data, buf);
@@ -1801,6 +1842,7 @@ static int uvc_flush_vbuf(const struct device *dev, struct video_buffer *vbuf)
 
 	/* End-of-Transfer condition */
 	if (next_vbuf_offset >= vbuf->bytesused) {
+		data->vbuf_offset = 0;
 		return UVC_VBUF_DONE;
 	}
 
@@ -1816,6 +1858,7 @@ static void uvc_flush_queue(const struct device *dev)
 	int ret;
 
 	__ASSERT_NO_MSG(atomic_test_bit(&data->state, UVC_STATE_INITIALIZED));
+	__ASSERT_NO_MSG(!k_is_in_isr());
 
 	if (!atomic_test_bit(&data->state, UVC_STATE_ENABLED) ||
 	    !atomic_test_bit(&data->state, UVC_STATE_STREAM_READY)) {
