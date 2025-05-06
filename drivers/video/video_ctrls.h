@@ -68,4 +68,6 @@ void video_cluster_ctrl(struct video_ctrl *ctrls, uint8_t sz);
 
 void video_auto_cluster_ctrl(struct video_ctrl *ctrls, uint8_t sz, bool set_volatile);
 
+void video_convert_ctrl_name(char const *src, char *dst, size_t dst_size);
+
 #endif /* ZEPHYR_INCLUDE_DRIVERS_VIDEO_VIDEO_CTRLS_H_ */

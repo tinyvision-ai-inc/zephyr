@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <ctype.h>
 
 #include <zephyr/drivers/video.h>
 #include <zephyr/drivers/video-controls.h>
@@ -591,6 +592,28 @@ static inline const char *video_get_ctrl_name(uint32_t id)
 	default:
 		return NULL;
 	}
+}
+
+void video_convert_ctrl_name(char const *src, char *dst, size_t dst_size)
+{
+	size_t i, o;
+	bool add_underscore = false;
+
+	for (i = 0, o = 0; o + 1 < dst_size && src[i] != '\0'; i++) {
+		if (isalnum(src[i])) {
+			dst[o] = tolower(src[i]);
+			o++;
+			add_underscore = true;
+		} else if (add_underscore) {
+			dst[o] = '_';
+			o++;
+			add_underscore = false;
+		}
+	}
+
+	do {
+		dst[o] = '\0';
+	} while (o-- > 0 && !isalnum(dst[o]));
 }
 
 int video_query_ctrl(const struct device *dev, struct video_ctrl_query *cq)

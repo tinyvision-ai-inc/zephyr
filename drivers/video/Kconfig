@@ -50,6 +50,13 @@ config VIDEO_BUFFER_SMH_ATTRIBUTE
 	  1: SMH_REG_ATTR_NON_CACHEABLE
 	  2: SMH_REG_ATTR_EXTERNAL
 
+config VIDEO_CTRL_NAME_MAX_SIZE
+	int "Maximum size for video control names after conversion"
+	default 40
+	help
+	  Video controls names can be converted from 'Control Name' to 'control_name',
+	  in various locations. The default is enough for at least all standard controls.
+
 source "drivers/video/Kconfig.esp32_dvp"
 
 source "drivers/video/Kconfig.mcux_csi"
