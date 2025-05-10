@@ -9,12 +9,13 @@
 
 LOG_MODULE_REGISTER(pixel_convert, CONFIG_PIXEL_LOG_LEVEL);
 
-int pixel_image_convert(struct pixel_image *img, uint32_t new_format)
+int pixel_image_convert(struct pixel_image *img, pixel_format_t new_format)
 {
 	const struct pixel_operation *op = NULL;
 
 	STRUCT_SECTION_FOREACH_ALTERNATE(pixel_convert, pixel_operation, tmp) {
-		if (tmp->fourcc_in == img->fourcc && tmp->fourcc_out == new_format) {
+		if (tmp->format_in->fourcc == img->format->fourcc &&
+		    tmp->format_out->fourcc == new_format->fourcc) {
 			op = tmp;
 			break;
 		}
@@ -22,7 +23,8 @@ int pixel_image_convert(struct pixel_image *img, uint32_t new_format)
 
 	if (op == NULL) {
 		LOG_ERR("Conversion operation from %s to %s not found",
-			VIDEO_FOURCC_TO_STR(img->fourcc), VIDEO_FOURCC_TO_STR(new_format));
+			PIXEL_FORMAT_TO_STR(img->format),
+			PIXEL_FORMAT_TO_STR(new_format));
 		return pixel_image_error(img, -ENOSYS);
 	}
 
@@ -33,7 +35,7 @@ void pixel_convert_op(struct pixel_operation *op)
 {
 	const uint8_t *line_in = pixel_operation_get_input_line(op);
 	uint8_t *line_out = pixel_operation_get_output_line(op);
-	void (*convert)(const uint8_t *rgb24i, uint8_t *rgb24o, uint16_t width) = op->arg;
+	void (*convert)(const uint8_t *src, uint8_t *dst, uint16_t width) = op->arg;
 
 	__ASSERT_NO_MSG(convert != NULL);
 
@@ -46,7 +48,7 @@ __weak void pixel_line_rgb24_to_rgb24(const uint8_t *rgb24i, uint8_t *rgb24o, ui
 	memcpy(rgb24o, rgb24i, width * 3);
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb24,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB24);
 
 __weak void pixel_line_rgb24_to_rgb332(const uint8_t *rgb24, uint8_t *rgb332, uint16_t width)
 {
@@ -58,7 +60,7 @@ __weak void pixel_line_rgb24_to_rgb332(const uint8_t *rgb24, uint8_t *rgb332, ui
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb332,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_RGB332);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB332);
 
 __weak void pixel_line_rgb332_to_rgb24(const uint8_t *rgb332, uint8_t *rgb24, uint16_t width)
 {
@@ -69,7 +71,7 @@ __weak void pixel_line_rgb332_to_rgb24(const uint8_t *rgb332, uint8_t *rgb24, ui
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb332_to_rgb24,
-			       VIDEO_PIX_FMT_RGB332, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_RGB332, PIXEL_FORMAT_RGB24);
 
 static inline uint16_t pixel_rgb24_to_rgb565(const uint8_t rgb24[3])
 {
@@ -95,7 +97,7 @@ __weak void pixel_line_rgb24_to_rgb565be(const uint8_t *rgb24, uint8_t *rgb565be
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565be,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_RGB565X);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB565X);
 
 __weak void pixel_line_rgb24_to_rgb565le(const uint8_t *rgb24, uint8_t *rgb565le, uint16_t width)
 {
@@ -104,7 +106,7 @@ __weak void pixel_line_rgb24_to_rgb565le(const uint8_t *rgb24, uint8_t *rgb565le
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565le,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_RGB565);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB565);
 
 __weak void pixel_line_rgb565be_to_rgb24(const uint8_t *rgb565be, uint8_t *rgb24, uint16_t width)
 {
@@ -113,7 +115,7 @@ __weak void pixel_line_rgb565be_to_rgb24(const uint8_t *rgb565be, uint8_t *rgb24
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565be_to_rgb24,
-			       VIDEO_PIX_FMT_RGB565X, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_RGB565X, PIXEL_FORMAT_RGB24);
 
 __weak void pixel_line_rgb565le_to_rgb24(const uint8_t *rgb565le, uint8_t *rgb24, uint16_t width)
 {
@@ -122,7 +124,7 @@ __weak void pixel_line_rgb565le_to_rgb24(const uint8_t *rgb565le, uint8_t *rgb24
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565le_to_rgb24,
-			       VIDEO_PIX_FMT_RGB565, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_RGB565, PIXEL_FORMAT_RGB24);
 
 #define Q21(val) ((int32_t)((val) * (1 << 21)))
 
@@ -178,7 +180,7 @@ __weak void pixel_line_yuv24_to_rgb24_bt709(const uint8_t *yuv24, uint8_t *rgb24
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_rgb24_bt709,
-			       VIDEO_PIX_FMT_YUV24, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_YUV24, PIXEL_FORMAT_RGB24);
 
 void pixel_line_rgb24_to_yuv24_bt709(const uint8_t *rgb24, uint8_t *yuv24, uint16_t width)
 {
@@ -189,7 +191,7 @@ void pixel_line_rgb24_to_yuv24_bt709(const uint8_t *rgb24, uint8_t *yuv24, uint1
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuv24_bt709,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_YUV24);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_YUV24);
 
 __weak void pixel_line_yuv24_to_yuyv(const uint8_t *yuv24, uint8_t *yuyv, uint16_t width)
 {
@@ -203,7 +205,7 @@ __weak void pixel_line_yuv24_to_yuyv(const uint8_t *yuv24, uint8_t *yuyv, uint16
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_yuyv,
-			       VIDEO_PIX_FMT_YUV24, VIDEO_PIX_FMT_YUYV);
+			       PIXEL_FORMAT_YUV24, PIXEL_FORMAT_YUYV);
 
 __weak void pixel_line_yuyv_to_yuv24(const uint8_t *yuyv, uint8_t *yuv24, uint16_t width)
 {
@@ -219,7 +221,7 @@ __weak void pixel_line_yuyv_to_yuv24(const uint8_t *yuyv, uint8_t *yuv24, uint16
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_yuv24,
-			       VIDEO_PIX_FMT_YUYV, VIDEO_PIX_FMT_YUV24);
+			       PIXEL_FORMAT_YUYV, PIXEL_FORMAT_YUV24);
 
 __weak void pixel_line_rgb24_to_yuyv_bt709(const uint8_t *rgb24, uint8_t *yuyv, uint16_t width)
 {
@@ -233,7 +235,7 @@ __weak void pixel_line_rgb24_to_yuyv_bt709(const uint8_t *rgb24, uint8_t *yuyv, 
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuyv_bt709,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_YUYV);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_YUYV);
 
 __weak void pixel_line_yuyv_to_rgb24_bt709(const uint8_t *yuyv, uint8_t *rgb24, uint16_t width)
 {
@@ -245,7 +247,7 @@ __weak void pixel_line_yuyv_to_rgb24_bt709(const uint8_t *yuyv, uint8_t *rgb24, 
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_rgb24_bt709,
-			       VIDEO_PIX_FMT_YUYV, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_YUYV, PIXEL_FORMAT_RGB24);
 
 __weak void pixel_line_y8_to_rgb24_bt709(const uint8_t *y8, uint8_t *rgb24, uint16_t width)
 {
@@ -254,7 +256,7 @@ __weak void pixel_line_y8_to_rgb24_bt709(const uint8_t *y8, uint8_t *rgb24, uint
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_y8_to_rgb24_bt709,
-			       VIDEO_PIX_FMT_GREY, VIDEO_PIX_FMT_RGB24);
+			       PIXEL_FORMAT_GREY, PIXEL_FORMAT_RGB24);
 
 __weak void pixel_line_rgb24_to_y8_bt709(const uint8_t *rgb24, uint8_t *y8, uint16_t width)
 {
@@ -263,4 +265,4 @@ __weak void pixel_line_rgb24_to_y8_bt709(const uint8_t *rgb24, uint8_t *y8, uint
 	}
 }
 PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_y8_bt709,
-			       VIDEO_PIX_FMT_RGB24, VIDEO_PIX_FMT_GREY);
+			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_GREY);
