@@ -17,14 +17,14 @@
  * Invoking this macro suffices for @ref pixel_image_convert() to include the extra format.
  *
  * @param _fn Function converting one input line.
- * @param _fourcc The pixel format of the data resized.
+ * @param _format The pixel format of the data resized.
  */
-#define PIXEL_DEFINE_RESIZE_OPERATION(_fn, _fourcc)                                                \
+#define PIXEL_DEFINE_RESIZE_OPERATION(_fn, _format)                                                \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_resize, pixel_operation,              \
-						       pixel_resize_op##_fourcc) = {               \
+						       pixel_resize_op##_format) = {               \
 		.name = #_fn,                                                                      \
-		.fourcc_in = _fourcc,                                                              \
-		.fourcc_out = _fourcc,                                                             \
+		.format_in = _format,                                                              \
+		.format_out = _format,                                                             \
 		.window_size = 1,                                                                  \
 		.run = _fn,                                                                        \
 	}

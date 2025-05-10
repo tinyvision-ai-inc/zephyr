@@ -18,18 +18,18 @@
  * @brief Define a new format conversion operation.
  *
  * @param _fn Function converting one input line.
- * @param _fourcc_in The input format for that operation.
- * @param _fourcc_out The Output format for that operation.
+ * @param _format_in The input format for that operation.
+ * @param _format_out The Output format for that operation.
  */
-#define PIXEL_DEFINE_CONVERT_OPERATION(_fn, _fourcc_in, _fourcc_out)                               \
+#define PIXEL_DEFINE_CONVERT_OPERATION(_fn, _format_in, _format_out)                               \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_convert, pixel_operation,             \
 						       _fn##_op) = {                               \
 		.name = #_fn,                                                                      \
-		.fourcc_in = _fourcc_in,                                                           \
-		.fourcc_out = _fourcc_out,                                                         \
-		.window_size = 1,                                                                  \
+		.format_in = (_format_in),                                                         \
+		.format_out = (_format_out),                                                       \
+		.window_size = _format_out##_BLOCK_HEIGHT,                                         \
 		.run = pixel_convert_op,                                                           \
-		.arg = _fn,                                                                        \
+		.arg = (_fn),                                                                      \
 	}
 /**
  * @brief Helper to turn a format conversion function into an operation.

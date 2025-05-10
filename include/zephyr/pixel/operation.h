@@ -16,6 +16,8 @@
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/sys/__assert.h>
 
+#include <zephyr/pixel/format.h>
+
 /**
  * @brief One step of a line operation pipeline
  *
@@ -30,10 +32,10 @@ struct pixel_operation {
 	const uint8_t *name;
 	/** Operation type in case there are several variants for an operation */
 	uint32_t type;
-	/** Pixel input format as a four character code */
-	uint32_t fourcc_in;
-	/** Pixel output format as a four character code */
-	uint32_t fourcc_out;
+	/** Pixel input format */
+	pixel_format_t format_in;
+	/** Pixel output format */
+	pixel_format_t format_out;
 	/** Width of the image in pixels */
 	uint16_t width;
 	/** Height of the image in pixels */
@@ -78,7 +80,7 @@ static inline uint8_t *pixel_operation_get_output_line(struct pixel_operation *o
 
 	__ASSERT_NO_MSG(next != NULL);
 
-	pitch = next->width * video_bits_per_pixel(next->fourcc_in) / BITS_PER_BYTE;
+	pitch = next->width * next->format_in->bits_per_pixel / BITS_PER_BYTE;
 	size = ring_buf_put_claim(&next->ring, &lines, pitch);
 	ring_buf_put_finish(&next->ring, size);
 
@@ -111,7 +113,7 @@ static inline const uint8_t *pixel_operation_get_input_lines(struct pixel_operat
 		"Trying to read at position %u beyond the height of the frame %u",
 		op->line_offset, op->height);
 
-	pitch = op->width * video_bits_per_pixel(op->fourcc_in) / BITS_PER_BYTE;
+	pitch = op->width * op->format_in->bits_per_pixel / BITS_PER_BYTE;
 	size = ring_buf_get_claim(&op->ring, &lines, pitch * nb);
 	ring_buf_get_finish(&op->ring, size);
 
@@ -143,11 +145,10 @@ static inline const uint8_t *pixel_operation_get_input_line(struct pixel_operati
  */
 static inline uint8_t *pixel_operation_peek_input_line(struct pixel_operation *op)
 {
-	uint32_t pitch = op->width * video_bits_per_pixel(op->fourcc_in) / BITS_PER_BYTE;
+	uint32_t pitch = op->width * op->format_in->bits_per_pixel / BITS_PER_BYTE;
 	uint8_t *line;
-	uint32_t size = ring_buf_get_claim(&op->ring, &line, pitch);
 
-	__ASSERT_NO_MSG(size == pitch);
+	__ASSERT_NO_MSG(ring_buf_get_claim(&op->ring, &line, pitch) == pitch);
 
 	return line;
 }

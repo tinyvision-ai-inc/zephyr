@@ -23,10 +23,10 @@
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_convert, pixel_operation,             \
 						       _fn##_op) = {                               \
 		.name = #_fn,                                                                      \
-		.fourcc_in = _fourcc_in,                                                           \
-		.fourcc_out = VIDEO_PIX_FMT_RGB24,                                                 \
-		.window_size = _window_size,                                                       \
-		.run = _fn,                                                                        \
+		.format_in = (_fourcc_in),                                                         \
+		.format_out = PIXEL_FORMAT_RGB24,                                                  \
+		.window_size = (_window_size),                                                     \
+		.run = (_fn),                                                                      \
 	}
 
 /**

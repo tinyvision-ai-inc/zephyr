@@ -17,7 +17,8 @@ int pixel_image_debayer(struct pixel_image *img, uint32_t window_size)
 	const struct pixel_operation *op = NULL;
 
 	STRUCT_SECTION_FOREACH_ALTERNATE(pixel_convert, pixel_operation, tmp) {
-		if (tmp->fourcc_in == img->fourcc && tmp->fourcc_out == VIDEO_PIX_FMT_RGB24 &&
+		if (tmp->format_in->fourcc == img->format->fourcc &&
+		    tmp->format_out->fourcc == PIXEL_FORMAT_RGB24->fourcc &&
 		    tmp->window_size == window_size) {
 			op = tmp;
 			break;
@@ -26,7 +27,7 @@ int pixel_image_debayer(struct pixel_image *img, uint32_t window_size)
 
 	if (op == NULL) {
 		LOG_ERR("Conversion operation from %s to %s using %ux%u window not found",
-			VIDEO_FOURCC_TO_STR(img->fourcc), VIDEO_FOURCC_TO_STR(VIDEO_PIX_FMT_RGB24),
+			PIXEL_FORMAT_TO_STR(img->format), PIXEL_FORMAT_TO_STR(PIXEL_FORMAT_RGB24),
 			window_size, window_size);
 		return pixel_image_error(img, -ENOSYS);
 	}
@@ -289,53 +290,53 @@ static void pixel_op_rggb8_to_rgb24_3x3(struct pixel_operation *op)
 	pixel_op_bayer_to_rgb24_3x3(op, &pixel_line_rggb8_to_rgb24_3x3,
 				    &pixel_line_gbrg8_to_rgb24_3x3);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_rggb8_to_rgb24_3x3, VIDEO_PIX_FMT_RGGB8, 3);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_rggb8_to_rgb24_3x3, PIXEL_FORMAT_SRGGB8, 3);
 
 static void pixel_op_gbrg8_to_rgb24_3x3(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_3x3(op, &pixel_line_gbrg8_to_rgb24_3x3,
 				    &pixel_line_rggb8_to_rgb24_3x3);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_gbrg8_to_rgb24_3x3, VIDEO_PIX_FMT_GBRG8, 3);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_gbrg8_to_rgb24_3x3, PIXEL_FORMAT_SGBRG8, 3);
 
 static void pixel_op_bggr8_to_rgb24_3x3(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_3x3(op, &pixel_line_bggr8_to_rgb24_3x3,
 				    &pixel_line_grbg8_to_rgb24_3x3);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_bggr8_to_rgb24_3x3, VIDEO_PIX_FMT_BGGR8, 3);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_bggr8_to_rgb24_3x3, PIXEL_FORMAT_SBGGR8, 3);
 
 static void pixel_op_grbg8_to_rgb24_3x3(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_3x3(op, &pixel_line_grbg8_to_rgb24_3x3,
 				    &pixel_line_bggr8_to_rgb24_3x3);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_grbg8_to_rgb24_3x3, VIDEO_PIX_FMT_GRBG8, 3);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_grbg8_to_rgb24_3x3, PIXEL_FORMAT_SGRBG8, 3);
 
 static void pixel_op_rggb8_to_rgb24_2x2(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_2x2(op, &pixel_line_rggb8_to_rgb24_2x2,
 				    &pixel_line_gbrg8_to_rgb24_2x2);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_rggb8_to_rgb24_2x2, VIDEO_PIX_FMT_RGGB8, 2);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_rggb8_to_rgb24_2x2, PIXEL_FORMAT_SRGGB8, 2);
 
 static void pixel_op_gbrg8_to_rgb24_2x2(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_2x2(op, &pixel_line_gbrg8_to_rgb24_2x2,
 				    &pixel_line_rggb8_to_rgb24_2x2);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_gbrg8_to_rgb24_2x2, VIDEO_PIX_FMT_GBRG8, 2);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_gbrg8_to_rgb24_2x2, PIXEL_FORMAT_SGBRG8, 2);
 
 static void pixel_op_bggr8_to_rgb24_2x2(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_2x2(op, &pixel_line_bggr8_to_rgb24_2x2,
 				    &pixel_line_grbg8_to_rgb24_2x2);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_bggr8_to_rgb24_2x2, VIDEO_PIX_FMT_BGGR8, 2);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_bggr8_to_rgb24_2x2, PIXEL_FORMAT_SBGGR8, 2);
 
 static void pixel_op_grbg8_to_rgb24_2x2(struct pixel_operation *op)
 {
 	pixel_op_bayer_to_rgb24_2x2(op, &pixel_line_grbg8_to_rgb24_2x2,
 				    pixel_line_bggr8_to_rgb24_2x2);
 }
-PIXEL_DEFINE_BAYER_OPERATION(pixel_op_grbg8_to_rgb24_2x2, VIDEO_PIX_FMT_GRBG8, 2);
+PIXEL_DEFINE_BAYER_OPERATION(pixel_op_grbg8_to_rgb24_2x2, PIXEL_FORMAT_SGRBG8, 2);

@@ -56,9 +56,9 @@ int pixel_image_add_operation(struct pixel_image *img, const struct pixel_operat
 		return -ECANCELED;
 	}
 
-	if (template->fourcc_in != img->fourcc) {
+	if (template->format_in->fourcc != img->format->fourcc) {
 		LOG_ERR("Wrong format for this operation: image has %s, operation uses %s",
-			VIDEO_FOURCC_TO_STR(template->fourcc_in), VIDEO_FOURCC_TO_STR(img->fourcc));
+			PIXEL_FORMAT_TO_STR(template->format_in), PIXEL_FORMAT_TO_STR(img->format));
 		return pixel_image_error(img, -EINVAL);
 	}
 
@@ -74,7 +74,7 @@ int pixel_image_add_operation(struct pixel_image *img, const struct pixel_operat
 	op->ring.buffer = NULL; /* allocated later */
 	op->ring.size = buffer_size;
 
-	img->fourcc = op->fourcc_out;
+	img->format = op->format_out;
 
 	sys_slist_append(&img->operations, &op->node);
 
@@ -83,10 +83,8 @@ int pixel_image_add_operation(struct pixel_image *img, const struct pixel_operat
 
 int pixel_image_add_uncompressed(struct pixel_image *img, const struct pixel_operation *template)
 {
-	size_t bpp = video_bits_per_pixel(img->fourcc);
-	size_t size = template->window_size * img->width * bpp / BITS_PER_BYTE;
-
-	__ASSERT(bpp > 0, "Unknown image pitch for format %s.", VIDEO_FOURCC_TO_STR(img->fourcc));
+	size_t pitch = img->width * img->format->bits_per_pixel / BITS_PER_BYTE;
+	size_t size = template->window_size * pitch;
 
 	return pixel_image_add_operation(img, template, size, size);
 }
@@ -133,8 +131,8 @@ int pixel_image_process(struct pixel_image *img)
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&img->operations, op, node) {
 		LOG_DBG("- %s %ux%u to %s, %s, threshold %u",
-			VIDEO_FOURCC_TO_STR(op->fourcc_in), op->width, op->height,
-			VIDEO_FOURCC_TO_STR(op->fourcc_out), op->name, op->threshold);
+			PIXEL_FORMAT_TO_STR(op->format_in), op->width, op->height,
+			PIXEL_FORMAT_TO_STR(op->format_out), op->name, op->threshold);
 	}
 
 	op = SYS_SLIST_PEEK_HEAD_CONTAINER(&img->operations, op, node);
@@ -146,21 +144,20 @@ int pixel_image_process(struct pixel_image *img)
 }
 
 void pixel_image_from_buffer(struct pixel_image *img, uint8_t *buffer, size_t size,
-			     uint16_t width, uint16_t height, uint32_t fourcc)
+			     uint16_t width, uint16_t height, pixel_format_t format)
 {
 	memset(img, 0x00, sizeof(*img));
 	img->buffer = buffer;
 	img->size = size;
 	img->width = width;
 	img->height = height;
-	img->fourcc = fourcc;
+	img->format = format;
 }
 
 void pixel_image_from_vbuf(struct pixel_image *img, struct video_buffer *vbuf,
-			   struct video_format *fmt)
+			   size_t width, size_t height, pixel_format_t format)
 {
-	pixel_image_from_buffer(img, vbuf->buffer, vbuf->size, fmt->width, fmt->height,
-				fmt->pixelformat);
+	pixel_image_from_buffer(img, vbuf->buffer, vbuf->size, width, height, format);
 }
 
 int pixel_image_to_buffer(struct pixel_image *img, uint8_t *buffer, size_t size)
@@ -180,8 +177,8 @@ int pixel_image_to_buffer(struct pixel_image *img, uint8_t *buffer, size_t size)
 	memset(op, 0x00, sizeof(*op));
 	op->name = __func__;
 	op->threshold = size;
-	op->fourcc_in = img->fourcc;
-	op->fourcc_out = img->fourcc;
+	op->format_in = img->format;
+	op->format_out = img->format;
 	op->width = img->width;
 	op->height = img->height;
 	op->ring.buffer = buffer;

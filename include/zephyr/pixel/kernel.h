@@ -17,14 +17,14 @@
  *
  * @param _fn Function converting 5 input lines into 1 output line.
  * @param _type Kernel operation type
- * @param _fourcc The input format for that operation.
+ * @param _format The input format for that operation.
  */
-#define PIXEL_DEFINE_KERNEL_5X5_OPERATION(_fn, _type, _fourcc)                                     \
+#define PIXEL_DEFINE_KERNEL_5X5_OPERATION(_fn, _type, _format)                                     \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_kernel, pixel_operation,              \
 						       _fn##_op) = {                               \
 		.name = #_fn,                                                                      \
-		.fourcc_in = _fourcc,                                                              \
-		.fourcc_out = _fourcc,                                                             \
+		.format_in = _format,                                                              \
+		.format_out = _format,                                                             \
 		.window_size = 5,                                                                  \
 		.run = pixel_kernel_5x5_op,                                                        \
 		.arg = _fn,                                                                        \
@@ -36,14 +36,14 @@
  *
  * @param _fn Function converting 3 input lines into 1 output line.
  * @param _type Kernel operation type
- * @param _fourcc The input format for that operation.
+ * @param _format The input format for that operation.
  */
-#define PIXEL_DEFINE_KERNEL_3X3_OPERATION(_fn, _type, _fourcc)                                     \
+#define PIXEL_DEFINE_KERNEL_3X3_OPERATION(_fn, _type, _format)                                     \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_kernel, pixel_operation,              \
 						       _fn##_op) = {                               \
 		.name = #_fn,                                                                      \
-		.fourcc_in = _fourcc,                                                              \
-		.fourcc_out = _fourcc,                                                             \
+		.format_in = _format,                                                              \
+		.format_out = _format,                                                             \
 		.window_size = 3,                                                                  \
 		.run = pixel_kernel_3x3_op,                                                        \
 		.arg = _fn,                                                                        \

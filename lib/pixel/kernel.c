@@ -17,7 +17,8 @@ int pixel_image_kernel(struct pixel_image *img, uint32_t kernel_type, int kernel
 	const struct pixel_operation *op = NULL;
 
 	STRUCT_SECTION_FOREACH_ALTERNATE(pixel_kernel, pixel_operation, tmp) {
-		if (tmp->fourcc_in == img->fourcc && tmp->type == kernel_type &&
+		if (tmp->format_in->fourcc == img->format->fourcc &&
+		    tmp->type == kernel_type &&
 		    kernel_size == tmp->window_size) {
 			op = tmp;
 			break;
@@ -26,7 +27,8 @@ int pixel_image_kernel(struct pixel_image *img, uint32_t kernel_type, int kernel
 
 	if (op == NULL) {
 		LOG_ERR("Kernel operation %u of size %ux%u on %s data not found",
-			kernel_type, kernel_size, kernel_size, VIDEO_FOURCC_TO_STR(img->fourcc));
+			kernel_type, kernel_size, kernel_size,
+			PIXEL_FORMAT_TO_STR(img->format));
 		return pixel_image_error(img, -ENOSYS);
 	}
 
@@ -320,7 +322,7 @@ __weak void pixel_identity_rgb24_3x3(const uint8_t *in[3], uint8_t *out, uint16_
 			 pixel_identity_3x3);
 }
 PIXEL_DEFINE_KERNEL_3X3_OPERATION(pixel_identity_rgb24_3x3,
-				  PIXEL_KERNEL_IDENTITY, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_IDENTITY, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_identity_5x5[] = {
 	0, 0, 0, 0, 0,
@@ -336,7 +338,7 @@ __weak void pixel_identity_rgb24_5x5(const uint8_t *in[5], uint8_t *out, uint16_
 			 pixel_identity_5x5);
 }
 PIXEL_DEFINE_KERNEL_5X5_OPERATION(pixel_identity_rgb24_5x5,
-				  PIXEL_KERNEL_IDENTITY, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_IDENTITY, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_edgedetect_3x3[] = {
 	-1, -1, -1,
@@ -350,7 +352,7 @@ __weak void pixel_edgedetect_rgb24_3x3(const uint8_t *in[3], uint8_t *out, uint1
 			      pixel_edgedetect_3x3);
 }
 PIXEL_DEFINE_KERNEL_3X3_OPERATION(pixel_edgedetect_rgb24_3x3,
-				  PIXEL_KERNEL_EDGE_DETECT, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_EDGE_DETECT, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_gaussianblur_3x3[] = {
 	1, 2, 1,
@@ -364,7 +366,7 @@ __weak void pixel_gaussianblur_rgb24_3x3(const uint8_t *in[3], uint8_t *out, uin
 			      pixel_gaussianblur_3x3);
 }
 PIXEL_DEFINE_KERNEL_3X3_OPERATION(pixel_gaussianblur_rgb24_3x3,
-				  PIXEL_KERNEL_GAUSSIAN_BLUR, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_GAUSSIAN_BLUR, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_gaussianblur_5x5[] = {
 	1,  4,  6,  4, 1,
@@ -380,7 +382,7 @@ __weak void pixel_gaussianblur_rgb24_5x5(const uint8_t *in[5], uint8_t *out, uin
 			 pixel_gaussianblur_5x5);
 }
 PIXEL_DEFINE_KERNEL_5X5_OPERATION(pixel_gaussianblur_rgb24_5x5,
-				  PIXEL_KERNEL_GAUSSIAN_BLUR, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_GAUSSIAN_BLUR, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_sharpen_3x3[] = {
 	 0, -1,  0,
@@ -394,7 +396,7 @@ __weak void pixel_sharpen_rgb24_3x3(const uint8_t *in[3], uint8_t *out, uint16_t
 			      pixel_sharpen_3x3);
 }
 PIXEL_DEFINE_KERNEL_3X3_OPERATION(pixel_sharpen_rgb24_3x3,
-				  PIXEL_KERNEL_SHARPEN, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_SHARPEN, PIXEL_FORMAT_RGB24);
 
 static const int16_t pixel_unsharp_5x5[] = {
 	-1,  -4,  -6,  -4, -1,
@@ -410,7 +412,7 @@ __weak void pixel_sharpen_rgb24_5x5(const uint8_t *in[5], uint8_t *out, uint16_t
 			 pixel_unsharp_5x5);
 }
 PIXEL_DEFINE_KERNEL_5X5_OPERATION(pixel_sharpen_rgb24_5x5,
-				  PIXEL_KERNEL_SHARPEN, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_SHARPEN, PIXEL_FORMAT_RGB24);
 
 /*
  * Declaration of median kernels, with the line-processing functions declared as __weak to
@@ -423,11 +425,11 @@ __weak void pixel_median_rgb24_5x5(const uint8_t *in[5], uint8_t *out, uint16_t 
 }
 
 PIXEL_DEFINE_KERNEL_5X5_OPERATION(pixel_median_rgb24_5x5,
-				  PIXEL_KERNEL_DENOISE, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_DENOISE, PIXEL_FORMAT_RGB24);
 
 __weak void pixel_median_rgb24_3x3(const uint8_t *in[3], uint8_t *out, uint16_t width)
 {
 	pixel_kernel_3x3(in, out, width, pixel_kernel_rgb24_3x3, pixel_median_3x3, NULL);
 }
 PIXEL_DEFINE_KERNEL_3X3_OPERATION(pixel_median_rgb24_3x3,
-				  PIXEL_KERNEL_DENOISE, VIDEO_PIX_FMT_RGB24);
+				  PIXEL_KERNEL_DENOISE, PIXEL_FORMAT_RGB24);

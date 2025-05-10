@@ -4,11 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef ZEPHYR_INCLUDE_PIXEL_IMAGE_H
-#define ZEPHYR_INCLUDE_PIXEL_IMAGE_H
+#ifndef ZEPHYR_INCLUDE_PIXEL_IMAGE_H_
+#define ZEPHYR_INCLUDE_PIXEL_IMAGE_H_
 
 #include <zephyr/sys/slist.h>
 #include <zephyr/pixel/operation.h>
+#include <zephyr/pixel/format.h>
 #include <zephyr/pixel/kernel.h>
 
 /**
@@ -20,8 +21,8 @@ struct pixel_image {
 	uint16_t width;
 	/** Current height of the image */
 	uint16_t height;
-	/** Current pixel format of the image as a four character code (fourcc) */
-	uint32_t fourcc;
+	/** Current pixel format of the image */
+	pixel_format_t format;
 	/** Input or output buffer used with the conversion */
 	uint8_t *buffer;
 	/** Size of the input or output buffer */
@@ -38,20 +39,22 @@ struct pixel_image {
  * @param size Total available size in the buffer, can be bigger/smaller than full width x height.
  * @param width Width of the complete image in pixels.
  * @param height Height of the complete image in pixels.
- * @param fourcc Format of data in the buffer as a four-character-code.
+ * @param format Format of data in the buffer as a four-character-code.
  */
 void pixel_image_from_buffer(struct pixel_image *img, uint8_t *buffer, size_t size,
-			     uint16_t width, uint16_t height, uint32_t fourcc);
+			     uint16_t width, uint16_t height, pixel_format_t format);
 
 /**
  * @brief Initialize an image from a video buffer.
  *
  * @param img Image to initialize.
  * @param vbuf Video buffer that contains the image data to process.
- * @param fmt Format of that video buffer.
+ * @param width Width of the complete image in pixels.
+ * @param height Height of the complete image in pixels.
+ * @param format Format of data in the buffer as a four-character-code.
  */
 void pixel_image_from_vbuf(struct pixel_image *img, struct video_buffer *vbuf,
-			   struct video_format *fmt);
+			   size_t width, size_t height, pixel_format_t format);
 
 /**
  * @brief Initialize an image from a memory buffer.
@@ -84,7 +87,7 @@ int pixel_image_to_vbuf(struct pixel_image *img, struct video_buffer *vbuf);
  * @param img Image to convert.
  * @param new_format A four-character-code (FOURCC) as defined by @c <zephyr/drivers/video.h>.
  */
-int pixel_image_convert(struct pixel_image *img, uint32_t new_format);
+int pixel_image_convert(struct pixel_image *img, pixel_format_t  new_format);
 
 /**
  * @brief Convert an image from a bayer array format to RGB24.
@@ -200,4 +203,4 @@ int pixel_image_error(struct pixel_image *img, int err);
 
 /** @endcond */
 
-#endif /* ZEPHYR_INCLUDE_PIXEL_IMAGE_H */
+#endif /* ZEPHYR_INCLUDE_PIXEL_IMAGE_H_ */
