@@ -33,9 +33,9 @@ struct pixel_operation {
 	/** Operation type in case there are several variants for an operation */
 	uint32_t type;
 	/** Pixel input format */
-	pixel_format_t format_in;
+	uint32_t format_in;
 	/** Pixel output format */
-	pixel_format_t format_out;
+	uint32_t format_out;
 	/** Width of the image in pixels */
 	uint16_t width;
 	/** Height of the image in pixels */
@@ -53,7 +53,9 @@ struct pixel_operation {
 	/** Function that performs the I/O */
 	void (*run)(struct pixel_operation *op);
 	/** Operation-specific data */
-	void *arg;
+	void *arg0;
+	/** Operation-specific data */
+	void *arg1;
 	/** Timestamp since the op started working in CPU cycles */
 	uint32_t start_time;
 	/** Total time spent working in this op through the operation in CPU cycles */
@@ -80,7 +82,7 @@ static inline uint8_t *pixel_operation_get_output_line(struct pixel_operation *o
 
 	__ASSERT_NO_MSG(next != NULL);
 
-	pitch = next->width * next->format_in->bits_per_pixel / BITS_PER_BYTE;
+	pitch = next->width * pixel_bits_per_pixel(next->format_in) / BITS_PER_BYTE;
 	size = ring_buf_put_claim(&next->ring, &lines, pitch);
 	ring_buf_put_finish(&next->ring, size);
 
@@ -113,7 +115,7 @@ static inline const uint8_t *pixel_operation_get_input_lines(struct pixel_operat
 		"Trying to read at position %u beyond the height of the frame %u",
 		op->line_offset, op->height);
 
-	pitch = op->width * op->format_in->bits_per_pixel / BITS_PER_BYTE;
+	pitch = op->width * pixel_bits_per_pixel(op->format_in) / BITS_PER_BYTE;
 	size = ring_buf_get_claim(&op->ring, &lines, pitch * nb);
 	ring_buf_get_finish(&op->ring, size);
 
@@ -145,7 +147,7 @@ static inline const uint8_t *pixel_operation_get_input_line(struct pixel_operati
  */
 static inline uint8_t *pixel_operation_peek_input_line(struct pixel_operation *op)
 {
-	uint32_t pitch = op->width * op->format_in->bits_per_pixel / BITS_PER_BYTE;
+	uint32_t pitch = op->width * pixel_bits_per_pixel(op->format_in) / BITS_PER_BYTE;
 	uint8_t *line;
 
 	__ASSERT_NO_MSG(ring_buf_get_claim(&op->ring, &line, pitch) == pitch);

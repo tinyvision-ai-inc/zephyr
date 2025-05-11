@@ -10,7 +10,10 @@
 #include <zephyr/sys/slist.h>
 #include <zephyr/pixel/operation.h>
 #include <zephyr/pixel/format.h>
+#include <zephyr/pixel/palettize.h>
 #include <zephyr/pixel/kernel.h>
+
+struct pixel_palette;
 
 /**
  * @brief Represent the image currently being processed
@@ -22,7 +25,7 @@ struct pixel_image {
 	/** Current height of the image */
 	uint16_t height;
 	/** Current pixel format of the image */
-	pixel_format_t format;
+	uint32_t format;
 	/** Input or output buffer used with the conversion */
 	uint8_t *buffer;
 	/** Size of the input or output buffer */
@@ -42,19 +45,17 @@ struct pixel_image {
  * @param format Format of data in the buffer as a four-character-code.
  */
 void pixel_image_from_buffer(struct pixel_image *img, uint8_t *buffer, size_t size,
-			     uint16_t width, uint16_t height, pixel_format_t format);
+			     uint16_t width, uint16_t height, uint32_t format);
 
 /**
  * @brief Initialize an image from a video buffer.
  *
  * @param img Image to initialize.
  * @param vbuf Video buffer that contains the image data to process.
- * @param width Width of the complete image in pixels.
- * @param height Height of the complete image in pixels.
- * @param format Format of data in the buffer as a four-character-code.
+ * @param vfmt Video format describing the buffer.
  */
 void pixel_image_from_vbuf(struct pixel_image *img, struct video_buffer *vbuf,
-			   size_t width, size_t height, pixel_format_t format);
+			   struct video_format *vfmt);
 
 /**
  * @brief Initialize an image from a memory buffer.
@@ -87,7 +88,38 @@ int pixel_image_to_vbuf(struct pixel_image *img, struct video_buffer *vbuf);
  * @param img Image to convert.
  * @param new_format A four-character-code (FOURCC) as defined by @c <zephyr/drivers/video.h>.
  */
-int pixel_image_convert(struct pixel_image *img, pixel_format_t  new_format);
+int pixel_image_convert(struct pixel_image *img, uint32_t new_format);
+
+/**
+ * @brief Convert an image to an indexed color format.
+ *
+ * An operation is added to convert the image to an indexed pixel format given the input palette.
+ *
+ * If the palette has up to 2 colors, 8 pixels are packed per byte.
+ * If the palette has up to 4 colors, 4 pixels are packed per byte.
+ * If the palette has up to 16 colors, 2 pixels are packed per byte.
+ * If the palette has up to 256 colors, 1 pixels are packed per byte.
+ *
+ * @param img Image to convert.
+ * @param palette The color palette to use for the conversion.
+ */
+int pixel_image_palettize(struct pixel_image *img, struct pixel_palette *palette);
+
+/**
+ * @brief Convert an image from an indexed color format.
+ *
+ * An operation is added to convert the image from an indexed pixel format given the input palette.
+ *
+ * If the palette has up to 2 colors, 8 pixels are packed per byte.
+ * If the palette has up to 4 colors, 4 pixels are packed per byte.
+ * If the palette has up to 16 colors, 2 pixels are packed per byte.
+ * If the palette has up to 256 colors, 1 pixels are packed per byte.
+ *
+ * @param img Image to convert.
+ * @param palette The color palette to use for the conversion.
+ * @param new_format A four-character-code (FOURCC) as defined by @c <zephyr/drivers/video.h>.
+ */
+int pixel_image_depalettize(struct pixel_image *img, struct pixel_palette *palette);
 
 /**
  * @brief Convert an image from a bayer array format to RGB24.

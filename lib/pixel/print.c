@@ -158,14 +158,12 @@ void pixel_print_buffer_256color(const uint8_t *buffer, size_t size, uint16_t wi
 
 void pixel_image_print_truecolor(struct pixel_image *img)
 {
-	pixel_print_buffer_truecolor(img->buffer, img->size, img->width, img->height,
-				     img->format->fourcc);
+	pixel_print_buffer_truecolor(img->buffer, img->size, img->width, img->height, img->format);
 }
 
 void pixel_image_print_256color(struct pixel_image *img)
 {
-	pixel_print_buffer_256color(img->buffer, img->size, img->width, img->height,
-				    img->format->fourcc);
+	pixel_print_buffer_256color(img->buffer, img->size, img->width, img->height, img->format);
 }
 
 void pixel_hexdump_raw8(const uint8_t *raw8, size_t size, uint16_t width, uint16_t height)

@@ -15,18 +15,18 @@
 /**
  * @brief Define a new bayer format conversion operation.
  *
- * @param _fn Function performing the operation.
+ * @param fn Function performing the operation.
  * @param _fourcc_in The input format for that operation.
  * @param _window_size The number of line of context needed for that debayer operation.
  */
-#define PIXEL_DEFINE_BAYER_OPERATION(_fn, _fourcc_in, _window_size)                                \
+#define PIXEL_DEFINE_BAYER_OPERATION(fn, fmt_in, win_sz)                                           \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_convert, pixel_operation,             \
-						       _fn##_op) = {                               \
-		.name = #_fn,                                                                      \
-		.format_in = (_fourcc_in),                                                         \
+						       fn##_op) = {                                \
+		.name = #fn,                                                                       \
+		.format_in = (PIXEL_FORMAT_##fmt_in),                                              \
 		.format_out = PIXEL_FORMAT_RGB24,                                                  \
-		.window_size = (_window_size),                                                     \
-		.run = (_fn),                                                                      \
+		.window_size = (win_sz),                                                           \
+		.run = (fn),                                                                       \
 	}
 
 /**

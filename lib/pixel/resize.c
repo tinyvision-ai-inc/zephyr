@@ -21,7 +21,7 @@ int pixel_image_resize(struct pixel_image *img, uint16_t width, uint16_t height)
 	int ret;
 
 	STRUCT_SECTION_FOREACH_ALTERNATE(pixel_resize, pixel_operation, tmp) {
-		if (tmp->format_in->fourcc == img->format->fourcc) {
+		if (tmp->format_in == img->format) {
 			op = tmp;
 			break;
 		}
@@ -100,19 +100,19 @@ __weak void pixel_op_resize_raw24(struct pixel_operation *op)
 {
 	pixel_op_resize(op, 24);
 }
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw24, PIXEL_FORMAT_RGB24);
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw24, PIXEL_FORMAT_YUV24);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw24, RGB24);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw24, YUV24);
 
 __weak void pixel_op_resize_raw16(struct pixel_operation *op)
 {
 	pixel_op_resize(op, 16);
 }
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw16, PIXEL_FORMAT_RGB565);
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw16, PIXEL_FORMAT_RGB565X);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw16, RGB565);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw16, RGB565X);
 
 __weak void pixel_op_resize_raw8(struct pixel_operation *op)
 {
 	pixel_op_resize(op, 8);
 }
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw8, PIXEL_FORMAT_GREY);
-PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw8, PIXEL_FORMAT_RGB332);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw8, GREY);
+PIXEL_DEFINE_RESIZE_OPERATION(pixel_op_resize_raw8, RGB332);

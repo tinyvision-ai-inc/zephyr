@@ -15,39 +15,39 @@
 /**
  * @brief Define a new 5x5 kernel conversion operation.
  *
- * @param _fn Function converting 5 input lines into 1 output line.
- * @param _type Kernel operation type
- * @param _format The input format for that operation.
+ * @param fn Function converting 5 input lines into 1 output line.
+ * @param t Kernel operation type
+ * @param fmt The input format for that operation.
  */
-#define PIXEL_DEFINE_KERNEL_5X5_OPERATION(_fn, _type, _format)                                     \
+#define PIXEL_DEFINE_KERNEL_5X5_OPERATION(fn, t, fmt)                                              \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_kernel, pixel_operation,              \
-						       _fn##_op) = {                               \
-		.name = #_fn,                                                                      \
-		.format_in = _format,                                                              \
-		.format_out = _format,                                                             \
+						       fn##_op) = {                                \
+		.name = #fn,                                                                       \
+		.format_in = (PIXEL_FORMAT_##fmt),                                                 \
+		.format_out = (PIXEL_FORMAT_##fmt),                                                \
 		.window_size = 5,                                                                  \
 		.run = pixel_kernel_5x5_op,                                                        \
-		.arg = _fn,                                                                        \
-		.type = _type,                                                                     \
+		.arg0 = fn,                                                                        \
+		.type = t,                                                                         \
 	}
 
 /**
  * @brief Define a new 3x3 kernel conversion operation.
  *
- * @param _fn Function converting 3 input lines into 1 output line.
- * @param _type Kernel operation type
- * @param _format The input format for that operation.
+ * @param fn Function converting 3 input lines into 1 output line.
+ * @param t Kernel operation type
+ * @param fmt The input format for that operation.
  */
-#define PIXEL_DEFINE_KERNEL_3X3_OPERATION(_fn, _type, _format)                                     \
+#define PIXEL_DEFINE_KERNEL_3X3_OPERATION(fn, t, fmt)                                              \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_kernel, pixel_operation,              \
-						       _fn##_op) = {                               \
-		.name = #_fn,                                                                      \
-		.format_in = _format,                                                              \
-		.format_out = _format,                                                             \
+						       fn##_op) = {                                \
+		.name = #fn,                                                                       \
+		.format_in = (PIXEL_FORMAT_##fmt),                                                 \
+		.format_out = (PIXEL_FORMAT_##fmt),                                                \
 		.window_size = 3,                                                                  \
 		.run = pixel_kernel_3x3_op,                                                        \
-		.arg = _fn,                                                                        \
-		.type = _type,                                                                     \
+		.arg0 = fn,                                                                         \
+		.type = t,                                                                         \
 	}
 
 /**
@@ -56,7 +56,7 @@
  * The line conversion function is free to perform any processing on the input lines and expected
  * to produce one output line.
  *
- * The line conversion function is to be provided in @c op->arg.
+ * The line conversion function is to be provided in @c op->arg0.
  *
  * @param op Current operation in progress.
  */

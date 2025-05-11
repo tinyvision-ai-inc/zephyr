@@ -9,13 +9,17 @@
 
 LOG_MODULE_REGISTER(pixel_convert, CONFIG_PIXEL_LOG_LEVEL);
 
-int pixel_image_convert(struct pixel_image *img, pixel_format_t new_format)
+int pixel_image_convert(struct pixel_image *img, uint32_t new_format)
 {
 	const struct pixel_operation *op = NULL;
 
+	if (img->format == new_format) {
+		/* no-op */
+		return 0;
+	}
+
 	STRUCT_SECTION_FOREACH_ALTERNATE(pixel_convert, pixel_operation, tmp) {
-		if (tmp->format_in->fourcc == img->format->fourcc &&
-		    tmp->format_out->fourcc == new_format->fourcc) {
+		if (tmp->format_in == img->format && tmp->format_out == new_format) {
 			op = tmp;
 			break;
 		}
@@ -35,20 +39,19 @@ void pixel_convert_op(struct pixel_operation *op)
 {
 	const uint8_t *line_in = pixel_operation_get_input_line(op);
 	uint8_t *line_out = pixel_operation_get_output_line(op);
-	void (*convert)(const uint8_t *src, uint8_t *dst, uint16_t width) = op->arg;
+	void (*fn)(const uint8_t *src, uint8_t *dst, uint16_t width) = op->arg0;
 
-	__ASSERT_NO_MSG(convert != NULL);
+	__ASSERT_NO_MSG(fn != NULL);
 
-	convert(line_in, line_out, op->width);
+	fn(line_in, line_out, op->width);
 	pixel_operation_done(op);
 }
 
-__weak void pixel_line_rgb24_to_rgb24(const uint8_t *rgb24i, uint8_t *rgb24o, uint16_t width)
+__weak void pixel_line_rgb24_to_rgb24(const uint8_t *src, uint8_t *dst, uint16_t width)
 {
-	memcpy(rgb24o, rgb24i, width * 3);
+	memcpy(dst, src, width * 3);
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb24,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb24, RGB24, RGB24);
 
 __weak void pixel_line_rgb24_to_rgb332(const uint8_t *rgb24, uint8_t *rgb332, uint16_t width)
 {
@@ -59,8 +62,7 @@ __weak void pixel_line_rgb24_to_rgb332(const uint8_t *rgb24, uint8_t *rgb332, ui
 		rgb332[o] |= (uint16_t)rgb24[i + 2] >> 6 << (0 + 0 + 0);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb332,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB332);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb332, RGB24, RGB332);
 
 __weak void pixel_line_rgb332_to_rgb24(const uint8_t *rgb332, uint8_t *rgb24, uint16_t width)
 {
@@ -70,8 +72,7 @@ __weak void pixel_line_rgb332_to_rgb24(const uint8_t *rgb332, uint8_t *rgb24, ui
 		rgb24[o + 2] = rgb332[i] >> (0 + 0 + 0) << 6;
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb332_to_rgb24,
-			       PIXEL_FORMAT_RGB332, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb332_to_rgb24, RGB332, RGB24);
 
 static inline uint16_t pixel_rgb24_to_rgb565(const uint8_t rgb24[3])
 {
@@ -96,8 +97,7 @@ __weak void pixel_line_rgb24_to_rgb565be(const uint8_t *rgb24, uint8_t *rgb565be
 		*(uint16_t *)&rgb565be[o] = sys_cpu_to_be16(pixel_rgb24_to_rgb565(&rgb24[i]));
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565be,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB565X);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565be, RGB24, RGB565X);
 
 __weak void pixel_line_rgb24_to_rgb565le(const uint8_t *rgb24, uint8_t *rgb565le, uint16_t width)
 {
@@ -105,8 +105,7 @@ __weak void pixel_line_rgb24_to_rgb565le(const uint8_t *rgb24, uint8_t *rgb565le
 		*(uint16_t *)&rgb565le[o] = sys_cpu_to_le16(pixel_rgb24_to_rgb565(&rgb24[i]));
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565le,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_RGB565);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_rgb565le, RGB24, RGB565);
 
 __weak void pixel_line_rgb565be_to_rgb24(const uint8_t *rgb565be, uint8_t *rgb24, uint16_t width)
 {
@@ -114,8 +113,7 @@ __weak void pixel_line_rgb565be_to_rgb24(const uint8_t *rgb565be, uint8_t *rgb24
 		pixel_rgb565_to_rgb24(sys_be16_to_cpu(*(uint16_t *)&rgb565be[i]), &rgb24[o]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565be_to_rgb24,
-			       PIXEL_FORMAT_RGB565X, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565be_to_rgb24, RGB565X, RGB24);
 
 __weak void pixel_line_rgb565le_to_rgb24(const uint8_t *rgb565le, uint8_t *rgb24, uint16_t width)
 {
@@ -123,8 +121,7 @@ __weak void pixel_line_rgb565le_to_rgb24(const uint8_t *rgb565le, uint8_t *rgb24
 		pixel_rgb565_to_rgb24(sys_le16_to_cpu(*(uint16_t *)&rgb565le[i]), &rgb24[o]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565le_to_rgb24,
-			       PIXEL_FORMAT_RGB565, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb565le_to_rgb24, RGB565, RGB24);
 
 #define Q21(val) ((int32_t)((val) * (1 << 21)))
 
@@ -179,8 +176,7 @@ __weak void pixel_line_yuv24_to_rgb24_bt709(const uint8_t *yuv24, uint8_t *rgb24
 		pixel_yuv24_to_rgb24_bt709(yuv24[i + 0], yuv24[i + 1], yuv24[i + 2], &rgb24[o]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_rgb24_bt709,
-			       PIXEL_FORMAT_YUV24, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_rgb24_bt709, YUV24, RGB24);
 
 void pixel_line_rgb24_to_yuv24_bt709(const uint8_t *rgb24, uint8_t *yuv24, uint16_t width)
 {
@@ -190,8 +186,7 @@ void pixel_line_rgb24_to_yuv24_bt709(const uint8_t *rgb24, uint8_t *yuv24, uint1
 		yuv24[o + 2] = pixel_rgb24_to_v8_bt709(&rgb24[i]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuv24_bt709,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_YUV24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuv24_bt709, RGB24, YUV24);
 
 __weak void pixel_line_yuv24_to_yuyv(const uint8_t *yuv24, uint8_t *yuyv, uint16_t width)
 {
@@ -204,8 +199,7 @@ __weak void pixel_line_yuv24_to_yuyv(const uint8_t *yuv24, uint8_t *yuyv, uint16
 		yuyv[o + 3] = yuv24[i + 5];
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_yuyv,
-			       PIXEL_FORMAT_YUV24, PIXEL_FORMAT_YUYV);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuv24_to_yuyv, YUV24, YUYV);
 
 __weak void pixel_line_yuyv_to_yuv24(const uint8_t *yuyv, uint8_t *yuv24, uint16_t width)
 {
@@ -220,8 +214,7 @@ __weak void pixel_line_yuyv_to_yuv24(const uint8_t *yuyv, uint8_t *yuv24, uint16
 		yuv24[o + 5] = yuyv[i + 3];
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_yuv24,
-			       PIXEL_FORMAT_YUYV, PIXEL_FORMAT_YUV24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_yuv24, YUYV, YUV24);
 
 __weak void pixel_line_rgb24_to_yuyv_bt709(const uint8_t *rgb24, uint8_t *yuyv, uint16_t width)
 {
@@ -234,8 +227,7 @@ __weak void pixel_line_rgb24_to_yuyv_bt709(const uint8_t *rgb24, uint8_t *yuyv, 
 		yuyv[o + 3] = pixel_rgb24_to_v8_bt709(&rgb24[i + 3]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuyv_bt709,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_YUYV);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_yuyv_bt709, RGB24, YUYV);
 
 __weak void pixel_line_yuyv_to_rgb24_bt709(const uint8_t *yuyv, uint8_t *rgb24, uint16_t width)
 {
@@ -246,8 +238,7 @@ __weak void pixel_line_yuyv_to_rgb24_bt709(const uint8_t *yuyv, uint8_t *rgb24, 
 		pixel_yuv24_to_rgb24_bt709(yuyv[i + 2], yuyv[i + 1], yuyv[i + 3], &rgb24[o + 3]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_rgb24_bt709,
-			       PIXEL_FORMAT_YUYV, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_yuyv_to_rgb24_bt709, YUYV, RGB24);
 
 __weak void pixel_line_y8_to_rgb24_bt709(const uint8_t *y8, uint8_t *rgb24, uint16_t width)
 {
@@ -255,8 +246,7 @@ __weak void pixel_line_y8_to_rgb24_bt709(const uint8_t *y8, uint8_t *rgb24, uint
 		pixel_yuv24_to_rgb24_bt709(y8[i], UINT8_MAX / 2, UINT8_MAX / 2, &rgb24[o]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_y8_to_rgb24_bt709,
-			       PIXEL_FORMAT_GREY, PIXEL_FORMAT_RGB24);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_y8_to_rgb24_bt709, GREY, RGB24);
 
 __weak void pixel_line_rgb24_to_y8_bt709(const uint8_t *rgb24, uint8_t *y8, uint16_t width)
 {
@@ -264,5 +254,4 @@ __weak void pixel_line_rgb24_to_y8_bt709(const uint8_t *rgb24, uint8_t *y8, uint
 		y8[o] = pixel_rgb24_to_y8_bt709(&rgb24[i]);
 	}
 }
-PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_y8_bt709,
-			       PIXEL_FORMAT_RGB24, PIXEL_FORMAT_GREY);
+PIXEL_DEFINE_CONVERT_OPERATION(pixel_line_rgb24_to_y8_bt709, RGB24, GREY);

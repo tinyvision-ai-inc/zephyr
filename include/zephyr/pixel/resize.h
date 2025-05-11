@@ -19,14 +19,14 @@
  * @param _fn Function converting one input line.
  * @param _format The pixel format of the data resized.
  */
-#define PIXEL_DEFINE_RESIZE_OPERATION(_fn, _format)                                                \
+#define PIXEL_DEFINE_RESIZE_OPERATION(fn, fmt)                                                     \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_resize, pixel_operation,              \
-						       pixel_resize_op##_format) = {               \
-		.name = #_fn,                                                                      \
-		.format_in = _format,                                                              \
-		.format_out = _format,                                                             \
+						       pixel_resize_op_##fmt) = {                  \
+		.name = #fn,                                                                       \
+		.format_in = (PIXEL_FORMAT_##fmt),                                                 \
+		.format_out = (PIXEL_FORMAT_##fmt),                                                \
 		.window_size = 1,                                                                  \
-		.run = _fn,                                                                        \
+		.run = fn,                                                                         \
 	}
 
 /**

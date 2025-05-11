@@ -56,7 +56,7 @@ int pixel_image_add_operation(struct pixel_image *img, const struct pixel_operat
 		return -ECANCELED;
 	}
 
-	if (template->format_in->fourcc != img->format->fourcc) {
+	if (template->format_in != img->format) {
 		LOG_ERR("Wrong format for this operation: image has %s, operation uses %s",
 			PIXEL_FORMAT_TO_STR(template->format_in), PIXEL_FORMAT_TO_STR(img->format));
 		return pixel_image_error(img, -EINVAL);
@@ -83,7 +83,7 @@ int pixel_image_add_operation(struct pixel_image *img, const struct pixel_operat
 
 int pixel_image_add_uncompressed(struct pixel_image *img, const struct pixel_operation *template)
 {
-	size_t pitch = img->width * img->format->bits_per_pixel / BITS_PER_BYTE;
+	size_t pitch = img->width * pixel_bits_per_pixel(img->format) / BITS_PER_BYTE;
 	size_t size = template->window_size * pitch;
 
 	return pixel_image_add_operation(img, template, size, size);
@@ -144,7 +144,7 @@ int pixel_image_process(struct pixel_image *img)
 }
 
 void pixel_image_from_buffer(struct pixel_image *img, uint8_t *buffer, size_t size,
-			     uint16_t width, uint16_t height, pixel_format_t format)
+			     uint16_t width, uint16_t height, uint32_t format)
 {
 	memset(img, 0x00, sizeof(*img));
 	img->buffer = buffer;
@@ -155,9 +155,10 @@ void pixel_image_from_buffer(struct pixel_image *img, uint8_t *buffer, size_t si
 }
 
 void pixel_image_from_vbuf(struct pixel_image *img, struct video_buffer *vbuf,
-			   size_t width, size_t height, pixel_format_t format)
+			   struct video_format *fmt)
 {
-	pixel_image_from_buffer(img, vbuf->buffer, vbuf->size, width, height, format);
+	pixel_image_from_buffer(img, vbuf->buffer, vbuf->size, fmt->width, fmt->height,
+				fmt->pixelformat);
 }
 
 int pixel_image_to_buffer(struct pixel_image *img, uint8_t *buffer, size_t size)

@@ -17,27 +17,25 @@
 /**
  * @brief Define a new format conversion operation.
  *
- * @param _fn Function converting one input line.
- * @param _format_in The input format for that operation.
- * @param _format_out The Output format for that operation.
+ * @param fn Function converting one input line.
+ * @param fmt_in The input format for that operation.
+ * @param fmt_out The Output format for that operation.
  */
-#define PIXEL_DEFINE_CONVERT_OPERATION(_fn, _format_in, _format_out)                               \
+#define PIXEL_DEFINE_CONVERT_OPERATION(fn, fmt_in, fmt_out)                                        \
 	static const STRUCT_SECTION_ITERABLE_ALTERNATE(pixel_convert, pixel_operation,             \
-						       _fn##_op) = {                               \
-		.name = #_fn,                                                                      \
-		.format_in = (_format_in),                                                         \
-		.format_out = (_format_out),                                                       \
-		.window_size = _format_out##_BLOCK_HEIGHT,                                         \
+						       fn##_op) = {                                \
+		.name = #fn,                                                                       \
+		.format_in = (PIXEL_FORMAT_##fmt_in),                                              \
+		.format_out = (PIXEL_FORMAT_##fmt_out),                                            \
+		.window_size = 1,                                                                  \
 		.run = pixel_convert_op,                                                           \
-		.arg = (_fn),                                                                      \
+		.arg0 = (fn),                                                                       \
 	}
 /**
  * @brief Helper to turn a format conversion function into an operation.
  *
- * The line conversion function is free to perform any processing on the input line.
- * The @c w argument is the width of both the source and destination buffers.
- *
- * The line conversion function is to be provided in @c op->arg
+ * The line conversion function is to be provided in @c op->arg0.
+ * It processes on the input line to convert it to the destination format.
  *
  * @param op Current operation in progress.
  */
