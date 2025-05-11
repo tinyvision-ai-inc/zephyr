@@ -205,10 +205,10 @@ int main(void)
 		video_set_ctrl(video_dev, &ctrl);
 	}
 
-#ifdef CONFIG_TEST
-	ctrl.id = VIDEO_CID_TEST_PATTERN;
-	video_set_ctrl(video_dev, &ctrl);
-#endif
+	if (IS_ENABLED(CONFIG_TEST)) {
+		ctrl.id = VIDEO_CID_TEST_PATTERN;
+		video_set_ctrl(video_dev, &ctrl);
+	}
 
 #if DT_HAS_CHOSEN(zephyr_display)
 	const struct device *const display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
@@ -267,11 +267,9 @@ int main(void)
 		LOG_DBG("Got frame %u! size: %u; timestamp %u ms", frame++, vbuf->bytesused,
 		       vbuf->timestamp);
 
-#ifdef CONFIG_TEST
-		if (is_colorbar_ok(vbuf->buffer, fmt)) {
+		if (IS_ENABLED(CONFIG_TEST) && is_colorbar_ok(vbuf->buffer, fmt)) {
 			LOG_DBG("Pattern OK!\n");
 		}
-#endif
 
 #if DT_HAS_CHOSEN(zephyr_display)
 		video_display_frame(display_dev, vbuf, fmt);
