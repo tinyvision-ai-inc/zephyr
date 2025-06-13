@@ -1,0 +1,18 @@
+/*
+ * Copyright 2025 tinyVision.ai Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <zephyr/dt-bindings/gpio/dvp-20pin-connector.h>
+
+/ {
+	dvp_20pin_connector: dvp-20pin-connector {
+		compatible = "arducam,dvp-20pin-connector";
+		#gpio-cells = <2>;
+		gpio-map-mask = <0xffffffff 0xffffffc0>;
+		gpio-map-pass-thru = <0x0 GPIO_DT_FLAGS_MASK>;
+		gpio-map =	<DVP_20PIN_PEN 0 &gpioa 1 0>,
+				<DVP_20PIN_PDN 0 &gpiod 4 0>;
+	};
+};

@@ -247,6 +247,46 @@
 	};
 };
 
+&dcmi {
+	pinctrl-0 = <&dcmi_d0_ph9 &dcmi_d1_ph10 &dcmi_d2_ph11 &dcmi_d3_pg11
+		     &dcmi_d4_ph14 &dcmi_d5_pi4 &dcmi_d6_pi6 &dcmi_d7_pi7
+		     &dcmi_pixclk_pa6 &dcmi_hsync_ph8 &dcmi_vsync_pi5>;
+	pinctrl-names = "default";
+};
+
+&dma1 {
+	status = "okay";
+};
+
+&dmamux1 {
+	status = "okay";
+};
+
+/* I2C lines on the camera connector */
+&i2c4 {
+	pinctrl-0 = <&i2c4_scl_pb6 &i2c4_sda_ph12>;
+	pinctrl-names = "default";
+};
+
+/* Provide the input clock that DVP sensors use for I2C communication. */
+&timers1 {
+	status = "okay";
+	st,prescaler = <0>;
+
+	tim1_pwm: pwm {
+		status = "okay";
+		pinctrl-0 = <&tim1_ch3_pj9>;
+		pinctrl-names = "default";
+
+		pwmclock: pwmclock {
+			status = "okay";
+			compatible = "pwm-clock";
+			#clock-cells = <1>;
+			pwms = <&tim1_pwm 3 PWM_HZ(10000000) PWM_POLARITY_NORMAL>;
+		};
+	};
+};
+
 zephyr_udc0: &usbotg_fs {
 	status = "okay";
 	pinctrl-0 = <&usb_otg_fs_dm_pa11 &usb_otg_fs_dp_pa12>;
@@ -258,3 +298,8 @@ zephyr_mipi_dsi: &mipi_dsi {};
 
 /* alias used by LCD display shields */
 zephyr_lcd_controller: &ltdc {};
+
+/* alias used by camera shields */
+dvp_20pin_xclk: &pwmclock {};
+dvp_20pin_i2c: &i2c4 {};
+dvp_20pin_interface: &dcmi {};
