@@ -5,6 +5,7 @@
  */
 
 #include "arduino_r3_connector.dtsi"
+#include "arducam_dvp_20pin_connector.dtsi"
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 / {
