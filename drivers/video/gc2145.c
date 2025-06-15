@@ -25,6 +25,7 @@ LOG_MODULE_REGISTER(video_gc2145, CONFIG_VIDEO_LOG_LEVEL);
 #define GC2145_REG_AMODE1_DEF           0x14
 #define GC2145_REG_OUTPUT_FMT           0x84
 #define GC2145_REG_OUTPUT_FMT_MASK      0x1F
+#define GC2145_REG_OUTPUT_FMT_BAYER     0x17
 #define GC2145_REG_OUTPUT_FMT_RGB565    0x06
 #define GC2145_REG_OUTPUT_FMT_YCBYCR    0x02
 #define GC2145_REG_SYNC_MODE            0x86
@@ -793,9 +794,18 @@ struct gc2145_data {
 #define RESOLUTION_UXGA_H	1200
 
 static const struct video_format_cap fmts[] = {
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_QVGA_W, RESOLUTION_QVGA_H, VIDEO_PIX_FMT_SBGGR8),
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_VGA_W, RESOLUTION_VGA_H, VIDEO_PIX_FMT_SBGGR8),
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_UXGA_W, RESOLUTION_UXGA_H, VIDEO_PIX_FMT_SBGGR8),
+
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_QVGA_W, RESOLUTION_QVGA_H, VIDEO_PIX_FMT_SRGGB8),
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_VGA_W, RESOLUTION_VGA_H, VIDEO_PIX_FMT_SRGGB8),
+	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_UXGA_W, RESOLUTION_UXGA_H, VIDEO_PIX_FMT_SRGGB8),
+
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_QVGA_W, RESOLUTION_QVGA_H, VIDEO_PIX_FMT_RGB565),
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_VGA_W, RESOLUTION_VGA_H, VIDEO_PIX_FMT_RGB565),
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_UXGA_W, RESOLUTION_UXGA_H, VIDEO_PIX_FMT_RGB565),
+
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_QVGA_W, RESOLUTION_QVGA_H, VIDEO_PIX_FMT_YUYV),
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_VGA_W, RESOLUTION_VGA_H, VIDEO_PIX_FMT_YUYV),
 	GC2145_VIDEO_FORMAT_CAP(RESOLUTION_UXGA_W, RESOLUTION_UXGA_H, VIDEO_PIX_FMT_YUYV),
@@ -982,11 +992,18 @@ static int gc2145_set_output_format(const struct device *dev, int output_format)
 	}
 
 	/* Map format to sensor format */
-	if (output_format == VIDEO_PIX_FMT_RGB565) {
+	switch (output_format) {
+	case VIDEO_PIX_FMT_SBGGR8:
+	case VIDEO_PIX_FMT_SRGGB8:
+		output_format = GC2145_REG_OUTPUT_FMT_BAYER;
+		break;
+	case VIDEO_PIX_FMT_RGB565:
 		output_format = GC2145_REG_OUTPUT_FMT_RGB565;
-	} else if (output_format == VIDEO_PIX_FMT_YUYV) {
+		break;
+	case VIDEO_PIX_FMT_YUYV:
 		output_format = GC2145_REG_OUTPUT_FMT_YCBYCR;
-	} else {
+		break;
+	default:
 		LOG_ERR("Image format not supported");
 		return -ENOTSUP;
 	}
@@ -1038,7 +1055,7 @@ static int gc2145_set_resolution(const struct device *dev, uint32_t w, uint32_t 
 	default:
 		LOG_ERR("Unsupported resolution %d %d", w, h);
 		return -EIO;
-	};
+	}
 
 	/* Calculates the window boundaries to obtain the desired resolution */
 	win_w = w * c_ratio;
@@ -1133,6 +1150,10 @@ static int gc2145_config_csi(const struct device *dev, uint32_t pixelformat,
 	int ret;
 
 	switch (pixelformat) {
+	case VIDEO_PIX_FMT_SBGGR8:
+	case VIDEO_PIX_FMT_SRGGB8:
+		csi_dt = VIDEO_MIPI_CSI2_DT_RAW8;
+		break;
 	case VIDEO_PIX_FMT_RGB565:
 		csi_dt = VIDEO_MIPI_CSI2_DT_RGB565;
 		break;
