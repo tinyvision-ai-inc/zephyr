@@ -20,6 +20,9 @@
 
 LOG_MODULE_REGISTER(video_gc2145, CONFIG_VIDEO_LOG_LEVEL);
 
+/* System registers - on page 0 */
+#define GC2145_REG_EXPOSURE_HIGH	0x03
+#define GC2145_REG_EXPOSURE_LOW		0x04
 #define GC2145_REG_AMODE1               0x17
 #define GC2145_AMODE1_WINDOW_MASK       0xFC
 #define GC2145_REG_AMODE1_DEF           0x14
@@ -42,6 +45,7 @@ LOG_MODULE_REGISTER(video_gc2145, CONFIG_VIDEO_LOG_LEVEL);
 #define GC2145_REG_SUBSAMPLE            0x99
 #define GC2145_REG_SUBSAMPLE_MODE       0x9A
 #define GC2145_SUBSAMPLE_MODE_SMOOTH    0x0E
+#define GC2145_REG_AEC_ENABLE		0xB6
 
 /* MIPI-CSI registers - on page 3 */
 #define GC2145_REG_DPHY_MODE1		0x01
@@ -771,6 +775,11 @@ struct gc2145_ctrls {
 	struct video_ctrl hflip;
 	struct video_ctrl vflip;
 	struct video_ctrl linkfreq;
+	/* Cluster for auto-exposure */
+	struct {
+		struct video_ctrl exposure_auto;
+		struct video_ctrl exposure;
+	};
 };
 
 struct gc2145_data {
@@ -1322,13 +1331,29 @@ static int gc2145_get_caps(const struct device *dev, struct video_caps *caps)
 
 static int gc2145_set_ctrl(const struct device *dev, uint32_t id)
 {
+	const struct gc2145_config *cfg = dev->config;
 	struct gc2145_data *drv_data = dev->data;
+	struct gc2145_ctrls *ctrls = &drv_data->ctrls;
+	int ret;
 
 	switch (id) {
 	case VIDEO_CID_HFLIP:
 		return gc2145_set_ctrl_hmirror(dev, drv_data->ctrls.hflip.val);
 	case VIDEO_CID_VFLIP:
 		return gc2145_set_ctrl_vflip(dev, drv_data->ctrls.vflip.val);
+	case VIDEO_CID_EXPOSURE_AUTO:
+		return gc2145_write_reg(&cfg->i2c, GC2145_REG_AEC_ENABLE,
+					ctrls->exposure_auto.val == VIDEO_EXPOSURE_MANUAL
+					? 0x00 : 0x01);
+	case VIDEO_CID_EXPOSURE:
+		ret = gc2145_write_reg(&cfg->i2c, GC2145_REG_EXPOSURE_HIGH,
+				       ctrls->exposure.val >> 8);
+		if (ret < 0) {
+			return ret;
+		}
+
+		return gc2145_write_reg(&cfg->i2c, GC2145_REG_EXPOSURE_LOW,
+					ctrls->exposure.val & 0xff);
 	default:
 		return -ENOTSUP;
 	}
@@ -1342,11 +1367,15 @@ static DEVICE_API(video, gc2145_driver_api) = {
 	.set_ctrl = gc2145_set_ctrl,
 };
 
+static const char *const gc2145_exposure_auto_menu[] = {"Auto Mode", "Manual Mode", NULL};
+
 static int gc2145_init_controls(const struct device *dev)
 {
 	int ret;
 	struct gc2145_data *drv_data = dev->data;
 	struct gc2145_ctrls *ctrls = &drv_data->ctrls;
+
+	/* H/V-Flip */
 
 	ret = video_init_ctrl(&ctrls->hflip, dev, VIDEO_CID_HFLIP,
 			      (struct video_ctrl_range){.min = 0, .max = 1, .step = 1, .def = 0});
@@ -1360,6 +1389,8 @@ static int gc2145_init_controls(const struct device *dev)
 		return ret;
 	}
 
+	/* Link Frequency */
+
 	ret = video_init_int_menu_ctrl(&ctrls->linkfreq, dev, VIDEO_CID_LINK_FREQ,
 				       GC2145_640_480_LINK_FREQ_ID, gc2145_link_frequency,
 				       ARRAY_SIZE(gc2145_link_frequency));
@@ -1368,6 +1399,22 @@ static int gc2145_init_controls(const struct device *dev)
 	}
 
 	ctrls->linkfreq.flags |= VIDEO_CTRL_FLAG_READ_ONLY;
+
+	/* Auto Exposure */
+	ret = video_init_menu_ctrl(&ctrls->exposure_auto, dev, VIDEO_CID_EXPOSURE_AUTO,
+				   VIDEO_EXPOSURE_AUTO, gc2145_exposure_auto_menu);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = video_init_ctrl(&ctrls->exposure, dev, VIDEO_CID_EXPOSURE,
+			      (struct video_ctrl_range){.min = 0, .max = 0x1FFF,
+							.step = 1, .def = 0});
+	if (ret < 0) {
+		return ret;
+	}
+
+	//video_auto_cluster_ctrl(&ctrls->exposure_auto, 2, true);
 
 	return 0;
 }
