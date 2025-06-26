@@ -1,6 +1,6 @@
 .. zephyr:code-sample:: uvc
    :name: USB Video webcam
-   :relevant-api: usbd_api video_interface
+   :relevant-api: usbd_api usbd_uvc video_interface
 
    Send video frames over USB.
 
