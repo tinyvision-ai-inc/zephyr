@@ -147,18 +147,26 @@ int video_enqueue(const struct device *dev, struct video_buffer *buf)
 	}
 
 	/* RTIO submission */
-	struct rtio_iodev *ri = video_find_iodev(dev);
+	struct rtio_iodev *iodev = video_find_iodev(dev);
 	struct rtio_sqe *sqe = rtio_sqe_acquire(&rtio);
 
-	__ASSERT_NO_MSG(ri != NULL);
+	__ASSERT_NO_MSG(iodev != NULL);
 	__ASSERT_NO_MSG(sqe != NULL);
 
-	rtio_sqe_prep_read(sqe, ri, RTIO_PRIO_NORM, video_buf[buf->index].buffer,
-			   video_buf[buf->index].size, &video_buf[buf->index]);
+	switch (buf->type) {
+	case VIDEO_BUF_TYPE_OUTPUT:
+		rtio_sqe_prep_read(sqe, iodev, RTIO_PRIO_NORM, video_buf[buf->index].buffer,
+				   video_buf[buf->index].size, &video_buf[buf->index]);
+		/* Repeat read requests as soon as they complete */
+		sqe->flags |= RTIO_SQE_MULTISHOT;
+		break;
+	case VIDEO_BUF_TYPE_INPUT:
+		rtio_sqe_prep_write(sqe, iodev, RTIO_PRIO_NORM, video_buf[buf->index].buffer,
+				    video_buf[buf->index].size, &video_buf[buf->index]);
+		break;
+	}
 
-	sqe->flags |= RTIO_SQE_MULTISHOT;
-
-	/* Do not wait for complete */
+	/* Do not wait for completion */
 	rtio_submit(&rtio, 0);
 
 	video_buf[buf->index].state = VIDEO_BUF_STATE_QUEUED;
@@ -208,9 +216,14 @@ static void video_iodev_submit(struct rtio_iodev_sqe *iodev_sqe)
 {
 	struct video_interface *vi = iodev_sqe->sqe.iodev->data;
 	const struct video_driver_api *api = vi->dev->api;
+	int ret;
 
 	if (api->iodev_submit != NULL) {
-		api->iodev_submit(vi->dev, iodev_sqe);
+		ret = api->iodev_submit(vi->dev, iodev_sqe);
+		if (ret < 0) {
+			rtio_iodev_sqe_err(iodev_sqe, ret);
+			return;
+		}
 	}
 
 	mpsc_push(vi->io_q, &iodev_sqe->q);

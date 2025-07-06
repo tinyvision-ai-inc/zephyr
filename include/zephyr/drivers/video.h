@@ -343,8 +343,8 @@ typedef int (*video_api_frmival_t)(const struct device *dev, struct video_frmiva
  */
 typedef int (*video_api_enum_frmival_t)(const struct device *dev, struct video_frmival_enum *fie);
 
-typedef void (*video_api_iodev_submit_t)(const struct device *dev,
-					 struct rtio_iodev_sqe *iodev_sqe);
+typedef int (*video_api_iodev_submit_t)(const struct device *dev,
+					struct rtio_iodev_sqe *iodev_sqe);
 
 /**
  * @typedef video_api_flush_t
