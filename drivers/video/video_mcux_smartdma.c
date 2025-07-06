@@ -11,14 +11,16 @@
 
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_mcux_smartdma.h>
-#include <zephyr/drivers/video.h>
 #include <zephyr/drivers/pinctrl.h>
+#include <zephyr/drivers/video.h>
+#include <zephyr/rtio/rtio.h>
 
 #define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(nxp_video_sdma);
 
 #include "video_device.h"
+#include "video_buffer.h"
 
 struct nxp_video_sdma_config {
 	const struct device *dma_dev;
@@ -41,13 +43,12 @@ struct nxp_video_sdma_data {
 	 */
 	smartdma_camera_param_t params __aligned(4);
 	uint32_t smartdma_stack[64] __aligned(32);
-	struct k_fifo fifo_in;
-	struct k_fifo fifo_out;
+	struct mpsc io_q;
 	struct k_sem stream_empty; /* Signals stream has run out of buffers */
 	bool stream_starved;
 	bool buf_reload_flag;
-	struct video_buffer *active_buf;
-	struct video_buffer *queued_buf;
+	struct rtio_iodev_sqe *active;
+	struct rtio_iodev_sqe *queued;
 	const struct nxp_video_sdma_config *config;
 	uint32_t frame_idx;
 };
@@ -57,6 +58,7 @@ static void nxp_video_sdma_callback(const struct device *dev, void *user_data,
 				uint32_t channel, int status)
 {
 	struct nxp_video_sdma_data *data = user_data;
+	struct video_buffer *vbuf;
 
 	if (status < 0) {
 		LOG_ERR("Transfer failed: %d, stopping DMA", status);
@@ -73,23 +75,24 @@ static void nxp_video_sdma_callback(const struct device *dev, void *user_data,
 	 */
 	if (data->buf_reload_flag) {
 		/* Save old framebuffer, we will dequeue it next interrupt */
-		data->active_buf = data->queued_buf;
+		data->active = data->queued;
 		/* Load new framebuffer */
-		data->queued_buf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
-		if (data->queued_buf == NULL) {
+		data->queued = video_pop_io_q(&data->io_q);
+		if (data->queued == NULL) {
 			data->stream_starved = true;
 		} else {
-			data->params.p_buffer_ping_pong = (uint32_t *)data->queued_buf->buffer;
+			vbuf = data->queued->sqe.userdata;
+			data->params.p_buffer_ping_pong = (uint32_t *)vbuf->buffer;
 		}
 	} else {
 		if (data->stream_starved) {
 			/* Signal any waiting threads */
 			k_sem_give(&data->stream_empty);
 		}
-		data->active_buf->line_offset = (data->frame_idx / 2) * SDMA_LINE_COUNT;
-		data->active_buf->timestamp = k_uptime_get_32();
-		k_fifo_put(&data->fifo_out, data->active_buf);
-
+		vbuf = data->active->sqe.userdata;
+		vbuf->line_offset = (data->frame_idx / 2) * SDMA_LINE_COUNT;
+		vbuf->timestamp = k_uptime_get_32();
+		rtio_iodev_sqe_ok(data->active, 0);
 	}
 	/* Toggle buffer reload flag*/
 	data->buf_reload_flag = !data->buf_reload_flag;
@@ -101,6 +104,7 @@ static int nxp_video_sdma_set_stream(const struct device *dev, bool enable,
 	const struct nxp_video_sdma_config *config = dev->config;
 	struct nxp_video_sdma_data *data = dev->data;
 	struct dma_config sdma_config = {0};
+	struct video_buffer *vbuf;
 	int ret;
 
 	if (!enable) {
@@ -121,11 +125,12 @@ static int nxp_video_sdma_set_stream(const struct device *dev, bool enable,
 	/* SmartDMA continuously streams data once started. If user
 	 * has not provided a framebuffer, we can't start DMA.
 	 */
-	data->queued_buf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
-	if (data->queued_buf == NULL) {
+	data->queued = video_pop_io_q(&data->io_q);
+	if (data->queued == NULL) {
 		return -EIO;
 	}
-	data->params.p_buffer_ping_pong = (uint32_t *)data->queued_buf->buffer;
+	vbuf = data->queued->sqe.userdata;
+	data->params.p_buffer_ping_pong = (uint32_t *)vbuf->buffer;
 	/* The firmware writes the index of the frame slice
 	 * (from 0-15) into this buffer
 	 */
@@ -149,9 +154,10 @@ static int nxp_video_sdma_set_stream(const struct device *dev, bool enable,
 	return 0;
 }
 
-static int nxp_video_sdma_enqueue(const struct device *dev, struct video_buffer *vbuf)
+static int nxp_video_sdma_iodev_submit(const struct device *dev, struct rtio_iodev_sqe *iodev_sqe)
 {
 	struct nxp_video_sdma_data *data = dev->data;
+	struct video_buffer *vbuf = iodev_sqe->sqe.userdata;
 
 	/* SmartDMA will read 30 lines of RGB565 video data into framebuffer */
 	vbuf->bytesused = SDMA_VBUF_WIDTH * SDMA_LINE_COUNT * sizeof(uint16_t);
@@ -159,45 +165,11 @@ static int nxp_video_sdma_enqueue(const struct device *dev, struct video_buffer 
 		return -EINVAL;
 	}
 
-	/* Put buffer into FIFO */
-	k_fifo_put(&data->fifo_in, vbuf);
 	if (data->stream_starved) {
 		/* Kick SmartDMA off */
 		nxp_video_sdma_set_stream(dev, true, vbuf->type);
 	}
-	return 0;
-}
 
-static int nxp_video_sdma_dequeue(const struct device *dev, struct video_buffer **vbuf,
-				  k_timeout_t timeout)
-{
-	struct nxp_video_sdma_data *data = dev->data;
-
-	*vbuf = k_fifo_get(&data->fifo_out, timeout);
-	if (*vbuf == NULL) {
-		return -EAGAIN;
-	}
-
-	return 0;
-}
-
-static int nxp_video_sdma_flush(const struct device *dev, bool cancel)
-{
-	const struct nxp_video_sdma_config *config = dev->config;
-	struct nxp_video_sdma_data *data = dev->data;
-	struct video_buf *vbuf;
-
-	if (!cancel) {
-		/* Wait for DMA to signal it is empty */
-		k_sem_take(&data->stream_empty, K_FOREVER);
-	} else {
-		/* Stop DMA engine */
-		dma_stop(config->dma_dev, 0);
-		/* Forward all buffers in fifo_in to fifo_out */
-		while ((vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT))) {
-			k_fifo_put(&data->fifo_out, vbuf);
-		}
-	}
 	return 0;
 }
 
@@ -307,8 +279,7 @@ static int nxp_video_sdma_init(const struct device *dev)
 	/* Turnoff clock to inputmux to save power. Clock is only needed to make changes */
 	INPUTMUX_Deinit(INPUTMUX0);
 
-	k_fifo_init(&data->fifo_in);
-	k_fifo_init(&data->fifo_out);
+	mpsc_init(&data->io_q);
 	/* Given to when the DMA engine runs out of buffers */
 	k_sem_init(&data->stream_empty, 0, 1);
 
@@ -328,9 +299,7 @@ static DEVICE_API(video, nxp_video_sdma_api) = {
 	.set_format = nxp_video_sdma_set_format,
 	.get_caps = nxp_video_sdma_get_caps,
 	.set_stream = nxp_video_sdma_set_stream,
-	.enqueue = nxp_video_sdma_enqueue,
-	.dequeue = nxp_video_sdma_dequeue,
-	.flush = nxp_video_sdma_flush
+	.iodev_submit = nxp_video_sdma_iodev_submit,
 };
 
 #define SOURCE_DEV(inst) DEVICE_DT_GET(DT_NODE_REMOTE_DEVICE(DT_INST_ENDPOINT_BY_ID(inst, 0, 0)))
@@ -353,6 +322,9 @@ static DEVICE_API(video, nxp_video_sdma_api) = {
 			      &sdma_config_##inst, POST_KERNEL,                                    \
 			      CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &nxp_video_sdma_api);            \
                                                                                                    \
-	VIDEO_DEVICE_DEFINE(sdma_##inst, DEVICE_DT_INST_GET(inst), SOURCE_DEV(inst));
+	VIDEO_DEVICE_DEFINE(sdma_##inst, DEVICE_DT_INST_GET(inst), SOURCE_DEV(inst));              \
+                                                                                                   \
+	VIDEO_INTERFACE_DEFINE(sdma_intf_##inst, DEVICE_DT_INST_GET(inst), &sdma_data_##inst.io_q);
+
 
 DT_INST_FOREACH_STATUS_OKAY(NXP_VIDEO_SDMA_INIT)
