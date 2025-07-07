@@ -17,10 +17,12 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_stm32.h>
+#include <zephyr/rtio/rtio.h>
 
 #include <stm32_ll_dma.h>
 
 #include "video_device.h"
+#include "video_buffer.h"
 
 LOG_MODULE_REGISTER(video_stm32_dcmi, CONFIG_VIDEO_LOG_LEVEL);
 
@@ -42,9 +44,8 @@ struct video_stm32_dcmi_data {
 	DCMI_HandleTypeDef hdcmi;
 	struct video_format fmt;
 	int capture_rate;
-	struct k_fifo fifo_in;
-	struct k_fifo fifo_out;
-	struct video_buffer *vbuf;
+	struct mpsc io_q;
+	struct rtio_iodev_sqe *active;
 };
 
 struct video_stm32_dcmi_config {
@@ -62,23 +63,29 @@ void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *hdcmi)
 
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *hdcmi)
 {
-	struct video_stm32_dcmi_data *dev_data =
-			CONTAINER_OF(hdcmi, struct video_stm32_dcmi_data, hdcmi);
+	struct video_stm32_dcmi_data *data =
+		CONTAINER_OF(hdcmi, struct video_stm32_dcmi_data, hdcmi);
+	struct rtio_iodev_sqe *iodev_sqe;
 	struct video_buffer *vbuf;
+	struct video_buffer *active_vbuf;
 
 	HAL_DCMI_Suspend(hdcmi);
 
-	vbuf = k_fifo_get(&dev_data->fifo_in, K_NO_WAIT);
-
-	if (vbuf == NULL) {
-		LOG_DBG("Failed to get buffer from fifo");
+	iodev_sqe = video_pop_io_q(&data->io_q);
+	if (iodev_sqe == NULL) {
+		LOG_DBG("Failed to get buffer from I/O queue");
 		goto resume;
 	}
 
-	vbuf->timestamp = k_uptime_get_32();
-	memcpy(vbuf->buffer, dev_data->vbuf->buffer, vbuf->bytesused);
+	__ASSERT_NO_MSG(data->active != NULL);
 
-	k_fifo_put(&dev_data->fifo_out, vbuf);
+	vbuf = iodev_sqe->sqe.userdata;
+	active_vbuf = data->active->sqe.userdata;
+
+	vbuf->timestamp = k_uptime_get_32();
+	memcpy(vbuf->buffer, active_vbuf->buffer, vbuf->bytesused);
+
+	rtio_iodev_sqe_ok(iodev_sqe, 0);
 
 resume:
 	HAL_DCMI_Resume(hdcmi);
@@ -239,6 +246,7 @@ static int video_stm32_dcmi_set_stream(const struct device *dev, bool enable,
 {
 	struct video_stm32_dcmi_data *data = dev->data;
 	const struct video_stm32_dcmi_config *config = dev->config;
+	struct video_buffer *active_vbuf;
 	int err;
 
 	if (!enable) {
@@ -254,24 +262,25 @@ static int video_stm32_dcmi_set_stream(const struct device *dev, bool enable,
 		}
 
 		/* Release the video buffer allocated when start streaming */
-		k_fifo_put(&data->fifo_in, data->vbuf);
+		rtio_iodev_sqe_ok(data->active, 0);
 
 		return 0;
 	}
 
-	data->vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
-
-	if (data->vbuf == NULL) {
+	data->active = video_pop_io_q(&data->io_q);
+	if (data->active == NULL) {
 		LOG_ERR("Failed to dequeue a DCMI buffer.");
 		return -ENOMEM;
 	}
+
+	active_vbuf = data->active->sqe.userdata;
 
 	/* Set the frame control */
 	data->hdcmi.Instance->CR &= ~(DCMI_CR_FCRC_0 | DCMI_CR_FCRC_1);
 	data->hdcmi.Instance->CR |= STM32_DCMI_GET_CAPTURE_RATE(data->capture_rate);
 
 	err = HAL_DCMI_Start_DMA(&data->hdcmi, DCMI_MODE_CONTINUOUS,
-			(uint32_t)data->vbuf->buffer, data->vbuf->bytesused / 4);
+			(uint32_t)active_vbuf->buffer, active_vbuf->bytesused / 4);
 	if (err != HAL_OK) {
 		LOG_ERR("Failed to start DCMI DMA");
 		return -EIO;
@@ -280,9 +289,10 @@ static int video_stm32_dcmi_set_stream(const struct device *dev, bool enable,
 	return video_stream_start(config->sensor_dev, type);
 }
 
-static int video_stm32_dcmi_enqueue(const struct device *dev, struct video_buffer *vbuf)
+static int video_stm32_dcmi_iodev_submit(const struct device *dev, struct rtio_iodev_sqe *iodev_sqe)
 {
 	struct video_stm32_dcmi_data *data = dev->data;
+	struct video_buffer *vbuf = iodev_sqe->sqe.userdata;
 	const uint32_t buffer_size = data->fmt.pitch * data->fmt.height;
 
 	if (buffer_size > vbuf->size) {
@@ -291,21 +301,6 @@ static int video_stm32_dcmi_enqueue(const struct device *dev, struct video_buffe
 
 	vbuf->bytesused = buffer_size;
 	vbuf->line_offset = 0;
-
-	k_fifo_put(&data->fifo_in, vbuf);
-
-	return 0;
-}
-
-static int video_stm32_dcmi_dequeue(const struct device *dev, struct video_buffer **vbuf,
-				    k_timeout_t timeout)
-{
-	struct video_stm32_dcmi_data *data = dev->data;
-
-	*vbuf = k_fifo_get(&data->fifo_out, timeout);
-	if (*vbuf == NULL) {
-		return -EAGAIN;
-	}
 
 	return 0;
 }
@@ -421,8 +416,7 @@ static DEVICE_API(video, video_stm32_dcmi_driver_api) = {
 	.set_format = video_stm32_dcmi_set_fmt,
 	.get_format = video_stm32_dcmi_get_fmt,
 	.set_stream = video_stm32_dcmi_set_stream,
-	.enqueue = video_stm32_dcmi_enqueue,
-	.dequeue = video_stm32_dcmi_dequeue,
+	.iodev_submit = video_stm32_dcmi_iodev_submit,
 	.get_caps = video_stm32_dcmi_get_caps,
 	.enum_frmival = video_stm32_dcmi_enum_frmival,
 	.set_frmival = video_stm32_dcmi_set_frmival,
@@ -540,8 +534,7 @@ static int video_stm32_dcmi_init(const struct device *dev)
 	}
 
 	data->dev = dev;
-	k_fifo_init(&data->fifo_in);
-	k_fifo_init(&data->fifo_out);
+	mpsc_init(&data->io_q);
 	data->capture_rate = 1;
 
 	/* Run IRQ init */
@@ -567,3 +560,5 @@ DEVICE_DT_INST_DEFINE(0, &video_stm32_dcmi_init,
 		    &video_stm32_dcmi_driver_api);
 
 VIDEO_DEVICE_DEFINE(dcmi, DEVICE_DT_INST_GET(0), SOURCE_DEV(0));
+
+VIDEO_INTERFACE_DEFINE(dcmi_intf, DEVICE_DT_INST_GET(0), &video_stm32_dcmi_data_0.io_q);
