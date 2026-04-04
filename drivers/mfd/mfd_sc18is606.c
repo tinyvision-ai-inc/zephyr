@@ -15,6 +15,7 @@ int nxp_sc18is606_transfer(const struct device *dev, const uint8_t *tx_data, uin
 {
 	struct sc18is606_data *data = dev->data;
 	const struct sc18is606_config *info = dev->config;
+	k_timepoint_t end = sys_timepoint_calc(K_MSEC(1000));
 	int ret;
 
 	ret = k_mutex_lock(&data->bridge_lock, K_FOREVER);
@@ -23,30 +24,32 @@ int nxp_sc18is606_transfer(const struct device *dev, const uint8_t *tx_data, uin
 	}
 
 	if (tx_data != NULL) {
-		if (id_buf != NULL) {
-			struct i2c_msg tx_msg[2] = {
-				{
-					.buf = id_buf,
-					.len = 1,
-					.flags = I2C_MSG_WRITE,
-				},
-				{
+		do {
+			if (id_buf != NULL) {
+				struct i2c_msg tx_msg[2] = {
+					{
+						.buf = id_buf,
+						.len = 1,
+						.flags = I2C_MSG_WRITE,
+					},
+					{
+						.buf = (uint8_t *)tx_data,
+						.len = tx_len,
+						.flags = I2C_MSG_WRITE,
+					},
+				};
+
+				ret = i2c_transfer_dt(&info->i2c_controller, tx_msg, 2);
+			} else {
+				struct i2c_msg tx_msg[1] = {{
 					.buf = (uint8_t *)tx_data,
 					.len = tx_len,
 					.flags = I2C_MSG_WRITE,
-				},
-			};
+				}};
 
-			ret = i2c_transfer_dt(&info->i2c_controller, tx_msg, 2);
-		} else {
-			struct i2c_msg tx_msg[1] = {{
-				.buf = (uint8_t *)tx_data,
-				.len = tx_len,
-				.flags = I2C_MSG_WRITE,
-			}};
-
-			ret = i2c_transfer_dt(&info->i2c_controller, tx_msg, 1);
-		}
+				ret = i2c_transfer_dt(&info->i2c_controller, tx_msg, 1);
+			}
+		} while (ret != 0 && !sys_timepoint_expired(end));
 
 		if (ret != 0) {
 			LOG_ERR("SPI write failed: %d", ret);
@@ -63,12 +66,6 @@ int nxp_sc18is606_transfer(const struct device *dev, const uint8_t *tx_data, uin
 	}
 
 	if (rx_data != NULL) {
-		/*What is the time*/
-		k_timepoint_t end;
-
-		/*Set a deadline in a second*/
-		end = sys_timepoint_calc(K_MSEC(1));
-
 		do {
 			ret = i2c_read(info->i2c_controller.bus, rx_data, rx_len,
 				       info->i2c_controller.addr);
