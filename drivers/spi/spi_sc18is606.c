@@ -20,13 +20,6 @@ LOG_MODULE_REGISTER(spi_sc18is606, CONFIG_SPI_LOG_LEVEL);
 #include "spi_context.h"
 #include <mfd_sc18is606.h>
 
-#define SC18IS606_CONFIG_SPI 0xF0
-#define CLEAR_INTERRUPT      0xF1
-#define IDLE_MODE            0xF2
-#define SC18IS606_LSB_MASK   GENMASK(5, 5)
-#define SC18IS606_MODE_MASK  GENMASK(3, 2)
-#define SC18IS606_FREQ_MASK  GENMASK(1, 0)
-
 struct spi_sc18is606_data {
 	struct spi_context ctx;
 	uint8_t frequency_idx;
@@ -43,6 +36,7 @@ static int sc18is606_spi_configure(const struct device *dev, const struct spi_co
 	struct spi_sc18is606_data *data = dev->data;
 	uint8_t cfg_byte = 0;
 	uint8_t buffer[2];
+	int ret;
 
 	if ((config->operation & SPI_OP_MODE_SLAVE) != 0U) {
 		LOG_ERR("SC18IS606 does not support Slave mode");
@@ -59,6 +53,12 @@ static int sc18is606_spi_configure(const struct device *dev, const struct spi_co
 	if (bits > 8) {
 		LOG_ERR("Word sizes > 8 bits not supported");
 		return -ENOTSUP;
+	}
+
+	ret = nxp_sc18is606_set_pin_mode(cfg->bridge, config->slave, false,
+					 SC18IS606_GPIO_CS_CONF);
+	if (ret < 0) {
+		LOG_ERR("Failed to set pin mode (%d)", ret);
 	}
 
 	/* Build SC18IS606  configuration byte*/

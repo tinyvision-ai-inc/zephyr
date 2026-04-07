@@ -10,6 +10,11 @@
 #include "mfd_sc18is606.h"
 LOG_MODULE_REGISTER(nxp_sc18is606, CONFIG_MFD_LOG_LEVEL);
 
+/* Avoid making CS outputs inputs by default */
+#define SC18IS606_GPIO_DEFAULT	(SC18IS606_GPIO_CS_CONF			\
+				| (SC18IS606_GPIO_CS_CONF << 2)		\
+				| (SC18IS606_GPIO_CS_CONF << 4))
+
 int nxp_sc18is606_transfer(const struct device *dev, const uint8_t *tx_data, uint8_t tx_len,
 			   uint8_t *rx_data, uint8_t rx_len, uint8_t *id_buf)
 {
@@ -134,6 +139,41 @@ static int int_gpios_setup(const struct device *dev)
 	return ret;
 }
 
+int nxp_sc18is606_set_pin_mode(const struct device *dev, const uint8_t pin, const bool is_gpio,
+			       const uint8_t mode)
+{
+	struct sc18is606_data *data = dev->data;
+	uint8_t enable_buf[] = {
+		SC18IS606_GPIO_ENABLE,
+		0x0,
+	};
+	uint8_t conf_buf[] = {
+		SC18IS606_GPIO_CONF,
+		0x00,
+	};
+
+	int ret;
+
+	if (is_gpio) {
+		data->gpio_enable |= FIELD_PREP(SC18IS606_GPIO_ENABLE_MASK, (1 << pin));
+	} else {
+		data->gpio_enable &= ~FIELD_PREP(SC18IS606_GPIO_ENABLE_MASK, (1 << pin));
+	}
+
+	enable_buf[1] = data->gpio_enable;
+
+	ret = nxp_sc18is606_transfer(dev, enable_buf, sizeof(enable_buf), NULL, 0, NULL);
+	if (ret < 0) {
+		return ret;
+	}
+
+	data->pin_conf &= ~(SC18IS606_GPIO_CONF_MASK << (pin * 2));
+	data->pin_conf |= (mode & SC18IS606_GPIO_CONF_MASK) << (pin * 2);
+	conf_buf[1] = data->pin_conf;
+
+	return nxp_sc18is606_transfer(dev, conf_buf, sizeof(conf_buf), NULL, 0, NULL);
+}
+
 static int sc18is606_init(const struct device *dev)
 {
 	const struct sc18is606_config *cfg = dev->config;
@@ -183,7 +223,10 @@ static int sc18is606_init(const struct device *dev)
 		.int_gpios = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(inst), int_gpios, {0}),               \
 	};                                                                                         \
                                                                                                    \
-	static struct sc18is606_data data##inst;                                                   \
+	static struct sc18is606_data data##inst = {                                                \
+		.pin_conf = SC18IS606_GPIO_DEFAULT,                                                \
+		.gpio_enable = 0x0,                                                                \
+	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(inst, sc18is606_init, NULL, &data##inst, &sc18is606_config_##inst,   \
 			      POST_KERNEL, CONFIG_MFD_INIT_PRIORITY, NULL);
