@@ -227,7 +227,16 @@ static int sreq_clear_feature(struct usbd_context *const uds_ctx)
 		if (setup->wValue == USB_SFS_REMOTE_WAKEUP) {
 			LOG_DBG("Clear feature remote wakeup");
 			uds_ctx->status.rwup = false;
-		}
+		} else if (setup->wValue == USB_SFS_U1_ENABLE) {
+			LOG_DBG("Clear feature U1 enable");
+			uds_ctx->status.u1_enable = false;
+		} else if(setup->wValue == USB_SFS_U2_ENABLE) {
+			LOG_DBG("Clear feature U2 enable");
+			uds_ctx->status.u2_enable = false;
+		} else {
+			errno = -ENOTSUP ;
+			return 0;
+ 		}
 		break;
 	case USB_REQTYPE_RECIPIENT_ENDPOINT:
 		if (setup->wValue == USB_SFS_ENDPOINT_HALT) {
@@ -303,7 +312,16 @@ static int sreq_set_feature(struct usbd_context *const uds_ctx)
 		if (setup->wValue == USB_SFS_REMOTE_WAKEUP) {
 			LOG_DBG("Set feature remote wakeup");
 			uds_ctx->status.rwup = true;
-		}
+		} else if (setup->wValue == USB_SFS_U1_ENABLE) {
+			LOG_DBG("Set feature U1 enable");
+			uds_ctx->status.u1_enable = true;
+		} else if(setup->wValue == USB_SFS_U2_ENABLE) {
+			LOG_DBG("Set feature U2 enable");
+			uds_ctx->status.u2_enable = true;
+		} else {
+			errno = -ENOTSUP;
+			return 0;
+ 		}
 		break;
 	case USB_REQTYPE_RECIPIENT_ENDPOINT:
 		if (setup->wValue == USB_SFS_ENDPOINT_HALT) {
@@ -322,6 +340,33 @@ static int sreq_set_feature(struct usbd_context *const uds_ctx)
 	}
 
 	return ret;
+}
+
+static int sreq_set_sel(struct usbd_context *const uds_ctx, struct net_buf *const buf)
+{
+	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+	struct usb_system_exit_latency sel;
+
+	if (buf == NULL) {
+		return 0;
+	}
+
+	if (setup->wValue != 0 || setup->wIndex != 0 || setup->wLength != 6) {
+		LOG_ERR("invalid command parameters");
+		return -ENOTSUP;
+	}
+
+	if (buf->len != setup->wLength) {
+		LOG_ERR("actual buffer length %d mis-matching wLength %d", buf->len,
+			 setup->wLength);
+		return -ENOTSUP;
+	}
+
+	memcpy(&sel, buf->data, sizeof(sel));
+	sel.u2sel = sys_le16_to_cpu(sel.u2sel);
+	sel.u2pel = sys_le16_to_cpu(sel.u2pel);
+
+	return udc_set_system_exit_latency(uds_ctx->dev, &sel);
 }
 
 static int std_request_to_device(struct usbd_context *const uds_ctx,
@@ -345,6 +390,12 @@ static int std_request_to_device(struct usbd_context *const uds_ctx,
 		break;
 	case USB_SREQ_SET_FEATURE:
 		ret = sreq_set_feature(uds_ctx);
+		break;
+	case USB_SREQ_SET_SEL:
+		ret = sreq_set_sel(uds_ctx, buf);
+		break;
+	case USB_SREQ_SET_ISOCH_DELAY:
+		ret = 0;
 		break;
 	default:
 		ret = -ENOTSUP;
@@ -591,6 +642,9 @@ static struct net_buf *sreq_get_desc_dev(struct usbd_context *const uds_ctx)
 	case USBD_SPEED_HS:
 		head = uds_ctx->hs_desc;
 		break;
+	case USBD_SPEED_SS:
+		head = uds_ctx->ss_desc;
+		break;
 	default:
 		return NULL;
 	}
@@ -732,6 +786,9 @@ static struct net_buf *sreq_get_desc_bos(struct usbd_context *const uds_ctx)
 		break;
 	case USBD_SPEED_HS:
 		dev_dsc = uds_ctx->hs_desc;
+		break;
+	case USBD_SPEED_SS:
+		dev_dsc = uds_ctx->ss_desc;
 		break;
 	default:
 		return NULL;

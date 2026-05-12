@@ -54,6 +54,13 @@ config SAMPLE_USBD_MAX_POWER
 	help
 	  bMaxPower value in the sample configuration in 2 mA units.
 
+config SAMPLE_USBD_MAX_POWER_SS
+	int "USB device sample bMaxPower value for SuperSpeed"
+	default 50
+	range 0 250
+	help
+	  bMaxPower value in the sample configuration in 8 mA units.
+
 config SAMPLE_USBD_20_EXTENSION_DESC
 	bool "Use default USB 2.0 Extension Descriptor"
 	depends on USBD_BOS_SUPPORT
