@@ -2105,6 +2105,13 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	data->caps.addr_before_status = true;
 
 	switch (cfg->maximum_speed_idx) {
+	case UDC_DWC3_SPEED_IDX_SUPER_SPEED:
+		LOG_DBG("UDC_DWC3_SPEED_IDX_SUPER_SPEED");
+		data->caps.mps0 = UDC_MPS0_512;
+		data->caps.hs = true;
+		data->caps.ss = true;
+		mps = 1024;
+		break;
 	case UDC_DWC3_SPEED_IDX_HIGH_SPEED:
 		LOG_DBG("UDC_DWC3_SPEED_IDX_HIGH_SPEED");
 		data->caps.mps0 = UDC_MPS0_64;
