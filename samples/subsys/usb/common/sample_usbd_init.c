@@ -40,6 +40,7 @@ IF_ENABLED(CONFIG_HWINFO, (USBD_DESC_SERIAL_NUMBER_DEFINE(sample_sn)));
 
 USBD_DESC_CONFIG_DEFINE(fs_cfg_desc, "FS Configuration");
 USBD_DESC_CONFIG_DEFINE(hs_cfg_desc, "HS Configuration");
+USBD_DESC_CONFIG_DEFINE(ss_cfg_desc, "SS Configuration");
 
 /* doc configuration instantiation start */
 static const uint8_t attributes = (IS_ENABLED(CONFIG_SAMPLE_USBD_SELF_POWERED) ?
@@ -56,22 +57,37 @@ USBD_CONFIGURATION_DEFINE(sample_fs_config,
 USBD_CONFIGURATION_DEFINE(sample_hs_config,
 			  attributes,
 			  CONFIG_SAMPLE_USBD_MAX_POWER, &hs_cfg_desc);
+
+/* Super speed configuration */
+USBD_CONFIGURATION_DEFINE(sample_ss_config,
+			  attributes,
+			  CONFIG_SAMPLE_USBD_MAX_POWER_SS, &ss_cfg_desc);
 /* doc configuration instantiation end */
 
 #if CONFIG_SAMPLE_USBD_20_EXTENSION_DESC
-/*
- * This does not yet provide valuable information, but rather serves as an
- * example, and will be improved in the future.
- */
 static const struct usb_bos_capability_lpm bos_cap_lpm = {
 	.bLength = sizeof(struct usb_bos_capability_lpm),
 	.bDescriptorType = USB_DESC_DEVICE_CAPABILITY,
 	.bDevCapabilityType = USB_BOS_CAPABILITY_EXTENSION,
-	.bmAttributes = 0UL,
+	.bmAttributes = USB_BOS_ATTRIBUTES_LPM,
 };
 
-USBD_DESC_BOS_DEFINE(sample_usbext, sizeof(bos_cap_lpm), &bos_cap_lpm);
+USBD_DESC_BOS_DEFINE(sample_usb2ext, sizeof(bos_cap_lpm), &bos_cap_lpm);
 #endif
+
+static const struct usb_bos_capability_superspeed_usb bos_cap_ss = {
+	.bLength = sizeof(struct usb_bos_capability_superspeed_usb),
+	.bDescriptorType = USB_DESC_DEVICE_CAPABILITY,
+	.bDevCapabilityType = USB_BOS_CAPABILITY_SUPERSPEED_USB,
+	.bmAttributes = 0,
+	.wSpeedsSupported = sys_cpu_to_le16(USB_BOS_SPEED_SUPERSPEED_GEN1 |
+					    USB_BOS_SPEED_HIGHSPEED | USB_BOS_SPEED_FULLSPEED),
+	.bFunctionnalSupport = 1,
+	.bU1DevExitLat = 10,
+	.wU2DevExitLat = sys_cpu_to_le16(1023),
+};
+
+USBD_DESC_BOS_DEFINE(sample_usb3ext, sizeof(bos_cap_ss), &bos_cap_ss);
 
 static void sample_fix_code_triple(struct usbd_context *uds_ctx,
 				   const enum usbd_speed speed)
@@ -146,6 +162,26 @@ struct usbd_context *sample_usbd_setup_device(usbd_msg_cb_t msg_cb)
 		sample_fix_code_triple(&sample_usbd, USBD_SPEED_HS);
 	}
 
+	if (USBD_SUPPORTS_SUPER_SPEED &&
+	    usbd_caps_speed(&sample_usbd) == USBD_SPEED_SS) {
+		LOG_INF("registering Super-Speed configuration");
+		err = usbd_add_configuration(&sample_usbd, USBD_SPEED_SS,
+					     &sample_ss_config);
+		if (err) {
+			LOG_ERR("Failed to add Super-Speed configuration");
+			return NULL;
+		}
+
+		err = usbd_register_all_classes(&sample_usbd, USBD_SPEED_SS, 1,
+						blocklist);
+		if (err) {
+			LOG_ERR("Failed to add register classes");
+			return NULL;
+		}
+
+		sample_fix_code_triple(&sample_usbd, USBD_SPEED_SS);
+	}
+
 	/* doc configuration register start */
 	err = usbd_add_configuration(&sample_usbd, USBD_SPEED_FS,
 				     &sample_fs_config);
@@ -177,15 +213,23 @@ struct usbd_context *sample_usbd_setup_device(usbd_msg_cb_t msg_cb)
 	}
 
 #if CONFIG_SAMPLE_USBD_20_EXTENSION_DESC
-	(void)usbd_device_set_bcd_usb(&sample_usbd, USBD_SPEED_FS, 0x0201);
-	(void)usbd_device_set_bcd_usb(&sample_usbd, USBD_SPEED_HS, 0x0201);
+	(void)usbd_device_set_bcd_usb(&sample_usbd, USBD_SPEED_FS, USB_SRN_2_1);
+	(void)usbd_device_set_bcd_usb(&sample_usbd, USBD_SPEED_HS, USB_SRN_2_1);
 
-	err = usbd_add_descriptor(&sample_usbd, &sample_usbext);
+	err = usbd_add_descriptor(&sample_usbd, &sample_usb2ext);
 	if (err) {
 		LOG_ERR("Failed to add USB 2.0 Extension Descriptor");
 		return NULL;
 	}
 #endif
+
+	(void)usbd_device_set_bcd_usb(&sample_usbd, USBD_SPEED_SS, USB_SRN_3_2);
+
+	err = usbd_add_descriptor(&sample_usbd, &sample_usb3ext);
+	if (err) {
+		LOG_ERR("Failed to add USB 2.0 Extension Descriptor");
+		return NULL;
+	}
 
 	return &sample_usbd;
 }
