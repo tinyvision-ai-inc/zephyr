@@ -583,8 +583,8 @@ struct udc_dwc3_vendor_quirks {
 #define UDC_DWC3_QUIRK_CFG(dev)  (((const struct udc_dwc3_config *)(dev->config))->quirk_config)
 #define UDC_DWC3_QUIRK_DATA(dev) (((const struct udc_dwc3_config *)(dev->config))->quirk_data)
 
-#if DT_HAS_COMPAT_STATUS_OKAY(snps_dwc3 /* <- replace with your more specific compatible */)
-#include "udc_dwc3_qemu.h"
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+#include "udc_dwc3_lattice_usb23.h"
 #endif
 
 /* Wrapper functions that fallback to returning 0 if no quirk is needed */
@@ -2018,6 +2018,13 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	data->caps.addr_before_status = true;
 
 	switch (cfg->maximum_speed_idx) {
+	case UDC_DWC3_SPEED_IDX_SUPER_SPEED:
+		LOG_DBG("UDC_DWC3_SPEED_IDX_SUPER_SPEED");
+		data->caps.mps0 = UDC_MPS0_512;
+		data->caps.hs = true;
+		data->caps.ss = true;
+		mps = 1024;
+		break;
 	case UDC_DWC3_SPEED_IDX_HIGH_SPEED:
 		LOG_DBG("UDC_DWC3_SPEED_IDX_HIGH_SPEED");
 		data->caps.mps0 = UDC_MPS0_64;
