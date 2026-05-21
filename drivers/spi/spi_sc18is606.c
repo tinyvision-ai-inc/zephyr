@@ -30,12 +30,24 @@ struct spi_sc18is606_config {
 	const struct device *bridge;
 };
 
+#define SC18IS606_SPI_FREQUENCY_CNT	4
+#define SC18IS606_SPI_FREQUENCY_1875	0
+#define SC18IS606_SPI_FREQUENCY_455	1
+#define SC18IS606_SPI_FREQUENCY_115	2
+#define SC18IS606_SPI_FREQUENCY_58	3
+
+#define SC18IS606_SPI_FREQUENCY_0	KHZ(1875)
+#define SC18IS606_SPI_FREQUENCY_1	KHZ(455)
+#define SC18IS606_SPI_FREQUENCY_2	KHZ(115)
+#define SC18IS606_SPI_FREQUENCY_3	KHZ(58)
+
 static int sc18is606_spi_configure(const struct device *dev, const struct spi_config *config)
 {
 	const struct spi_sc18is606_config *cfg = dev->config;
 	struct spi_sc18is606_data *data = dev->data;
 	uint8_t cfg_byte = 0;
 	uint8_t buffer[2];
+	uint8_t freq_idx;
 	int ret;
 
 	if ((config->operation & SPI_OP_MODE_SLAVE) != 0U) {
@@ -66,7 +78,17 @@ static int sc18is606_spi_configure(const struct device *dev, const struct spi_co
 
 	cfg_byte |= FIELD_PREP(SC18IS606_MODE_MASK, (SPI_MODE_GET(config->operation) >> 1));
 
-	cfg_byte |= FIELD_PREP(SC18IS606_FREQ_MASK, config->frequency);
+	if (config->frequency >= SC18IS606_SPI_FREQUENCY_0) {
+		freq_idx = SC18IS606_SPI_FREQUENCY_1875;
+	} else if (config->frequency >= SC18IS606_SPI_FREQUENCY_1) {
+		freq_idx = SC18IS606_SPI_FREQUENCY_455;
+	} else if (config->frequency >= SC18IS606_SPI_FREQUENCY_2) {
+		freq_idx = SC18IS606_SPI_FREQUENCY_115;
+	} else {
+		freq_idx = SC18IS606_SPI_FREQUENCY_58;
+	}
+
+	cfg_byte |= FIELD_PREP(SC18IS606_FREQ_MASK, freq_idx);
 
 	data->ctx.config = config;
 
@@ -104,36 +126,53 @@ static int sc18is606_spi_transceive(const struct device *dev, const struct spi_c
 
 	uint8_t function_id = (1 << ss_idx) & 0x07;
 
-	if (tx_buffer_set && tx_buffer_set->buffers && tx_buffer_set->count > 0) {
+	if (tx_buffer_set && tx_buffer_set->buffers && rx_buffer_set && rx_buffer_set->buffers) {
 		for (size_t i = 0; i < tx_buffer_set->count; i++) {
 			const struct spi_buf *tx_buf = &tx_buffer_set->buffers[i];
+			const struct spi_buf *rx_buf = &rx_buffer_set->buffers[i];
 
 			uint8_t id_buf[1] = {function_id};
 
-			ret = nxp_sc18is606_transfer(cfg->bridge, tx_buf->buf, tx_buf->len, NULL, 0,
-						     id_buf);
+			ret = nxp_sc18is606_transfer(cfg->bridge, tx_buf->buf, tx_buf->len, rx_buf->buf, rx_buf->len,
+						id_buf);
 			if (ret < 0) {
 				LOG_ERR("SC18IS606: TX of size: %d failed %s", tx_buf->len,
 					dev->name);
 				return ret;
 			}
 		}
-	}
+	} else {
+		if (tx_buffer_set && tx_buffer_set->buffers && tx_buffer_set->count > 0) {
+			for (size_t i = 0; i < tx_buffer_set->count; i++) {
+				const struct spi_buf *tx_buf = &tx_buffer_set->buffers[i];
 
-	if (rx_buffer_set && rx_buffer_set->buffers && rx_buffer_set->count > 0) {
-		for (size_t i = 0; i < rx_buffer_set->count; i++) {
-			/* Function ID first to select the device */
-			uint8_t cmd_buf[1] = {function_id};
+				uint8_t id_buf[1] = {function_id};
 
-			const struct spi_buf *rx_buf = &rx_buffer_set->buffers[i];
+				ret = nxp_sc18is606_transfer(cfg->bridge, tx_buf->buf, tx_buf->len, NULL, 0,
+							id_buf);
+				if (ret < 0) {
+					LOG_ERR("SC18IS606: TX of size: %d failed %s", tx_buf->len,
+						dev->name);
+					return ret;
+				}
+			}
+		}
 
-			ret = nxp_sc18is606_transfer(cfg->bridge, cmd_buf, sizeof(cmd_buf),
-						     rx_buf->buf, rx_buf->len, NULL);
+		if (rx_buffer_set && rx_buffer_set->buffers && rx_buffer_set->count > 0) {
+			for (size_t i = 0; i < rx_buffer_set->count; i++) {
+				/* Function ID first to select the device */
+				uint8_t cmd_buf[1] = {function_id};
 
-			if (ret < 0) {
-				LOG_ERR("SC18IS606: RX of size: %d failed on  (%s)", rx_buf->len,
-					dev->name);
-				return ret;
+				const struct spi_buf *rx_buf = &rx_buffer_set->buffers[i];
+
+				ret = nxp_sc18is606_transfer(cfg->bridge, cmd_buf, sizeof(cmd_buf),
+							rx_buf->buf, rx_buf->len, NULL);
+
+				if (ret < 0) {
+					LOG_ERR("SC18IS606: RX of size: %d failed on  (%s)", rx_buf->len,
+						dev->name);
+					return ret;
+				}
 			}
 		}
 	}
