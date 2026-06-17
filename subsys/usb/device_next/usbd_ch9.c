@@ -84,8 +84,9 @@ static int sreq_set_address(struct usbd_context *const uds_ctx)
 	}
 
 	if (usbd_state_is_configured(uds_ctx)) {
-		errno = -EPERM;
-		return 0;
+		LOG_WRN("SET_ADDRESS while configured; deconfiguring");
+		(void)usbd_config_set(uds_ctx, 0);
+		uds_ctx->ch9_data.state = USBD_STATE_DEFAULT;
 	}
 
 	if (caps.addr_before_status) {
@@ -129,7 +130,11 @@ static int sreq_set_configuration(struct usbd_context *const uds_ctx)
 		return 0;
 	}
 
-	if (usbd_state_is_default(uds_ctx)) {
+	if (usbd_state_is_default(uds_ctx) && setup->wValue != 0) {
+		LOG_WRN("SET_CONFIGURATION while DEFAULT; promoting to ADDRESS "
+			"(addr-before-status race?)");
+		uds_ctx->ch9_data.state = USBD_STATE_ADDRESS;
+	} else if (usbd_state_is_default(uds_ctx)) {
 		errno = -EPERM;
 		return 0;
 	}
@@ -390,6 +395,9 @@ static int sreq_set_sel(struct usbd_context *const uds_ctx, struct net_buf *cons
 	sel.u2pel = sys_le16_to_cpu(sel.u2pel);
 
 	errno = udc_set_system_exit_latency(uds_ctx->dev, &sel);
+	if (errno == 0) {
+		LOG_INF("SET_SEL accepted");
+	}
 	return 0;
 }
 
@@ -1082,7 +1090,8 @@ static int handle_setup_request(struct usbd_context *const uds_ctx,
 	}
 
 	if (errno) {
-		LOG_INF("protocol error:");
+		LOG_INF("protocol error req=0x%02x state=%u",
+			setup->bRequest, uds_ctx->ch9_data.state);
 		LOG_HEXDUMP_INF(setup, sizeof(*setup), "setup:");
 		if (errno == -ENOTSUP) {
 			LOG_INF("not supported");
@@ -1102,6 +1111,7 @@ static int ctrl_xfer_get_setup(struct usbd_context *const uds_ctx,
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 
 	if (buf->len != sizeof(struct usb_setup_packet)) {
+		LOG_ERR("Malformed setup packet (len=%u)", buf->len);
 		return -EINVAL;
 	}
 

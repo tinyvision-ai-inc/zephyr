@@ -119,6 +119,7 @@ static void usbd_class_bcast_event(struct usbd_context *const uds_ctx,
 static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 {
 	enum udc_bus_speed udc_speed;
+	uint8_t prev_state = uds_ctx->ch9_data.state;
 	int ret;
 
 	usbd_status_suspended(uds_ctx, false);
@@ -134,7 +135,9 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 		return ret;
 	}
 
+	LOG_INF("Bus reset prev_state=%u", prev_state);
 	LOG_INF("Actual device speed %u", udc_device_speed(uds_ctx->dev));
+
 	udc_speed = udc_device_speed(uds_ctx->dev);
 	switch (udc_speed) {
 	case UDC_BUS_SPEED_SS:
@@ -154,6 +157,17 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 	uds_ctx->status.u1_enable = false;
 
 	uds_ctx->status.u2_enable = false;
+
+	/* Driver re-arms SETUP when the buffer is still queued; if the queue
+	 * is empty (mid-transfer reset consumed it), enqueue a fresh one.
+	 */
+	if (udc_ep_queue_is_empty(uds_ctx->dev, USB_CONTROL_EP_OUT)) {
+		ret = usbd_init_control_pipe(uds_ctx, true);
+		if (ret) {
+			LOG_ERR("Failed to re-enqueue SETUP after bus reset");
+			return ret;
+		}
+	}
 
 	return 0;
 }
