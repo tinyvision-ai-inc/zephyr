@@ -16,11 +16,12 @@ if UDC_DWC3
 
 config UDC_DWC3_EVENTS_NUM
 	int "Number of events in the event ring buffer"
-	default 16
+	default 64
 	help
-	  It is typically not needed to increase the number of events, but
-	  if it were to happen due to some rare condition, increasing this
-	  number could be useful.
+	  Hardware event ring depth (each slot is one 32-bit event word).
+	  The known-good usb23 driver used the same default depth; 16 entries
+	  is too shallow for SuperSpeed streaming on this platform and causes
+	  immediate EVNTOVERFLOW / IRQ wedge at stream start.
 
 config UDC_DWC3_TRB_NUM
 	int "Number of buffers for each non-control endpoint"
@@ -31,5 +32,84 @@ config UDC_DWC3_TRB_NUM
 	  endpoint. This does not affect control endpoints. The default is
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
+
+config UDC_DWC3_EVENTS_POLL_MS
+	int "Poll interval for emulated USB device events (milliseconds)"
+	default 10
+	help
+	  On tinyCLUNX33 the DWC3 device events are not wired to a CPU IRQ;
+	  the lattice_usb23 quirk polls the event ring from a delayable
+	  workqueue at this interval. The known-good usb23 driver used 10 ms.
+	  A 1 ms poll starves the 81 MHz CPU during SuperSpeed streaming.
+
+config UDC_DWC3_REMOTEWAKEUP_GUARD
+	bool "Gate DepStartXfer remote-wakeup on link being in U1/U2/U3"
+	default y
+	help
+	  When y, DCTL.ULSTCHNGREQ=REMOTEWAKEUP is only issued (and U0 is
+	  waited for) when the SuperSpeed link is actually in a low-power
+	  state. When n, the remote-wakeup is written unconditionally on every
+	  DepStartXfer, matching the original custom tinyvision driver.
+
+config UDC_DWC3_BULK_RESTART_XFER
+	bool "Reset bulk-IN EP/TRB ring before starting a stream"
+	default n
+	help
+	  When y, lattice_usb23_bulk_restart_xfer() tears down and re-inits the
+	  bulk-IN endpoint TRB ring at stream start. When n, this is skipped,
+	  matching the original custom tinyvision driver.
+
+config UDC_DWC3_EP0_RELEASE_XFER
+	bool "Release dangling EP0 transfer resource on bus-reset reconfigure"
+	default y
+	help
+	  When y, a dangling EP0 transfer left over from a reset-aborted
+	  transfer is ended (DepEndXfer HIPRI_FORCERM) before DEPCFG INIT.
+	  When n, this is skipped, matching the original custom tinyvision
+	  driver.
+
+config UDC_DWC3_ULSTCNGEN
+	bool "Enable ULSTCHNG device events (SuperSpeed link-state changes)"
+	default n
+	help
+	  When y, DEVTEN.ULSTCNGEN is set and every U-state transition
+	  generates a device event. The known-good usb23 driver explicitly
+	  left this disabled; enabling it floods the hardware event ring with
+	  ULSTCHNG -> U0 events during streaming and contributes to
+	  EVNTOVERFLOW / IRQ wedge. Enable only for link-state debugging.
+
+config UDC_DWC3_DISABLE_LPM
+	bool "Disable USB link power management (pin the link in U0)"
+	default n
+	help
+	  When y, the driver explicitly disables all USB low-power link states
+	  at soft-reset: clears DCTL.{INITU1,ACCEPTU1,INITU2,ACCEPTU2}ENA so
+	  the device never enters/accepts U1/U2, clears
+	  GUSB3PIPECTL.SUSPENDENABLE and GUSB2PHYCFG.ENBLSLPM (no PHY suspend /
+	  USB2 LPM), and clears DCFG.LPMCAP. This matches the original custom
+	  tinyvision driver, which kept the SuperSpeed link continuously in U0.
+	  Video offload on this platform assumes a continuously-live bulk transfer.
+
+# --- Diagnostics ----------------------------------------------------------
+
+config UDC_DWC3_FLIGHT_RECORDER
+	bool "Record controller events into a RAM ring buffer (flight recorder)"
+	default n
+	help
+	  When y, every DWC3 event (DEPEVT/DEVT) is timestamped and stored in a
+	  small in-RAM ring buffer on the hot path with no logging, plus the
+	  driver enables XferNotReady events on bulk-IN endpoints (the underrun
+	  signature). On a mid-stream USB reset the last
+	  UDC_DWC3_FLIGHT_RECORDER_NUM events are dumped, giving an exact
+	  pre-crash history (e.g. an XferNotReady storm or a BUSERR status)
+	  without flooding the log during normal streaming.
+
+config UDC_DWC3_FLIGHT_RECORDER_NUM
+	int "Number of events kept in the flight recorder ring"
+	default 128
+	depends on UDC_DWC3_FLIGHT_RECORDER
+	help
+	  Depth of the event ring buffer dumped at a mid-stream failure. Larger
+	  captures more pre-crash history at the cost of RAM (8 bytes/entry).
 
 endif # UDC_DWC3
