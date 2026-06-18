@@ -581,6 +581,7 @@ struct udc_dwc3_vendor_quirks {
 	int (*enable)(const struct device *const dev);
 	int (*disable)(const struct device *const dev);
 	int (*shutdown)(const struct device *const dev);
+	void (*post_soft_reset)(const struct device *const dev);
 };
 
 /* Helper for accessing vendor quirks */
@@ -607,6 +608,13 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(init);
 UDC_DWC3_QUIRK_FUNC_DEFINE(enable);
 UDC_DWC3_QUIRK_FUNC_DEFINE(disable);
 UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
+
+static inline void udc_dwc3_quirk_post_soft_reset(const struct device *const dev)
+{
+	if (udc_dwc3_vendor_quirks.post_soft_reset != NULL) {
+		udc_dwc3_vendor_quirks.post_soft_reset(dev);
+	}
+}
 
 #define DEV_CFG(dev) ((const struct udc_dwc3_config *)(dev->config))
 #define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
@@ -1494,6 +1502,8 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/* Configure endpoint 0x00 and 0x80 only for now */
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
+
+	udc_dwc3_quirk_post_soft_reset(dev);
 }
 
 static bool udc_dwc3_collapse_captured;
