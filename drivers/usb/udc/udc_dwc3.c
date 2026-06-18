@@ -538,6 +538,10 @@ struct udc_dwc3_data {
 	uint32_t evt_next;
 	/* CONNECTDONE received since last bus reset */
 	bool link_ready;
+	/* EP0 needs DEPCFG INIT (not MODIFY) after USBRST */
+	bool ep_reinit_after_reset;
+	/* Stack bus-reset handler still running; block early SET_ADDRESS */
+	bool bus_reset_recovering;
 	/* Back-reference to parent */
 	const struct device *dev;
 };
@@ -593,8 +597,20 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
 #define DEV_CFG(dev) ((const struct udc_dwc3_config *)(dev->config))
 #define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
 
+static void udc_dwc3_next_ctrl(const struct device *const dev,
+			       struct udc_dwc3_ep_data *const ep_data);
+
+/* Optional hooks for platform-specific USB video offload. */
+void udc_dwc3_vendor_bus_reset(const struct device *const dev)
+	__attribute__((weak));
+
+void udc_dwc3_vendor_ep_clear_halt(const struct device *const dev, const uint8_t ep_addr)
+	__attribute__((weak));
+
+void udc_bus_reset_recovery_done(const struct device *const dev);
+
 static int udc_dwc3_apply_address(const struct device *const dev, const uint8_t addr,
-				  bool ep_reconfigure, bool rearm_setup);
+				  bool ep_reconfigure);
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr);
 
 /* Shut down the controller completely  */
@@ -731,10 +747,15 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	uint32_t param0 = 0;
 	uint32_t param1 = 0;
 
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	bool force_init = priv->ep_reinit_after_reset &&
+		(ep_data->cfg.addr == USB_CONTROL_EP_IN ||
+		 ep_data->cfg.addr == USB_CONTROL_EP_OUT);
+
 	LOG_INF("configuring endpoint 0x%02x with wMaxPacketSize=%u",
 		ep_data->cfg.addr, ep_data->cfg.mps);
 
-	if (ep_data->cfg.stat.enabled) {
+	if (ep_data->cfg.stat.enabled && !force_init) {
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_MODIFY;
 	} else {
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_INIT;
@@ -797,6 +818,25 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 	reg = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
+}
+
+static void udc_dwc3_ep0_reconfigure(const struct device *const dev, const bool final)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (!priv->ep_reinit_after_reset) {
+		return;
+	}
+
+	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
+	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
+	udc_dwc3_depcmd_ep_xfer_config(dev, &cfg->ep_data_in[0]);
+	udc_dwc3_depcmd_ep_xfer_config(dev, &cfg->ep_data_out[0]);
+
+	if (final) {
+		priv->ep_reinit_after_reset = false;
+	}
 }
 
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
@@ -1088,6 +1128,54 @@ static void udc_dwc3_ctrl_setup_rearm(const struct device *const dev)
 	}
 }
 
+static void udc_dwc3_finish_address_zero(const struct device *const dev)
+{
+	udc_dwc3_ep0_reconfigure(dev, true);
+	udc_dwc3_ctrl_setup_rearm(dev);
+}
+
+static void udc_dwc3_ep_reset_state(const struct device *const dev,
+				      struct udc_dwc3_ep_data *const ep_data)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	if (!ep_data->cfg.stat.enabled && !udc_ep_is_busy(&ep_data->cfg)) {
+		return;
+	}
+
+	LOG_INF("bus reset: ep 0x%02x busy=%u en=%u halted=%u",
+		ep_data->cfg.addr, udc_ep_is_busy(&ep_data->cfg),
+		ep_data->cfg.stat.enabled, ep_data->cfg.stat.halted);
+
+	k_work_cancel(&ep_data->work);
+	udc_ep_cancel_queued(dev, &ep_data->cfg);
+	udc_ep_set_busy(&ep_data->cfg, false);
+	ep_data->cfg.stat.halted = false;
+	/* Leave stat.enabled for the stack: usbd_config_set(0) disables
+	 * endpoints and clears ep_active. Clearing enabled here desyncs
+	 * the driver from the stack and makes ep_disable return -EALREADY.
+	 */
+	ep_data->head = ep_data->tail = 0;
+	ep_data->total = 0;
+	ep_data->full = false;
+	ep_data->xferrscidx = 0;
+
+	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
+}
+
+static void udc_dwc3_reset_noncontrol_eps(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
+		udc_dwc3_ep_reset_state(dev, &cfg->ep_data_in[epn]);
+	}
+
+	for (int epn = 1; epn < cfg->num_out_eps; epn++) {
+		udc_dwc3_ep_reset_state(dev, &cfg->ep_data_out[epn]);
+	}
+}
+
 /*
  * Events
  *
@@ -1196,6 +1284,8 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	struct net_buf *buf;
 
 	priv->link_ready = false;
+	priv->ep_reinit_after_reset = true;
+	priv->bus_reset_recovering = true;
 
 	/* Instrumentation: capture the EP0 control-pipe state on reset entry.
 	 * A "stuck busy" EP0 OUT or a missing SETUP buffer here is the
@@ -1206,23 +1296,11 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 		udc_ep_is_busy(&ep0_in->cfg), udc_ep_is_busy(&ep0_out->cfg),
 		(void *)buf, (buf != NULL) ? udc_get_buf_info(buf)->setup : 0);
 
-	/* Reset all ongoing transfers on non-control IN endpoints */
-	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
-		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[epn];
-
-		continue; /* TODO */
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, 0);
-		udc_dwc3_depcmd_clear_stall(dev, ep_data);
-	}
-
-	/* Reset all ongoing transfers on non-control OUT endpoints */
-	for (int epn = 1; epn < cfg->num_out_eps; epn++) {
-		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[epn];
-
-		continue; /* TODO */
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, 0);
-		udc_dwc3_depcmd_clear_stall(dev, ep_data);
-	}
+	/* Reset all ongoing transfers on non-control endpoints (e.g. UVC bulk
+	 * IN while streaming). Software-only: do not DepEndXfer during USBRST.
+	 */
+	udc_dwc3_reset_noncontrol_eps(dev);
+	udc_dwc3_vendor_bus_reset(dev);
 
 	/* A USB reset aborts in-flight EP0 transfers in hardware; completion
 	 * events never arrive, so the busy flags go stale. Clear them without
@@ -1232,8 +1310,11 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	udc_ep_set_busy(&ep0_in->cfg, false);
 	udc_ep_set_busy(&ep0_out->cfg, false);
 
-	/* Drop stale data/status OUT buffers left from an aborted control
-	 * transfer so the SETUP buffer (if any) moves back to queue head.
+	/* Drop stale DATA/STATUS OUT buffers from an aborted control transfer.
+	 * Keep a SETUP buffer at queue head — it is the idle control-pipe
+	 * buffer and is re-armed in finish_address_zero(). When the queue is
+	 * empty the stack enqueues a fresh SETUP immediately after
+	 * set_address(0).
 	 */
 	while ((buf = udc_buf_peek(&ep0_out->cfg)) != NULL &&
 	       !udc_get_buf_info(buf)->setup) {
@@ -1242,7 +1323,7 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	}
 
 	/* Clear DCFG address only; CONNECTDONE reconfigures EP0 at link speed. */
-	udc_dwc3_apply_address(dev, 0, false, false);
+	udc_dwc3_apply_address(dev, 0, false);
 
 	/* Do not re-arm SETUP here: DepStartXfer fails while the controller
 	 * is still in reset. CONNECTDONE (and set_address(0) from the stack)
@@ -1255,7 +1336,6 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 static void udc_dwc3_on_connect_done(const struct device *const dev)
 {
-	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	int mps = 0;
@@ -1277,12 +1357,10 @@ static void udc_dwc3_on_connect_done(const struct device *const dev)
 	/* Reconfigure control endpoints connection speed */
 	udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT)->mps = mps;
 	udc_get_ep_cfg(dev, USB_CONTROL_EP_IN)->mps = mps;
-	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
-
-	/* SETUP is re-armed once from set_address(0) after the stack handles
-	 * UDC_EVT_RESET; arming here as well races with that and causes bogus
-	 * SETUP completions (Malformed setup packet).
+	/* CONNECTDONE updates MPS only; EP0 DEPCFG INIT runs in
+	 * finish_address_zero() when the stack calls set_address(0).
+	 * Reconfiguring here clears ep_reinit_after_reset before the
+	 * stack reset handler runs and leaves EP0 unconfigured (log-17).
 	 */
 
 	/* Letting GTXFIFOSIZn unchanged */
@@ -1440,13 +1518,18 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		setup = (struct usb_setup_packet *)buf->data;
 
-		/* Latency optimization: set the address immediately to be able to be able
-		 * to ACK/NAK the first packets from the host with the new address,
-		 * otherwise the host issue a reset.
+		/* Apply SET_ADDRESS before the status stage so the device can
+		 * ACK at the new address (Windows SS). Skip while the stack
+		 * reset handler is still running — that races with set_address(0).
 		 */
 		if (setup->bmRequestType == USB_REQTYPE_TYPE_STANDARD &&
 		    setup->bRequest == USB_SREQ_SET_ADDRESS) {
-			udc_dwc3_apply_address(dev, setup->wValue, true, false);
+			struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+			if (!priv->ep_reinit_after_reset && !priv->bus_reset_recovering &&
+			    setup->wValue != 0) {
+				udc_dwc3_apply_address(dev, setup->wValue, false);
+			}
 		}
 
 		/* Update the size to what the hardware reports */
@@ -1742,8 +1825,21 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_OUT);
 	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_IN);
 
+	/* Host CLEAR_FEATURE must terminate any active transfer before
+	 * DepClearStall, even when stat.halted was cleared in software.
+	 */
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 && ep_data->xferrscidx != 0) {
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
+
+	udc_dwc3_vendor_ep_clear_halt(dev, ep_data->cfg.addr);
+
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		k_work_submit(&ep_data->work);
+	}
 
 	return 0;
 }
@@ -1783,10 +1879,8 @@ static int udc_dwc3_set_system_exit_latency(const struct device *const dev,
 }
 
 static int udc_dwc3_apply_address(const struct device *const dev, const uint8_t addr,
-				  bool ep_reconfigure, bool rearm_setup)
+				  bool ep_reconfigure)
 {
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
@@ -1798,12 +1892,7 @@ static int udc_dwc3_apply_address(const struct device *const dev, const uint8_t 
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
 	if (ep_reconfigure) {
-		udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
-		udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
-	}
-
-	if (rearm_setup && priv->link_ready) {
-		udc_dwc3_ctrl_setup_rearm(dev);
+		udc_dwc3_finish_address_zero(dev);
 	}
 
 	return 0;
@@ -1812,24 +1901,19 @@ static int udc_dwc3_apply_address(const struct device *const dev, const uint8_t 
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	uint8_t current;
 
 	current = FIELD_GET(UDC_DWC3_DCFG_DEVADDR_MASK, sys_read32(base + UDC_DWC3_DCFG));
 
 	if (current == addr) {
-		/* addr-before-status: SET_ADDRESS was already applied in the
-		 * SETUP handler. After bus reset the address is already 0 but
-		 * SETUP must still be re-armed exactly once.
-		 */
-		if (addr == 0 && priv->link_ready) {
-			udc_dwc3_ctrl_setup_rearm(dev);
+		if (addr == 0) {
+			udc_dwc3_finish_address_zero(dev);
 		}
 
 		return 0;
 	}
 
-	return udc_dwc3_apply_address(dev, addr, true, addr == 0);
+	return udc_dwc3_apply_address(dev, addr, addr == 0);
 }
 
 static enum udc_bus_speed udc_dwc3_device_speed(const struct device *const dev)
@@ -1908,6 +1992,11 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 
 	/* Starting from here, the endpoint can be used */
 	sys_set_bits(base + UDC_DWC3_DALEPENA, UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
+
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		udc_dwc3_depcmd_clear_stall(dev, ep_data);
+		ep_data->cfg.stat.halted = false;
+	}
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
@@ -2148,6 +2237,42 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	return 0;
 }
+
+void udc_bus_reset_recovery_done(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	priv->bus_reset_recovering = false;
+}
+
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+void lattice_usb23_bulk_restart_xfer(const struct device *dev, uint8_t ep_addr)
+{
+	struct udc_dwc3_ep_data *ep_data = (void *)udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_data == NULL || USB_EP_GET_IDX(ep_addr) == 0 ||
+	    !ep_data->cfg.stat.enabled) {
+		return;
+	}
+
+	k_work_cancel(&ep_data->work);
+	udc_ep_cancel_queued(dev, &ep_data->cfg);
+	udc_ep_set_busy(&ep_data->cfg, false);
+	ep_data->cfg.stat.halted = false;
+
+	if (ep_data->xferrscidx != 0) {
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+
+	ep_data->head = ep_data->tail = ep_data->total = 0;
+	ep_data->full = false;
+	ep_data->xferrscidx = 0;
+
+	memset((void *)ep_data->trb_buf, 0,
+	       sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
+	udc_dwc3_trb_norm_init(dev, ep_data);
+}
+#endif /* DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23) */
 
 #define UDC_DWC3_DEVICE_DEFINE(n)						\
 	UDC_DWC3_QUIRK_DEFINE(n);						\

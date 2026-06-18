@@ -25,6 +25,11 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(usbd_core, CONFIG_USBD_LOG_LEVEL);
 
+__attribute__((weak)) void udc_bus_reset_recovery_done(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+}
+
 static K_KERNEL_STACK_DEFINE(usbd_stack, CONFIG_USBD_THREAD_STACK_SIZE);
 static struct k_thread usbd_thread_data;
 
@@ -129,6 +134,17 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 		return ret;
 	}
 
+	/* Host may send SETUP as soon as EP0 is reconfigured. Enqueue before
+	 * config teardown so the hardware always has a SETUP TRB armed.
+	 */
+	if (udc_ep_queue_is_empty(uds_ctx->dev, USB_CONTROL_EP_OUT)) {
+		ret = usbd_init_control_pipe(uds_ctx, true);
+		if (ret) {
+			LOG_ERR("Failed to re-enqueue SETUP after bus reset");
+			return ret;
+		}
+	}
+
 	ret = usbd_config_set(uds_ctx, 0);
 	if (ret) {
 		LOG_ERR("Failed to set default state after bus reset");
@@ -158,16 +174,7 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 
 	uds_ctx->status.u2_enable = false;
 
-	/* Driver re-arms SETUP when the buffer is still queued; if the queue
-	 * is empty (mid-transfer reset consumed it), enqueue a fresh one.
-	 */
-	if (udc_ep_queue_is_empty(uds_ctx->dev, USB_CONTROL_EP_OUT)) {
-		ret = usbd_init_control_pipe(uds_ctx, true);
-		if (ret) {
-			LOG_ERR("Failed to re-enqueue SETUP after bus reset");
-			return ret;
-		}
-	}
+	udc_bus_reset_recovery_done(uds_ctx->dev);
 
 	return 0;
 }

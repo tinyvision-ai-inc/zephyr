@@ -39,6 +39,14 @@ int usbd_ep_disable(const struct device *dev,
 	int ret;
 
 	ret = udc_ep_disable(dev, ep);
+	if (ret == -EALREADY) {
+		/* Driver may have cleared DALEPENA on bus reset before the stack
+		 * runs usbd_config_set(0). Treat as disabled and finish cleanup.
+		 */
+		usbd_ep_bm_clear(ep_bm, ep);
+		(void)udc_ep_dequeue(dev, ep);
+		return 0;
+	}
 	if (ret) {
 		return ret;
 	}
