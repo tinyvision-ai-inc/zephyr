@@ -1279,7 +1279,22 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
 
-	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
+	/* TX packet-count threshold to reduce bulk-IN transmit underrun on
+	 * SuperSpeed. With threshold disabled, DWC3 may start a burst before
+	 * enough data is buffered, yielding truncated packets (-71 / EPROTO).
+	 * Values restored from the pre-2026-05-12 custom tinyvision driver.
+	 */
+	{
+		const uint32_t tx_thr_num = 1;
+		const uint32_t tx_max_burst = 2;
+
+		reg = UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL;
+		reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBTXPKTCNT_MASK, tx_thr_num);
+		reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBMAXTXBURSTSIZE_MASK, tx_max_burst);
+		sys_write32(reg, base + UDC_DWC3_GTXTHRCFG);
+		LOG_INF("GTXTHRCFG=0x%08x (tx_thr_num=%u tx_max_burst=%u)",
+			sys_read32(base + UDC_DWC3_GTXTHRCFG), tx_thr_num, tx_max_burst);
+	}
 
 	/* Read the chip identification */
 	reg = sys_read32(base + UDC_DWC3_GCOREID);
