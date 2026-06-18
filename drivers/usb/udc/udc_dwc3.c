@@ -525,20 +525,6 @@ struct udc_dwc3_ep_data {
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
-	/* Diagnostics: number of DEPXFERCFG (transfer-resource allocations)
-	 * issued for this EP since boot. Should be 1; >1 means a resource leak.
-	 */
-	uint32_t xfercfg_count;
-	/* Linux-style DWC3_EP_RESOURCE_ALLOCATED: a transfer resource is
-	 * allocated for this EP only once per DEPSTARTCFG(0) pool reset.
-	 * Re-running DEPXFERCFG on EP re-enable would leak a resource and push
-	 * the bulk-IN transfer resource index out of range for platform handoff.
-	 */
-	bool xfer_res_allocated;
-	/* Edge detector for bulk-IN stall snapshot: capture controller state
-	 * once at the first XferNotReady after (re)arm. Cleared on DepStartXfer.
-	 */
-	bool nrdy_reported;
 };
 
 /*
@@ -619,12 +605,6 @@ void udc_dwc3_vendor_bus_reset(const struct device *const dev)
 	__attribute__((weak));
 
 void udc_dwc3_vendor_ep_clear_halt(const struct device *const dev, const uint8_t ep_addr)
-	__attribute__((weak));
-
-/* Called once at the first bulk-IN XferNotReady after (re)arm so platform
- * code can snapshot accelerator state at the stall instant.
- */
-void udc_dwc3_vendor_bulk_stall(const struct device *const dev, const uint8_t ep_addr)
 	__attribute__((weak));
 
 void udc_bus_reset_recovery_done(const struct device *const dev);
@@ -743,39 +723,15 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	uint32_t reg;
 
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
-	{
-		/* Bound the CMDACT poll. The DWC3 normally clears CMDACT within
-		 * microseconds, but a command issued while the SuperSpeed link
-		 * is unstable (Recovery/SS.Inactive) can leave CMDACT set far
-		 * longer. This runs in the USB IRQ, so an unbounded spin wedges
-		 * all event processing and can freeze streaming.
-		 */
-		const uint32_t start = k_cycle_get_32();
-		const uint32_t hz = sys_clock_hw_cycles_per_sec();
-		const uint32_t limit = hz / 100U; /* ~10 ms */
-		uint32_t spun;
-
-		do {
-			reg = sys_read32(base + addr);
-			spun = k_cycle_get_32() - start;
-		} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0 && spun < limit);
-
-		if (reg & UDC_DWC3_DEPCMD_CMDACT) {
-			LOG_ERR("DEPCMD CMDACT stuck: ep_reg_off=0x%lx cmdtype=0x%x "
-				"cmd=0x%08x reg=0x%08x spun=%uus",
-				(unsigned long)addr, (unsigned int)(cmd & 0xfU), cmd, reg,
-				(unsigned int)(((uint64_t)spun * 1000000U) / hz));
-			return 0;
-		}
-	}
+	do {
+		reg = sys_read32(base + addr);
+	} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0);
 
 	switch (reg & UDC_DWC3_DEPCMD_STATUS_MASK) {
 	case UDC_DWC3_DEPCMD_STATUS_OK:
 		break;
 	case UDC_DWC3_DEPCMD_STATUS_CMDERR:
-		/* Log endpoint and command on failure for post-mortem debug. */
-		LOG_ERR("DEPCMD failed: ep_reg_off=0x%lx cmdtype=0x%x cmd=0x%08x reg=0x%08x",
-			(unsigned long)addr, (unsigned int)(cmd & 0xfU), cmd, reg);
+		LOG_ERR("endpoint command failed");
 		break;
 	default:
 		LOG_ERR("command failed with unknown status: 0x%08x", reg);
@@ -837,12 +793,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Per-endpoint events */
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
-	/* Do NOT enable XFERNRDYEN on bulk-IN EPs. The known-good usb23 driver
-	 * left this commented out; turning it on for the flight recorder
-	 * floods the 16-entry hardware event ring during a bulk-IN NRDY storm
-	 * (762k+ EVNTOVERFLOW in one run), wedging the IRQ and drowning the
-	 * console even with rate-limited logging.
-	 */
+	/* UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN is useful for debugging */
 
 	/* This is the usb protocol endpoint number, but the data encoding
 	 * we chose for physical endpoint number is the same as this
@@ -862,36 +813,18 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
-	/* Allocate a transfer resource only once per EP (until the next
-	 * DEPSTARTCFG(0) pool reset), matching the Linux dwc3 driver's
-	 * DWC3_EP_RESOURCE_ALLOCATED gate. Each DEPXFERCFG (NumXferRes=1)
-	 * consumes the next slot from the pool; re-running it on EP re-enable
-	 * (every UVC stream restart re-enables the bulk-IN EP) leaks a resource
-	 * and advances the pool, pushing the bulk-IN rscidx out of the range
-	 * expected by platform handoff.
-	 */
-	if (ep_data->xfer_res_allocated) {
-		LOG_INF("DepXferConfig: ep=0x%02x epn=%u SKIP (already allocated)",
-			ep_data->cfg.addr, ep_data->epn);
-		return;
-	}
-
-	ep_data->xfercfg_count++;
-	LOG_INF("DepXferConfig: ep=0x%02x epn=%u alloc#%u",
-		ep_data->cfg.addr, ep_data->epn, ep_data->xfercfg_count);
+	LOG_DBG("DepXferConfig: ep=0x%02x", ep_data->cfg.addr);
 
 	reg = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
-
-	ep_data->xfer_res_allocated = true;
 }
 
 static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
 				     uint32_t flags);
 
-static void __maybe_unused udc_dwc3_ep0_release_xfer(const struct device *const dev,
+static void udc_dwc3_ep0_release_xfer(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)
 {
 	/* Release a dangling EP0 transfer resource left over from a transfer
@@ -921,10 +854,8 @@ static void udc_dwc3_ep0_reconfigure(const struct device *const dev, const bool 
 		return;
 	}
 
-#if CONFIG_UDC_DWC3_EP0_RELEASE_XFER
 	udc_dwc3_ep0_release_xfer(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_ep0_release_xfer(dev, &cfg->ep_data_out[0]);
-#endif
 
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
@@ -968,7 +899,6 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
-#if CONFIG_UDC_DWC3_REMOTEWAKEUP_GUARD
 	/* If the SuperSpeed link is in a low-power state (U1/U2/U3), request a
 	 * transition back to U0 (remote wakeup) before starting the transfer.
 	 *
@@ -1006,15 +936,6 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 			}
 		}
 	}
-#else
-	/* Known-good custom-driver behaviour: unconditionally request remote
-	 * wakeup on every DepStartXfer, assuming the TX FIFO is empty.
-	 */
-	reg = sys_read32(base + UDC_DWC3_DCTL);
-	reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
-	reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
-	sys_write32(reg, base + UDC_DWC3_DCTL);
-#endif /* CONFIG_UDC_DWC3_REMOTEWAKEUP_GUARD */
 
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
@@ -1025,18 +946,6 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	reg = sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
 	if ((reg & UDC_DWC3_DEPCMD_STATUS_MASK) != UDC_DWC3_DEPCMD_STATUS_OK) {
 		udc_ep_set_busy(&ep_data->cfg, false);
-	}
-
-	/* Log bulk stream-arm for handoff debug. */
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) != 0) {
-		/* Re-arm: re-prime the stall edge detector so the next
-		 * XferNotReady captures a fresh snapshot.
-		 */
-		ep_data->nrdy_reported = false;
-		LOG_INF("ARM bulk ep=0x%02x epn=%u xferrscidx=%u depcmd_status=0x%x trb=%p trbctl=0x%08x",
-			ep_data->cfg.addr, ep_data->epn, ep_data->xferrscidx,
-			(unsigned int)FIELD_GET(UDC_DWC3_DEPCMD_STATUS_MASK, reg),
-			(void *)ep_data->trb_buf, ep_data->trb_buf[0].ctrl);
 	}
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
@@ -1074,35 +983,13 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
 					 struct udc_dwc3_ep_data *const ep_data)
 {
-	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) == 0;
+	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) > 0;
 	uint32_t flags = 0;
 
-	/* DEPSTARTCFG XferRscIdx: 0 for the control endpoint (this also resets
-	 * the whole transfer-resource pool after a USB reset, as required by the
-	 * DWC3 databook), 2 for non-control endpoints (after the two EP0
-	 * resources). The previous (idx > 0) test inverted this, leaving the
-	 * resource pool uninitialised and corrupting transfers under heavy
-	 * streaming load.
-	 */
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
-
-	/* DEPSTARTCFG with XferRscIdx=0 frees the entire transfer-resource
-	 * pool, so every EP must re-allocate its resource on the next
-	 * DEPXFERCFG. Drop the "already allocated" gate for all EPs.
-	 */
-	if (is_control) {
-		const struct udc_dwc3_config *const cfg = dev->config;
-
-		for (int i = 0; i < cfg->num_in_eps; i++) {
-			cfg->ep_data_in[i].xfer_res_allocated = false;
-		}
-		for (int i = 0; i < cfg->num_out_eps; i++) {
-			cfg->ep_data_out[i].xfer_res_allocated = false;
-		}
-	}
 
 	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
 }
@@ -1455,27 +1342,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 15);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
-#if CONFIG_UDC_DWC3_DISABLE_LPM
-	/* Pin the SuperSpeed link in U0 (disable U1/U2/U3). Matches the original
-	 * custom driver; video offload on this platform assumes a live transfer.
-	 */
-	reg = sys_read32(base + UDC_DWC3_DCTL);
-	reg &= ~(UDC_DWC3_DCTL_INITU1ENA | UDC_DWC3_DCTL_ACCEPTU1ENA |
-		 UDC_DWC3_DCTL_INITU2ENA | UDC_DWC3_DCTL_ACCEPTU2ENA);
-	sys_write32(reg, base + UDC_DWC3_DCTL);
-
-	sys_clear_bits(base + UDC_DWC3_DCFG, UDC_DWC3_DCFG_LPMCAP);
-	sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_SUSPENDENABLE);
-	sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_ENBLSLPM);
-	LOG_INF("LPM disabled: DCTL=0x%08x DCFG=0x%08x PIPECTL=0x%08x PHYCFG=0x%08x",
-		sys_read32(base + UDC_DWC3_DCTL), sys_read32(base + UDC_DWC3_DCFG),
-		sys_read32(base + UDC_DWC3_GUSB3PIPECTL), sys_read32(base + UDC_DWC3_GUSB2PHYCFG));
-#endif /* CONFIG_UDC_DWC3_DISABLE_LPM */
-
-	/* Enable reception of USB events. ULSTCNGEN is off by default to
-	 * match the known-good usb23 driver, which explicitly excluded it;
-	 * every ULSTCHNG -> U0 during streaming was flooding the event ring.
-	 */
+	/* Enable reception of all USB events except UDC_DWC3_DEVTEN_ULSTCNGEN */
 	reg = UDC_DWC3_DEVTEN_INACTTIMEOUTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_VNDRDEVTSTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_EVNTOVERFLOWEN;
@@ -1483,9 +1350,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
 	reg |= UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN;
 	reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
-#if CONFIG_UDC_DWC3_ULSTCNGEN
-	reg |= UDC_DWC3_DEVTEN_ULSTCNGEN;
-#endif
 	reg |= UDC_DWC3_DEVTEN_CONNECTDONEEN;
 	reg |= UDC_DWC3_DEVTEN_USBRSTEN;
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
@@ -1494,277 +1358,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/* Configure endpoint 0x00 and 0x80 only for now */
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
-}
-
-static bool udc_dwc3_collapse_captured;
-
-#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
-/*
- * Flight recorder.
- *
- * Every controller event (raw 32-bit DEPEVT/DEVT word) is timestamped and
- * stored in a RAM ring on the IRQ hot path with NO logging, so it does not
- * generate extra events or flood the console during streaming. On a mid-stream
- * USB reset the ring is dumped, giving the exact sequence of events leading up
- * to the failure (e.g. an XferNotReady storm = TX FIFO underrun, or a DEPEVT
- * status with BUSERR set = controller/DMA fault) which is impossible to see
- * from a single post-mortem snapshot.
- */
-struct udc_dwc3_fr_entry {
-	uint32_t first_cyc; /* k_cycle_get_32() of first occurrence in this run */
-	uint32_t last_cyc;  /* k_cycle_get_32() of most recent occurrence */
-	uint32_t evt;       /* full, unmasked event word */
-	uint32_t count;     /* number of consecutive identical events coalesced */
-};
-
-static struct udc_dwc3_fr_entry udc_dwc3_fr[CONFIG_UDC_DWC3_FLIGHT_RECORDER_NUM];
-static uint32_t udc_dwc3_fr_head;  /* index of the most recently written entry */
-static uint32_t udc_dwc3_fr_count; /* number of valid entries */
-/* Once set, recording stops so the ring preserves the run-up to a failure
- * instead of being overwritten by the (potentially many seconds of) identical
- * storm that follows it. Frozen at the first bulk-IN stall edge.
- */
-static bool udc_dwc3_fr_frozen;
-
-/*
- * Coalesce runs of identical consecutive events. A streaming endpoint that
- * stalls produces thousands of identical XferNotReady events; without
- * coalescing they would evict the interesting transition (the last good
- * XferInProgress and whatever immediately preceded the stall) from the ring.
- * Collapsing a run into a single entry with a repeat count keeps every slot
- * meaningful.
- */
-static inline void udc_dwc3_fr_freeze(void)
-{
-	udc_dwc3_fr_frozen = true;
-}
-
-static inline void udc_dwc3_fr_record(const uint32_t evt)
-{
-	const uint32_t now = k_cycle_get_32();
-	struct udc_dwc3_fr_entry *cur = &udc_dwc3_fr[udc_dwc3_fr_head];
-	const uint32_t devt_type = (evt >> 8) & 0xfU;
-
-	if (udc_dwc3_fr_frozen) {
-		return;
-	}
-
-	/* Never store overflow/errtic storms: they coalesce to one useless
-	 * entry and burn IRQ cycles while the ring is already full.
-	 */
-	if (devt_type == 0xbU || devt_type == 0x9U) {
-		return;
-	}
-
-	if (udc_dwc3_fr_count != 0U && cur->evt == evt) {
-		cur->last_cyc = now;
-		cur->count++;
-		return;
-	}
-
-	udc_dwc3_fr_head = (udc_dwc3_fr_head + 1U) % ARRAY_SIZE(udc_dwc3_fr);
-	cur = &udc_dwc3_fr[udc_dwc3_fr_head];
-	cur->first_cyc = now;
-	cur->last_cyc = now;
-	cur->evt = evt;
-	cur->count = 1U;
-	if (udc_dwc3_fr_count < ARRAY_SIZE(udc_dwc3_fr)) {
-		udc_dwc3_fr_count++;
-	}
-}
-
-static const char *udc_dwc3_fr_depevt_name(const uint32_t type)
-{
-	switch (type) {
-	case 0x01: return "XFERCOMPLETE";
-	case 0x02: return "XFERINPROGRESS";
-	case 0x03: return "XFERNOTREADY";
-	case 0x04: return "RXTXFIFOEVT";
-	case 0x06: return "STREAMEVT";
-	case 0x07: return "EPCMDCMPLT";
-	default:   return "DEPEVT?";
-	}
-}
-
-static const char *udc_dwc3_fr_devt_name(const uint32_t type)
-{
-	switch (type) {
-	case 0x0: return "DISCONNECT";
-	case 0x1: return "USBRST";
-	case 0x2: return "CONNECTDONE";
-	case 0x3: return "ULSTCHNG";
-	case 0x4: return "WKUP";
-	case 0x6: return "SUSPEND";
-	case 0x7: return "SOF";
-	case 0x9: return "ERRTICERR";
-	case 0xa: return "CMDCMPLT";
-	case 0xb: return "EVNTOVERFLOW";
-	case 0xc: return "VNDRDEVTSTRCVED";
-	default:  return "DEVT?";
-	}
-}
-
-/* SuperSpeed link state names, indexed by DSTS.USBLNKST / the ULSTCHNG event
- * information field (raw_event >> 16) & 0xf. U1/U2 = LPM low power; RECOV/
- * SS_INACT = link error path (SS_INACT is a hard failure needing re-enum).
- */
-static const char *udc_dwc3_fr_linkstate_name(const uint32_t st)
-{
-	switch (st) {
-	case 0x0: return "U0";
-	case 0x1: return "U1";
-	case 0x2: return "U2";
-	case 0x3: return "U3";
-	case 0x4: return "SS.Dis";
-	case 0x5: return "RX.Det";
-	case 0x6: return "SS.Inact";
-	case 0x7: return "Poll";
-	case 0x8: return "Recov";
-	case 0x9: return "HReset";
-	case 0xa: return "Cmply";
-	case 0xb: return "Lpbk";
-	case 0xf: return "ResetResume";
-	default:  return "?";
-	}
-}
-
-static void udc_dwc3_fr_dump(const char *const reason)
-{
-	const uint32_t n = udc_dwc3_fr_count;
-	const uint32_t hz = sys_clock_hw_cycles_per_sec();
-	/* Walk oldest -> newest. Newest is at fr_head; oldest is n-1 behind it. */
-	uint32_t idx = (udc_dwc3_fr_head + ARRAY_SIZE(udc_dwc3_fr) + 1U - n) %
-		       ARRAY_SIZE(udc_dwc3_fr);
-	uint32_t prev_cyc = 0;
-
-	LOG_ERR("FR[%s]: %u distinct event runs (oldest first), hz=%u", reason, n, hz);
-
-	for (uint32_t i = 0; i < n; i++) {
-		const struct udc_dwc3_fr_entry *const e = &udc_dwc3_fr[idx];
-		const uint32_t evt = e->evt;
-		/* gap (us) from the previous run's last event to this run's first */
-		const uint32_t gap_us = (i == 0) ? 0U :
-			(uint32_t)(((uint64_t)(e->first_cyc - prev_cyc) * 1000000U) / hz);
-		/* span (us) covered by this run (first -> last occurrence) */
-		const uint32_t span_us =
-			(uint32_t)(((uint64_t)(e->last_cyc - e->first_cyc) * 1000000U) / hz);
-
-		if (evt & BIT(0)) {
-			/* Device event (DEVT): type in bits[11:8]. For ULSTCHNG
-			 * the new link state is in the event-info field [20:16].
-			 */
-			const uint32_t devt = (evt >> 8) & 0xf;
-
-			if (devt == 0x3) {
-				LOG_ERR("FR %3u +%7uus x%-5u DEVT   ULSTCHNG -> %-11s raw=0x%08x",
-					i, gap_us, e->count,
-					udc_dwc3_fr_linkstate_name((evt >> 16) & 0xf), evt);
-			} else {
-				LOG_ERR("FR %3u +%7uus x%-5u DEVT   %-14s raw=0x%08x",
-					i, gap_us, e->count,
-					udc_dwc3_fr_devt_name(devt), evt);
-			}
-		} else {
-			/* DEPEVT: epn[5:1] type[9:6] status[15:12] param[31:16] */
-			const uint32_t epn = (evt >> 1) & 0x1f;
-			const uint32_t type = (evt >> 6) & 0xf;
-			const uint32_t status = (evt >> 12) & 0xf;
-			/* BUSERR (status bit0) is only meaningful for transfer
-			 * completion events; for XferNotReady bit3 = "transfer
-			 * resource active", lower bits are the request reason.
-			 */
-			const bool is_xfer_done = (type == 0x01 || type == 0x02);
-			const char *flag =
-				(is_xfer_done && (status & UDC_DWC3_DEPEVT_STATUS_BUSERR))
-					? " BUSERR"
-				: (type == 0x03 && !(status & BIT(3))) ? " NOT_ACTIVE"
-									: "";
-
-			LOG_ERR("FR %3u +%7uus x%-5u DEPEVT phys_ep=%u %-14s status=0x%x%s "
-				"span=%uus param=0x%04x",
-				i, gap_us, e->count, epn,
-				udc_dwc3_fr_depevt_name(type), status, flag,
-				span_us, (evt >> 16) & 0xffff);
-		}
-
-		prev_cyc = e->last_cyc;
-		idx = (idx + 1U) % ARRAY_SIZE(udc_dwc3_fr);
-	}
-}
-#else
-static inline void udc_dwc3_fr_record(const uint32_t evt) { ARG_UNUSED(evt); }
-static inline void udc_dwc3_fr_dump(const char *const reason) { ARG_UNUSED(reason); }
-static inline void udc_dwc3_fr_freeze(void) { }
-#endif /* CONFIG_UDC_DWC3_FLIGHT_RECORDER */
-
-/*
- * Failure-state capture for the bulk-IN streaming path.
- * Dumps controller link/FIFO/TRB state at bus reset during streaming.
- */
-static void udc_dwc3_diag_snapshot(const struct device *const dev, const char *const reason)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
-	const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
-
-	LOG_ERR("DIAG[%s]: DSTS=0x%08x linkst=0x%x spd=%u LTSSM=0x%08x GSTS=0x%08x",
-		reason, dsts,
-		(unsigned int)FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, dsts),
-		(unsigned int)FIELD_GET(UDC_DWC3_DSTS_CONNECTSPD_MASK, dsts),
-		sys_read32(base + UDC_DWC3_GDBGLTSSM), gsts);
-
-	if (gsts & UDC_DWC3_GSTS_BUSERRADDRVLD) {
-		LOG_ERR("DIAG[%s]: BUS_ERROR addr=0x%08x%08x", reason,
-			sys_read32(base + UDC_DWC3_GBUSERRADDR_HI),
-			sys_read32(base + UDC_DWC3_GBUSERRADDR_LO));
-	}
-
-	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
-		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[epn];
-		volatile struct udc_dwc3_trb *trb;
-		uint32_t txfifo;
-
-		if (!ep_data->cfg.stat.enabled) {
-			continue;
-		}
-
-		/* TX FIFO occupancy for this IN EP. GDBGFIFOSPACE must be primed
-		 * with a {queue type, queue num} select before reading the
-		 * AVAILABLE field; the bare read returns FIFO 0 (EP0), which is
-		 * useless here. FIFONUM for an IN EP is (addr & 0x7f), matching
-		 * what DEPCFG programs. AVAILABLE counts free MDWIDTH words; a
-		 * value at/near the FIFO depth means the FIFO is empty.
-		 */
-		sys_write32(UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX |
-			    FIELD_PREP(UDC_DWC3_GDBGFIFOSPACE_QUEUENUM_MASK,
-				       ep_data->cfg.addr & 0x7f),
-			    base + UDC_DWC3_GDBGFIFOSPACE);
-		txfifo = FIELD_GET(UDC_DWC3_GDBGFIFOSPACE_AVAILABLE_MASK,
-				   sys_read32(base + UDC_DWC3_GDBGFIFOSPACE));
-
-		trb = &ep_data->trb_buf[ep_data->tail];
-		LOG_ERR("DIAG[%s]: ep 0x%02x busy=%u rscidx=%u head=%u tail=%u trbsts=%u "
-			"trbctl=0x%08x txfifo_avail=%u",
-			reason, ep_data->cfg.addr, udc_ep_is_busy(&ep_data->cfg),
-			ep_data->xferrscidx, ep_data->head, ep_data->tail,
-			(unsigned int)FIELD_GET(UDC_DWC3_TRB_STATUS_TRBSTS_MASK, trb->status),
-			trb->ctrl, txfifo);
-	}
-}
-
-/* True while at least one bulk-IN (video) endpoint is streaming. */
-static bool udc_dwc3_is_streaming(const struct device *const dev)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
-		if (cfg->ep_data_in[epn].cfg.stat.enabled) {
-			return true;
-		}
-	}
-
-	return false;
 }
 
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
@@ -1778,7 +1371,6 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	priv->link_ready = false;
 	priv->ep_reinit_after_reset = true;
 	priv->bus_reset_recovering = true;
-	udc_dwc3_collapse_captured = false;
 
 	/* Instrumentation: capture the EP0 control-pipe state on reset entry.
 	 * A "stuck busy" EP0 OUT or a missing SETUP buffer here is the
@@ -1788,15 +1380,6 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	LOG_INF("USB bus reset (hw addr -> 0): ep0 in_busy=%u out_busy=%u out_buf=%p setup=%u",
 		udc_ep_is_busy(&ep0_in->cfg), udc_ep_is_busy(&ep0_out->cfg),
 		(void *)buf, (buf != NULL) ? udc_get_buf_info(buf)->setup : 0);
-
-	/* If the host reset us mid-stream it is reacting to a bad bulk-IN packet
-	 * (-71). Snapshot the controller's failure state before we tear the
-	 * non-control endpoints down below.
-	 */
-	if (udc_dwc3_is_streaming(dev)) {
-		udc_dwc3_diag_snapshot(dev, "USBRST-streaming");
-		udc_dwc3_fr_dump("USBRST-streaming");
-	}
 
 	/* Reset all ongoing transfers on non-control endpoints (e.g. UVC bulk
 	 * IN while streaming). Software-only: do not DepEndXfer during USBRST.
@@ -1898,21 +1481,6 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_SS_INACT:
 			LOG_DBG("DSTS_USBLNKST_USB3_SS_INACT");
-			/* Irreversible SuperSpeed link failure. If a bulk-IN stall
-			 * preceded it, this is the real death (not a clean
-			 * disconnect): freeze the flight recorder and snapshot both
-			 * sides exactly once, so the ring holds the true run-up
-			 * (the XferNotReady storm coalesces into one FR entry).
-			 */
-			if (udc_dwc3_is_streaming(dev) && !udc_dwc3_collapse_captured) {
-				udc_dwc3_collapse_captured = true;
-				udc_dwc3_fr_freeze();
-				LOG_ERR("LINK-COLLAPSE SS.Inactive after bulk stall");
-				udc_dwc3_diag_snapshot(dev, "LINK-COLLAPSE");
-				if (udc_dwc3_vendor_bulk_stall != NULL) {
-					udc_dwc3_vendor_bulk_stall(dev, 0x81);
-				}
-			}
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_POLL:
 			LOG_DBG("DSTS_USBLNKST_USB3_POLL");
@@ -2111,14 +1679,12 @@ static void udc_dwc3_on_xfer_done(const struct device *const dev,
 		break;
 	case UDC_DWC3_TRB_STATUS_TRBSTS_MISSEDISOC:
 		LOG_ERR("UDC_DWC3_TRB_STATUS_TRBSTS_MISSEDISOC");
-		udc_dwc3_diag_snapshot(dev, "TRB-MISSEDISOC");
 		break;
 	case UDC_DWC3_TRB_STATUS_TRBSTS_SETUPPENDING:
 		LOG_ERR("UDC_DWC3_TRB_STATUS_TRBSTS_SETUPPENDING");
 		break;
 	case UDC_DWC3_TRB_STATUS_TRBSTS_XFERINPROGRESS:
 		LOG_ERR("UDC_DWC3_TRB_STATUS_TRBSTS_XFERINPROGRESS");
-		udc_dwc3_diag_snapshot(dev, "TRB-XFERINPROGRESS");
 		break;
 	case UDC_DWC3_TRB_STATUS_TRBSTS_ZLPPENDING:
 		LOG_ERR("UDC_DWC3_TRB_STATUS_TRBSTS_ZLPPENDING");
@@ -2185,8 +1751,6 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
 		udc_dwc3_on_xfer_not_ready(dev, evt);
 		break;
-	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
-		break;
 	case UDC_DWC3_DEVT_DISCONNEVT:
 		LOG_INF("USB disconnect event");
 		break;
@@ -2218,19 +1782,13 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		LOG_DBG("DEVT_VNDRDEVTSTRCVED");
 		break;
 	case UDC_DWC3_DEVT_ERRTICERR:
-	case UDC_DWC3_DEVT_EVNTOVERFLOW: {
-		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-		static bool overflow_logged;
-
-		if (!overflow_logged) {
-			overflow_logged = true;
-			/* Stop the overflow->event->overflow feedback loop. */
-			sys_clear_bits(base + UDC_DWC3_DEVTEN, UDC_DWC3_DEVTEN_EVNTOVERFLOWEN);
-			LOG_ERR("DEVT overflow/errtic evt=0x%x (further logs suppressed)",
-				evt);
-		}
+		LOG_ERR("DEVT_ERRTICERR");
+		CODE_UNREACHABLE;
 		break;
-	}
+	case UDC_DWC3_DEVT_EVNTOVERFLOW:
+		LOG_ERR("DEVT_EVNTOVERFLOW");
+		CODE_UNREACHABLE;
+		break;
 	default:
 		LOG_ERR("unhandled event: 0x%x", evt);
 		CODE_UNREACHABLE;
@@ -2249,12 +1807,6 @@ static void udc_dwc3_irq_handler(void *const ptr)
 
 	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
-
-		/* Flight recorder: store the full, unmasked word (carries the
-		 * DEPEVT status nibble, e.g. BUSERR) before the dispatch mask
-		 * strips it. RAM-only, no logging on the hot path.
-		 */
-		udc_dwc3_fr_record(evt);
 
 		/* Dispatch the even directly from IRQ */
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
@@ -2316,24 +1868,7 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-
-	/* End any active transfer before disabling. ep_enable() always issues
-	 * DEPSTRTXFER; if the previous transfer was never ended the command
-	 * returns CMDERR (status 0x1) and platform handoff gets a dead resource.
-	 * Skip during bus-reset recovery: DEPENDXFER must not run in USBRST.
-	 */
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 && ep_data->xferrscidx != 0 &&
-	    !priv->bus_reset_recovering) {
-		LOG_INF("DepEndXfer on disable ep=0x%02x rscidx=%u",
-			ep_data->cfg.addr, ep_data->xferrscidx);
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-		ep_data->xferrscidx = 0;
-	}
-
-	k_work_cancel(&ep_data->work);
-	udc_ep_set_busy(&ep_data->cfg, false);
 
 	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
 
@@ -2528,7 +2063,6 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 			      struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	LOG_DBG("%s 0x%02x", __func__, ep_data->cfg.addr);
@@ -2536,20 +2070,6 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
 	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
-
-	/* After a mid-stream crash the host re-enables bulk EPs during re-
-	 * enumeration while the controller still owns the previous transfer
-	 * (bus reset clears software state but does not issue DEPENDXFER).
-	 * Run after DEPCFG so the endpoint is configured; skip during bus-
-	 * reset recovery when DEPENDXFER can hang the controller.
-	 */
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 && ep_data->xferrscidx != 0 &&
-	    !priv->bus_reset_recovering) {
-		LOG_INF("DepEndXfer on enable ep=0x%02x rscidx=%u",
-			ep_data->cfg.addr, ep_data->xferrscidx);
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-		ep_data->xferrscidx = 0;
-	}
 
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		udc_dwc3_trb_norm_init(dev, ep_data);
@@ -2831,9 +2351,7 @@ void lattice_usb23_bulk_restart_xfer(const struct device *dev, uint8_t ep_addr)
 
 	ep_data->head = ep_data->tail = ep_data->total = 0;
 	ep_data->full = false;
-	/* Keep xferrscidx: DEPXFERCFG allocated it once; platform handoff reads
-	 * this index. Zeroing it here made handoff use rscidx=0 after restart.
-	 */
+	ep_data->xferrscidx = 0;
 
 	memset((void *)ep_data->trb_buf, 0,
 	       sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
