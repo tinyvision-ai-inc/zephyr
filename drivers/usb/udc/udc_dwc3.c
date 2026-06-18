@@ -831,8 +831,18 @@ static void udc_dwc3_ep0_reconfigure(const struct device *const dev, const bool 
 
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
-	udc_dwc3_depcmd_ep_xfer_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_ep_xfer_config(dev, &cfg->ep_data_out[0]);
+
+	/* DEPXFERCFG (transfer-resource allocation) is intentionally NOT redone
+	 * here. The EP0 IN/OUT transfer resources are allocated once in
+	 * udc_dwc3_ep_enable() at power-on and are preserved across USB bus
+	 * resets. Re-running DEPXFERCFG on every reset allocates a fresh
+	 * transfer resource each time without freeing the previous one, leaking
+	 * one resource per reset. On hosts that issue many resets during
+	 * enumeration (e.g. some Windows laptops) the pool is exhausted and the
+	 * controller starts returning CMDERR ("endpoint command failed").
+	 * This mirrors the Linux dwc3 driver, which gates set_xfer_resource()
+	 * behind a one-time DWC3_EP_RESOURCE_ALLOCATED flag.
+	 */
 
 	if (final) {
 		priv->ep_reinit_after_reset = false;
@@ -861,11 +871,43 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
-	/* Make sure the device is in U0 state, assuming TX FIFO is empty */
-	reg = sys_read32(base + UDC_DWC3_DCTL);
-	reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
-	reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
-	sys_write32(reg, base + UDC_DWC3_DCTL);
+	/* If the SuperSpeed link is in a low-power state (U1/U2/U3), request a
+	 * transition back to U0 (remote wakeup) before starting the transfer.
+	 *
+	 * This DCTL.ULSTCHNGREQ write MUST be gated on the link actually being
+	 * in a low-power state. Issuing the request while the link is already in
+	 * U0 (the normal case during active streaming) drives the LTSSM into
+	 * Recovery and, on this PHY, into SS.Inactive, killing the link the
+	 * instant a stream's first transfer is started. This matches the Linux
+	 * dwc3 driver, which only issues remote wakeup from U1/U2/U3.
+	 */
+	reg = sys_read32(base + UDC_DWC3_DSTS);
+	if ((reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) == UDC_DWC3_DSTS_CONNECTSPD_SS) {
+		uint32_t lnkst = reg & UDC_DWC3_DSTS_USBLNKST_MASK;
+
+		if (lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U1 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U2 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U3) {
+			reg = sys_read32(base + UDC_DWC3_DCTL);
+			reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
+			reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
+			sys_write32(reg, base + UDC_DWC3_DCTL);
+
+			/* Wait for the link to actually reach U0 before issuing
+			 * DEPSTRTXFER. Issuing a transfer command while the link
+			 * is still transitioning out of a low-power state is a
+			 * suspected SS.Inactive trigger on this PHY.
+			 */
+			for (int i = 0; i < 1000; i++) {
+				lnkst = sys_read32(base + UDC_DWC3_DSTS) &
+					UDC_DWC3_DSTS_USBLNKST_MASK;
+				if (lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U0) {
+					break;
+				}
+				k_busy_wait(1);
+			}
+		}
+	}
 
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
