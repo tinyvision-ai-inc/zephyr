@@ -820,6 +820,31 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
 }
 
+static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
+				     struct udc_dwc3_ep_data *const ep_data,
+				     uint32_t flags);
+
+static void udc_dwc3_ep0_release_xfer(const struct device *const dev,
+				      struct udc_dwc3_ep_data *const ep_data)
+{
+	/* Release a dangling EP0 transfer resource left over from a transfer
+	 * that was aborted by a USB bus reset. A DEPCFG INIT issued while the
+	 * endpoint still owns a transfer resource returns CMDERR ("endpoint
+	 * command failed"); on rapid (Windows-style) reset storms this
+	 * eventually wedges re-enumeration. This mirrors the proven
+	 * lattice_usb23_bulk_restart_xfer() teardown and is safe here because
+	 * ep0_reconfigure() runs at set_address(0), after the controller is out
+	 * of reset (DEPENDXFER must not be issued during USBRST).
+	 */
+	if (ep_data->xferrscidx == 0) {
+		return;
+	}
+
+	udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	ep_data->xferrscidx = 0;
+	udc_ep_set_busy(&ep_data->cfg, false);
+}
+
 static void udc_dwc3_ep0_reconfigure(const struct device *const dev, const bool final)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -828,6 +853,9 @@ static void udc_dwc3_ep0_reconfigure(const struct device *const dev, const bool 
 	if (!priv->ep_reinit_after_reset) {
 		return;
 	}
+
+	udc_dwc3_ep0_release_xfer(dev, &cfg->ep_data_in[0]);
+	udc_dwc3_ep0_release_xfer(dev, &cfg->ep_data_out[0]);
 
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0]);
