@@ -59,6 +59,69 @@ config UDC_DWC3_BULK_RESTART_XFER
 	  bulk-IN endpoint TRB ring at stream start. When n, this is skipped,
 	  matching the original custom tinyvision driver.
 
+config UDC_DWC3_RESIZE_TX_FIFOS
+	bool "Repartition per-IN-EP TX FIFO RAM at init (avoid FIFO overlap)"
+	default n
+	help
+	  When y, the driver programs GTXFIFOSIZn at init so each IN endpoint
+	  gets a non-overlapping slice of the controller TX FIFO RAM (sized from
+	  GHWPARAMS7 RAM1_DEPTH). The stock flow leaves GTXFIFOSIZn at IP
+	  defaults, which on this Lattice USB23 IP can overlap: a high-bandwidth
+	  IN endpoint (FPGA video on 0x84) then corrupts another IN endpoint's
+	  bulk FIFO (CDC ACM on 0x82), wedging ACM ~the moment video streams.
+	  Low-bandwidth IN endpoints (CDC ACM bulk, CDC interrupt) get a small
+	  FIFO and a 1-packet burst; the high-bandwidth video endpoints get the
+	  large burst and the remaining RAM. Enable only after confirming the
+	  default GTXFIFOSIZn overlap from the boot-time
+	  "ep 0x.. -> TXFIFOn start=.. depth=.." log.
+
+config UDC_DWC3_NUM_VIDEO_IN_EPS
+	int "Number of high-bandwidth (video) IN endpoints"
+	default 2
+	range 1 4
+	help
+	  The highest-numbered N bulk-IN endpoints are treated as high-bandwidth
+	  video endpoints (large burst + large TX FIFO). All lower-numbered IN
+	  endpoints (CDC ACM bulk, CDC interrupt) are low-bandwidth. For a single
+	  active camera use 1; for dual concurrent UVC streams use 2.
+
+config UDC_DWC3_VIDEO_EP_BURST
+	int "DEPCFG burst size (N-1) for video IN endpoints"
+	default 15
+	range 0 15
+	help
+	  Burst size programmed in DEPCFG for the high-bandwidth video IN
+	  endpoints, encoded as (packets - 1): 15 => 16-packet burst (legacy),
+	  0 => single packet. A perpetually-ready 16-packet video burst can
+	  monopolise the controller TX datapath and starve a concurrent CPU
+	  bulk-IN (CDC ACM), so lowering this lets ACM interleave at some video
+	  throughput cost. 15 preserves the original behaviour.
+
+config UDC_DWC3_LOWBW_EP_BURST
+	int "DEPCFG burst size (N-1) for low-bandwidth / OUT endpoints"
+	default 0
+	range 0 15
+	help
+	  Burst size programmed in DEPCFG for every endpoint that is not a
+	  high-bandwidth video IN endpoint (CDC ACM bulk, CDC interrupt, all OUT
+	  endpoints, control), encoded as (packets - 1). Must match the
+	  bMaxBurst these endpoints advertise in their SS companion descriptor;
+	  CDC ACM bulk/interrupt advertise 0 (single packet). The previous driver
+	  hardcoded 15 here, which over-bursted the ACM bulk endpoint relative to
+	  its descriptor and wedged it under concurrent FPGA video streaming.
+
+config UDC_DWC3_LOWBW_FIFO_DEPTH
+	int "TX FIFO depth (RAM words) for low-bandwidth IN endpoints"
+	default 256
+	range 64 1024
+	depends on UDC_DWC3_RESIZE_TX_FIFOS
+	help
+	  Per-endpoint TX FIFO depth, in controller RAM (MDWIDTH) words, given to
+	  each low-bandwidth IN endpoint. Must hold at least one max-size packet
+	  (1024 B). Confirm against the boot-time FIFO map; the default is sized
+	  for an 8-byte MDWIDTH (256 words = 2 KiB). The video endpoints split
+	  whatever RAM remains.
+
 config UDC_DWC3_EP0_RELEASE_XFER
 	bool "Release dangling EP0 transfer resource on bus-reset reconfigure"
 	default y
@@ -90,6 +153,33 @@ config UDC_DWC3_DISABLE_LPM
 	  tinyvision driver, which kept the SuperSpeed link continuously in U0.
 	  Video offload on this platform assumes a continuously-live bulk transfer.
 
+config UDC_DWC3_MASK_FPGA_EP_EVENTS
+	bool "Disable XferComplete/XferInProgress events on FPGA-owned EPs"
+	default n
+	help
+	  When y, an FPGA-owned (hardware-accelerated) IN endpoint is configured
+	  with XferComplete/XferInProgress events disabled in DEPCFG, and DEPCFG
+	  is re-issued (MODIFY) whenever ownership changes. The uvcmanager drives
+	  the FPGA EP via the doorbell after handoff and the CPU never services
+	  its TRB ring, so the controller would otherwise raise (and internally
+	  track) completion events nothing consumes, interfering with concurrent
+	  CPU bulk endpoints (CDC ACM). When n, events are left enabled for all
+	  endpoints (legacy behaviour) -- use this to confirm, via the per-phys-EP
+	  DEPEVT counters, that the FPGA EP actually generates events.
+
+config UDC_DWC3_NRDY_PROBE_OUT
+	bool "Probe: enable XferNotReady events on bulk-OUT EPs (count only)"
+	default n
+	help
+	  When y, XFERNRDYEN is set in DEPCFG for every non-control bulk-OUT
+	  endpoint (the CDC ACM OUT 0x01), and each XferNotReady is counted per
+	  physical endpoint (no hot-path logging) and dumped in the DIAG snapshot
+	  as "NRDY ep 0x.. nrdy=N". Use to diagnose a SuperSpeed bulk-OUT
+	  flow-control deadlock: if nrdy>0 at a wedge, the host is still asking to
+	  send while the device went NRDY and never re-issued ERDY. Unlike
+	  enabling XferNotReady on bulk-IN (which storms the event ring), the
+	  modest host write rate on OUT keeps this safe. Diagnostic only.
+
 # --- Diagnostics ----------------------------------------------------------
 
 config UDC_DWC3_FLIGHT_RECORDER
@@ -110,6 +200,71 @@ config UDC_DWC3_FLIGHT_RECORDER_NUM
 	depends on UDC_DWC3_FLIGHT_RECORDER
 	help
 	  Depth of the event ring buffer dumped at a mid-stream failure. Larger
-	  captures more pre-crash history at the cost of RAM (8 bytes/entry).
+	  captures more pre-crash history at the cost of RAM (16 bytes/entry).
+
+config UDC_DWC3_FR_CLEAR_HALT_STORM
+	bool "Capture on CLEAR_HALT storm during streaming"
+	default y
+	depends on UDC_DWC3_FLIGHT_RECORDER
+	help
+	  When y, repeated host CLEAR_FEATURE(HALT) on the same bulk endpoint
+	  while UVC is streaming freezes the flight recorder and dumps a DIAG
+	  snapshot without waiting for USBRst. Use for ACM bulk-OUT storms.
+
+config UDC_DWC3_FR_CLEAR_HALT_BULK_IN
+	bool "Capture on first CLEAR_HALT on bulk-IN while streaming"
+	default y
+	depends on UDC_DWC3_FLIGHT_RECORDER
+	help
+	  When y, the first DepClearStall on any enabled bulk-IN endpoint during
+	  UVC streaming triggers an immediate failure capture. Catches the
+	  HANDOFF-then-ClearStall wedge seen on camera bulk-IN (e.g. 0x84).
+
+config UDC_DWC3_FR_CLEAR_HALT_THRESHOLD
+	int "CLEAR_HALT events on one EP before capture (bulk-OUT storm)"
+	default 3
+	range 2 64
+	depends on UDC_DWC3_FR_CLEAR_HALT_STORM
+	help
+	  Number of DepClearStall calls on the same bulk-OUT endpoint within the
+	  window below that triggers a one-shot failure capture.
+
+config UDC_DWC3_FR_CLEAR_HALT_WINDOW_MS
+	int "CLEAR_HALT storm window (milliseconds)"
+	default 2000
+	range 500 10000
+	depends on UDC_DWC3_FR_CLEAR_HALT_STORM
+	help
+	  Rolling time window for counting CLEAR_HALT events per endpoint.
+
+config UDC_DWC3_FR_STREAM_IDLE_MS
+	int "Capture when no bulk-IN completion for this long (ms, 0=off)"
+	default 8000
+	range 0 60000
+	depends on UDC_DWC3_FLIGHT_RECORDER
+	help
+	  While UVC is streaming, schedule a periodic check. If no bulk-IN
+	  XferComplete occurs for this many milliseconds, dump the flight
+	  recorder. Catches silent stalls after stream was running (e.g. CPU
+	  overload from ACM shell spam). Set 0 to disable.
+
+config UDC_DWC3_FR_STREAM_HANDOFF_GRACE_MS
+	int "STREAM-IDLE grace after FPGA handoff (milliseconds)"
+	default 15000
+	range 0 120000
+	depends on UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	help
+	  Do not trigger STREAM-IDLE for this long after fpga_streaming starts.
+	  Covers sensor bring-up and the first frames while the host opens the
+	  UVC node. FPGA progress is also polled via uvcmanager DONE_BYTES.
+
+config UDC_DWC3_FR_TRB_DESYNC
+	bool "Capture on TRB ring desync (head != tail, empty pop)"
+	default y
+	depends on UDC_DWC3_FLIGHT_RECORDER
+	help
+	  When y, a bulk completion with no net_buf while head != tail triggers
+	  an immediate failure capture (TRB-DESYNC-0xNN). Catches ACM OUT ring
+	  desync (e.g. 0x01 tail ahead of head) without spamming the log.
 
 endif # UDC_DWC3

@@ -1269,7 +1269,7 @@ struct usbd_class_api usbd_cdc_acm_api = {
 	.if1_ss_in_ep_co = {							\
 		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,						\
+		.bMaxBurst = 0,							\
 		.bmAttributes = 0x00,						\
 		.wBytesPerInterval = 0x00,					\
 	},									\
@@ -1286,7 +1286,7 @@ struct usbd_class_api usbd_cdc_acm_api = {
 	.if1_ss_out_ep_co = {							\
 		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,						\
+		.bMaxBurst = 0,							\
 		.bmAttributes = 0x00,						\
 		.wBytesPerInterval = 0x00,					\
 	},
@@ -1498,5 +1498,24 @@ const static struct usb_desc_header *cdc_acm_ss_desc_##n[] = {			\
 		&uart_data_##n, &uart_config_##n,				\
 		PRE_KERNEL_1, CONFIG_SERIAL_INIT_PRIORITY,			\
 		&cdc_acm_uart_api);
+
+void cdc_acm_bulk_restart(const struct device *dev)
+{
+	struct cdc_acm_uart_data *data;
+
+	if (dev == NULL || dev->data == NULL) {
+		return;
+	}
+
+	data = dev->data;
+
+	atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+	atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+	cdc_acm_work_submit(&data->rx_fifo_work);
+
+	if (!ring_buf_is_empty(data->tx_fifo.rb)) {
+		cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+	}
+}
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_CDC_ACM_DT_DEVICE_DEFINE);

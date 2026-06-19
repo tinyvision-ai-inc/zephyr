@@ -48,6 +48,16 @@ typedef void (*cdc_dte_rate_callback_t)(const struct device *dev,
 __deprecated int cdc_acm_dte_rate_callback_set(const struct device *dev,
 				  cdc_dte_rate_callback_t callback);
 
+/**
+ * @brief Re-arm CDC ACM bulk OUT/IN after a UDC TRB ring restart.
+ *
+ * Clears stale RX/TX busy flags and re-submits an OUT read. Used when a
+ * composite UVC handoff wedges the ACM bulk path on shared DWC3 hardware.
+ *
+ * @param dev CDC ACM UART device.
+ */
+void cdc_acm_bulk_restart(const struct device *dev);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

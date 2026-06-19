@@ -13,6 +13,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/usb/udc.h>
+#include <zephyr/sys/util.h>
 #include <zephyr/sys/device_mmio.h>
 #include <zephyr/sys/util.h>
 
@@ -454,6 +455,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GHWPARAMS6					0xc158
 #define UDC_DWC3_GHWPARAMS6_USB3_HSPHY_INTERFACE		GENMASK(5, 4)
 #define UDC_DWC3_GHWPARAMS7					0xc15c
+#define UDC_DWC3_GHWPARAMS7_RAM1_DEPTH_MASK			GENMASK(15, 0)
 #define UDC_DWC3_GHWPARAMS8					0xc600
 
 /* Helper macros */
@@ -539,6 +541,15 @@ struct udc_dwc3_ep_data {
 	 * once at the first XferNotReady after (re)arm. Cleared on DepStartXfer.
 	 */
 	bool nrdy_reported;
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	/* Bulk-IN TRB ring is driven by the FPGA uvcmanager after handoff. */
+	bool fpga_owned;
+	/* True from HANDOFF until stream stop; gates idle watchdog + heartbeat. */
+	bool fpga_streaming;
+	/* Consecutive TRBSTS_INPROGRESS events at the same tail (underrun wedge). */
+	uint8_t inprog_tail;
+	uint8_t inprog_cnt;
+#endif
 };
 
 /*
@@ -558,6 +569,30 @@ struct udc_dwc3_data {
 	bool bus_reset_recovering;
 	/* Back-reference to parent */
 	const struct device *dev;
+	/* Per-physical-endpoint DEPEVT counters (session total, survives the
+	 * 128-entry flight recorder ring). Index = physical EP number (epn<<1|dir).
+	 * Confirms whether FPGA-owned (accelerated) endpoints raise any events.
+	 */
+	uint32_t depevt_count[32];
+#ifdef CONFIG_UDC_DWC3_NRDY_PROBE_OUT
+	/* Per-physical-EP XferNotReady counter (only meaningful for EPs that
+	 * have XFERNRDYEN set, i.e. the ACM OUT EP under this probe). A non-zero
+	 * value at a wedge means the host is knocking (it wants to transfer) and
+	 * the device went NRDY without re-issuing ERDY: a SuperSpeed bulk
+	 * flow-control deadlock. Also records the last NRDY event word.
+	 */
+	uint32_t depevt_nrdy_count[32];
+	uint32_t depevt_nrdy_last[32];
+#endif
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	/* Last CPU-handled bulk-IN XferComplete (stream progress heartbeat). */
+	uint32_t last_bulk_in_complete_cyc;
+	/* Last FPGA-managed bulk-IN completion (ignored by pop_trb). */
+	uint32_t last_fpga_in_complete_cyc;
+	/* When FPGA streaming last started (grace before STREAM-IDLE). */
+	uint32_t last_fpga_handoff_cyc;
+	struct k_work_delayable fr_watchdog_work;
+#endif
 };
 
 /*
@@ -633,6 +668,19 @@ void udc_dwc3_vendor_ep_clear_halt(const struct device *const dev, const uint8_t
  * code can snapshot accelerator state at the stall instant.
  */
 void udc_dwc3_vendor_bulk_stall(const struct device *const dev, const uint8_t ep_addr)
+	__attribute__((weak));
+
+void udc_dwc3_vendor_failure_capture(const struct device *const dev,
+				     const char *const reason)
+	__attribute__((weak));
+
+bool udc_dwc3_vendor_fpga_frames_active(void)
+	__attribute__((weak));
+
+void udc_dwc3_vendor_fpga_handoff(const struct device *const dev, uint8_t ep_addr)
+	__attribute__((weak));
+
+void udc_dwc3_vendor_ep_recovery(const struct device *const dev, uint8_t ep_addr)
 	__attribute__((weak));
 
 void udc_bus_reset_recovery_done(const struct device *const dev);
@@ -711,21 +759,39 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	ep_data->full = (ep_data->head == ep_data->tail);
 }
 
+static void udc_dwc3_trb_ring_reset(struct udc_dwc3_ep_data *const ep_data)
+{
+	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
+		ep_data->net_buf[i] = NULL;
+	}
+
+	ep_data->head = 0;
+	ep_data->tail = 0;
+	ep_data->total = 0;
+	ep_data->full = false;
+}
+
 static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
 	struct net_buf *const buf = ep_data->net_buf[ep_data->tail];
+
+	if (buf == NULL) {
+		if (ep_data->head == ep_data->tail) {
+			LOG_DBG("pop: stray completion ep=0x%02x tail=%u",
+				ep_data->cfg.addr, ep_data->tail);
+		} else {
+			LOG_ERR("pop: the next TRB is emtpy ep=0x%02x head=%u tail=%u",
+				ep_data->cfg.addr, ep_data->head, ep_data->tail);
+		}
+		return NULL;
+	}
 
 	/* Clear the last TRB */
 	ep_data->net_buf[ep_data->tail] = NULL;
 
 	/* Move to the next position in the ring buffer */
 	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
-
-	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
-		return NULL;
-	}
 
 	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
 		ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
@@ -833,8 +899,37 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Max Packet Size according to the USB descriptor configuration */
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
-	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
-	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 15);
+	/* Burst size (encoded as N-1). The high-bandwidth video IN endpoints
+	 * (the top CONFIG_UDC_DWC3_NUM_VIDEO_IN_EPS) and the low-bandwidth ones
+	 * (CDC ACM bulk, CDC interrupt) get separately tunable bursts. A
+	 * perpetually-ready 16-packet video burst can monopolise the controller
+	 * TX datapath and starve a concurrent CPU bulk-IN; lowering the video
+	 * burst and/or the ACM burst lets ACM interleave. Defaults (15/15)
+	 * preserve the original behaviour.
+	 */
+	{
+		/* Default low (single packet). Only the high-bandwidth video IN
+		 * endpoints get the deep burst. This must match the bMaxBurst the
+		 * class advertises in its SS endpoint companion descriptor: UVC
+		 * uses 15, CDC ACM bulk/interrupt and all OUT endpoints use 0. A
+		 * BRSTSIZ that exceeds the host-negotiated bMaxBurst makes the
+		 * endpoint depend on SS burst resync, which wedges under concurrent
+		 * FPGA video streaming.
+		 */
+		uint32_t brstsiz = CONFIG_UDC_DWC3_LOWBW_EP_BURST;
+
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+			const struct udc_dwc3_config *const ccfg = dev->config;
+			uint32_t fifonum = ep_data->cfg.addr & 0x7f;
+			uint32_t first_video = (uint32_t)ccfg->num_in_eps -
+					       CONFIG_UDC_DWC3_NUM_VIDEO_IN_EPS;
+
+			if (fifonum >= first_video) {
+				brstsiz = CONFIG_UDC_DWC3_VIDEO_EP_BURST;
+			}
+		}
+		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, brstsiz);
+	}
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
@@ -842,15 +937,40 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 				     ep_data->cfg.addr & 0x7f);
 	}
 
-	/* Per-endpoint events */
+	/* Per-endpoint events. An FPGA-owned (hardware-accelerated) endpoint is
+	 * driven entirely by the uvcmanager via the doorbell after handoff; the
+	 * CPU never services its TRB ring, so the controller must not raise
+	 * XferComplete/XferInProgress for it. Leaving these enabled makes the
+	 * controller generate (and internally track) completion events for the
+	 * FPGA transfers that nothing consumes, which interferes with servicing
+	 * the concurrent CPU bulk endpoints (CDC ACM).
+	 */
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23) && defined(CONFIG_UDC_DWC3_MASK_FPGA_EP_EVENTS)
+	if (!ep_data->fpga_owned) {
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	}
+#else
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+#endif
 	/* Do NOT enable XFERNRDYEN on bulk-IN EPs. The known-good usb23 driver
 	 * left this commented out; turning it on for the flight recorder
 	 * floods the 16-entry hardware event ring during a bulk-IN NRDY storm
 	 * (762k+ EVNTOVERFLOW in one run), wedging the IRQ and drowning the
 	 * console even with rate-limited logging.
+	 *
+	 * Probe: enable XferNotReady on bulk-OUT EPs only (the ACM OUT 0x01).
+	 * OUT NRDY does not storm under the modest host write rate of the ACM
+	 * stress test, and it lets us prove whether, at the wedge, the host is
+	 * still asking to send (NRDY fires) while the device fails to re-ERDY.
 	 */
+#ifdef CONFIG_UDC_DWC3_NRDY_PROBE_OUT
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
+	    USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+	}
+#endif
 
 	/* This is the usb protocol endpoint number, but the data encoding
 	 * we chose for physical endpoint number is the same as this
@@ -862,6 +982,20 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	sys_write32(param1, base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCFG);
+
+	/* Surface the TX FIFO RAM region this IN EP was assigned. Overlapping
+	 * start/depth across IN EPs lets a high-bandwidth EP (FPGA video on
+	 * 0x84/FIFO4) corrupt another EP's bulk FIFO (ACM on 0x82/FIFO2).
+	 */
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		uint32_t fifonum = ep_data->cfg.addr & 0x7f;
+		uint32_t txf = sys_read32(base + UDC_DWC3_GTXFIFOSIZ(fifonum));
+
+		LOG_INF("ep 0x%02x -> TXFIFO%u start=%u depth=%u (raw=0x%08x)",
+			ep_data->cfg.addr, fifonum,
+			(unsigned int)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFSTADDR_MASK, txf),
+			(unsigned int)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK, txf), txf);
+	}
 }
 
 static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
@@ -1041,7 +1175,7 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 		 * XferNotReady captures a fresh snapshot.
 		 */
 		ep_data->nrdy_reported = false;
-		LOG_INF("ARM bulk ep=0x%02x epn=%u xferrscidx=%u depcmd_status=0x%x trb=%p trbctl=0x%08x",
+		LOG_DBG("ARM bulk ep=0x%02x epn=%u xferrscidx=%u depcmd_status=0x%x trb=%p trbctl=0x%08x",
 			ep_data->cfg.addr, ep_data->epn, ep_data->xferrscidx,
 			(unsigned int)FIELD_GET(UDC_DWC3_DEPCMD_STATUS_MASK, reg),
 			(void *)ep_data->trb_buf, ep_data->trb_buf[0].ctrl);
@@ -1076,7 +1210,7 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
-	ep_data->head = ep_data->tail = 0;
+	udc_dwc3_trb_ring_reset(ep_data);
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
@@ -1193,7 +1327,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
 
-	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
+	LOG_DBG("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
 
 	if (ep_data->full) {
@@ -1346,10 +1480,12 @@ static void udc_dwc3_ep_reset_state(const struct device *const dev,
 	 * endpoints and clears ep_active. Clearing enabled here desyncs
 	 * the driver from the stack and makes ep_disable return -EALREADY.
 	 */
-	ep_data->head = ep_data->tail = 0;
-	ep_data->total = 0;
-	ep_data->full = false;
+	udc_dwc3_trb_ring_reset(ep_data);
 	ep_data->xferrscidx = 0;
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	ep_data->fpga_owned = false;
+	ep_data->fpga_streaming = false;
+#endif
 
 	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
 }
@@ -1374,6 +1510,95 @@ static void udc_dwc3_reset_noncontrol_eps(const struct device *const dev)
  * hint that an event is available, which we fetch from a ring buffer shared
  * with the hardware.
  */
+
+#if CONFIG_UDC_DWC3_RESIZE_TX_FIFOS
+/*
+ * A high-bandwidth (video) IN endpoint is one of the top
+ * CONFIG_UDC_DWC3_NUM_VIDEO_IN_EPS bulk-IN FIFOs. These carry the FPGA video
+ * stream and get the large burst + large FIFO. All lower-numbered IN
+ * endpoints (CDC ACM bulk, CDC interrupt) are low-bandwidth: a 1-packet burst
+ * and a small FIFO are plenty, and starving them of RAM is what frees enough
+ * for the video EP to own a non-overlapping region.
+ */
+static bool udc_dwc3_ep_in_is_video(const struct device *const dev, uint32_t fifonum)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const uint32_t first_video = (uint32_t)cfg->num_in_eps - CONFIG_UDC_DWC3_NUM_VIDEO_IN_EPS;
+
+	return fifonum >= first_video;
+}
+
+/*
+ * Give each IN endpoint a non-overlapping TX FIFO RAM region.
+ *
+ * FIFO0 (EP0) is left as the IP configured it; the remaining RAM1 words are
+ * handed out in FIFO-number order: low-bandwidth EPs take a fixed small slice,
+ * the high-bandwidth video EPs split whatever remains.
+ */
+static void udc_dwc3_resize_tx_fifos(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t ram1 = FIELD_GET(UDC_DWC3_GHWPARAMS7_RAM1_DEPTH_MASK,
+					sys_read32(base + UDC_DWC3_GHWPARAMS7));
+	const uint32_t f0 = sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0));
+	const uint32_t f0_start = FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFSTADDR_MASK, f0);
+	const uint32_t f0_depth = FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK, f0);
+	const int n_in = cfg->num_in_eps - 1; /* data IN FIFOs: 1..num_in_eps-1 */
+	const uint32_t lowbw_depth = CONFIG_UDC_DWC3_LOWBW_FIFO_DEPTH;
+	const int n_video = CONFIG_UDC_DWC3_NUM_VIDEO_IN_EPS;
+	uint32_t start = f0_start + f0_depth;
+	int n_lowbw;
+	uint32_t video_total;
+	uint32_t video_unit;
+
+	if (ram1 == 0U || n_in <= 0 || start >= ram1) {
+		LOG_WRN("TX FIFO resize skipped: ram1=%u f0_start=%u f0_depth=%u n_in=%d",
+			ram1, f0_start, f0_depth, n_in);
+		return;
+	}
+
+	n_lowbw = n_in - n_video;
+	if (n_lowbw < 0) {
+		n_lowbw = 0;
+	}
+
+	if (start + (uint32_t)n_lowbw * lowbw_depth >= ram1) {
+		LOG_WRN("TX FIFO resize skipped: RAM too small (ram1=%u, lowbw needs %u)",
+			ram1, (uint32_t)n_lowbw * lowbw_depth);
+		return;
+	}
+
+	video_total = ram1 - start - (uint32_t)n_lowbw * lowbw_depth;
+	video_unit = (n_video > 0) ? (video_total / (uint32_t)n_video) : 0U;
+
+	LOG_INF("TX FIFO resize: ram1=%u f0=[%u,%u] lowbw=%u x%d video=%u x%d",
+		ram1, f0_start, f0_depth, lowbw_depth, n_lowbw, video_unit, n_video);
+
+	for (int fifonum = 1; fifonum <= n_in; fifonum++) {
+		bool is_video = udc_dwc3_ep_in_is_video(dev, fifonum);
+		uint32_t depth = is_video ? video_unit : lowbw_depth;
+		uint32_t val;
+
+		/* Last endpoint absorbs any rounding remainder. */
+		if (fifonum == n_in) {
+			depth = ram1 - start;
+		}
+		if (start + depth > ram1) {
+			depth = ram1 - start;
+		}
+
+		val = FIELD_PREP(UDC_DWC3_GTXFIFOSIZ_TXFSTADDR_MASK, start) |
+		      FIELD_PREP(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK, depth);
+		sys_write32(val, base + UDC_DWC3_GTXFIFOSIZ(fifonum));
+
+		LOG_INF("  GTXFIFOSIZ(%d) start=%u depth=%u %s (raw=0x%08x)",
+			fifonum, start, depth, is_video ? "video" : "lowbw", val);
+
+		start += depth;
+	}
+}
+#endif /* CONFIG_UDC_DWC3_RESIZE_TX_FIFOS */
 
 static void udc_dwc3_on_soft_reset(const struct device *const dev)
 {
@@ -1427,6 +1652,10 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/* Letting GUID unchanged */
 	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
 	/* Letting GRXFIFOSIZ unchanged */
+
+#if CONFIG_UDC_DWC3_RESIZE_TX_FIFOS
+	udc_dwc3_resize_tx_fifos(dev);
+#endif
 
 	/* Setup the event buffer address, size and start event reception */
 	memset((void *)cfg->evt_buf, 0, CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
@@ -1507,6 +1736,16 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 }
 
 static bool udc_dwc3_collapse_captured;
+
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_CLEAR_HALT_STORM
+struct udc_dwc3_clear_halt_storm {
+	uint32_t window_start_cyc;
+	uint8_t ep_addr;
+	uint16_t count;
+};
+
+static struct udc_dwc3_clear_halt_storm udc_dwc3_clr_halt_storm;
+#endif
 
 #if CONFIG_UDC_DWC3_FLIGHT_RECORDER
 /*
@@ -1701,11 +1940,39 @@ static void udc_dwc3_fr_dump(const char *const reason)
 		idx = (idx + 1U) % ARRAY_SIZE(udc_dwc3_fr);
 	}
 }
+
 #else
 static inline void udc_dwc3_fr_record(const uint32_t evt) { ARG_UNUSED(evt); }
 static inline void udc_dwc3_fr_dump(const char *const reason) { ARG_UNUSED(reason); }
 static inline void udc_dwc3_fr_freeze(void) { }
 #endif /* CONFIG_UDC_DWC3_FLIGHT_RECORDER */
+
+/* Read one GDBGFIFOSPACE {queue type, queue num} AVAILABLE counter. */
+static uint32_t udc_dwc3_dbg_queue_space(const mm_reg_t base, uint32_t qtype, uint32_t qnum)
+{
+	sys_write32(qtype | FIELD_PREP(UDC_DWC3_GDBGFIFOSPACE_QUEUENUM_MASK, qnum),
+		    base + UDC_DWC3_GDBGFIFOSPACE);
+	return FIELD_GET(UDC_DWC3_GDBGFIFOSPACE_AVAILABLE_MASK,
+			sys_read32(base + UDC_DWC3_GDBGFIFOSPACE));
+}
+
+/* Dump the full software TRB ring for one endpoint (HWO = hardware still owns
+ * it, i.e. the controller has not completed that descriptor).
+ */
+static void udc_dwc3_diag_dump_trb_ring(const char *const reason,
+					struct udc_dwc3_ep_data *const ep_data)
+{
+	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
+		volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[i];
+
+		LOG_ERR("DIAG[%s]:   ep 0x%02x trb[%d] addr=0x%08x sts=0x%08x ctrl=0x%08x "
+			"HWO=%u LST=%u IOC=%u",
+			reason, ep_data->cfg.addr, i, trb->addr_lo, trb->status, trb->ctrl,
+			(trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) ? 1 : 0,
+			(trb->ctrl & UDC_DWC3_TRB_CTRL_LST) ? 1 : 0,
+			(trb->ctrl & UDC_DWC3_TRB_CTRL_IOC) ? 1 : 0);
+	}
+}
 
 /*
  * Failure-state capture for the bulk-IN streaming path.
@@ -1728,6 +1995,57 @@ static void udc_dwc3_diag_snapshot(const struct device *const dev, const char *c
 		LOG_ERR("DIAG[%s]: BUS_ERROR addr=0x%08x%08x", reason,
 			sys_read32(base + UDC_DWC3_GBUSERRADDR_HI),
 			sys_read32(base + UDC_DWC3_GBUSERRADDR_LO));
+	}
+
+	/* Controller transfer-engine queue depths (GDBGFIFOSPACE AVAILABLE).
+	 * DESCFETCH per phys-ep shows whether the controller is still able to
+	 * fetch that endpoint's TRB from memory; a stuck ACM EP with an empty
+	 * TX FIFO but pending TRBs points at the descriptor-fetch / DMA engine
+	 * being monopolised by the FPGA video transfer rather than a FIFO
+	 * collision (the FIFO partition was confirmed non-overlapping).
+	 */
+	LOG_ERR("DIAG[%s]: QSPACE txreq=%u rxreq=%u protocol=%u wrevent=%u auxevent=%u", reason,
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXREQ, 0),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXREQ, 0),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_PROTOCOL, 0),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_WREVENT, 0),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_AUXEVENT, 0));
+	/* DESCFETCH for ACM OUT (phys2), ACM IN (phys5), video IN (phys9). */
+	LOG_ERR("DIAG[%s]: DESCFETCH phys2(0x01)=%u phys5(0x82)=%u phys9(0x84)=%u", reason,
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, 2),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, 5),
+		udc_dwc3_dbg_queue_space(base, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH, 9));
+	/* Per-EP DEPEVT counters (session total). FPGA-owned EPs must read 0. */
+	{
+		struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+		for (int epn = 1; epn < cfg->num_in_eps; epn++) {
+			struct udc_dwc3_ep_data *const ed = &cfg->ep_data_in[epn];
+			uint32_t phys = (epn << 1) | 1;
+
+			if (!ed->cfg.stat.enabled) {
+				continue;
+			}
+			LOG_ERR("DIAG[%s]: EVTCNT ep 0x%02x phys%u depevt=%u fpga_owned=%u",
+				reason, ed->cfg.addr, phys, priv->depevt_count[phys & 0x1f],
+				ed->fpga_owned);
+		}
+#ifdef CONFIG_UDC_DWC3_NRDY_PROBE_OUT
+		/* OUT EP XferNotReady probe. nrdy>0 at the wedge == host is still
+		 * asking to send while the device never re-ERDYs (SS bulk hang).
+		 */
+		for (int epn = 1; epn < cfg->num_out_eps; epn++) {
+			struct udc_dwc3_ep_data *const ed = &cfg->ep_data_out[epn];
+			uint32_t phys = (epn << 1);
+
+			if (!ed->cfg.stat.enabled) {
+				continue;
+			}
+			LOG_ERR("DIAG[%s]: NRDY ep 0x%02x phys%u nrdy=%u last=0x%08x depevt=%u",
+				reason, ed->cfg.addr, phys, priv->depevt_nrdy_count[phys & 0x1f],
+				priv->depevt_nrdy_last[phys & 0x1f], priv->depevt_count[phys & 0x1f]);
+		}
+#endif
 	}
 
 	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
@@ -1754,14 +2072,76 @@ static void udc_dwc3_diag_snapshot(const struct device *const dev, const char *c
 				   sys_read32(base + UDC_DWC3_GDBGFIFOSPACE));
 
 		trb = &ep_data->trb_buf[ep_data->tail];
-		LOG_ERR("DIAG[%s]: ep 0x%02x busy=%u rscidx=%u head=%u tail=%u trbsts=%u "
-			"trbctl=0x%08x txfifo_avail=%u",
+		LOG_ERR("DIAG[%s]: ep 0x%02x IN busy=%u halted=%u rscidx=%u head=%u tail=%u "
+			"trbsts=%u trbctl=0x%08x txfifo_avail=%u queued=%u"
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+			" fpga_owned=%u fpga_streaming=%u"
+#endif
+			,
 			reason, ep_data->cfg.addr, udc_ep_is_busy(&ep_data->cfg),
-			ep_data->xferrscidx, ep_data->head, ep_data->tail,
+			ep_data->cfg.stat.halted, ep_data->xferrscidx,
+			ep_data->head, ep_data->tail,
 			(unsigned int)FIELD_GET(UDC_DWC3_TRB_STATUS_TRBSTS_MASK, trb->status),
-			trb->ctrl, txfifo);
+			trb->ctrl, txfifo, udc_buf_peek(&ep_data->cfg) != NULL
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+			, ep_data->fpga_owned, ep_data->fpga_streaming
+#endif
+			);
+		if (!ep_data->fpga_owned) {
+			udc_dwc3_diag_dump_trb_ring(reason, ep_data);
+		}
+	}
+
+	for (int epn = 1; epn < cfg->num_out_eps; epn++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[epn];
+		volatile struct udc_dwc3_trb *trb;
+
+		if (!ep_data->cfg.stat.enabled) {
+			continue;
+		}
+
+		trb = &ep_data->trb_buf[ep_data->tail];
+		LOG_ERR("DIAG[%s]: ep 0x%02x OUT busy=%u halted=%u rscidx=%u head=%u tail=%u "
+			"trbsts=%u trbctl=0x%08x queued=%u",
+			reason, ep_data->cfg.addr, udc_ep_is_busy(&ep_data->cfg),
+			ep_data->cfg.stat.halted, ep_data->xferrscidx,
+			ep_data->head, ep_data->tail,
+			(unsigned int)FIELD_GET(UDC_DWC3_TRB_STATUS_TRBSTS_MASK, trb->status),
+			trb->ctrl, udc_buf_peek(&ep_data->cfg) != NULL);
+		udc_dwc3_diag_dump_trb_ring(reason, ep_data);
 	}
 }
+
+/* True while at least one bulk-IN endpoint has FPGA streaming active. */
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+static bool udc_dwc3_any_fpga_streaming(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
+		if (cfg->ep_data_in[epn].fpga_streaming) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool udc_dwc3_fpga_bringup_pending(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[epn];
+
+		if (ep_data->fpga_owned && !ep_data->fpga_streaming) {
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif
 
 /* True while at least one bulk-IN (video) endpoint is streaming. */
 static bool udc_dwc3_is_streaming(const struct device *const dev)
@@ -1777,6 +2157,237 @@ static bool udc_dwc3_is_streaming(const struct device *const dev)
 	return false;
 }
 
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
+static void udc_dwc3_failure_capture(const struct device *const dev,
+				     const char *const reason)
+{
+	if (udc_dwc3_collapse_captured) {
+		return;
+	}
+
+	udc_dwc3_collapse_captured = true;
+	udc_dwc3_fr_freeze();
+	LOG_ERR("USB failure capture: %s", reason);
+	udc_dwc3_vendor_failure_capture(dev, reason);
+	udc_dwc3_diag_snapshot(dev, reason);
+	udc_dwc3_fr_dump(reason);
+}
+
+#if CONFIG_UDC_DWC3_FR_CLEAR_HALT_STORM
+static void udc_dwc3_clear_halt_storm_reset(void)
+{
+	udc_dwc3_clr_halt_storm.window_start_cyc = 0;
+	udc_dwc3_clr_halt_storm.ep_addr = 0;
+	udc_dwc3_clr_halt_storm.count = 0;
+}
+
+static void udc_dwc3_clear_halt_storm_check(const struct device *const dev,
+					    const uint8_t ep_addr)
+{
+	const uint32_t now = k_cycle_get_32();
+	const uint32_t hz = sys_clock_hw_cycles_per_sec();
+	const uint32_t window_cyc =
+		((uint64_t)CONFIG_UDC_DWC3_FR_CLEAR_HALT_WINDOW_MS * hz) / 1000U;
+	char reason[24];
+
+	if (!udc_dwc3_is_streaming(dev)) {
+		return;
+	}
+
+	if (udc_dwc3_clr_halt_storm.count != 0U &&
+	    (now - udc_dwc3_clr_halt_storm.window_start_cyc) > window_cyc) {
+		udc_dwc3_clear_halt_storm_reset();
+	}
+
+	if (udc_dwc3_clr_halt_storm.count == 0U ||
+	    udc_dwc3_clr_halt_storm.ep_addr != ep_addr) {
+		udc_dwc3_clr_halt_storm.window_start_cyc = now;
+		udc_dwc3_clr_halt_storm.ep_addr = ep_addr;
+		udc_dwc3_clr_halt_storm.count = 1U;
+		return;
+	}
+
+	udc_dwc3_clr_halt_storm.count++;
+
+	if (udc_dwc3_clr_halt_storm.count < CONFIG_UDC_DWC3_FR_CLEAR_HALT_THRESHOLD) {
+		return;
+	}
+
+	snprintk(reason, sizeof(reason), "CLR-HALT-0x%02x", ep_addr);
+	udc_dwc3_failure_capture(dev, reason);
+}
+
+#if CONFIG_UDC_DWC3_FR_CLEAR_HALT_BULK_IN
+static void udc_dwc3_clear_halt_bulk_in_check(const struct device *const dev,
+					      const uint8_t ep_addr)
+{
+	char reason[28];
+
+	if (!udc_dwc3_is_streaming(dev)) {
+		return;
+	}
+
+	if (!USB_EP_DIR_IS_IN(ep_addr) || USB_EP_GET_IDX(ep_addr) == 0) {
+		return;
+	}
+
+	snprintk(reason, sizeof(reason), "CLR-HALT-IN-0x%02x", ep_addr);
+	udc_dwc3_failure_capture(dev, reason);
+}
+#endif /* CONFIG_UDC_DWC3_FR_CLEAR_HALT_BULK_IN */
+#endif /* CONFIG_UDC_DWC3_FR_CLEAR_HALT_STORM */
+
+#if CONFIG_UDC_DWC3_FR_TRB_DESYNC
+static void udc_dwc3_trb_desync_check(const struct device *const dev,
+				      struct udc_dwc3_ep_data *const ep_data)
+{
+	char reason[24];
+
+	if (ep_data->head == ep_data->tail) {
+		return;
+	}
+
+	snprintk(reason, sizeof(reason), "TRB-DESYNC-0x%02x", ep_data->cfg.addr);
+	udc_dwc3_failure_capture(dev, reason);
+}
+#endif
+
+#if CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+static void udc_dwc3_fr_watchdog_kick(const struct device *const dev);
+
+static void udc_dwc3_fr_stream_progress_reset(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uint32_t now = k_cycle_get_32();
+
+	(void)k_work_cancel_delayable(&priv->fr_watchdog_work);
+	priv->last_bulk_in_complete_cyc = now;
+	priv->last_fpga_in_complete_cyc = now;
+	udc_dwc3_fr_watchdog_kick(dev);
+}
+
+static uint32_t udc_dwc3_stream_progress_cyc(const struct udc_dwc3_data *const priv)
+{
+	uint32_t progress = priv->last_bulk_in_complete_cyc;
+
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	if (priv->last_fpga_in_complete_cyc > progress) {
+		progress = priv->last_fpga_in_complete_cyc;
+	}
+#endif
+
+	return progress;
+}
+
+static void udc_dwc3_fr_watchdog_fn(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct udc_dwc3_data *priv = CONTAINER_OF(dwork, struct udc_dwc3_data,
+						  fr_watchdog_work);
+	const struct device *const dev = priv->dev;
+	const uint32_t hz = sys_clock_hw_cycles_per_sec();
+	const uint32_t idle_cyc =
+		((uint64_t)CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS * hz) / 1000U;
+	const uint32_t now = k_cycle_get_32();
+	uint32_t progress;
+
+	if (udc_dwc3_collapse_captured) {
+		return;
+	}
+
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	/* COMMIT set fpga_owned before sensor bring-up; do not idle-capture yet. */
+	if (udc_dwc3_fpga_bringup_pending(dev)) {
+		k_work_schedule(dwork, K_MSEC(CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS / 2));
+		return;
+	}
+
+	if (!udc_dwc3_any_fpga_streaming(dev) && !udc_dwc3_is_streaming(dev)) {
+		return;
+	}
+
+#if CONFIG_UDC_DWC3_FR_STREAM_HANDOFF_GRACE_MS > 0
+	if (priv->last_fpga_handoff_cyc != 0U) {
+		const uint32_t grace_cyc =
+			((uint64_t)CONFIG_UDC_DWC3_FR_STREAM_HANDOFF_GRACE_MS * hz) /
+			1000U;
+
+		if ((now - priv->last_fpga_handoff_cyc) < grace_cyc) {
+			k_work_schedule(dwork, K_MSEC(CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS / 2));
+			return;
+		}
+	}
+#endif
+
+	/* RTL accelerator may keep producing frames after ACM dies; poll frame
+	 * counters when FPGA owns the bulk-IN path (DepEvt heartbeats can lag).
+	 */
+	if (udc_dwc3_any_fpga_streaming(dev) && udc_dwc3_vendor_fpga_frames_active()) {
+		priv->last_fpga_in_complete_cyc = now;
+		k_work_schedule(dwork, K_MSEC(CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS / 2));
+		return;
+	}
+
+	progress = udc_dwc3_any_fpga_streaming(dev) ? priv->last_fpga_in_complete_cyc :
+						      udc_dwc3_stream_progress_cyc(priv);
+#else
+	if (!udc_dwc3_is_streaming(dev)) {
+		return;
+	}
+
+	progress = udc_dwc3_stream_progress_cyc(priv);
+#endif
+
+	if (progress != 0U && (now - progress) > idle_cyc) {
+		udc_dwc3_failure_capture(dev, "STREAM-IDLE");
+		return;
+	}
+
+	k_work_schedule(dwork, K_MSEC(CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS / 2));
+}
+
+static void udc_dwc3_fr_watchdog_kick(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	k_work_schedule(&priv->fr_watchdog_work,
+			K_MSEC(CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS / 2));
+}
+#endif /* CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0 */
+#else
+static inline void udc_dwc3_failure_capture(const struct device *const dev,
+					    const char *const reason)
+{
+	if (udc_dwc3_collapse_captured) {
+		return;
+	}
+
+	udc_dwc3_collapse_captured = true;
+	udc_dwc3_diag_snapshot(dev, reason);
+}
+#endif /* CONFIG_UDC_DWC3_FLIGHT_RECORDER */
+
+void udc_dwc3_flight_recorder_dump(const struct device *const dev, const char *reason)
+{
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
+	ARG_UNUSED(dev);
+	udc_dwc3_fr_dump(reason != NULL ? reason : "manual");
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(reason);
+#endif
+}
+
+void udc_dwc3_debug_snapshot(const struct device *const dev, const char *reason)
+{
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
+	udc_dwc3_diag_snapshot(dev, reason != NULL ? reason : "debug");
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(reason);
+#endif
+}
+
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -1789,6 +2400,18 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	priv->ep_reinit_after_reset = true;
 	priv->bus_reset_recovering = true;
 	udc_dwc3_collapse_captured = false;
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_CLEAR_HALT_STORM
+	udc_dwc3_clear_halt_storm_reset();
+#endif
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	{
+		struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+		priv->last_bulk_in_complete_cyc = 0;
+		priv->last_fpga_in_complete_cyc = 0;
+		k_work_cancel_delayable(&priv->fr_watchdog_work);
+	}
+#endif
 
 	/* Instrumentation: capture the EP0 control-pipe state on reset entry.
 	 * A "stuck busy" EP0 OUT or a missing SETUP buffer here is the
@@ -1804,8 +2427,7 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	 * non-control endpoints down below.
 	 */
 	if (udc_dwc3_is_streaming(dev)) {
-		udc_dwc3_diag_snapshot(dev, "USBRST-streaming");
-		udc_dwc3_fr_dump("USBRST-streaming");
+		udc_dwc3_failure_capture(dev, "USBRST-streaming");
 	}
 
 	/* Reset all ongoing transfers on non-control endpoints (e.g. UVC bulk
@@ -1915,10 +2537,8 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 			 * (the XferNotReady storm coalesces into one FR entry).
 			 */
 			if (udc_dwc3_is_streaming(dev) && !udc_dwc3_collapse_captured) {
-				udc_dwc3_collapse_captured = true;
-				udc_dwc3_fr_freeze();
 				LOG_ERR("LINK-COLLAPSE SS.Inactive after bulk stall");
-				udc_dwc3_diag_snapshot(dev, "LINK-COLLAPSE");
+				udc_dwc3_failure_capture(dev, "LINK-COLLAPSE");
 				if (udc_dwc3_vendor_bulk_stall != NULL) {
 					udc_dwc3_vendor_bulk_stall(dev, 0x81);
 				}
@@ -2149,9 +2769,75 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	struct net_buf *buf;
 	int ret;
 
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	/* FPGA uvcmanager owns the TRB ring after handoff; completions have no
+	 * net_buf association and must not advance the CPU-side ring.
+	 */
+	if (ep_data->fpga_owned) {
+		if (ep_data->fpga_streaming && USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+		    USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+			struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+			priv->last_fpga_in_complete_cyc = k_cycle_get_32();
+			udc_dwc3_fr_watchdog_kick(dev);
+#endif
+		}
+		LOG_DBG("ignore FPGA-managed completion ep=0x%02x", ep_data->cfg.addr);
+		return;
+	}
+#endif
+
+	/* Lattice USB23 often raises DEPEVT XFERINPROGRESS for bulk completion while
+	 * the TRB still shows XFERINPROGRESS (underrun / not yet done). Only pop
+	 * when the TRB status indicates the transfer finished (OK). Popping on
+	 * every INPROGRESS event breaks ACM; never popping breaks bulk entirely.
+	 */
+	if ((trb->status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) ==
+	    UDC_DWC3_TRB_STATUS_TRBSTS_XFERINPROGRESS) {
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+		if (ep_data->tail == ep_data->inprog_tail) {
+			if (ep_data->inprog_cnt < 255) {
+				ep_data->inprog_cnt++;
+			}
+		} else {
+			ep_data->inprog_tail = ep_data->tail;
+			ep_data->inprog_cnt = 1;
+		}
+
+		if (ep_data->inprog_cnt >= 6U && ep_data->xferrscidx != 0U) {
+			LOG_ERR("Force DepEndXfer ep=0x%02x tail=%u head=%u (stuck INPROGRESS)",
+				ep_data->cfg.addr, ep_data->tail, ep_data->head);
+			udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+			udc_ep_cancel_queued(dev, &ep_data->cfg);
+			udc_dwc3_trb_ring_reset(ep_data);
+			ep_data->inprog_cnt = 0;
+			udc_dwc3_vendor_ep_recovery(dev, ep_data->cfg.addr);
+			k_work_submit(&ep_data->work);
+			return;
+		}
+#endif
+		LOG_DBG("TRB in-progress ep=0x%02x, re-arm only", ep_data->cfg.addr);
+		k_work_submit(&ep_data->work);
+		return;
+	}
+
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	ep_data->inprog_cnt = 0;
+#endif
+
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
+		/* Stray completion after DepEndXfer with an empty ring. */
+		if (ep_data->head == ep_data->tail) {
+			LOG_DBG("discard stray completion ep=0x%02x", ep_data->cfg.addr);
+			return;
+		}
+
+#if CONFIG_UDC_DWC3_FR_TRB_DESYNC
+		udc_dwc3_trb_desync_check(dev, ep_data);
+#endif
 		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 		return;
 	}
@@ -2168,6 +2854,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	if (ret != 0) {
 		LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
 	}
+
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) && USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+		priv->last_bulk_in_complete_cyc = k_cycle_get_32();
+		udc_dwc3_fr_watchdog_kick(dev);
+	}
+#endif
 
 	/* We just made some room for a new buffer, check if something more to enqueue */
 	k_work_submit(&ep_data->work);
@@ -2188,7 +2883,6 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
-		LOG_DBG("DEPEVT_XFERINPROGRESS");
 		udc_dwc3_on_xfer_done_norm(dev, evt);
 		break;
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
@@ -2196,6 +2890,15 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_xfer_not_ready(dev, evt);
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
+#ifdef CONFIG_UDC_DWC3_NRDY_PROBE_OUT
+		{
+			struct udc_dwc3_data *const priv = udc_get_private(dev);
+			uint32_t phys = (evt >> 1) & 0x1f;
+
+			priv->depevt_nrdy_count[phys]++;
+			priv->depevt_nrdy_last[phys] = evt;
+		}
+#endif
 		break;
 	case UDC_DWC3_DEVT_DISCONNEVT:
 		LOG_INF("USB disconnect event");
@@ -2265,6 +2968,14 @@ static void udc_dwc3_irq_handler(void *const ptr)
 		 * strips it. RAM-only, no logging on the hot path.
 		 */
 		udc_dwc3_fr_record(evt);
+
+		/* Count DEPEVT events per physical endpoint (bit0=0 => DEPEVT).
+		 * An FPGA-owned EP should stay at 0 here; any increase means the
+		 * controller is still raising events for the accelerated transfer.
+		 */
+		if ((evt & 0x1) == 0U) {
+			priv->depevt_count[(evt >> 1) & 0x1f]++;
+		}
 
 		/* Dispatch the even directly from IRQ */
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
@@ -2396,6 +3107,20 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	ep_data->cfg.stat.halted = false;
 
 	udc_dwc3_vendor_ep_clear_halt(dev, ep_data->cfg.addr);
+
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
+#if CONFIG_UDC_DWC3_FR_CLEAR_HALT_BULK_IN
+	udc_dwc3_clear_halt_bulk_in_check(dev, ep_data->cfg.addr);
+#endif
+#if CONFIG_UDC_DWC3_FR_CLEAR_HALT_STORM
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
+		udc_dwc3_clear_halt_storm_check(dev, ep_data->cfg.addr);
+	}
+#endif
+#if CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	udc_dwc3_fr_watchdog_kick(dev);
+#endif
+#endif /* CONFIG_UDC_DWC3_FLIGHT_RECORDER */
 
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		k_work_submit(&ep_data->work);
@@ -2665,8 +3390,15 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 		return;
 	}
 
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+	if (ep_data->fpga_owned) {
+		LOG_DBG("endpoint is FPGA-owned, not processing buffers");
+		return;
+	}
+#endif
+
 	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
-		LOG_INF("Processing buffer %p from queue", (void *)buf);
+		LOG_DBG("Processing buffer %p from queue", (void *)buf);
 
 		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
 		if (ret != 0) {
@@ -2810,6 +3542,22 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		}
 	}
 
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER
+#if CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+	{
+		struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+		k_work_init_delayable(&priv->fr_watchdog_work, udc_dwc3_fr_watchdog_fn);
+	}
+#endif
+	LOG_INF("UDC flight recorder ON: %u entries, bulk_in_halt=%d, out_storm_thr=%d, "
+		"idle_ms=%d",
+		CONFIG_UDC_DWC3_FLIGHT_RECORDER_NUM,
+		IS_ENABLED(CONFIG_UDC_DWC3_FR_CLEAR_HALT_BULK_IN),
+		CONFIG_UDC_DWC3_FR_CLEAR_HALT_THRESHOLD,
+		CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS);
+#endif
+
 	return 0;
 }
 
@@ -2839,8 +3587,7 @@ void lattice_usb23_bulk_restart_xfer(const struct device *dev, uint8_t ep_addr)
 		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 	}
 
-	ep_data->head = ep_data->tail = ep_data->total = 0;
-	ep_data->full = false;
+	udc_dwc3_trb_ring_reset(ep_data);
 	/* Keep xferrscidx: DEPXFERCFG allocated it once; platform handoff reads
 	 * this index. Zeroing it here made handoff use rscidx=0 after restart.
 	 */
@@ -2848,6 +3595,104 @@ void lattice_usb23_bulk_restart_xfer(const struct device *dev, uint8_t ep_addr)
 	memset((void *)ep_data->trb_buf, 0,
 	       sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
 	udc_dwc3_trb_norm_init(dev, ep_data);
+}
+
+void lattice_usb23_ep_set_fpga_owned(const struct device *dev, uint8_t ep_addr, bool owned)
+{
+	struct udc_dwc3_ep_data *ep_data = (void *)udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_data == NULL || USB_EP_GET_IDX(ep_addr) == 0 ||
+	    !USB_EP_DIR_IS_IN(ep_addr)) {
+		return;
+	}
+
+	if (ep_data->fpga_owned == owned) {
+		return;
+	}
+
+	ep_data->fpga_owned = owned;
+	if (!owned) {
+		ep_data->fpga_streaming = false;
+	}
+
+	/* Re-issue DEPCFG (MODIFY) so the controller stops/starts raising
+	 * XferComplete/XferInProgress events for this endpoint: an FPGA-owned EP
+	 * must be event-free (the CPU never services it), and on release it must
+	 * generate events again for normal CPU-driven transfers. Only meaningful
+	 * when the masking is compiled in; otherwise events are always enabled
+	 * and re-issuing DEPCFG mid-stream would be a pointless disruption.
+	 */
+#ifdef CONFIG_UDC_DWC3_MASK_FPGA_EP_EVENTS
+	if (ep_data->cfg.stat.enabled) {
+		udc_dwc3_depcmd_ep_config(dev, ep_data);
+		LOG_INF("ep 0x%02x fpga_owned=%d, events %s", ep_addr, owned,
+			owned ? "disabled" : "enabled");
+	} else {
+		LOG_DBG("ep 0x%02x fpga_owned=%d", ep_addr, owned);
+	}
+#else
+	LOG_INF("ep 0x%02x fpga_owned=%d (events left enabled)", ep_addr, owned);
+#endif
+}
+
+void lattice_usb23_ep_set_fpga_streaming(const struct device *dev, uint8_t ep_addr,
+					 bool streaming)
+{
+	struct udc_dwc3_ep_data *ep_data = (void *)udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_data == NULL || USB_EP_GET_IDX(ep_addr) == 0 ||
+	    !USB_EP_DIR_IS_IN(ep_addr)) {
+		return;
+	}
+
+	if (streaming) {
+#if CONFIG_UDC_DWC3_FLIGHT_RECORDER && CONFIG_UDC_DWC3_FR_STREAM_IDLE_MS > 0
+		struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+		udc_dwc3_fr_stream_progress_reset(dev);
+		priv->last_fpga_handoff_cyc = k_cycle_get_32();
+#endif
+	}
+
+	ep_data->fpga_streaming = streaming;
+	LOG_INF("ep 0x%02x fpga_streaming=%d", ep_addr, streaming);
+
+	if (streaming) {
+		udc_dwc3_vendor_fpga_handoff(dev, ep_addr);
+	}
+}
+
+void lattice_usb23_log_endpoint_map(const struct device *dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	LOG_INF("USB endpoint map (%s):", dev->name);
+	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[epn];
+
+		if (!ep_data->cfg.stat.enabled) {
+			continue;
+		}
+
+		LOG_INF("  IN 0x%02x epn=%u rscidx=%u mps=%u"
+#if DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23)
+			" fpga_capable=1"
+#endif
+			, ep_data->cfg.addr, ep_data->epn, ep_data->xferrscidx,
+			ep_data->cfg.mps);
+	}
+
+	for (int epn = 1; epn < cfg->num_out_eps; epn++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[epn];
+
+		if (!ep_data->cfg.stat.enabled) {
+			continue;
+		}
+
+		LOG_INF("  OUT 0x%02x epn=%u rscidx=%u mps=%u",
+			ep_data->cfg.addr, ep_data->epn, ep_data->xferrscidx,
+			ep_data->cfg.mps);
+	}
 }
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(lattice_usb23) */
 
