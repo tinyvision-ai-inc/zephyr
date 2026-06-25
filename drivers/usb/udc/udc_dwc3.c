@@ -15,6 +15,7 @@
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/device_mmio.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/barrier.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
@@ -519,6 +520,8 @@ struct udc_dwc3_ep_data {
 	/* Index of the next TRB to receive data in the TRB ring, Link TRB excluded */
 	uint32_t head;
 	uint32_t tail;
+	uint32_t buf_head;
+	uint32_t buf_tail;
 	/* Total size sent from the device to the host for the ongoing transfer */
 	uint32_t total;
 	/* A flag to tell when the ring buffer is full */
@@ -633,19 +636,47 @@ void udc_dwc3_ring_inc(uint32_t *const nump, const uint32_t size)
 	*nump = (num >= size) ? 0 : num;
 }
 
+static void udc_dwc3_dump_ep_trb_state(const struct device *const dev,
+				       const struct udc_dwc3_ep_data *const ep_data,
+				       const char *reason){
+	LOG_DBG("REASON: %s for EP 0x%02x", reason, ep_data->cfg.addr);
+	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; ++i) {
+		const struct udc_dwc3_trb *trb = &ep_data->trb_buf[i];
+		const char *name = "FREE";
+
+		if (trb->ctrl & UDC_DWC3_TRB_CTRL_LST) {
+			name = "LST";
+		} else if (i == ep_data->head && i == ep_data->tail) {
+			name = ep_data->full ? "FULL(H/T)" : "EMPTY(H/T)";
+		} else if (i == ep_data->head) {
+			name = "HEAD";
+		} else if (i == ep_data->tail) {
+			name = "TAIL";
+		} else if (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) {
+			name = "HWO";
+		} else if (ep_data->net_buf[i]){
+			name = "QUEUED";
+		}
+
+		LOG_DBG("TRB[%d] %-10s ctrl=0x%08x status=0x%08x buf=%p",
+			i, name, trb->ctrl, trb->status, ep_data->net_buf[i]);
+	}
+}
+
+
 static void udc_dwc3_push_trb(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data,
 			      struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
-
+	udc_dwc3_dump_ep_trb_state(dev, ep_data, "before push");
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available.
 	 */
 	__ASSERT_NO_MSG(!ep_data->full);
 
 	/* Associate an active buffer and a TRB together */
-	ep_data->net_buf[ep_data->head] = buf;
+	ep_data->net_buf[ep_data->buf_head] = buf;
 
 	/* TRB# with one more chunk of data */
 	trb->addr_lo = LO32((uintptr_t)buf->data);
@@ -653,11 +684,14 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	trb->status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
 	trb->ctrl = ctrl;
 
-	LOG_DBG("PUSH %u buf %p, data %p, size %u",
-		ep_data->head, (void *)buf, (void *)buf->data, buf->size);
+	LOG_DBG("PUSH %u trb %u, buf %p, data %p, size %u",
+		ep_data->buf_head, ep_data->head, (void *)buf, (void *)buf->data, buf->size);
 
 	/* Shift the head */
 	udc_dwc3_ring_inc(&ep_data->head, CONFIG_UDC_DWC3_TRB_NUM - 1);
+	udc_dwc3_ring_inc(&ep_data->buf_head, CONFIG_UDC_DWC3_TRB_NUM - 1);
+
+	udc_dwc3_dump_ep_trb_state(dev, ep_data, "after push");
 
 	/* If the head touches the tail after we add something, we are full */
 	ep_data->full = (ep_data->head == ep_data->tail);
@@ -667,23 +701,25 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
 	struct net_buf *const buf = ep_data->net_buf[ep_data->tail];
-
+	udc_dwc3_dump_ep_trb_state(dev, ep_data,  "before pop");
 	/* Clear the last TRB */
-	ep_data->net_buf[ep_data->tail] = NULL;
+	ep_data->net_buf[ep_data->buf_tail] = NULL;
 
 	/* Move to the next position in the ring buffer */
 	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
+	udc_dwc3_ring_inc(&ep_data->buf_tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
 	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
+		LOG_ERR("pop: the next TRB is emtpy for EP 0x%02x", ep_data->cfg.addr);
 		return NULL;
 	}
 
-	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
-		ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
+	LOG_DBG("POP %u trb %u EP 0x%02x, buf %p, data %p",
+		ep_data->buf_tail, ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
 
 	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
+	udc_dwc3_dump_ep_trb_state(dev, ep_data, "after pop");
 
 	return buf;
 }
@@ -859,6 +895,7 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
 	ep_data->head = ep_data->tail = 0;
+	ep_data->buf_head = ep_data->buf_tail = 0;
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
@@ -951,7 +988,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
-	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_CSP;
 
 	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
@@ -978,6 +1015,10 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			ep_data->total = 0;
 		}
 	}
+
+	barrier_dmem_fence_full();
+
+	ctrl |= UDC_DWC3_TRB_CTRL_HWO;
 
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
@@ -1467,6 +1508,34 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
 	int ret;
+	uint32_t event_code = (evt >> 6) & 0x7;
+
+	/* If the USB event is XFERINPROGRESS and the IOC bit is set
+	 * Handle this for IN endpoint only since it seemed that
+	 * we notice the problem for those alone, in the beginning
+	 * it also does hang the OUT endpoint.
+	 */
+	if (event_code == 0x02
+	    && evt & UDC_DWC3_DEPEVT_STATUS_IOC
+	    && USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		LOG_DBG("XFERINPROGRESS with IOC set (%lu) bytes remaining for EP 0x%02x... updating transfer",
+			FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status), ep_data->cfg.addr);
+
+		buf = ep_data->net_buf[ep_data->buf_head];
+		ep_data->net_buf[ep_data->buf_head] = NULL;
+		udc_dwc3_ring_inc(&ep_data->buf_head, CONFIG_UDC_DWC3_TRB_NUM - 1);
+		if (buf != NULL) {
+			LOG_DBG("Next buffer was found, using that without popping TRB then ending the transfer");
+			trb->addr_lo = LO32((uintptr_t)buf->data);
+			trb->addr_hi = HI32((uintptr_t)buf->data);
+			trb->status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
+			/* End this transfer */
+			trb->ctrl |= UDC_DWC3_TRB_CTRL_LST;
+			udc_dwc3_depcmd_update_xfer(dev, ep_data);
+			return;
+		}
+		LOG_DBG("Failed to handle XFERINPROGRESS for EP 0x%02x", ep_data->cfg.addr);
+	}
 
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
@@ -1496,67 +1565,375 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt)
 {
-	switch (evt) {
-	case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
-		LOG_DBG("DEPEVT_XFERCOMPLETE(0)");
-		udc_dwc3_on_ctrl_out(dev);
-		break;
-	case UDC_DWC3_DEPEVT_XFERCOMPLETE(1):
-		LOG_DBG("DEPEVT_XFERCOMPLETE(1)");
-		udc_dwc3_on_ctrl_in(dev);
-		break;
-	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
-	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
-		LOG_DBG("DEPEVT_XFERINPROGRESS");
-		udc_dwc3_on_xfer_done_norm(dev, evt);
-		break;
-	case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
-	case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
-		udc_dwc3_on_xfer_not_ready(dev, evt);
-		break;
-	case UDC_DWC3_DEVT_DISCONNEVT:
-		LOG_DBG("DEVT_DISCONNEVT");
-		break;
-	case UDC_DWC3_DEVT_USBRST:
-		LOG_DBG("DEVT_USBRST");
-		udc_dwc3_on_usb_reset(dev);
-		break;
-	case UDC_DWC3_DEVT_CONNECTDONE:
-		LOG_DBG("DEVT_CONNECTDONE");
-		udc_dwc3_on_connect_done(dev);
-		break;
-	case UDC_DWC3_DEVT_ULSTCHNG:
-		LOG_DBG("DEVT_ULSTCHNG");
-		udc_dwc3_on_link_state_event(dev);
-		break;
-	case UDC_DWC3_DEVT_WKUPEVT:
-		LOG_DBG("DEVT_WKUPEVT");
-		break;
-	case UDC_DWC3_DEVT_SUSPEND:
-		LOG_DBG("DEVT_SUSPEND");
-		break;
-	case UDC_DWC3_DEVT_SOF:
-		LOG_DBG("DEVT_SOF");
-		break;
-	case UDC_DWC3_DEVT_CMDCMPLT:
-		LOG_DBG("DEVT_CMDCMPLT");
-		break;
-	case UDC_DWC3_DEVT_VNDRDEVTSTRCVED:
-		LOG_DBG("DEVT_VNDRDEVTSTRCVED");
-		break;
-	case UDC_DWC3_DEVT_ERRTICERR:
-		LOG_ERR("DEVT_ERRTICERR");
-		CODE_UNREACHABLE;
-		break;
-	case UDC_DWC3_DEVT_EVNTOVERFLOW:
-		LOG_ERR("DEVT_EVNTOVERFLOW");
-		CODE_UNREACHABLE;
-		break;
-	default:
-		LOG_ERR("unhandled event: 0x%x", evt);
-		CODE_UNREACHABLE;
-	}
+    uint32_t ep_num = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+    uint32_t status = evt & 0xF;
+    uint32_t event_code = (evt >> 6) & 0x7;
+    uint32_t masked_evt = evt & UDC_DWC3_EVT_MASK;
+
+    switch (masked_evt) {
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
+        LOG_DBG("EVENT: XFERCOMPLETE(0) - Control OUT complete, status=0x%x", status);
+        udc_dwc3_on_ctrl_out(dev);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(1):
+        LOG_DBG("EVENT: XFERCOMPLETE(1) - Control IN complete, status=0x%x", status);
+        udc_dwc3_on_ctrl_in(dev);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(2):
+        LOG_DBG("EVENT: XFERCOMPLETE(2) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 1, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(3):
+        LOG_DBG("EVENT: XFERCOMPLETE(3) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 1, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(4):
+        LOG_DBG("EVENT: XFERCOMPLETE(4) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 2, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(5):
+        LOG_DBG("EVENT: XFERCOMPLETE(5) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 2, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(6):
+        LOG_DBG("EVENT: XFERCOMPLETE(6) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 3, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(7):
+        LOG_DBG("EVENT: XFERCOMPLETE(7) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 3, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(8):
+        LOG_DBG("EVENT: XFERCOMPLETE(8) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 4, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(9):
+        LOG_DBG("EVENT: XFERCOMPLETE(9) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 4, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(10):
+        LOG_DBG("EVENT: XFERCOMPLETE(10) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 5, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(11):
+        LOG_DBG("EVENT: XFERCOMPLETE(11) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 5, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(12):
+        LOG_DBG("EVENT: XFERCOMPLETE(12) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 6, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(13):
+        LOG_DBG("EVENT: XFERCOMPLETE(13) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 6, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(14):
+        LOG_DBG("EVENT: XFERCOMPLETE(14) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 7, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(15):
+        LOG_DBG("EVENT: XFERCOMPLETE(15) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 7, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(16):
+        LOG_DBG("EVENT: XFERCOMPLETE(16) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 8, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(17):
+        LOG_DBG("EVENT: XFERCOMPLETE(17) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 8, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(18):
+        LOG_DBG("EVENT: XFERCOMPLETE(18) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 9, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(19):
+        LOG_DBG("EVENT: XFERCOMPLETE(19) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 9, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(20):
+        LOG_DBG("EVENT: XFERCOMPLETE(20) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 10, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(21):
+        LOG_DBG("EVENT: XFERCOMPLETE(21) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 10, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(22):
+        LOG_DBG("EVENT: XFERCOMPLETE(22) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 11, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(23):
+        LOG_DBG("EVENT: XFERCOMPLETE(23) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 11, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(24):
+        LOG_DBG("EVENT: XFERCOMPLETE(24) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 12, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(25):
+        LOG_DBG("EVENT: XFERCOMPLETE(25) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 12, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(26):
+        LOG_DBG("EVENT: XFERCOMPLETE(26) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 13, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(27):
+        LOG_DBG("EVENT: XFERCOMPLETE(27) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 13, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(28):
+        LOG_DBG("EVENT: XFERCOMPLETE(28) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 14, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(29):
+        LOG_DBG("EVENT: XFERCOMPLETE(29) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 14, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(30):
+        LOG_DBG("EVENT: XFERCOMPLETE(30) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 15, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERCOMPLETE(31):
+        LOG_DBG("EVENT: XFERCOMPLETE(31) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 15, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(2):
+        LOG_DBG("EVENT: XFERINPROGRESS(2) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 1, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(3):
+        LOG_DBG("EVENT: XFERINPROGRESS(3) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 1, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(4):
+        LOG_DBG("EVENT: XFERINPROGRESS(4) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 2, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(5):
+        LOG_DBG("EVENT: XFERINPROGRESS(5) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 2, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(6):
+        LOG_DBG("EVENT: XFERINPROGRESS(6) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 3, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(7):
+        LOG_DBG("EVENT: XFERINPROGRESS(7) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 3, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(8):
+        LOG_DBG("EVENT: XFERINPROGRESS(8) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 4, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(9):
+        LOG_DBG("EVENT: XFERINPROGRESS(9) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 4, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(10):
+        LOG_DBG("EVENT: XFERINPROGRESS(10) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 5, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(11):
+        LOG_DBG("EVENT: XFERINPROGRESS(11) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 5, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(12):
+        LOG_DBG("EVENT: XFERINPROGRESS(12) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 6, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(13):
+        LOG_DBG("EVENT: XFERINPROGRESS(13) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 6, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(14):
+        LOG_DBG("EVENT: XFERINPROGRESS(14) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 7, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(15):
+        LOG_DBG("EVENT: XFERINPROGRESS(15) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 7, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(16):
+        LOG_DBG("EVENT: XFERINPROGRESS(16) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 8, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(17):
+        LOG_DBG("EVENT: XFERINPROGRESS(17) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 8, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(18):
+        LOG_DBG("EVENT: XFERINPROGRESS(18) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 9, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(19):
+        LOG_DBG("EVENT: XFERINPROGRESS(19) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 9, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(20):
+        LOG_DBG("EVENT: XFERINPROGRESS(20) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 10, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(21):
+        LOG_DBG("EVENT: XFERINPROGRESS(21) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 10, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(22):
+        LOG_DBG("EVENT: XFERINPROGRESS(22) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 11, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(23):
+        LOG_DBG("EVENT: XFERINPROGRESS(23) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 11, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(24):
+        LOG_DBG("EVENT: XFERINPROGRESS(24) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 12, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(25):
+        LOG_DBG("EVENT: XFERINPROGRESS(25) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 12, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(26):
+        LOG_DBG("EVENT: XFERINPROGRESS(26) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 13, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(27):
+        LOG_DBG("EVENT: XFERINPROGRESS(27) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 13, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(28):
+        LOG_DBG("EVENT: XFERINPROGRESS(28) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 14, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(29):
+        LOG_DBG("EVENT: XFERINPROGRESS(29) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 14, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(30):
+        LOG_DBG("EVENT: XFERINPROGRESS(30) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_IN | 15, status, "IN");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERINPROGRESS(31):
+        LOG_DBG("EVENT: XFERINPROGRESS(31) - ep=0x%02x, status=0x%x, type=%s",
+                USB_EP_DIR_OUT | 15, status, "OUT");
+        udc_dwc3_on_xfer_done_norm(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
+        LOG_DBG("EVENT: XFERNOTREADY(0) - Control OUT not ready");
+        udc_dwc3_on_xfer_not_ready(dev, evt);
+        break;
+    case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
+        LOG_DBG("EVENT: XFERNOTREADY(1) - Control IN not ready");
+        udc_dwc3_on_xfer_not_ready(dev, evt);
+        break;
+    case UDC_DWC3_DEVT_DISCONNEVT:
+        LOG_DBG("EVENT: DEVT_DISCONNEVT - Device disconnected");
+        break;
+    case UDC_DWC3_DEVT_USBRST:
+        LOG_DBG("EVENT: DEVT_USBRST - USB bus reset");
+        udc_dwc3_on_usb_reset(dev);
+        break;
+    case UDC_DWC3_DEVT_CONNECTDONE:
+        LOG_DBG("EVENT: DEVT_CONNECTDONE - Connection complete");
+        udc_dwc3_on_connect_done(dev);
+        break;
+    case UDC_DWC3_DEVT_ULSTCHNG:
+        LOG_DBG("EVENT: DEVT_ULSTCHNG - Link state change");
+        udc_dwc3_on_link_state_event(dev);
+        break;
+    case UDC_DWC3_DEVT_WKUPEVT:
+        LOG_DBG("EVENT: DEVT_WKUPEVT - Wakeup event");
+        break;
+    case UDC_DWC3_DEVT_SUSPEND:
+        LOG_DBG("EVENT: DEVT_SUSPEND - Suspend");
+        break;
+    case UDC_DWC3_DEVT_SOF:
+        LOG_DBG("EVENT: DEVT_SOF - Start of Frame");
+        break;
+    case UDC_DWC3_DEVT_CMDCMPLT:
+        LOG_DBG("EVENT: DEVT_CMDCMPLT - Command complete");
+        break;
+    case UDC_DWC3_DEVT_VNDRDEVTSTRCVED:
+        LOG_DBG("EVENT: DEVT_VNDRDEVTSTRCVED - Vendor device event received");
+        break;
+    case UDC_DWC3_DEVT_ERRTICERR:
+        LOG_ERR("EVENT: DEVT_ERRTICERR - Error TICERR");
+        CODE_UNREACHABLE;
+        break;
+    case UDC_DWC3_DEVT_EVNTOVERFLOW:
+        LOG_ERR("EVENT: DEVT_EVNTOVERFLOW - Event overflow");
+        CODE_UNREACHABLE;
+        break;
+
+    default:
+        LOG_ERR("EVENT: UNHANDLED - evt=0x%x, ep=%d, code=%d, status=0x%x",
+                evt, ep_num, event_code, status);
+        CODE_UNREACHABLE;
+        break;
+    }
 }
+
 
 static void udc_dwc3_irq_handler(void *const ptr)
 {
@@ -1878,8 +2255,8 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 		}
 
 		LOG_DBG("success: Buffer enqueued");
-
 		udc_buf_get(&ep_data->cfg);
+		/* k_sleep(K_MSEC(1)); */
 	}
 }
 
