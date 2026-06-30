@@ -15,11 +15,25 @@
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/device_mmio.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/shell/shell.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
+
+/* Debug counters (aggregate across instances):
+ *   udc_dwc3_hwirq_count - times udc_dwc3_irq_handler ran in real IRQ context
+ *                          (a genuine hardware interrupt on the USB line)
+ *   udc_dwc3_poll_count  - times it ran from the Lattice quirk's 1ms poll worker
+ *                          (thread context, i.e. emulated interrupts)
+ *   udc_dwc3_evt_count   - DWC3 events actually dispatched/drained
+ * Inspect at runtime with the `tvai_dwc3 irq <device>` shell command.
+ */
+static atomic_t udc_dwc3_hwirq_count;
+static atomic_t udc_dwc3_poll_count;
+static atomic_t udc_dwc3_evt_count;
 
 /* TRB memory buffer fields */
 #define UDC_DWC3_TRB_STATUS_BUFSIZ_MASK				GENMASK(23, 0)
@@ -538,6 +552,8 @@ struct udc_dwc3_data {
 	uint32_t evt_next;
 	/* Back-reference to parent */
 	const struct device *dev;
+	/* Drains the DWC3 event buffer in thread context (mutexes are illegal in ISRs) */
+	struct k_work event_work;
 };
 
 /*
@@ -1561,17 +1577,40 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 static void udc_dwc3_irq_handler(void *const ptr)
 {
 	const struct device *const dev = ptr;
-	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	/* disable further interrupts until all events are processed */
+	/* k_is_in_isr() distinguishes a real hardware interrupt from the Lattice
+	 * quirk's workqueue-based poll that also calls this handler.
+	 */
+	if (k_is_in_isr()) {
+		atomic_inc(&udc_dwc3_hwirq_count);
+	} else {
+		atomic_inc(&udc_dwc3_poll_count);
+	}
+
+	/* Mask the event interrupt and defer the actual event processing to a
+	 * workqueue. udc_dwc3_handle_event() takes the UDC mutex (and submits
+	 * other work), which is illegal from ISR context. The worker re-enables
+	 * the interrupt once the event buffer is drained.
+	 */
 	sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+
+	k_work_submit(&priv->event_work);
+}
+
+/* Drain the DWC3 event buffer from thread context (mutex-safe). */
+static void udc_dwc3_event_worker(struct k_work *const work)
+{
+	struct udc_dwc3_data *const priv = CONTAINER_OF(work, struct udc_dwc3_data, event_work);
+	const struct device *const dev = priv->dev;
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
-		/* Dispatch the even directly from IRQ */
+		atomic_inc(&udc_dwc3_evt_count);
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
 		/* Move to next event entry for both hardware and software */
@@ -1891,6 +1930,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_data *const data = dev->data;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct udc_dwc3_ep_data *ep_data;
 	uint16_t mps = 0;
 	int ret;
@@ -1903,6 +1943,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	DEVICE_MMIO_NAMED_MAP(dev, base, K_MEM_CACHE_NONE);
 
 	k_mutex_init(&data->mutex);
+
+	priv->dev = dev;
+	k_work_init(&priv->event_work, udc_dwc3_event_worker);
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
