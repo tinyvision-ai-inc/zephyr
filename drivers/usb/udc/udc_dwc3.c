@@ -17,23 +17,37 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/shell/shell.h>
+#include <zephyr/net_buf.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
 
-/* Debug counters (aggregate across instances):
- *   udc_dwc3_hwirq_count - times udc_dwc3_irq_handler ran in real IRQ context
- *                          (a genuine hardware interrupt on the USB line)
- *   udc_dwc3_poll_count  - times it ran from the Lattice quirk's 1ms poll worker
- *                          (thread context, i.e. emulated interrupts)
- *   udc_dwc3_evt_count   - DWC3 events actually dispatched/drained
- * Inspect at runtime with the `tvai_dwc3 irq <device>` shell command.
- */
 static atomic_t udc_dwc3_hwirq_count;
 static atomic_t udc_dwc3_poll_count;
 static atomic_t udc_dwc3_evt_count;
+static atomic_t udc_dwc3_ctrl_setup_count;
+static atomic_t udc_dwc3_ctrl_in_count;
+static atomic_t udc_dwc3_ctrl_out_count;
+static atomic_t udc_dwc3_norm_done_count;
+static atomic_t udc_dwc3_enobufs_count;
+static atomic_t udc_dwc3_usbrst_count;
+
+static atomic_t udc_dwc3_ep0_stage_fixed;
+static atomic_t udc_dwc3_ep0_stage_mismatch;
+static atomic_t udc_dwc3_ep0_setuppending;
+static atomic_t udc_dwc3_ep0_trb_err;
+
+static struct usb_setup_packet udc_dwc3_dbg_setup;
+static bool udc_dwc3_dbg_setup_valid;
+
+static const char *udc_dwc3_linkstate_str(const uint32_t dsts);
+static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *const tag);
+
+static atomic_t udc_dwc3_ss_inact_count;
+static atomic_t udc_dwc3_ss_recov_count;
+static atomic_t udc_dwc3_remwk_count;
 
 /* TRB memory buffer fields */
 #define UDC_DWC3_TRB_STATUS_BUFSIZ_MASK				GENMASK(23, 0)
@@ -554,6 +568,13 @@ struct udc_dwc3_data {
 	const struct device *dev;
 	/* Drains the DWC3 event buffer in thread context (mutexes are illegal in ISRs) */
 	struct k_work event_work;
+	/* Cached SETUP for the in-flight control transfer. udc_data->setup stays
+	 * stale because this driver passes NULL to udc_setup_received().
+	 */
+	struct usb_setup_packet ctrl_setup;
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+	struct k_work_delayable health_work;
+#endif
 };
 
 /*
@@ -833,11 +854,21 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
-	/* Make sure the device is in U0 state, assuming TX FIFO is empty */
-	reg = sys_read32(base + UDC_DWC3_DCTL);
-	reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
-	reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
-	sys_write32(reg, base + UDC_DWC3_DCTL);
+	/* REMOTEWAKEUP from U0 is illegal and can drop the link to SS.Inactive */
+	reg = sys_read32(base + UDC_DWC3_DSTS);
+	if ((reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) == UDC_DWC3_DSTS_CONNECTSPD_SS) {
+		const uint32_t lnkst = reg & UDC_DWC3_DSTS_USBLNKST_MASK;
+
+		if (lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U1 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U2 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U3) {
+			atomic_inc(&udc_dwc3_remwk_count);
+			reg = sys_read32(base + UDC_DWC3_DCTL);
+			reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
+			reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
+			sys_write32(reg, base + UDC_DWC3_DCTL);
+		}
+	}
 
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
@@ -1012,8 +1043,36 @@ static void udc_dwc3_next_ctrl_in(const struct device *const dev,
 				  struct net_buf *const buf)
 {
 	struct udc_data *const data = dev->data;
-	const struct usb_setup_packet *const setup = (void *)data->setup;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	/* STATUS_2 vs STATUS_3 must use priv->ctrl_setup, not stale data->setup */
+	const struct usb_setup_packet *const setup = &priv->ctrl_setup;
 	struct udc_buf_info *const bi = udc_get_buf_info(buf);
+
+	if (bi->status) {
+		const bool chose_status2 = (setup->wLength == 0);
+		const struct usb_setup_packet *const stale = (void *)data->setup;
+		const bool stale_status2 = (stale->wLength == 0);
+
+		if (chose_status2 != stale_status2) {
+			atomic_inc(&udc_dwc3_ep0_stage_fixed);
+			LOG_INF("EP0 STATUS FIX: bmRT=0x%02x bReq=0x%02x real wLen=%u -> "
+				"STATUS_%d (stale data->setup wLen=%u would pick STATUS_%d)",
+				setup->bmRequestType, setup->bRequest, setup->wLength,
+				chose_status2 ? 2 : 3, stale->wLength, stale_status2 ? 2 : 3);
+		}
+
+		const bool want_status2 = udc_dwc3_dbg_setup_valid
+			? (udc_dwc3_dbg_setup.wLength == 0) : chose_status2;
+
+		if (chose_status2 != want_status2) {
+			atomic_inc(&udc_dwc3_ep0_stage_mismatch);
+			LOG_WRN("EP0 STATUS MISMATCH (post-fix!): bmRT=0x%02x bReq=0x%02x "
+				"real wLen=%u snapshot wLen=%u chose=STATUS_%d want=STATUS_%d",
+				setup->bmRequestType, setup->bRequest, setup->wLength,
+				udc_dwc3_dbg_setup.wLength, chose_status2 ? 2 : 3,
+				want_status2 ? 2 : 3);
+		}
+	}
 
 	if (bi->data) {
 		LOG_DBG("TRB_CONTROL_IN_DATA len=%d buf=%p", buf->len, buf);
@@ -1078,6 +1137,31 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
 	}
 }
 
+static void udc_dwc3_ep0_check_trb(const struct device *const dev, const uint32_t trb_status)
+{
+	ARG_UNUSED(dev);
+
+	switch (trb_status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
+	case UDC_DWC3_TRB_STATUS_TRBSTS_OK:
+		break;
+	case UDC_DWC3_TRB_STATUS_TRBSTS_SETUPPENDING:
+		atomic_inc(&udc_dwc3_ep0_setuppending);
+		LOG_WRN("EP0 SETUPPENDING (host started a new control transfer while one "
+			"was pending) last setup bmRT=0x%02x bReq=0x%02x wLen=%u",
+			udc_dwc3_dbg_setup.bmRequestType, udc_dwc3_dbg_setup.bRequest,
+			udc_dwc3_dbg_setup.wLength);
+		break;
+	default:
+		atomic_inc(&udc_dwc3_ep0_trb_err);
+		LOG_WRN("EP0 TRB non-OK trbsts=0x%08x (status=0x%08x) last setup "
+			"bmRT=0x%02x bReq=0x%02x wLen=%u",
+			(uint32_t)(trb_status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK), trb_status,
+			udc_dwc3_dbg_setup.bmRequestType, udc_dwc3_dbg_setup.bRequest,
+			udc_dwc3_dbg_setup.wLength);
+		break;
+	}
+}
+
 /*
  * Events
  *
@@ -1111,7 +1195,17 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
 
-	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
+	/*
+	 * Program GTXTHRCFG TX threshold (omitted in the 4.4 port). Buffer
+	 * USBTXPKTCNT packets before each SS burst to avoid TX FIFO underrun.
+	 * count=3 / burst=4 — sized from FIFO depth, see USB_COMPLIANCE_CHANGES.md §6.
+	 */
+	reg = UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL;
+	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBTXPKTCNT_MASK, 3);
+	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBMAXTXBURSTSIZE_MASK, 4);
+	sys_write32(reg, base + UDC_DWC3_GTXTHRCFG);
+
+	/* Letting GRXTHRCFG unchanged */
 
 	/* Read the chip identification */
 	reg = sys_read32(base + UDC_DWC3_GCOREID);
@@ -1159,7 +1253,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 15);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
-	/* Enable reception of all USB events except UDC_DWC3_DEVTEN_ULSTCNGEN */
+	/* All USB events; ULSTCNGEN surfaces link transitions before re-enumeration */
 	reg = UDC_DWC3_DEVTEN_INACTTIMEOUTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_VNDRDEVTSTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_EVNTOVERFLOWEN;
@@ -1167,10 +1261,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
 	reg |= UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN;
 	reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
+	reg |= UDC_DWC3_DEVTEN_ULSTCNGEN;
 	reg |= UDC_DWC3_DEVTEN_CONNECTDONEEN;
 	reg |= UDC_DWC3_DEVTEN_USBRSTEN;
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
 	sys_write32(reg, base + UDC_DWC3_DEVTEN);
+	udc_dwc3_dump_link_cfg(dev, "after-enable");
 
 	/* Configure endpoint 0x00 and 0x80 only for now */
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
@@ -1181,6 +1277,7 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 
+	atomic_inc(&udc_dwc3_usbrst_count);
 	LOG_DBG("Going through DWC3 reset logic");
 
 	/* Reset all ongoing transfers on non-control IN endpoints */
@@ -1242,6 +1339,8 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 
 	reg = sys_read32(base + UDC_DWC3_DSTS);
 
+	LOG_INF("ULSTCHNG -> %s (dsts=0x%08x)", udc_dwc3_linkstate_str(reg), reg);
+
 	switch (reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) {
 	case UDC_DWC3_DSTS_CONNECTSPD_SS:
 		switch (reg & UDC_DWC3_DSTS_USBLNKST_MASK) {
@@ -1264,13 +1363,17 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 			LOG_DBG("DSTS_USBLNKST_USB3_RX_DET");
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_SS_INACT:
-			LOG_DBG("DSTS_USBLNKST_USB3_SS_INACT");
+			atomic_inc(&udc_dwc3_ss_inact_count);
+			LOG_WRN("LINK DROP: SS.Inactive (the re-enumeration trigger) "
+				"dsts=0x%08x", reg);
+			udc_dwc3_dump_link_cfg(dev, "ss-inact");
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_POLL:
 			LOG_DBG("DSTS_USBLNKST_USB3_POLL");
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_RECOV:
-			LOG_DBG("DSTS_USBLNKST_USB3_RECOV");
+			atomic_inc(&udc_dwc3_ss_recov_count);
+			LOG_WRN("LINK: entered Recovery dsts=0x%08x", reg);
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_HRESET:
 			LOG_DBG("DSTS_USBLNKST_USB3_HRESET");
@@ -1334,12 +1437,17 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	const uint32_t trb_trbctl = ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 
+	udc_dwc3_ep0_check_trb(dev, ep_data->trb_buf[0].status);
+
 	buf = udc_buf_get(&ep_data->cfg);
 	if (buf == NULL) {
+		atomic_inc(&udc_dwc3_enobufs_count);
 		LOG_ERR("Failed to get a buffer for ep 0x%02x", ep_data->cfg.addr);
 		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 		return;
 	}
+
+	atomic_inc(&udc_dwc3_ctrl_in_count);
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
@@ -1375,17 +1483,27 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	const uint32_t trb_status = ep_data->trb_buf[0].status;
 	struct net_buf *buf;
 
+	udc_dwc3_ep0_check_trb(dev, trb_status);
+
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		struct usb_setup_packet *setup;
 
 		buf = udc_buf_peek(&ep_data->cfg);
 		if (buf == NULL) {
+			atomic_inc(&udc_dwc3_enobufs_count);
 			LOG_ERR("missing buffer for SETUP packet");
 			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 			return;
 		}
 
+		atomic_inc(&udc_dwc3_ctrl_setup_count);
+
 		setup = (struct usb_setup_packet *)buf->data;
+
+		/* Refresh before EP0 IN status stage selects STATUS_2 vs STATUS_3 */
+		memcpy(&DEV_DATA(dev)->ctrl_setup, setup, sizeof(DEV_DATA(dev)->ctrl_setup));
+		memcpy(&udc_dwc3_dbg_setup, setup, sizeof(udc_dwc3_dbg_setup));
+		udc_dwc3_dbg_setup_valid = true;
 
 		/* Latency optimization: set the address immediately to be able to be able
 		 * to ACK/NAK the first packets from the host with the new address,
@@ -1406,10 +1524,13 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
 		if (buf == NULL) {
+			atomic_inc(&udc_dwc3_enobufs_count);
 			LOG_ERR("Failed to get a buffer for ep 0x%02x", ep_data->cfg.addr);
 			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 			return;
 		}
+
+		atomic_inc(&udc_dwc3_ctrl_out_count);
 
 		/* Update the size to what the hardware reports */
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
@@ -1487,9 +1608,12 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
+		atomic_inc(&udc_dwc3_enobufs_count);
 		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
 		return;
 	}
+
+	atomic_inc(&udc_dwc3_norm_done_count);
 
 	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
 	udc_dwc3_on_xfer_done(dev, ep_data);
@@ -1531,10 +1655,10 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_xfer_not_ready(dev, evt);
 		break;
 	case UDC_DWC3_DEVT_DISCONNEVT:
-		LOG_DBG("DEVT_DISCONNEVT");
+		LOG_INF("DEVT_DISCONNEVT");
 		break;
 	case UDC_DWC3_DEVT_USBRST:
-		LOG_DBG("DEVT_USBRST");
+		LOG_INF("DEVT_USBRST");
 		udc_dwc3_on_usb_reset(dev);
 		break;
 	case UDC_DWC3_DEVT_CONNECTDONE:
@@ -1542,14 +1666,14 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_connect_done(dev);
 		break;
 	case UDC_DWC3_DEVT_ULSTCHNG:
-		LOG_DBG("DEVT_ULSTCHNG");
+		LOG_INF("DEVT_ULSTCHNG");
 		udc_dwc3_on_link_state_event(dev);
 		break;
 	case UDC_DWC3_DEVT_WKUPEVT:
-		LOG_DBG("DEVT_WKUPEVT");
+		LOG_INF("DEVT_WKUPEVT (resume)");
 		break;
 	case UDC_DWC3_DEVT_SUSPEND:
-		LOG_DBG("DEVT_SUSPEND");
+		LOG_INF("DEVT_SUSPEND (link entering low power)");
 		break;
 	case UDC_DWC3_DEVT_SOF:
 		LOG_DBG("DEVT_SOF");
@@ -1580,9 +1704,6 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	/* k_is_in_isr() distinguishes a real hardware interrupt from the Lattice
-	 * quirk's workqueue-based poll that also calls this handler.
-	 */
 	if (k_is_in_isr()) {
 		atomic_inc(&udc_dwc3_hwirq_count);
 	} else {
@@ -1621,6 +1742,140 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 	/* Allow further interrupts */
 	sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
 }
+
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+static void udc_dwc3_log_pools(void)
+{
+	STRUCT_SECTION_FOREACH(net_buf_pool, pool) {
+		const size_t total = pool->buf_count;
+		const size_t avail = net_buf_get_available(pool);
+		const size_t used = total - avail;
+		const size_t max_used = net_buf_get_max_used(pool);
+		const char *const name = (pool->name != NULL) ? pool->name : "?";
+
+		/* Zero-sized pools are unused, not exhausted */
+		if (total != 0 && avail == 0) {
+			LOG_WRN("pool %s EXHAUSTED used=%zu/%zu max=%zu", name, used, total,
+				max_used);
+		} else {
+			LOG_INF("pool %s used=%zu/%zu max=%zu", name, used, total, max_used);
+		}
+	}
+}
+
+static const char *udc_dwc3_linkstate_str(const uint32_t dsts)
+{
+	if ((dsts & UDC_DWC3_DSTS_CONNECTSPD_MASK) == UDC_DWC3_DSTS_CONNECTSPD_SS) {
+		switch (dsts & UDC_DWC3_DSTS_USBLNKST_MASK) {
+		case UDC_DWC3_DSTS_USBLNKST_USB3_U0:		return "U0";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_U1:		return "U1";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_U2:		return "U2";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_U3:		return "U3";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_SS_DIS:	return "SS.Dis";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_RX_DET:	return "RxDet";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_SS_INACT:	return "SS.Inact";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_POLL:		return "Poll";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_RECOV:		return "Recov";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_HRESET:	return "HotReset";
+		case UDC_DWC3_DSTS_USBLNKST_USB3_RESET_RESUME:	return "ResetResume";
+		default:					return "U?";
+		}
+	}
+	switch (dsts & UDC_DWC3_DSTS_USBLNKST_MASK) {
+	case UDC_DWC3_DSTS_USBLNKST_USB2_ON_STATE:	return "On";
+	case UDC_DWC3_DSTS_USBLNKST_USB2_SLEEP_STATE:	return "Sleep(L1)";
+	case UDC_DWC3_DSTS_USBLNKST_USB2_SUSPEND_STATE:	return "Suspend(L2)";
+	case UDC_DWC3_DSTS_USBLNKST_USB2_DISCONNECTED:	return "Disc";
+	case UDC_DWC3_DSTS_USBLNKST_USB2_RESET:		return "Reset";
+	case UDC_DWC3_DSTS_USBLNKST_USB2_RESUME:	return "Resume";
+	default:					return "L?";
+	}
+}
+
+static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *const tag)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t dctl = sys_read32(base + UDC_DWC3_DCTL);
+	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
+
+	LOG_INF("linkcfg(%s): GUSB3PIPECTL=0x%08x GCTL=0x%08x GUSB2PHYCFG=0x%08x "
+		"DCTL=0x%08x DEVTEN=0x%08x DCFG=0x%08x",
+		tag,
+		sys_read32(base + UDC_DWC3_GUSB3PIPECTL),
+		sys_read32(base + UDC_DWC3_GCTL),
+		sys_read32(base + UDC_DWC3_GUSB2PHYCFG),
+		dctl,
+		sys_read32(base + UDC_DWC3_DEVTEN),
+		sys_read32(base + UDC_DWC3_DCFG));
+	LOG_INF("linkcfg(%s): U1[init=%d accept=%d] U2[init=%d accept=%d] GTXTHRCFG=0x%08x link=%s dsts=0x%08x",
+		tag,
+		!!(dctl & UDC_DWC3_DCTL_INITU1ENA), !!(dctl & UDC_DWC3_DCTL_ACCEPTU1ENA),
+		!!(dctl & UDC_DWC3_DCTL_INITU2ENA), !!(dctl & UDC_DWC3_DCTL_ACCEPTU2ENA),
+		sys_read32(base + UDC_DWC3_GTXTHRCFG),
+		udc_dwc3_linkstate_str(dsts), dsts);
+
+	LOG_INF("fifosiz(%s): GTXFIFOSIZ[0]=0x%08x[dep=%u] [1]=0x%08x[dep=%u] "
+		"[2]=0x%08x[dep=%u] GRXFIFOSIZ[0]=0x%08x[dep=%u]",
+		tag,
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0)),
+		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0)) &
+			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1)),
+		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1)) &
+			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2)),
+		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2)) &
+			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
+		sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0)),
+		(uint32_t)(sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0)) &
+			   UDC_DWC3_GRXFIFOSIZ_RXFDEP_MASK));
+}
+
+static void udc_dwc3_log_health(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
+
+	LOG_INF("health %s: hwirq=%u poll=%u evt=%u rst=%u | setup=%u ctrlin=%u ctrlout=%u "
+		"norm=%u enobufs=%u | ep0 in_busy=%d out_busy=%d evtcnt=%u | "
+		"ep0 fixed=%u mismatch=%u setuppend=%u trberr=%u | "
+		"ssinact=%u ssrecov=%u remwk=%u | link=%s dsts=0x%08x",
+		dev->name,
+		(uint32_t)atomic_get(&udc_dwc3_hwirq_count),
+		(uint32_t)atomic_get(&udc_dwc3_poll_count),
+		(uint32_t)atomic_get(&udc_dwc3_evt_count),
+		(uint32_t)atomic_get(&udc_dwc3_usbrst_count),
+		(uint32_t)atomic_get(&udc_dwc3_ctrl_setup_count),
+		(uint32_t)atomic_get(&udc_dwc3_ctrl_in_count),
+		(uint32_t)atomic_get(&udc_dwc3_ctrl_out_count),
+		(uint32_t)atomic_get(&udc_dwc3_norm_done_count),
+		(uint32_t)atomic_get(&udc_dwc3_enobufs_count),
+		(int)udc_ep_is_busy(&cfg->ep_data_in[0].cfg),
+		(int)udc_ep_is_busy(&cfg->ep_data_out[0].cfg),
+		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)),
+		(uint32_t)atomic_get(&udc_dwc3_ep0_stage_fixed),
+		(uint32_t)atomic_get(&udc_dwc3_ep0_stage_mismatch),
+		(uint32_t)atomic_get(&udc_dwc3_ep0_setuppending),
+		(uint32_t)atomic_get(&udc_dwc3_ep0_trb_err),
+		(uint32_t)atomic_get(&udc_dwc3_ss_inact_count),
+		(uint32_t)atomic_get(&udc_dwc3_ss_recov_count),
+		(uint32_t)atomic_get(&udc_dwc3_remwk_count),
+		udc_dwc3_linkstate_str(dsts), dsts);
+
+	udc_dwc3_log_pools();
+}
+
+static void udc_dwc3_health_worker(struct k_work *const work)
+{
+	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
+	struct udc_dwc3_data *const priv = CONTAINER_OF(dwork, struct udc_dwc3_data, health_work);
+
+	udc_dwc3_log_health(priv->dev);
+
+	k_work_reschedule(&priv->health_work, K_MSEC(CONFIG_UDC_DWC3_HEALTH_LOG_INTERVAL_MS));
+}
+#endif /* CONFIG_UDC_DWC3_HEALTH_LOG */
 
 /*
  * UDC API
@@ -1776,6 +2031,11 @@ static int udc_dwc3_enable(const struct device *const dev)
 	/* Enable the IRQ (for now, just schedule a first work queue job) */
 	cfg->irq_enable_func();
 
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+	k_work_reschedule(&DEV_DATA(dev)->health_work,
+			  K_MSEC(CONFIG_UDC_DWC3_HEALTH_LOG_INTERVAL_MS));
+#endif
+
 	return 0;
 }
 
@@ -1784,6 +2044,10 @@ static int udc_dwc3_disable(const struct device *const dev)
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	LOG_DBG("Disabling DWC3 driver");
+
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+	k_work_cancel_delayable(&DEV_DATA(dev)->health_work);
+#endif
 
 	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
 
@@ -1946,6 +2210,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	priv->dev = dev;
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+	k_work_init_delayable(&priv->health_work, udc_dwc3_health_worker);
+#endif
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
