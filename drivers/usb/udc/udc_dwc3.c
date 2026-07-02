@@ -42,8 +42,10 @@ static atomic_t udc_dwc3_ep0_trb_err;
 static struct usb_setup_packet udc_dwc3_dbg_setup;
 static bool udc_dwc3_dbg_setup_valid;
 
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 static const char *udc_dwc3_linkstate_str(const uint32_t dsts);
 static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *const tag);
+#endif
 
 static atomic_t udc_dwc3_ss_inact_count;
 static atomic_t udc_dwc3_ss_recov_count;
@@ -1253,7 +1255,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 15);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
-	/* All USB events; ULSTCNGEN surfaces link transitions before re-enumeration */
+	/* All USB events except ULSTCNGEN (enabled with HEALTH_LOG for link diagnostics) */
 	reg = UDC_DWC3_DEVTEN_INACTTIMEOUTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_VNDRDEVTSTRCVEDEN;
 	reg |= UDC_DWC3_DEVTEN_EVNTOVERFLOWEN;
@@ -1261,12 +1263,16 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
 	reg |= UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN;
 	reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	reg |= UDC_DWC3_DEVTEN_ULSTCNGEN;
+#endif
 	reg |= UDC_DWC3_DEVTEN_CONNECTDONEEN;
 	reg |= UDC_DWC3_DEVTEN_USBRSTEN;
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
 	sys_write32(reg, base + UDC_DWC3_DEVTEN);
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	udc_dwc3_dump_link_cfg(dev, "after-enable");
+#endif
 
 	/* Configure endpoint 0x00 and 0x80 only for now */
 	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
@@ -1339,7 +1345,9 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 
 	reg = sys_read32(base + UDC_DWC3_DSTS);
 
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	LOG_INF("ULSTCHNG -> %s (dsts=0x%08x)", udc_dwc3_linkstate_str(reg), reg);
+#endif
 
 	switch (reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) {
 	case UDC_DWC3_DSTS_CONNECTSPD_SS:
@@ -1363,17 +1371,25 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 			LOG_DBG("DSTS_USBLNKST_USB3_RX_DET");
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_SS_INACT:
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 			atomic_inc(&udc_dwc3_ss_inact_count);
 			LOG_WRN("LINK DROP: SS.Inactive (the re-enumeration trigger) "
 				"dsts=0x%08x", reg);
 			udc_dwc3_dump_link_cfg(dev, "ss-inact");
+#else
+			LOG_DBG("DSTS_USBLNKST_USB3_SS_INACT");
+#endif
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_POLL:
 			LOG_DBG("DSTS_USBLNKST_USB3_POLL");
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_RECOV:
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 			atomic_inc(&udc_dwc3_ss_recov_count);
 			LOG_WRN("LINK: entered Recovery dsts=0x%08x", reg);
+#else
+			LOG_DBG("DSTS_USBLNKST_USB3_RECOV");
+#endif
 			break;
 		case UDC_DWC3_DSTS_USBLNKST_USB3_HRESET:
 			LOG_DBG("DSTS_USBLNKST_USB3_HRESET");
