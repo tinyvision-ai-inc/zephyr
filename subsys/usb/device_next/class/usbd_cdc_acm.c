@@ -22,6 +22,7 @@
 #include "usbd_msg.h"
 
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/uart/cdc_acm.h>
 /* Prevent endless recursive logging loop and warn user about it */
 #if defined(CONFIG_USBD_CDC_ACM_LOG_LEVEL) && CONFIG_USBD_CDC_ACM_LOG_LEVEL != LOG_LEVEL_NONE
 #define CHOSEN_CONSOLE DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart)
@@ -136,9 +137,32 @@ struct cdc_acm_uart_data {
 	atomic_t state;
 	struct k_sem notif_sem;
 	struct k_spinlock lock;
+#if defined(CONFIG_USBD_CDC_ACM_DIAG_COUNTERS)
+	struct {
+		atomic_t tx_fifo_fill;
+		atomic_t irq_cb_tx_scheduled;
+		atomic_t irq_cb_tx_skipped_busy;
+		atomic_t tx_handler_busy;
+		atomic_t tx_alloc_fail;
+		atomic_t tx_enqueue_ok;
+		atomic_t tx_enqueue_fail;
+		atomic_t tx_complete;
+		atomic_t tx_complete_err;
+		atomic_t rx_enqueue_ok;
+		atomic_t rx_enqueue_fail;
+		atomic_t rx_alloc_fail;
+		atomic_t rx_complete;
+	} diag;
+#endif
 };
 
 static void cdc_acm_irq_rx_enable(const struct device *dev);
+
+#if defined(CONFIG_USBD_CDC_ACM_DIAG_COUNTERS)
+#define CDC_ACM_DIAG_INC(_data, _field) atomic_inc(&(_data)->diag._field)
+#else
+#define CDC_ACM_DIAG_INC(_data, _field)
+#endif
 
 #if CONFIG_USBD_CDC_ACM_BUF_POOL
 UDC_BUF_POOL_DEFINE(cdc_acm_ep_pool,
@@ -329,6 +353,7 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 
 		if (bi->ep == cdc_acm_get_bulk_in(c_data)) {
 			atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+			CDC_ACM_DIAG_INC(data, tx_complete_err);
 		}
 
 		if (bi->ep == cdc_acm_get_int_in(c_data)) {
@@ -349,6 +374,7 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		}
 
 		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, rx_complete);
 		cdc_acm_work_submit(&data->rx_fifo_work);
 	}
 
@@ -359,6 +385,7 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		}
 
 		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, tx_complete);
 
 		if (!ring_buf_is_empty(data->tx_fifo.rb)) {
 			/* Queue pending TX data on IN endpoint */
@@ -691,12 +718,14 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 
 	if (atomic_test_and_set_bit(&data->state, CDC_ACM_TX_FIFO_BUSY)) {
 		LOG_DBG("TX transfer already in progress");
+		CDC_ACM_DIAG_INC(data, tx_handler_busy);
 		return;
 	}
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_in(c_data));
 	if (buf == NULL) {
 		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, tx_alloc_fail);
 		cdc_acm_work_schedule(&data->tx_fifo_work, K_MSEC(1));
 		return;
 	}
@@ -711,6 +740,9 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 		LOG_ERR("Failed to enqueue");
 		net_buf_unref(buf);
 		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, tx_enqueue_fail);
+	} else {
+		CDC_ACM_DIAG_INC(data, tx_enqueue_ok);
 	}
 }
 
@@ -752,6 +784,8 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
 	if (buf == NULL) {
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, rx_alloc_fail);
 		return;
 	}
 
@@ -763,6 +797,10 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x",
 			cdc_acm_get_bulk_out(c_data));
 		net_buf_unref(buf);
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+		CDC_ACM_DIAG_INC(data, rx_enqueue_fail);
+	} else {
+		CDC_ACM_DIAG_INC(data, rx_enqueue_ok);
 	}
 }
 
@@ -830,6 +868,8 @@ static int cdc_acm_fifo_fill(const struct device *dev,
 	if (done) {
 		data->tx_fifo.altered = true;
 	}
+
+	CDC_ACM_DIAG_INC(data, tx_fifo_fill);
 
 	LOG_INF("UART dev %p, len %d, remaining space %u",
 		dev, len, ring_buf_space_get(data->tx_fifo.rb));
@@ -982,11 +1022,15 @@ static void cdc_acm_irq_cb_handler(struct k_work *work)
 	if (!atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY)) {
 		if (data->tx_fifo.altered) {
 			LOG_DBG("tx fifo altered, submit work");
+			CDC_ACM_DIAG_INC(data, irq_cb_tx_scheduled);
 			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
 		} else if (data->zlp_needed) {
 			LOG_DBG("zlp needed, submit work");
+			CDC_ACM_DIAG_INC(data, irq_cb_tx_scheduled);
 			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
 		}
+	} else if (data->tx_fifo.altered || data->zlp_needed) {
+		CDC_ACM_DIAG_INC(data, irq_cb_tx_skipped_busy);
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED) &&
@@ -1498,5 +1542,60 @@ const static struct usb_desc_header *cdc_acm_ss_desc_##n[] = {			\
 		&uart_data_##n, &uart_config_##n,				\
 		PRE_KERNEL_1, CONFIG_SERIAL_INIT_PRIORITY,			\
 		&cdc_acm_uart_api);
+
+#if defined(CONFIG_USBD_CDC_ACM_DIAG_COUNTERS)
+static void cdc_acm_diag_dump(const struct cdc_acm_uart_data *data)
+{
+	const bool tx_busy = atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+	const bool rx_busy = atomic_test_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+	const size_t tx_rb_used = ring_buf_size_get(data->tx_fifo.rb);
+	const size_t rx_rb_used = ring_buf_size_get(data->rx_fifo.rb);
+
+	LOG_INF("CDCACM diag: tx_busy=%d rx_busy=%d tx_rb=%u rx_rb=%u | "
+		"fill=%u sched=%u skip_busy=%u h_busy=%u | "
+		"tx_alloc_fail=%u tx_enq_ok=%u tx_enq_fail=%u | "
+		"tx_done=%u tx_err=%u rx_enq_ok=%u rx_enq_fail=%u rx_alloc_fail=%u rx_done=%u",
+		tx_busy, rx_busy, tx_rb_used, rx_rb_used,
+		(uint32_t)atomic_get(&data->diag.tx_fifo_fill),
+		(uint32_t)atomic_get(&data->diag.irq_cb_tx_scheduled),
+		(uint32_t)atomic_get(&data->diag.irq_cb_tx_skipped_busy),
+		(uint32_t)atomic_get(&data->diag.tx_handler_busy),
+		(uint32_t)atomic_get(&data->diag.tx_alloc_fail),
+		(uint32_t)atomic_get(&data->diag.tx_enqueue_ok),
+		(uint32_t)atomic_get(&data->diag.tx_enqueue_fail),
+		(uint32_t)atomic_get(&data->diag.tx_complete),
+		(uint32_t)atomic_get(&data->diag.tx_complete_err),
+		(uint32_t)atomic_get(&data->diag.rx_enqueue_ok),
+		(uint32_t)atomic_get(&data->diag.rx_enqueue_fail),
+		(uint32_t)atomic_get(&data->diag.rx_alloc_fail),
+		(uint32_t)atomic_get(&data->diag.rx_complete));
+}
+
+void cdc_acm_diag_log(const struct device *dev)
+{
+	struct cdc_acm_uart_data *data = dev->data;
+
+	cdc_acm_diag_dump(data);
+}
+
+void cdc_acm_diag_reset(const struct device *dev)
+{
+	struct cdc_acm_uart_data *data = dev->data;
+
+	atomic_set(&data->diag.tx_fifo_fill, 0);
+	atomic_set(&data->diag.irq_cb_tx_scheduled, 0);
+	atomic_set(&data->diag.irq_cb_tx_skipped_busy, 0);
+	atomic_set(&data->diag.tx_handler_busy, 0);
+	atomic_set(&data->diag.tx_alloc_fail, 0);
+	atomic_set(&data->diag.tx_enqueue_ok, 0);
+	atomic_set(&data->diag.tx_enqueue_fail, 0);
+	atomic_set(&data->diag.tx_complete, 0);
+	atomic_set(&data->diag.tx_complete_err, 0);
+	atomic_set(&data->diag.rx_enqueue_ok, 0);
+	atomic_set(&data->diag.rx_enqueue_fail, 0);
+	atomic_set(&data->diag.rx_alloc_fail, 0);
+	atomic_set(&data->diag.rx_complete, 0);
+}
+#endif /* CONFIG_USBD_CDC_ACM_DIAG_COUNTERS */
 
 DT_INST_FOREACH_STATUS_OKAY(USBD_CDC_ACM_DT_DEVICE_DEFINE);

@@ -37,6 +37,14 @@ config USBD_CDC_ACM_BUF_POOL
 	  ACM instances and the size of the bulk endpoints. When disabled, the
 	  implementation uses the UDC driver's pool.
 
+config USBD_CDC_ACM_DIAG_COUNTERS
+	bool "CDC ACM TX/RX funnel diagnostic counters"
+	help
+	  Track per-instance counters for the CDC ACM bulk path: UART fifo
+	  fills, tx_fifo_work scheduling skips (TX_FIFO_BUSY), buffer alloc
+	  failures, enqueue success/failure, and transfer completions.  Logs
+	  via cdc_acm_diag_log().
+
 module = USBD_CDC_ACM
 module-str = usbd cdc_acm
 default-count = 1

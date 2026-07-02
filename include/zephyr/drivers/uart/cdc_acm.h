@@ -48,6 +48,19 @@ typedef void (*cdc_dte_rate_callback_t)(const struct device *dev,
 __deprecated int cdc_acm_dte_rate_callback_set(const struct device *dev,
 				  cdc_dte_rate_callback_t callback);
 
+#if defined(CONFIG_USBD_CDC_ACM_DIAG_COUNTERS) || defined(__DOXYGEN__)
+/**
+ * @brief Log CDC ACM bulk-path funnel counters for @p dev.
+ *
+ * Counters distinguish normal TX_FIFO_BUSY back-pressure from a wedged IN
+ * endpoint (fifo_fill grows while tx_enqueue_ok and tx_complete stall).
+ */
+void cdc_acm_diag_log(const struct device *dev);
+
+/** @brief Reset CDC ACM diagnostic counters for @p dev. */
+void cdc_acm_diag_reset(const struct device *dev);
+#endif
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
