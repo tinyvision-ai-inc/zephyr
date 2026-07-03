@@ -122,8 +122,19 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 	int ret;
 
 	usbd_status_suspended(uds_ctx, false);
-	ret = udc_set_address(uds_ctx->dev, 0);
-	if (ret) {
+
+	/*
+	 * USB 3.x Link negotiation may end up in a Hot Reset
+	 * Here the device's addre is set back to 0 and some configuration
+	 * parameters are cleared
+	 *
+	 * Let's Handle this by promoting to ADDRES state if the device was already
+	 * configured, keeping address 0 byut allowing SET_CONFIGURATION to proceed
+	 * without needing an address
+	 */
+	bool was_configured = usbd_state_is_configured(uds_ctx);
+
+	ret = udc_set_address(uds_ctx->dev, 0); if (ret) {
 		LOG_ERR("Failed to set default address after bus reset");
 		return ret;
 	}
@@ -147,7 +158,12 @@ static int event_handler_bus_reset(struct usbd_context *const uds_ctx)
 		uds_ctx->status.speed = USBD_SPEED_FS;
 	}
 
-	uds_ctx->ch9_data.state = USBD_STATE_DEFAULT;
+	if (was_configured) {
+		LOG_WRN("Bus reset from CONFIGURED state, promoting to ADDRESS to handle speed negotiation");
+		uds_ctx->ch9_data.state = USBD_STATE_ADDRESS;
+	} else {
+		uds_ctx->ch9_data.state = USBD_STATE_DEFAULT;
+	}
 
 	uds_ctx->status.rwup = false;
 

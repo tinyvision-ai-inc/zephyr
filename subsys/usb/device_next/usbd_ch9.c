@@ -104,6 +104,10 @@ static int sreq_set_address(struct usbd_context *const uds_ctx)
 		uds_ctx->ch9_data.state = USBD_STATE_DEFAULT;
 	} else {
 		uds_ctx->ch9_data.state = USBD_STATE_ADDRESS;
+		if (setup->wValue != 0) {
+			/* Save for recovery in case USB 3.x Hot Resets */
+			uds_ctx->ch9_data.last_address = (uint8_t)setup->wValue;
+		}
 	}
 
 
@@ -130,8 +134,23 @@ static int sreq_set_configuration(struct usbd_context *const uds_ctx)
 	}
 
 	if (usbd_state_is_default(uds_ctx)) {
-		errno = -EPERM;
-		return 0;
+
+		/*
+		 * SET_CONFIGURATION is only valid from ADDRESS state, but
+		 * after a Hot Reset hosts send SET_CONFIGURATION  while the device
+		 * is in DEFAULT state.
+		 * We promote to ADDRESS state and restore the last know address
+		 * to match the host's cache
+		 */
+		if (uds_ctx->ch9_data.last_address != 0) {
+			LOG_WRN("SET_CONFIGURATION in DEFAULT state, restoring address %u and promoting to ADDRESS state",
+				uds_ctx->ch9_data.last_address);
+			udc_set_address(uds_ctx->dev, uds_ctx->ch9_data.last_address);
+		} else {
+			errno = -EPERM;
+			return 0;
+		}
+
 	}
 
 	if (setup->wValue && !usbd_config_exist(uds_ctx, speed, setup->wValue)) {
