@@ -226,6 +226,8 @@ struct usbd_ch9_data {
 	bool post_status;
 	/** Array to track interfaces alternate settings */
 	uint8_t alternate[USBD_NUMOF_INTERFACES_MAX];
+	/** Last USB address assigned via SET_ADDRESS */
+	uint8_t last_address;
 };
 
 /**
