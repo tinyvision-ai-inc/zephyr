@@ -69,4 +69,27 @@ config UDC_DWC3_XFER_TRACE
 	  link TRB is still HW-owned, when xfer_active clears with link_hwo set,
 	  or on other ring/HW desync suspects.  Intended for ACM+UVC soak debug.
 
+config UDC_DWC3_IN_COMPLETION_POLL
+	bool "Periodic SW-retire poll to recover dropped IN completions"
+	help
+	  On this SoC the bulk IN XferComplete event is not always delivered to
+	  the CPU event ring under multi-stream load: an armed IN TRB is filled
+	  and released by hardware (HWO cleared) but no DEPEVT is posted, so the
+	  transfer never retires and the endpoint wedges even though the CPU is
+	  healthy.  Enable a light periodic poll that reclaims any endpoint whose
+	  tail TRB had HWO cleared without a matching event, breaking the wedge.
+
+	  The poll runs on the system workqueue, serialised with the event and
+	  endpoint workers, and is a cheap per-endpoint HWO test when events are
+	  delivered normally.
+
+config UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US
+	int "Interval between IN completion recovery polls (us)"
+	default 500
+	depends on UDC_DWC3_IN_COMPLETION_POLL
+	help
+	  How often the dropped-IN-completion recovery poll runs, in
+	  microseconds.  Lower values reduce worst-case IN latency on a dropped
+	  event at the cost of more workqueue wakeups.
+
 endif # UDC_DWC3

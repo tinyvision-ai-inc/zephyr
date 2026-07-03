@@ -775,6 +775,12 @@ struct udc_dwc3_data {
 #if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	struct k_work_delayable health_work;
 #endif
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	/* Periodic SW-retire poll to recover IN transfers whose XferComplete
+	 * event was dropped by the controller/RTL (see the worker for details).
+	 */
+	struct k_work_delayable in_poll_work;
+#endif
 };
 
 /*
@@ -3363,6 +3369,61 @@ static unsigned udc_dwc3_retire_sw_done_eps(const struct device *const dev,
 	return retired;
 }
 
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+/*
+ * Periodic recovery poll for dropped IN completions.
+ *
+ * On this SoC the bulk IN XferComplete event is not always delivered to the CPU
+ * event ring: under multi-stream load (e.g. two UVC IN streams sharing the
+ * controller with the CDC IN pipe) an armed IN TRB is filled and released by HW
+ * (HWO cleared) but no DEPEVT is posted (GEVNTCOUNT stays 0).  Because the UDC
+ * only advances an endpoint from an event, the transfer never retires: the
+ * class layer keeps its "transfer busy" flag set, stops enqueuing, and the pipe
+ * wedges even though the CPU is otherwise healthy (observed on-core: one IN TRB
+ * outstanding forever, watchdog still logging).
+ *
+ * udc_dwc3_retire_sw_done_eps() already reclaims any endpoint whose tail TRB has
+ * had HWO cleared by HW without a matching event — exactly the dropped-event
+ * case — so run it on a light periodic cadence.  It executes on the system
+ * workqueue, serialised with the event/endpoint workers, so it needs no extra
+ * locking.  When events are delivered normally this poll finds nothing (a cheap
+ * HWO test per endpoint) and costs only the wakeup.
+ */
+static atomic_t udc_dwc3_in_poll_recovered;
+
+static void udc_dwc3_in_poll_worker(struct k_work *const work)
+{
+	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
+	struct udc_dwc3_data *const priv =
+		CONTAINER_OF(dwork, struct udc_dwc3_data, in_poll_work);
+	const struct device *const dev = priv->dev;
+	const unsigned retired = udc_dwc3_retire_sw_done_eps(dev, "in-poll");
+
+	if (retired > 0U) {
+		static int64_t last_log;
+		static atomic_t since_log;
+		const atomic_val_t total =
+			atomic_add(&udc_dwc3_in_poll_recovered, retired) + retired;
+		const atomic_val_t burst = atomic_add(&since_log, retired) + retired;
+		const int64_t now = k_uptime_get();
+
+		/* Rate-limit: this runs every few hundred us, so report at most
+		 * once per second with the count recovered since the last line
+		 * plus the cumulative total.
+		 */
+		if (now - last_log >= 1000) {
+			last_log = now;
+			atomic_clear(&since_log);
+			LOG_WRN("in-poll recovered dropped IN completions: +%ld (total %ld)",
+				(long)burst, (long)total);
+		}
+	}
+
+	k_work_reschedule(&priv->in_poll_work,
+			  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+}
+#endif /* CONFIG_UDC_DWC3_IN_COMPLETION_POLL */
+
 #define NORMAL_EP(n, fn) fn(n + 2)
 
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt)
@@ -3473,8 +3534,21 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	 * workqueue. udc_dwc3_handle_event() takes the UDC mutex (and submits
 	 * other work), which is illegal from ISR context. The worker re-enables
 	 * the interrupt once the event buffer is drained.
+	 *
+	 * The mask store is a posted MMIO write on this SoC.  If it does not
+	 * land before the ISR returns while the event IRQ is still asserted
+	 * (more events posting under a sustained IN + UVC load), the ISR
+	 * re-enters immediately and storms, pegging the CPU at interrupt level
+	 * and starving every thread (console dead, no log output, device
+	 * appears hung though ISRs still run).  Confirm the mask is actually set
+	 * via read-back before returning so the storm cannot start.
 	 */
-	sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	do {
+		sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0),
+			     UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+		barrier_dmem_fence_full();
+	} while ((sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) &
+		  UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK) == 0U);
 
 	k_work_submit(&priv->event_work);
 }
@@ -3488,66 +3562,56 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	/*
-	 * This IP's event IRQ is edge-driven on event-post: unmasking with a
-	 * non-empty ring does NOT re-assert it.  So the worker must never return
-	 * while masked with events still pending — if it did, no IRQ would ever
-	 * reschedule it and the endpoint wedges (observed on-core: GEVNTSIZ mask
-	 * stuck set, GEVNTCOUNT climbing, hwirq/evt frozen while the rest of the
-	 * system keeps running; a manual unmask recovered it every time).  The
-	 * previous single-shot "unmask then k_work_submit if count>0" re-arm was
-	 * racy under load and left exactly that state.
-	 *
-	 * Loop in place instead: drain, unmask only when the ring is empty, and
-	 * if an event slipped into the unmask window re-mask and drain it here
-	 * rather than trusting a resubmit.  The worker can only return with the
-	 * ring empty AND unmasked, from which a future event-post raises the IRQ.
+	 * Drain every event currently posted to the ring.
 	 */
-	for (;;) {
-		while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0U) {
-			const uint32_t evt = cfg->evt_buf[priv->evt_next];
+	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0U) {
+		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
-			atomic_inc(&udc_dwc3_evt_count);
+		atomic_inc(&udc_dwc3_evt_count);
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
-			udc_dwc3_trace_evt_note(evt & UDC_DWC3_EVT_MASK);
+		udc_dwc3_trace_evt_note(evt & UDC_DWC3_EVT_MASK);
 #endif
-			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
-			/* Move to next event entry for both hardware and software */
-			sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
-			udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
-		}
+		/* Move to next event entry for both hardware and software */
+		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+		udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+	}
 
-		/*
-		 * Ring drained: allow further interrupts.  The unmask MUST be
-		 * confirmed landed before we commit to returning.  On this SoC
-		 * MMIO stores are posted and can be delayed/dropped under load;
-		 * an unmask that does not take effect leaves GEVNTSIZ's mask bit
-		 * stuck set from the IRQ handler.  Because the event IRQ is
-		 * edge-on-post, a stuck mask means no future edge is ever
-		 * delivered, the worker is never rescheduled, and the endpoint
-		 * wedges (observed on-core: GEVNTSIZ=0x80000400, GEVNTCOUNT
-		 * climbing, hwirq/evt frozen, sysworkq idle; a manual unmask from
-		 * an uncontended context recovered it every time).  Read the
-		 * register back and retry until the mask is actually clear.
-		 */
-		do {
-			sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0),
-				       UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
-			barrier_dmem_fence_full();
-		} while ((sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) &
-			  UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK) != 0U);
+	/*
+	 * Ring drained: allow further interrupts.  The unmask MUST be confirmed
+	 * landed.  On this SoC MMIO stores are posted and can be delayed/dropped
+	 * under load; an unmask that does not take effect leaves GEVNTSIZ's mask
+	 * bit stuck set from the IRQ handler.  Because the event IRQ is
+	 * edge-on-post, a stuck mask means no future edge is delivered, the
+	 * worker is never rescheduled, and the endpoint wedges (observed
+	 * on-core: GEVNTSIZ=0x80000400, GEVNTCOUNT climbing, hwirq/evt frozen; a
+	 * manual unmask recovered it every time).  Read the register back and
+	 * retry until the mask is actually clear.
+	 */
+	do {
+		sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0),
+			       UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+		barrier_dmem_fence_full();
+	} while ((sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) &
+		  UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK) != 0U);
 
-		/* Empty and unmasked: a future event-post will raise the IRQ. */
-		if (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) == 0U) {
-			return;
-		}
-
-		/*
-		 * An event posted during the unmask window.  The edge won't
-		 * re-fire for it, so re-mask and drain it here in-place.
-		 */
+	/*
+	 * If an event posted during the unmask window, the edge-on-post IRQ will
+	 * NOT re-fire for it.  Re-mask and resubmit so it is drained on the next
+	 * pass without relying on the IRQ.  We deliberately do NOT loop in place:
+	 * an unbounded in-place re-drain monopolises the CPU under a sustained
+	 * event rate (e.g. high-rate IN + UVC) and starves lower-priority threads
+	 * (observed: console "RX ring buffer full", shell unresponsive, log
+	 * output stalled — the device appears hung though ISRs still run).
+	 * Returning here yields the workqueue between passes so the endpoint
+	 * worker and shell make progress; the explicit resubmit (not the IRQ)
+	 * guarantees the slipped event is still serviced, so this cannot wedge.
+	 */
+	if (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0U) {
 		sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0),
 			     UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+		k_work_submit(&priv->event_work);
 	}
 }
 
@@ -4060,6 +4124,10 @@ static int udc_dwc3_enable(const struct device *const dev)
 	k_work_reschedule(&DEV_DATA(dev)->health_work,
 			  K_MSEC(CONFIG_UDC_DWC3_HEALTH_LOG_INTERVAL_MS));
 #endif
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
+			  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+#endif
 
 	return 0;
 }
@@ -4072,6 +4140,9 @@ static int udc_dwc3_disable(const struct device *const dev)
 
 #if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	k_work_cancel_delayable(&DEV_DATA(dev)->health_work);
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
 #endif
 
 	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
@@ -4249,6 +4320,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
 #if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 	k_work_init_delayable(&priv->health_work, udc_dwc3_health_worker);
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	k_work_init_delayable(&priv->in_poll_work, udc_dwc3_in_poll_worker);
 #endif
 
 	data->caps.rwup = false;
