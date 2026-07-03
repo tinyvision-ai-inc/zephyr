@@ -62,4 +62,11 @@ config UDC_DWC3_DMA_SLOT_DIAG
 	  uses, log DMA-SLOT lines, memset 0xA5 on IN enqueue (debug builds only),
 	  and dump slot history plus scrub fingerprints in stall_snapshot().
 
+config UDC_DWC3_XFER_TRACE
+	bool "Anomaly WRN logs for xfer_active / ring-reset / link-TRB hypothesis"
+	help
+	  Emit XFER-TRACE WRN lines when ring_reset or DepStartXfer runs while the
+	  link TRB is still HW-owned, when xfer_active clears with link_hwo set,
+	  or on other ring/HW desync suspects.  Intended for ACM+UVC soak debug.
+
 endif # UDC_DWC3
