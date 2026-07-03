@@ -1213,7 +1213,10 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 
 		if (bi->setup) {
 			if (ctrl_xfer_get_setup(uds_ctx, buf)) {
-				LOG_ERR("Malformed setup packet");
+				LOG_ERR("Malformed setup packet (len=%u, expect %zu)",
+					buf->len, sizeof(struct usb_setup_packet));
+				LOG_HEXDUMP_ERR(buf->data, MIN(buf->len, 16U),
+						"setup raw");
 				net_buf_unref(buf);
 				goto ctrl_xfer_stall;
 			}
