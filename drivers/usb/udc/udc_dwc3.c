@@ -748,6 +748,16 @@ struct udc_dwc3_ep_data {
 	bool xfer_active;
 	/* XFERCOMPLETE events to ignore after try_retire_chained_zlp() popped the ZLP */
 	uint8_t skip_xfer_done_count;
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	/* Grace state for the recovery poll: the tail slot last seen retire-
+	 * eligible (HWO cleared, buffer still pending) and whether that slot has
+	 * been eligible across a prior poll.  Used so the poll waits one interval
+	 * before reclaiming a completion, giving a merely-late (not lost) event
+	 * time to arrive first and avoiding a double-retire.
+	 */
+	uint32_t poll_grace_tail;
+	bool poll_grace_armed;
+#endif
 };
 
 #if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
@@ -1999,11 +2009,21 @@ static int udc_dwc3_ring_push_guard(struct udc_dwc3_ep_data *const ep_data)
  * is reset whenever the command completes.
  */
 
-static uint32_t udc_dwc3_depcmd(const struct device *const dev,
-				const uint32_t addr, const uint32_t cmd)
+/*
+ * Issue an endpoint command and wait for CMDACT to clear.  Returns the transfer
+ * resource index from the completion word; when cmderr is non-NULL it is set to
+ * true if the controller rejected the command (CMDERR).  Callers that re-issue a
+ * transfer doorbell use this to tell an accepted-but-unfetched command (dropped
+ * doorbell, retry) apart from a rejected one (e.g. StartXfer on an already
+ * running transfer, back off).
+ */
+static uint32_t udc_dwc3_depcmd_status(const struct device *const dev,
+				       const uint32_t addr, const uint32_t cmd,
+				       bool *const cmderr)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
+	bool err = false;
 
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 	do {
@@ -2014,13 +2034,25 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	case UDC_DWC3_DEPCMD_STATUS_OK:
 		break;
 	case UDC_DWC3_DEPCMD_STATUS_CMDERR:
+		err = true;
 		LOG_ERR("endpoint command failed");
 		break;
 	default:
+		err = true;
 		LOG_ERR("command failed with unknown status: 0x%08x", reg);
 	}
 
+	if (cmderr != NULL) {
+		*cmderr = err;
+	}
+
 	return FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
+}
+
+static uint32_t udc_dwc3_depcmd(const struct device *const dev,
+				const uint32_t addr, const uint32_t cmd)
+{
+	return udc_dwc3_depcmd_status(dev, addr, cmd, NULL);
 }
 
 static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
@@ -2230,6 +2262,90 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 	if (udc_dwc3_acm_diag_ep(ep_data->cfg.addr)) {
 		udc_dwc3_link_check(ep_data, "post-DepUpdateXfer");
 	}
+#endif
+}
+
+/*
+ * IN DepStartXfer doorbell verify-and-retry.
+ *
+ * Derived from the OUT run-dry recovery (udc_dwc3_out_rundry_restart).  On this
+ * IP a transfer-arming doorbell can be accepted (CMDACT clears, status OK) yet
+ * HW never fetches the owned TRB when the shared command/scheduler path is busy
+ * servicing the two RTL-driven UVC IN streams.  For CDC ACM IN every MPS-aligned
+ * packet is LST-terminated, so xfer_active drops and every packet re-arms with
+ * DepStartXfer -- one exposure per KB -- and a single dropped start strands the
+ * pipe permanently: HWO stays 1, no XferComplete is posted, and the class layer
+ * stops enqueuing (observed on-core, con5.out: ep 0x82 head=1 tail=0, tail TRB
+ * HWO=1, GEVNTCOUNT=0, host frozen at 24 KiB).
+ *
+ * The OUT side proved a re-issued doorbell "from a settled state" takes when
+ * done promptly and verified.  So immediately after DepStartXfer, confirm HW
+ * consumed the just-armed tail TRB (under a continuous host IN drain HWO clears
+ * within microseconds).  If it is still owned after a short settle, re-issue
+ * DepUpdateXfer -- the transfer resource is now allocated by the StartXfer, so
+ * UpdateXfer (a ring re-scan), not another StartXfer, is the correct nudge -- and
+ * re-verify.  This is deliberately inline and immediate: the earlier background
+ * poll re-kick fired milliseconds late and never recovered.  UpdateXfer against
+ * a transfer that is legitimately armed and merely waiting for the host is
+ * idempotent, so an over-issue during a host pause is harmless (the retry budget
+ * bounds the cost).  EndXfer+StartXfer is intentionally avoided: on this IP it
+ * corrupts the endpoint beyond even manual recovery (see out_rundry_restart).
+ */
+#define UDC_DWC3_INSTART_SETTLE_US     10U
+#define UDC_DWC3_INSTART_FAST_STEPS    8U
+#define UDC_DWC3_INSTART_REARM_RETRIES 6U
+#define UDC_DWC3_INSTART_SETTLE_STEPS  8U
+
+static atomic_t udc_dwc3_in_start_retook;
+static atomic_t udc_dwc3_in_start_exhausted;
+
+static void udc_dwc3_in_start_verify(const struct device *const dev,
+				     struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t tail = ep_data->tail;
+
+	/*
+	 * Fast path: HW usually fetches the armed TRB within a few microseconds
+	 * of the next host IN token, so poll briefly before deciding a doorbell
+	 * was dropped.  At real ACM data rates the per-packet cost of this window
+	 * is negligible; it only matters when a start is actually stranded.
+	 */
+	for (unsigned int step = 0U; step < UDC_DWC3_INSTART_FAST_STEPS; step++) {
+		if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
+			return;
+		}
+		k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
+	}
+
+	for (unsigned int attempt = 0U; attempt < UDC_DWC3_INSTART_REARM_RETRIES; attempt++) {
+		bool cmderr = false;
+
+		udc_dwc3_depcmd_status(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+				       UDC_DWC3_DEPCMD_DEPUPDXFER |
+				       FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
+						  ep_data->xferrscidx),
+				       &cmderr);
+
+		for (unsigned int step = 0U; step < UDC_DWC3_INSTART_SETTLE_STEPS; step++) {
+			k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
+			if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
+				atomic_inc(&udc_dwc3_in_start_retook);
+				return;
+			}
+		}
+
+		if (cmderr) {
+			/* The controller rejected the nudge, i.e. it already
+			 * considers the transfer running -- the TRB is armed and
+			 * waiting for the host, not stranded.  Stop poking it.
+			 */
+			return;
+		}
+	}
+
+	atomic_inc(&udc_dwc3_in_start_exhausted);
+#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
+	udc_dwc3_xfer_trace("IN-START-REARM", ep_data, "verify retries exhausted");
 #endif
 }
 
@@ -2489,6 +2605,15 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		udc_dwc3_xfer_trace("DEPSTART", ep_data, "post-DepStartXfer");
 #endif
+		/*
+		 * Confirm HW actually fetched the freshly-armed TRB; re-nudge if
+		 * the StartXfer doorbell was dropped under UVC-stream contention
+		 * (see udc_dwc3_in_start_verify).  IN only: OUT re-arm goes
+		 * through the run-dry path below.
+		 */
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+			udc_dwc3_in_start_verify(dev, ep_data);
+		}
 	} else {
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		if (ep_data->cfg.addr == 0x01) {
@@ -3391,31 +3516,106 @@ static unsigned udc_dwc3_retire_sw_done_eps(const struct device *const dev,
  */
 static atomic_t udc_dwc3_in_poll_recovered;
 
+static bool udc_dwc3_in_poll_slot_eligible(const struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t tail = ep_data->tail;
+
+	return ep_data->net_buf[tail] != NULL &&
+	       !udc_dwc3_trb_hwo(&ep_data->trb_buf[tail]);
+}
+
+/*
+ * Grace-gated reclaim of a single endpoint's dropped IN completion.
+ *
+ * The plain retire (udc_dwc3_retire_sw_done) fires as soon as HW has cleared
+ * HWO, which races a completion event that is merely late rather than lost: the
+ * poll pops the slot, then the real XferComplete arrives and hits an empty tail
+ * ("xfer-done ... empty TRB" error, seen in con5.out).  Wait until the same tail
+ * slot is still eligible a full poll interval later before reclaiming it -- by
+ * then a late event would have retired it -- then drain any further slots HW has
+ * already released (their events would have arrived alongside the first, so they
+ * are genuinely lost, not late).
+ */
+static unsigned udc_dwc3_in_poll_retire_ep(const struct device *const dev,
+					   struct udc_dwc3_ep_data *const ep_data)
+{
+	unsigned retired = 0U;
+
+	if (ep_data->trb_buf == NULL) {
+		return 0U;
+	}
+
+	if (!udc_dwc3_in_poll_slot_eligible(ep_data)) {
+		ep_data->poll_grace_armed = false;
+		return 0U;
+	}
+
+	if (!ep_data->poll_grace_armed || ep_data->poll_grace_tail != ep_data->tail) {
+		ep_data->poll_grace_armed = true;
+		ep_data->poll_grace_tail = ep_data->tail;
+		return 0U;
+	}
+
+	ep_data->poll_grace_armed = false;
+	while (udc_dwc3_retire_sw_done(dev, ep_data, "in-poll")) {
+		retired++;
+	}
+
+	return retired;
+}
+
+static unsigned udc_dwc3_in_poll_retire_graced(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	unsigned retired = 0U;
+
+	for (int i = 1; i < cfg->num_in_eps; i++) {
+		retired += udc_dwc3_in_poll_retire_ep(dev, &cfg->ep_data_in[i]);
+	}
+	for (int i = 1; i < cfg->num_out_eps; i++) {
+		retired += udc_dwc3_in_poll_retire_ep(dev, &cfg->ep_data_out[i]);
+	}
+
+	return retired;
+}
+
 static void udc_dwc3_in_poll_worker(struct k_work *const work)
 {
 	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
 	struct udc_dwc3_data *const priv =
 		CONTAINER_OF(dwork, struct udc_dwc3_data, in_poll_work);
 	const struct device *const dev = priv->dev;
-	const unsigned retired = udc_dwc3_retire_sw_done_eps(dev, "in-poll");
+	const unsigned retired = udc_dwc3_in_poll_retire_graced(dev);
 
 	if (retired > 0U) {
+		atomic_add(&udc_dwc3_in_poll_recovered, retired);
+	}
+
+	/*
+	 * Rate-limited health line covering all three IN recovery signals:
+	 *   lost-compl   - completions HW finished but never signalled (this poll)
+	 *   start-retook - StartXfer doorbells re-nudged into taking (inline)
+	 *   start-stuck  - StartXfer arms the inline verify could not recover
+	 * Emitted at most once per second and only when a counter advances.
+	 */
+	{
 		static int64_t last_log;
-		static atomic_t since_log;
-		const atomic_val_t total =
-			atomic_add(&udc_dwc3_in_poll_recovered, retired) + retired;
-		const atomic_val_t burst = atomic_add(&since_log, retired) + retired;
+		static atomic_val_t last_recovered;
+		static atomic_val_t last_retook;
+		static atomic_val_t last_stuck;
+		const atomic_val_t recovered = atomic_get(&udc_dwc3_in_poll_recovered);
+		const atomic_val_t retook = atomic_get(&udc_dwc3_in_start_retook);
+		const atomic_val_t stuck = atomic_get(&udc_dwc3_in_start_exhausted);
 		const int64_t now = k_uptime_get();
 
-		/* Rate-limit: this runs every few hundred us, so report at most
-		 * once per second with the count recovered since the last line
-		 * plus the cumulative total.
-		 */
-		if (now - last_log >= 1000) {
+		if ((recovered != last_recovered || retook != last_retook ||
+		     stuck != last_stuck) && (now - last_log >= 1000)) {
+			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld start-stuck=%ld",
+				(long)recovered, (long)retook, (long)stuck);
 			last_log = now;
-			atomic_clear(&since_log);
-			LOG_WRN("in-poll recovered dropped IN completions: +%ld (total %ld)",
-				(long)burst, (long)total);
+			last_recovered = recovered;
+			last_retook = retook;
+			last_stuck = stuck;
 		}
 	}
 
