@@ -1823,45 +1823,6 @@ static void udc_dwc3_trace_ring_reset_haz(struct udc_dwc3_ep_data *const ep_data
 	}
 }
 
-static unsigned udc_dwc3_evt_batch_uvc;
-static unsigned udc_dwc3_evt_batch_acm;
-
-static void udc_dwc3_trace_evt_note(const uint32_t evt)
-{
-	const uint32_t type = evt & GENMASK(7, 6);
-	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
-
-	if (type != (0x1 << 6) && type != (0x2 << 6)) {
-		return;
-	}
-
-	if (epn == 7 || epn == 9) {
-		udc_dwc3_evt_batch_uvc++;
-	} else if (epn == 2 || epn == 5) {
-		udc_dwc3_evt_batch_acm++;
-	}
-}
-
-static void udc_dwc3_trace_evt_batch_flush(const unsigned batch)
-{
-	if (batch < 16U) {
-		udc_dwc3_evt_batch_uvc = 0U;
-		udc_dwc3_evt_batch_acm = 0U;
-		return;
-	}
-
-	if (udc_dwc3_evt_batch_uvc >= 8U && udc_dwc3_evt_batch_acm == 0U) {
-		LOG_WRN("XFER-TRACE EVENT-MIX uvc=%u acm=0 batch=%u (H4 starvation?)",
-			udc_dwc3_evt_batch_uvc, batch);
-	} else if (udc_dwc3_evt_batch_uvc > 0U || udc_dwc3_evt_batch_acm > 0U) {
-		LOG_WRN("XFER-TRACE EVENT-MIX uvc=%u acm=%u batch=%u",
-			udc_dwc3_evt_batch_uvc, udc_dwc3_evt_batch_acm, batch);
-	}
-
-	udc_dwc3_evt_batch_uvc = 0U;
-	udc_dwc3_evt_batch_acm = 0U;
-}
-
 static void udc_dwc3_xfer_trace(const char *const tag,
 				struct udc_dwc3_ep_data *const ep_data,
 				const char *const detail)
@@ -3832,9 +3793,6 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
 		atomic_inc(&udc_dwc3_evt_count);
-#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
-		udc_dwc3_trace_evt_note(evt & UDC_DWC3_EVT_MASK);
-#endif
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
 		/* Move to next event entry for both hardware and software */
