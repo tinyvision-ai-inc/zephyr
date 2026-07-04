@@ -92,4 +92,19 @@ config UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US
 	  microseconds.  Lower values reduce worst-case IN latency on a dropped
 	  event at the cost of more workqueue wakeups.
 
+config UDC_DWC3_IN_START_ENDXFER_ESCALATE
+	bool "Escalate a stranded IN StartXfer to EndXfer(ForceRM)+StartXfer"
+	help
+	  When an IN DepStartXfer doorbell is accepted but the controller never
+	  fetches the owned TRB (confirmed on-core under two RTL-driven UVC IN
+	  streams: the tail TRB stays HWO=1 and re-issued DepUpdateXfer commands
+	  complete with no CMDERR yet do not resume it), the inline verify's
+	  UpdateXfer retry budget is exhausted with the pipe still wedged.
+
+	  Enable this to escalate that stranded-start case to the only remaining
+	  databook lever: EndTransfer(ForceRM) to drop the parked transfer
+	  resource, then a fresh StartXfer re-arming the same still-owned TRB.
+	  This is safe only for IN (device-paced); the OUT path deliberately does
+	  not use EndXfer+StartXfer because the restart races host-driven data.
+
 endif # UDC_DWC3

@@ -2298,6 +2298,59 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 
 static atomic_t udc_dwc3_in_start_retook;
 static atomic_t udc_dwc3_in_start_exhausted;
+static atomic_t udc_dwc3_in_start_recycled;
+
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+/*
+ * Last-resort recovery for a stranded IN DepStartXfer.
+ *
+ * When the UpdateXfer verify-and-retry budget is exhausted the transfer is
+ * parked in a way UpdateXfer cannot resume (confirmed on-core: DEPCMD shows the
+ * UpdateXfer completed with CMDACT clear and no CMDERR, yet the tail TRB stays
+ * HWO=1 and unfetched while the two RTL-driven UVC IN streams monopolise the
+ * controller scheduler).  The only remaining databook lever is to tear the
+ * transfer resource down with EndTransfer(ForceRM) and re-arm the same
+ * still-owned TRB with a fresh StartXfer.  Unlike OUT -- where EndXfer+StartXfer
+ * corrupts because the restart races host-driven incoming data -- IN is
+ * device-paced: the TRB is ours and merely awaiting a token, so a clean
+ * end+restart is safe.
+ *
+ * The ring pointers are deliberately left intact (unlike udc_dwc3_depcmd_end_xfer,
+ * which zeroes head/tail): the class layer is still waiting on this TRB's
+ * completion, so re-arming the same slot lets the normal XferComplete path retire
+ * it and keep bookkeeping in sync.
+ */
+#define UDC_DWC3_INSTART_RECYCLE_STEPS 16U
+
+static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
+					      struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t tail = ep_data->tail;
+
+	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			UDC_DWC3_DEPCMD_DEPENDXFER | UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+			FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx));
+
+	/*
+	 * Re-arm the same parked (still HWO=1) TRB.  StartXfer allocates a fresh
+	 * transfer resource and updates ep_data->xferrscidx.
+	 */
+	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, &ep_data->trb_buf[tail]);
+
+	for (unsigned int step = 0U; step < UDC_DWC3_INSTART_RECYCLE_STEPS; step++) {
+		k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
+		if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
+			atomic_inc(&udc_dwc3_in_start_recycled);
+			return;
+		}
+	}
+
+	atomic_inc(&udc_dwc3_in_start_exhausted);
+#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
+	udc_dwc3_xfer_trace("IN-START-RECYCLE", ep_data, "endxfer+start failed");
+#endif
+}
+#endif /* CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE */
 
 static void udc_dwc3_in_start_verify(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data)
@@ -2343,9 +2396,14 @@ static void udc_dwc3_in_start_verify(const struct device *const dev,
 		}
 	}
 
-	atomic_inc(&udc_dwc3_in_start_exhausted);
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 	udc_dwc3_xfer_trace("IN-START-REARM", ep_data, "verify retries exhausted");
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	/* UpdateXfer is a dead lever here; escalate to EndXfer(ForceRM)+StartXfer. */
+	udc_dwc3_in_start_endxfer_recycle(dev, ep_data);
+#else
+	atomic_inc(&udc_dwc3_in_start_exhausted);
 #endif
 }
 
@@ -3595,26 +3653,32 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 	 * Rate-limited health line covering all three IN recovery signals:
 	 *   lost-compl   - completions HW finished but never signalled (this poll)
 	 *   start-retook - StartXfer doorbells re-nudged into taking (inline)
-	 *   start-stuck  - StartXfer arms the inline verify could not recover
+	 *   start-recycled - stranded starts recovered via EndXfer(ForceRM)+StartXfer
+	 *   start-stuck  - StartXfer arms no lever could recover
 	 * Emitted at most once per second and only when a counter advances.
 	 */
 	{
 		static int64_t last_log;
 		static atomic_val_t last_recovered;
 		static atomic_val_t last_retook;
+		static atomic_val_t last_recycled;
 		static atomic_val_t last_stuck;
 		const atomic_val_t recovered = atomic_get(&udc_dwc3_in_poll_recovered);
 		const atomic_val_t retook = atomic_get(&udc_dwc3_in_start_retook);
+		const atomic_val_t recycled = atomic_get(&udc_dwc3_in_start_recycled);
 		const atomic_val_t stuck = atomic_get(&udc_dwc3_in_start_exhausted);
 		const int64_t now = k_uptime_get();
 
 		if ((recovered != last_recovered || retook != last_retook ||
-		     stuck != last_stuck) && (now - last_log >= 1000)) {
-			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld start-stuck=%ld",
-				(long)recovered, (long)retook, (long)stuck);
+		     recycled != last_recycled || stuck != last_stuck) &&
+		    (now - last_log >= 1000)) {
+			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld "
+				"start-recycled=%ld start-stuck=%ld",
+				(long)recovered, (long)retook, (long)recycled, (long)stuck);
 			last_log = now;
 			last_recovered = recovered;
 			last_retook = retook;
+			last_recycled = recycled;
 			last_stuck = stuck;
 		}
 	}
