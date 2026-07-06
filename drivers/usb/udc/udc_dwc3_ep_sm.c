@@ -161,7 +161,12 @@ static void udc_dwc3_sm_out_update_verify(const struct device *dev,
 		}
 	}
 
-	LOG_WRN("EP-SM: OUT-RUNDRY ep=0x%02x update verify exhausted", ep_data->cfg.addr);
+	LOG_WRN("EP-SM: OUT-RUNDRY ep=0x%02x update verify exhausted tail=%u "
+		"ctl=0x%08x sts=0x%08x hwo=%d head=%u active=%d",
+		ep_data->cfg.addr, tail, ep_data->trb_buf[tail].ctrl,
+		ep_data->trb_buf[tail].status,
+		udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail]) ? 1 : 0,
+		ep_data->head, ep_data->xfer_active);
 }
 
 int udc_dwc3_doorbell_issue(const struct device *dev,
@@ -292,6 +297,19 @@ void udc_dwc3_ep_advance(const struct device *dev,
 	/* Poll path uses grace gating inside poll_all. */
 	if (reason == UDC_DWC3_EP_ADV_POLL) {
 		(void)udc_dwc3_sm_poll_ep(dev, ep_data);
+		return;
+	}
+
+	/*
+	 * DEPEVT hint: retire every tail slot HW has released (HWO=0) with a
+	 * matching net_buf.  Duplicate/late events find tail already advanced
+	 * with NULL buf — handled in ep_sm_depevt() before we get here.
+	 */
+	if (reason == UDC_DWC3_EP_ADV_DEPEVT) {
+		while (udc_dwc3_sm_retire_tail(dev, ep_data, via)) {
+			;
+		}
+		udc_dwc3_int_submit_ep_work(ep_data);
 	}
 }
 
@@ -382,9 +400,27 @@ bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 	const bool from_inprog = ((evt & GENMASK(7, 6)) == (0x2U << 6));
 	const uint32_t tail = ep_data->tail;
 	const bool hwo = udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail]);
+	const bool had_buf = ep_data->net_buf[tail] != NULL;
+
+	if (ep_data->skip_xfer_done_count > 0U) {
+		return false;
+	}
+
+	/*
+	 * HWO-first: DEPEVT does not name a TRB slot — tail is SW's best guess.
+	 * If tail has no net_buf and HWO is clear, HW and SW already agree the
+	 * slot was retired (late/duplicate hint after poll or a prior completion).
+	 */
+	if (!had_buf && !hwo) {
+		LOG_DBG("EP-SM: DEPEVT-DUP-HINT ep=0x%02x evt=0x%08x inprog=%d "
+			"tail=%u",
+			ep_data->cfg.addr, evt, from_inprog, tail);
+		udc_dwc3_int_submit_ep_work(ep_data);
+		return true;
+	}
 
 #if defined(CONFIG_UDC_DWC3_EP_SM_LOG_UNMATCHED)
-	if (ep_data->net_buf[tail] == NULL && ep_data->skip_xfer_done_count == 0U) {
+	if (!had_buf) {
 		LOG_WRN("EP-SM: UNMATCHED-DEPEVT ep=0x%02x evt=0x%08x inprog=%d "
 			"state=%d tail=%u hwo=%d",
 			ep_data->cfg.addr, evt, from_inprog, ep_data->sm.state,
@@ -393,12 +429,14 @@ bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 		LOG_WRN("EP-SM: DEPEVT-HWO ep=0x%02x evt=0x%08x state=%d tail=%u",
 			ep_data->cfg.addr, evt, ep_data->sm.state, tail);
 	}
-#else
-	ARG_UNUSED(from_inprog);
-	ARG_UNUSED(hwo);
-	ARG_UNUSED(tail);
 #endif
 
 	udc_dwc3_ep_advance(dev, ep_data, UDC_DWC3_EP_ADV_DEPEVT);
-	return false;
+
+	/* Tail still HWO=1 with a buffer: norm handles DONE-HWO defer. */
+	if (had_buf && hwo) {
+		return false;
+	}
+
+	return true;
 }

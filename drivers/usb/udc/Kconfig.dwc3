@@ -69,6 +69,13 @@ config UDC_DWC3_XFER_TRACE
 	  link TRB is still HW-owned, when xfer_active clears with link_hwo set,
 	  or on other ring/HW desync suspects.  Intended for ACM+UVC soak debug.
 
+config UDC_DWC3_WEDGE_LOG
+	bool "Compact WEDGE snapshots on ACM/UVC concurrent failure paths"
+	help
+	  On rare wedge paths (empty TRB xfer-done, OUT run-dry verify exhausted,
+	  etc.) emit a short per-EP ring summary and full stall_snapshot().  Much
+	  less chatty than CONFIG_UDC_DWC3_XFER_TRACE for short soak iterations.
+
 config UDC_DWC3_IN_COMPLETION_POLL
 	bool "Periodic SW-retire poll to recover dropped IN completions"
 	help

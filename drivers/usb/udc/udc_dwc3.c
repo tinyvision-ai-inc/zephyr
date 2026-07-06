@@ -2900,6 +2900,12 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	udc_dwc3_next_ctrl(dev, ep_data);
 }
 
+#if defined(CONFIG_UDC_DWC3_WEDGE_LOG)
+static void udc_dwc3_wedge_snap(const struct device *const dev,
+				struct udc_dwc3_ep_data *const ep_data,
+				const char *const reason);
+#endif
+
 static void udc_dwc3_on_xfer_not_ready(const struct device *const dev,
 				       const uint32_t evt)
 {
@@ -2977,6 +2983,14 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 			ep_data->skip_xfer_done_count--;
 			LOG_DBG("EP 0x%02x: suppress spurious xfer-done (remain %u)",
 				ep_data->cfg.addr, ep_data->skip_xfer_done_count);
+#if defined(CONFIG_UDC_DWC3_WEDGE_LOG)
+			if (ep_data->skip_xfer_done_count == 0U &&
+			    udc_dwc3_ep_sm_is_cpu(ep_data)) {
+				LOG_WRN("WEDGE spur-done-done ep=0x%02x via=%s link_hwo=%d",
+					ep_data->cfg.addr, from_inprog ? "inprog" : "complete",
+					udc_dwc3_link_trb_hwo(ep_data));
+			}
+#endif
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 			if (ep_data->cfg.addr == 0x01) {
 				udc_dwc3_xfer_trace("OUT-SPUR-DONE", ep_data,
@@ -2991,6 +3005,28 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 			k_work_submit(&ep_data->work);
 			return;
 		}
+
+		/*
+		 * HWO-first: empty net_buf at tail with HWO clear means the slot
+		 * was already retired — late/duplicate DEPEVT (see poll grace note
+		 * in udc_dwc3_in_poll_retire_ep).  Not ENOBUFS.
+		 */
+		if (!udc_dwc3_trb_hwo(trb)) {
+			LOG_DBG("EP 0x%02x: duplicate DEPEVT hint at tail %u (inprog=%d)",
+				ep_data->cfg.addr, ep_data->tail, from_inprog);
+			k_work_submit(&ep_data->work);
+			return;
+		}
+
+#if defined(CONFIG_UDC_DWC3_WEDGE_LOG)
+		if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+			udc_dwc3_wedge_snap(dev, ep_data,
+					    from_inprog ? "done-empty-inprog" : "done-empty");
+			atomic_inc(&udc_dwc3_enobufs_count);
+			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+			return;
+		}
+#endif
 
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		if (ep_data->cfg.addr == 0x01) {
@@ -3393,7 +3429,9 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_note_depevt(evt, false);
 		LOG_DBG("DEPEVT_XFERCOMPLETE");
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-		(void)udc_dwc3_ep_sm_depevt(dev, evt);
+		if (udc_dwc3_ep_sm_depevt(dev, evt)) {
+			break;
+		}
 #endif
 		udc_dwc3_on_xfer_done_norm(dev, evt);
 		break;
@@ -3413,7 +3451,9 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		} else {
 			LOG_DBG("DEPEVT_XFERINPROGRESS epn=%u OUT", epn);
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-			(void)udc_dwc3_ep_sm_depevt(dev, evt);
+			if (udc_dwc3_ep_sm_depevt(dev, evt)) {
+				break;
+			}
 #endif
 			udc_dwc3_on_xfer_done_norm(dev, evt);
 		}
@@ -3820,6 +3860,44 @@ static void udc_dwc3_dma_slot_dump_stall(const struct device *const dev)
 	}
 }
 #endif /* CONFIG_UDC_DWC3_DMA_SLOT_DIAG */
+
+#if defined(CONFIG_UDC_DWC3_WEDGE_LOG)
+void udc_dwc3_stall_snapshot(const struct device *const dev);
+
+static void udc_dwc3_wedge_snap_ep(struct udc_dwc3_ep_data *const ep_data,
+				   const char *const reason)
+{
+	const uint32_t tail = ep_data->tail;
+	const volatile struct udc_dwc3_trb *const t = &ep_data->trb_buf[tail];
+	const bool hwo = !!(t->ctrl & UDC_DWC3_TRB_CTRL_HWO);
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	LOG_WRN("WEDGE %s ep=0x%02x head=%u tail=%u full=%d active=%d sm=%d "
+		"skip=%u chain=%p",
+		reason, ep_data->cfg.addr, ep_data->head, tail, ep_data->full,
+		ep_data->xfer_active, (int)ep_data->sm.state,
+		ep_data->skip_xfer_done_count, (void *)ep_data->chain_buf);
+#else
+	LOG_WRN("WEDGE %s ep=0x%02x head=%u tail=%u full=%d active=%d skip=%u "
+		"chain=%p",
+		reason, ep_data->cfg.addr, ep_data->head, tail, ep_data->full,
+		ep_data->xfer_active, ep_data->skip_xfer_done_count,
+		(void *)ep_data->chain_buf);
+#endif
+	LOG_WRN("WEDGE %s ep=0x%02x tail[%u] ctl=0x%08x sts=0x%08x hwo=%d "
+		"buf=%p",
+		reason, ep_data->cfg.addr, tail, t->ctrl, t->status, hwo,
+		(void *)ep_data->net_buf[tail]);
+}
+
+static void udc_dwc3_wedge_snap(const struct device *const dev,
+				struct udc_dwc3_ep_data *const ep_data,
+				const char *const reason)
+{
+	udc_dwc3_wedge_snap_ep(ep_data, reason);
+	udc_dwc3_stall_snapshot(dev);
+}
+#endif /* CONFIG_UDC_DWC3_WEDGE_LOG */
 
 void udc_dwc3_stall_snapshot(const struct device *const dev)
 {
