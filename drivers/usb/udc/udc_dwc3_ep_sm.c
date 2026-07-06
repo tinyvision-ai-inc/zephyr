@@ -29,6 +29,7 @@ struct udc_dwc3_ep_data {
 	uint32_t tail;
 	uint32_t total;
 	bool full;
+	uint32_t xferrscidx;
 	struct net_buf *chain_buf;
 	bool absorb_cdc_zlp;
 	bool xfer_active;
@@ -323,13 +324,14 @@ unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev)
 bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 {
 	struct udc_dwc3_ep_data *ep_data = udc_dwc3_int_ep_from_evt(dev, evt);
-	const bool from_inprog = ((evt & GENMASK(7, 6)) == (0x2U << 6));
-	const uint32_t tail = ep_data->tail;
-	const bool hwo = udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail]);
 
 	if (!udc_dwc3_ep_sm_is_cpu(ep_data)) {
 		return false;
 	}
+
+	const bool from_inprog = ((evt & GENMASK(7, 6)) == (0x2U << 6));
+	const uint32_t tail = ep_data->tail;
+	const bool hwo = udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail]);
 
 #if defined(CONFIG_UDC_DWC3_EP_SM_LOG_UNMATCHED)
 	if (ep_data->net_buf[tail] == NULL && ep_data->skip_xfer_done_count == 0U) {
