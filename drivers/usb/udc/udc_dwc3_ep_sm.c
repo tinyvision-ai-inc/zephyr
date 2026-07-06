@@ -80,6 +80,38 @@ static const char *udc_dwc3_sm_reason_str(enum udc_dwc3_ep_adv_reason reason)
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+static const char *udc_dwc3_sm_state_str(enum udc_dwc3_ep_sm_state state)
+{
+	switch (state) {
+	case UDC_DWC3_EP_SM_IDLE:
+		return "idle";
+	case UDC_DWC3_EP_SM_ACTIVE:
+		return "active";
+	case UDC_DWC3_EP_SM_HALTED:
+		return "halted";
+	case UDC_DWC3_EP_SM_CLEAR_PENDING:
+		return "clear_pending";
+	default:
+		return "?";
+	}
+}
+
+static const char *udc_dwc3_sm_doorbell_str(enum udc_dwc3_doorbell_cmd cmd)
+{
+	switch (cmd) {
+	case UDC_DWC3_DB_START:
+		return "start";
+	case UDC_DWC3_DB_UPDATE:
+		return "update";
+	case UDC_DWC3_DB_UPDATE_VERIFY:
+		return "update_verify";
+	default:
+		return "?";
+	}
+}
+#endif
+
 
 static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 					struct udc_dwc3_ep_data *ep_data)
@@ -139,6 +171,14 @@ int udc_dwc3_doorbell_issue(const struct device *dev,
 	if (!udc_dwc3_ep_sm_is_cpu(ep_data)) {
 		return -ENOTSUP;
 	}
+
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+	if (!udc_dwc3_int_bulk_eps_live(dev)) {
+		LOG_WRN("EP-SM: DOORBELL-PREMATURE ep=0x%02x cmd=%s live=0 state=%s",
+			ep_data->cfg.addr, udc_dwc3_sm_doorbell_str(cmd),
+			udc_dwc3_sm_state_str(ep_data->sm.state));
+	}
+#endif
 
 	switch (cmd) {
 	case UDC_DWC3_DB_START:
@@ -216,6 +256,12 @@ void udc_dwc3_ep_advance(const struct device *dev,
 
 	if ((reason == UDC_DWC3_EP_ADV_DEPEVT || reason == UDC_DWC3_EP_ADV_POLL) &&
 	    !udc_dwc3_int_bulk_eps_live(dev)) {
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+		LOG_WRN("EP-SM: ADVANCE-BLOCKED ep=0x%02x via=%s live=0 state=%s "
+			"active=%d",
+			ep_data->cfg.addr, via, udc_dwc3_sm_state_str(ep_data->sm.state),
+			ep_data->xfer_active);
+#endif
 		return;
 	}
 
@@ -311,11 +357,25 @@ bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 {
 	struct udc_dwc3_ep_data *ep_data = udc_dwc3_int_ep_from_evt(dev, evt);
 
-	if (!udc_dwc3_int_bulk_eps_live(dev) || !udc_dwc3_ep_sm_is_cpu(ep_data)) {
+	if (!udc_dwc3_int_bulk_eps_live(dev)) {
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+		if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+			LOG_WRN("EP-SM: DEPEVT-PREMATURE ep=0x%02x evt=0x%08x live=0",
+				ep_data->cfg.addr, evt);
+		}
+#endif
+		return false;
+	}
+
+	if (!udc_dwc3_ep_sm_is_cpu(ep_data)) {
 		return false;
 	}
 
 	if (!ep_data->xfer_active && ep_data->sm.state == UDC_DWC3_EP_SM_IDLE) {
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+		LOG_DBG("EP-SM: DEPEVT-IDLE-SKIP ep=0x%02x evt=0x%08x",
+			ep_data->cfg.addr, evt);
+#endif
 		return false;
 	}
 

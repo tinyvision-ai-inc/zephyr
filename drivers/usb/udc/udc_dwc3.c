@@ -2636,6 +2636,9 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 # if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 	k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
 # endif
+# if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+	LOG_WRN("EP-SM: USBRST bulk_eps_live=0 poll stopped");
+# endif
 #endif
 }
 
@@ -3963,11 +3966,18 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 &&
-	    atomic_dec(&DEV_DATA(dev)->bulk_eps_live) == 1) {
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		const atomic_val_t live = atomic_dec(&DEV_DATA(dev)->bulk_eps_live);
+
+		if (live == 0) {
 # if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
-		k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
+			k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
 # endif
+# if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+			LOG_WRN("EP-SM: last bulk ep=0x%02x live=0 poll stop",
+				ep_data->cfg.addr);
+# endif
+		}
 	}
 #endif
 
@@ -4274,6 +4284,9 @@ static int udc_dwc3_enable(const struct device *const dev)
 #endif
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	atomic_set(&DEV_DATA(dev)->bulk_eps_live, 0);
+# if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+	LOG_INF("EP-SM: udc_enable bulk_eps_live=0 poll deferred");
+# endif
 #endif
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) && !defined(CONFIG_UDC_DWC3_EP_SM)
 	k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
@@ -4338,11 +4351,19 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	/* Walk through the list of buffer to enqueue we might have blocked */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-		if (atomic_inc(&DEV_DATA(dev)->bulk_eps_live) == 1) {
+		{
+			const atomic_val_t live = atomic_inc(&DEV_DATA(dev)->bulk_eps_live);
+
+			if (live == 1) {
 # if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
-			k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
-				K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+				k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
+					K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
 # endif
+# if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
+				LOG_WRN("EP-SM: first bulk ep=0x%02x live=%ld poll start",
+					ep_data->cfg.addr, (long)live);
+# endif
+			}
 		}
 #endif
 		k_work_submit(&ep_data->work);

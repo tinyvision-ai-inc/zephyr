@@ -105,6 +105,16 @@ config UDC_DWC3_EP_SM_LOG_UNMATCHED
 	depends on UDC_DWC3_EP_SM
 	default y
 
+config UDC_DWC3_EP_SM_LOG_PHASE
+	bool "Log EP-SM enumeration phase transitions and premature SM activity"
+	depends on UDC_DWC3_EP_SM
+	default y
+	help
+	  Emit WRN/INF lines when bulk_eps_live changes (enable, reset, first
+	  bulk ep enable, last bulk ep disable) and when doorbell/advance/depevt
+	  would touch CPU bulk endpoints before configuration.  Any premature
+	  line during SET_ADDRESS is a smoking gun for enumeration wedges.
+
 config UDC_DWC3_IN_START_ENDXFER_ESCALATE
 	bool "Escalate a stranded IN StartXfer to EndXfer(ForceRM)+StartXfer"
 	help
