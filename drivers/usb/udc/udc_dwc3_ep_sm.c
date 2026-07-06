@@ -357,9 +357,15 @@ unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev)
 		if ((recovered != last_recovered || retook != last_retook ||
 		     recycled != last_recycled || stuck != last_stuck) &&
 		    (now - last_log >= 1000)) {
+#if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
 			LOG_WRN("ep-sm-recovery: lost-compl=%ld start-retook=%ld "
 				"start-recycled=%ld start-stuck=%ld",
 				(long)recovered, (long)retook, (long)recycled, (long)stuck);
+#else
+			LOG_DBG("ep-sm-recovery: lost-compl=%ld start-retook=%ld "
+				"start-recycled=%ld start-stuck=%ld",
+				(long)recovered, (long)retook, (long)recycled, (long)stuck);
+#endif
 			last_log = now;
 			last_recovered = recovered;
 			last_retook = retook;

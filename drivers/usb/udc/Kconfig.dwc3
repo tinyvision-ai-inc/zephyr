@@ -102,20 +102,22 @@ config UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US
 config UDC_DWC3_EP_SM
 	bool "HWO-ground-truth state machine for CPU bulk endpoints"
 	default y
+	select UDC_DWC3_IN_COMPLETION_POLL
 	help
 	  Unified per-endpoint state machine for CPU-terminated bulk endpoints
 	  (ACM IN/OUT, etc.).  HWO on the tail TRB is ground truth; DEPEVT and
 	  periodic poll are hints.  RTL-offloaded UVC IN endpoints bypass this.
+	  Implies IN_COMPLETION_POLL for the shared periodic HWO poll worker.
 
 config UDC_DWC3_EP_SM_LOG_UNMATCHED
 	bool "Log DEPEVT without matching CPU-EP SM expectation"
 	depends on UDC_DWC3_EP_SM
-	default y
+	default n
 
 config UDC_DWC3_EP_SM_LOG_PHASE
 	bool "Log EP-SM enumeration phase transitions and premature SM activity"
 	depends on UDC_DWC3_EP_SM
-	default y
+	default n
 	help
 	  Emit WRN/INF lines when bulk_eps_live changes (enable, reset, first
 	  bulk ep enable, last bulk ep disable) and when doorbell/advance/depevt
