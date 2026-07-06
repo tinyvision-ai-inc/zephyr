@@ -92,6 +92,19 @@ config UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US
 	  microseconds.  Lower values reduce worst-case IN latency on a dropped
 	  event at the cost of more workqueue wakeups.
 
+config UDC_DWC3_EP_SM
+	bool "HWO-ground-truth state machine for CPU bulk endpoints"
+	default y
+	help
+	  Unified per-endpoint state machine for CPU-terminated bulk endpoints
+	  (ACM IN/OUT, etc.).  HWO on the tail TRB is ground truth; DEPEVT and
+	  periodic poll are hints.  RTL-offloaded UVC IN endpoints bypass this.
+
+config UDC_DWC3_EP_SM_LOG_UNMATCHED
+	bool "Log DEPEVT without matching CPU-EP SM expectation"
+	depends on UDC_DWC3_EP_SM
+	default y
+
 config UDC_DWC3_IN_START_ENDXFER_ESCALATE
 	bool "Escalate a stranded IN StartXfer to EndXfer(ForceRM)+StartXfer"
 	help

@@ -25,6 +25,7 @@
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
+#include "udc_dwc3_int.h"
 
 static atomic_t udc_dwc3_hwirq_count;
 static atomic_t udc_dwc3_poll_count;
@@ -56,6 +57,15 @@ static atomic_t udc_dwc3_ep0_stage_fixed;
 static atomic_t udc_dwc3_ep0_stage_mismatch;
 static atomic_t udc_dwc3_ep0_setuppending;
 static atomic_t udc_dwc3_ep0_trb_err;
+
+/* IN endpoints re-armed with a fresh StartXfer after CLEAR_FEATURE(HALT). */
+static atomic_t udc_dwc3_clrhalt_rearm;
+/* IN endpoints force-restarted at UVC stream handoff (RTL UpdateXfer wedge). */
+static atomic_t udc_dwc3_in_stream_rearm;
+
+typedef void (*lattice_usb23_in_halt_fn)(const struct device *usb_dev, uint8_t ep_addr);
+static lattice_usb23_in_halt_fn lattice_in_halt_cb;
+static lattice_usb23_in_halt_fn lattice_in_clear_halt_cb;
 
 static struct usb_setup_packet udc_dwc3_dbg_setup;
 static bool udc_dwc3_dbg_setup_valid;
@@ -682,12 +692,7 @@ static void udc_dwc3_reset_depevt_counts(void)
  * software driver. If the architecture involves cache, it must be flushed before accessing
  * this memory region.
  */
-struct udc_dwc3_trb {
-	uint32_t addr_lo;
-	uint32_t addr_hi;
-	uint32_t status;
-	uint32_t ctrl;
-} __packed __aligned(16);
+/* struct udc_dwc3_trb — defined in udc_dwc3_int.h */
 
 /*
  * Controller configuration items that can remain in non-volatile memory
@@ -748,22 +753,13 @@ struct udc_dwc3_ep_data {
 	bool xfer_active;
 	/* XFERCOMPLETE events to ignore after try_retire_chained_zlp() popped the ZLP */
 	uint8_t skip_xfer_done_count;
-#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
-	/* Grace state for the recovery poll: the tail slot last seen retire-
-	 * eligible (HWO cleared, buffer still pending) and whether that slot has
-	 * been eligible across a prior poll.  Used so the poll waits one interval
-	 * before reclaiming a completion, giving a merely-late (not lost) event
-	 * time to arrive first and avoiding a double-retire.
-	 */
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	struct udc_dwc3_ep_sm sm;
+#elif defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;
 #endif
 };
-
-#if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
-static void udc_dwc3_out_ghost_sram_dump(struct udc_dwc3_ep_data *const ep_data,
-					 const char *const where);
-#endif
 
 /*
  * Data of each instance of the driver, that can be read and written to.
@@ -1242,335 +1238,6 @@ static void udc_dwc3_trb_cmp_log_slot(const char *const where, const uint32_t id
 	}
 }
 
-static bool udc_dwc3_out_slot_ghost_like(const struct udc_dwc3_ep_data *const ep_data,
-					 const uint32_t idx)
-{
-	const volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[idx];
-
-	if (ep_data->net_buf[idx] != NULL) {
-		return false;
-	}
-
-	if (trb->ctrl == 0U && trb->addr_lo == 0U && trb->status == 0U) {
-		return false;
-	}
-
-	if (trb->addr_lo == LO32((uintptr_t)ep_data->trb_buf)) {
-		return false;
-	}
-
-	return true;
-}
-
-/*
- * Re-read TRB metadata to see if ghost/corrupt slots are stable in SRAM.
- * Logs CONFIRMED (both reads match) or TRANSIENT (reads differ).
- */
-static void udc_dwc3_out_ghost_confirm_slot(const struct udc_dwc3_ep_data *const ep_data,
-					    const char *const where,
-					    const uint32_t idx)
-{
-	const volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[idx];
-	struct udc_dwc3_trb_snap r1;
-	struct udc_dwc3_trb_snap r2;
-	const bool ghost_like = udc_dwc3_out_slot_ghost_like(ep_data, idx);
-
-	udc_dwc3_trb_snap_read(trb, &r1);
-	udc_dwc3_trb_snap_read(trb, &r2);
-
-	LOG_WRN("OUT-GHOST %s [%u] ghost_like=%d buf=%p data=%p "
-		"r1 ctl=0x%08x sts=0x%08x addr=0x%08x "
-		"r2 ctl=0x%08x sts=0x%08x addr=0x%08x %s",
-		where, idx, ghost_like, (void *)ep_data->net_buf[idx],
-		udc_dwc3_net_buf_data(ep_data->net_buf[idx]),
-		r1.ctrl, r1.status, r1.addr_lo,
-		r2.ctrl, r2.status, r2.addr_lo,
-		udc_dwc3_trb_snap_equal(&r1, &r2) ? "CONFIRMED" : "TRANSIENT");
-}
-
-static void udc_dwc3_out_ghost_confirm_ring(const struct udc_dwc3_ep_data *const ep_data,
-					    const char *const where)
-{
-	const uint32_t li = CONFIG_UDC_DWC3_TRB_NUM - 1U;
-	uint32_t ghost_like = 0U;
-
-	for (uint32_t i = 0; i < li; i++) {
-		if (udc_dwc3_out_slot_ghost_like(ep_data, i)) {
-			ghost_like++;
-			udc_dwc3_out_ghost_confirm_slot(ep_data, where, i);
-		}
-	}
-
-	if (ghost_like == 0U) {
-		LOG_WRN("OUT-GHOST %s no ghost-like data slots (head=%u tail=%u)",
-			where, ep_data->head, ep_data->tail);
-		udc_dwc3_out_ghost_confirm_slot(ep_data, where, ep_data->tail);
-	} else {
-		LOG_WRN("OUT-GHOST %s ring summary ghost_like=%u head=%u tail=%u",
-			where, ghost_like, ep_data->head, ep_data->tail);
-	}
-
-#if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
-	if (ghost_like > 0U) {
-		udc_dwc3_out_ghost_sram_dump((struct udc_dwc3_ep_data *)ep_data, where);
-	}
-#endif
-}
-
-#if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
-#define UDC_DWC3_SRAM_HEXDUMP_LINE 16U
-#define UDC_DWC3_GHOST_LANDING_CTX 64U
-
-static bool udc_dwc3_ghost_sram_dump_done;
-
-static bool udc_dwc3_dma_in_sram(const uintptr_t dma)
-{
-	return UDC_DWC3_DMA_SRAM_SIZE != 0U &&
-	       dma >= UDC_DWC3_DMA_SRAM_BASE &&
-	       dma < UDC_DWC3_DMA_SRAM_BASE + UDC_DWC3_DMA_SRAM_SIZE;
-}
-
-static uintptr_t udc_dwc3_snap_dma_target(const struct udc_dwc3_trb_snap *const snap)
-{
-	return (uintptr_t)(((uint64_t)snap->addr_hi << 32) | snap->addr_lo);
-}
-
-static void udc_dwc3_hexdump_bytes(const char *const tag, const uint8_t *const bytes,
-				   const size_t len)
-{
-	char line[4 * UDC_DWC3_SRAM_HEXDUMP_LINE + 1];
-
-	for (size_t off = 0; off < len; off += UDC_DWC3_SRAM_HEXDUMP_LINE) {
-		const size_t n = MIN(len - off, UDC_DWC3_SRAM_HEXDUMP_LINE);
-		size_t pos = 0;
-
-		for (size_t i = 0; i < n && pos + 3 < sizeof(line); i++) {
-			pos += snprintk(&line[pos], sizeof(line) - pos, "%02x ", bytes[off + i]);
-		}
-
-		line[pos] = '\0';
-		LOG_WRN("%s +%04zx %s", tag, off, line);
-	}
-}
-
-static void udc_dwc3_hexdump_ring_diff(const uint8_t *const act, const uint8_t *const exp,
-				       const size_t len)
-{
-	for (size_t off = 0; off < len; off += 16U) {
-		if (memcmp(act + off, exp + off, 16U) == 0) {
-			continue;
-		}
-
-		LOG_WRN("SRAM-RING-DIFF slot +%04zx", off);
-		udc_dwc3_hexdump_bytes("           EXP", exp + off, 16U);
-		udc_dwc3_hexdump_bytes("           ACT", act + off, 16U);
-	}
-}
-
-static void udc_dwc3_trb_ring_expect_actual_dump(struct udc_dwc3_ep_data *const ep_data,
-						 const char *const where)
-{
-	const size_t ring_len = CONFIG_UDC_DWC3_TRB_NUM * sizeof(struct udc_dwc3_trb);
-	uint8_t act_ring[CONFIG_UDC_DWC3_TRB_NUM * sizeof(struct udc_dwc3_trb)];
-	uint8_t exp_ring[CONFIG_UDC_DWC3_TRB_NUM * sizeof(struct udc_dwc3_trb)];
-	bool ring_mismatch = false;
-
-	LOG_WRN("TRB-RING-CMP %s ep=0x%02x ring=0x%08x head=%u tail=%u",
-		where, ep_data->cfg.addr, (uint32_t)(uintptr_t)ep_data->trb_buf,
-		ep_data->head, ep_data->tail);
-
-	for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
-		struct udc_dwc3_trb_snap actual;
-		struct udc_dwc3_trb_snap expect;
-		const uintptr_t meta = (uintptr_t)&ep_data->trb_buf[i];
-		struct net_buf *const buf = ep_data->net_buf[i];
-		const char *mark = "";
-
-		if (i == ep_data->head) {
-			mark = " HEAD";
-		} else if (i == ep_data->tail) {
-			mark = ep_data->full ? " TAIL+FULL" : " TAIL";
-		}
-
-		udc_dwc3_trb_snap_read(&ep_data->trb_buf[i], &actual);
-		udc_dwc3_expected_trb_snap(ep_data, i, &expect);
-		udc_dwc3_trb_snap_pack(&actual, &act_ring[i * 16U]);
-		udc_dwc3_trb_snap_pack(&expect, &exp_ring[i * 16U]);
-
-		if (!udc_dwc3_trb_snap_equal(&actual, &expect)) {
-			ring_mismatch = true;
-		}
-
-		udc_dwc3_trb_cmp_log_slot(where, i, mark, meta, buf, &expect, &actual,
-					  !udc_dwc3_trb_snap_equal(&actual, &expect));
-	}
-
-	if (ring_mismatch) {
-		udc_dwc3_hexdump_ring_diff(act_ring, exp_ring, ring_len);
-	}
-	LOG_WRN("TRB-RING-CMP %s ep=0x%02x %s", where, ep_data->cfg.addr,
-		ring_mismatch ? "RING-MISMATCH" : "ring-ok");
-}
-
-static void udc_dwc3_sram_hexdump(const char *const tag, const uintptr_t addr,
-				  const size_t len)
-{
-	udc_dwc3_hexdump_bytes(tag, (const uint8_t *)addr, len);
-}
-
-static bool udc_dwc3_uvc_diag_ep(const uint8_t addr)
-{
-	return addr == 0x83 || addr == 0x84;
-}
-
-static void udc_dwc3_ghost_sram_dump_ep(struct udc_dwc3_ep_data *const ep_data,
-					const char *const where,
-					uintptr_t *const landing_addrs,
-					uint32_t *const landing_count,
-					const bool ring_hex)
-{
-	const uintptr_t ring = (uintptr_t)ep_data->trb_buf;
-	const size_t ring_len = CONFIG_UDC_DWC3_TRB_NUM * sizeof(struct udc_dwc3_trb);
-	const uint32_t li = CONFIG_UDC_DWC3_TRB_NUM - 1U;
-
-	LOG_WRN("SRAM-DUMP %s ep=0x%02x epn=%d ring=0x%08x head=%u tail=%u",
-		where, ep_data->cfg.addr, ep_data->epn, (uint32_t)ring,
-		ep_data->head, ep_data->tail);
-
-	udc_dwc3_trb_ring_expect_actual_dump(ep_data, where);
-
-	for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
-		struct udc_dwc3_trb_snap snap;
-		const bool ghost_like = (ep_data->cfg.addr & USB_EP_DIR_MASK) == USB_EP_DIR_OUT &&
-					udc_dwc3_out_slot_ghost_like(ep_data, i);
-		uintptr_t actual;
-
-		udc_dwc3_trb_snap_read(&ep_data->trb_buf[i], &snap);
-		actual = udc_dwc3_snap_dma_target(&snap);
-
-		if (ghost_like && actual != 0U && landing_addrs != NULL &&
-		    landing_count != NULL && *landing_count < li) {
-			bool dup = false;
-
-			for (uint32_t j = 0; j < *landing_count; j++) {
-				if (landing_addrs[j] == actual) {
-					dup = true;
-					break;
-				}
-			}
-
-			if (!dup) {
-				landing_addrs[(*landing_count)++] = actual;
-			}
-		}
-	}
-
-	if (ring_hex) {
-		udc_dwc3_sram_hexdump("SRAM-RING-LIVE", ring, ring_len);
-	}
-}
-
-static void udc_dwc3_ghost_sram_dump_landings(const char *const where,
-					      const uintptr_t *const landing_addrs,
-					      const uint32_t landing_count)
-{
-	for (uint32_t i = 0; i < landing_count; i++) {
-		const uintptr_t landing = landing_addrs[i];
-		const uintptr_t dump_base = landing & ~(UDC_DWC3_SRAM_HEXDUMP_LINE - 1U);
-		const uintptr_t dump_end = landing + UDC_DWC3_GHOST_LANDING_CTX;
-		size_t dump_len = UDC_DWC3_GHOST_LANDING_CTX;
-
-		if (!udc_dwc3_dma_in_sram(landing)) {
-			LOG_WRN("SRAM-LAND %s ghost_dma=0x%08x outside sram1 "
-				"(base=0x%08x size=0x%x)",
-				where, (uint32_t)landing,
-				(uint32_t)UDC_DWC3_DMA_SRAM_BASE,
-				(uint32_t)UDC_DWC3_DMA_SRAM_SIZE);
-			continue;
-		}
-
-		if (dump_end > UDC_DWC3_DMA_SRAM_BASE + UDC_DWC3_DMA_SRAM_SIZE) {
-			dump_len = UDC_DWC3_DMA_SRAM_BASE + UDC_DWC3_DMA_SRAM_SIZE - dump_base;
-		}
-
-		LOG_WRN("SRAM-LAND %s ghost_dma=0x%08x slot=%d "
-			"(TRB addr field landed here; meta was elsewhere)",
-			where, (uint32_t)landing, udc_dwc3_dma_slot_index(landing));
-		udc_dwc3_sram_hexdump("SRAM-LAND", dump_base, dump_len);
-	}
-}
-
-static void udc_dwc3_ghost_sram_crosscheck(const struct device *const dev,
-					   const char *const where,
-					   const uintptr_t *const landing_addrs,
-					   const uint32_t landing_count)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	for (int i = 0; i < cfg->num_in_eps; i++) {
-		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[i];
-
-		if (ep_data->trb_buf == NULL || !udc_dwc3_uvc_diag_ep(ep_data->cfg.addr)) {
-			continue;
-		}
-
-		for (uint32_t t = 0; t < CONFIG_UDC_DWC3_TRB_NUM; t++) {
-			struct udc_dwc3_trb_snap snap;
-			const uintptr_t meta = (uintptr_t)&ep_data->trb_buf[t];
-			uintptr_t actual;
-
-			udc_dwc3_trb_snap_read(&ep_data->trb_buf[t], &snap);
-			actual = udc_dwc3_snap_dma_target(&snap);
-
-			for (uint32_t g = 0; g < landing_count; g++) {
-				if (landing_addrs[g] == actual) {
-					LOG_WRN("SRAM-XMATCH %s uvc_ep=0x%02x trb[%u] "
-						"meta@0x%08x dma=0x%08x matches acm ghost",
-						where, ep_data->cfg.addr, t,
-						(uint32_t)meta, (uint32_t)actual);
-				}
-			}
-		}
-	}
-}
-
-static void udc_dwc3_out_ghost_sram_dump(struct udc_dwc3_ep_data *const ep_data,
-					 const char *const where)
-{
-	const struct device *const dev = ep_data->dev;
-	const struct udc_dwc3_config *const cfg = dev->config;
-	uintptr_t landing_addrs[CONFIG_UDC_DWC3_TRB_NUM - 1U];
-	uint32_t landing_count = 0U;
-
-	if (udc_dwc3_ghost_sram_dump_done) {
-		LOG_WRN("SRAM-DUMP %s skipped (already dumped)", where);
-		return;
-	}
-
-	udc_dwc3_ghost_sram_dump_done = true;
-
-	LOG_WRN("SRAM-DUMP %s begin (ghost TRB vs UVC EP rings)", where);
-
-	udc_dwc3_ghost_sram_dump_ep(ep_data, where, landing_addrs, &landing_count, true);
-	udc_dwc3_ghost_sram_dump_landings(where, landing_addrs, landing_count);
-
-	for (int i = 0; i < cfg->num_in_eps; i++) {
-		struct udc_dwc3_ep_data *const uvc = &cfg->ep_data_in[i];
-
-		if (uvc->trb_buf == NULL || !udc_dwc3_uvc_diag_ep(uvc->cfg.addr)) {
-			continue;
-		}
-
-		LOG_WRN("SRAM-DUMP %s uvc compare ep=0x%02x epn=%d",
-			where, uvc->cfg.addr, uvc->epn);
-		udc_dwc3_ghost_sram_dump_ep(uvc, where, NULL, NULL, false);
-	}
-
-	udc_dwc3_ghost_sram_crosscheck(dev, where, landing_addrs, landing_count);
-	LOG_WRN("SRAM-DUMP %s end landing_addrs=%u", where, landing_count);
-}
-#endif /* CONFIG_UDC_DWC3_DMA_SLOT_DIAG */
-
 static bool udc_dwc3_diag_verbose(atomic_t *const seq)
 {
 	const uint32_t n = (uint32_t)atomic_inc(seq);
@@ -1622,7 +1289,6 @@ static void udc_dwc3_out_acct_note_push(struct udc_dwc3_ep_data *const ep_data)
 			orphans, tail,
 			!!(t->ctrl & UDC_DWC3_TRB_CTRL_HWO),
 			(void *)ep_data->net_buf[tail]);
-		udc_dwc3_out_ghost_confirm_ring(ep_data, "orphan-pre-push");
 		udc_dwc3_out_acct_log("orphan-pre-push", ep_data);
 	}
 }
@@ -1978,9 +1644,9 @@ static int udc_dwc3_ring_push_guard(struct udc_dwc3_ep_data *const ep_data)
  * doorbell, retry) apart from a rejected one (e.g. StartXfer on an already
  * running transfer, back off).
  */
-static uint32_t udc_dwc3_depcmd_status(const struct device *const dev,
-				       const uint32_t addr, const uint32_t cmd,
-				       bool *const cmderr)
+static uint32_t udc_dwc3_depcmd_issue(const struct device *const dev,
+				      const uint32_t addr, const uint32_t cmd,
+				      bool *const cmderr)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
@@ -1996,11 +1662,10 @@ static uint32_t udc_dwc3_depcmd_status(const struct device *const dev,
 		break;
 	case UDC_DWC3_DEPCMD_STATUS_CMDERR:
 		err = true;
-		LOG_ERR("endpoint command failed");
 		break;
 	default:
 		err = true;
-		LOG_ERR("command failed with unknown status: 0x%08x", reg);
+		break;
 	}
 
 	if (cmderr != NULL) {
@@ -2008,6 +1673,35 @@ static uint32_t udc_dwc3_depcmd_status(const struct device *const dev,
 	}
 
 	return FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
+}
+
+static uint32_t udc_dwc3_depcmd_status(const struct device *const dev,
+				       const uint32_t addr, const uint32_t cmd,
+				       bool *const cmderr)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	bool err = false;
+	uint32_t reg;
+	const uint32_t rscidx = udc_dwc3_depcmd_issue(dev, addr, cmd, &err);
+
+	if (err) {
+		reg = sys_read32(base + addr);
+		switch (reg & UDC_DWC3_DEPCMD_STATUS_MASK) {
+		case UDC_DWC3_DEPCMD_STATUS_CMDERR:
+			LOG_ERR("endpoint command failed epn=%u cmd=0x%08x depcmd=0x%08x",
+				(addr - UDC_DWC3_DEPCMD(0)) / 16U, cmd, reg);
+			break;
+		default:
+			LOG_ERR("command failed with unknown status: 0x%08x", reg);
+			break;
+		}
+	}
+
+	if (cmderr != NULL) {
+		*cmderr = err;
+	}
+
+	return rscidx;
 }
 
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
@@ -2102,9 +1796,16 @@ static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
-	LOG_INF("DepClearStall ep=0x%02x", ep_data->cfg.addr);
+	bool cmderr = false;
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCSTALL);
+	udc_dwc3_depcmd_status(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			       UDC_DWC3_DEPCMD_DEPCSTALL, &cmderr);
+	if (cmderr) {
+		LOG_DBG("DepClearStall CMDERR ep=0x%02x (endpoint was not stalled)",
+			ep_data->cfg.addr);
+	} else {
+		LOG_INF("DepClearStall ep=0x%02x", ep_data->cfg.addr);
+	}
 }
 
 static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
@@ -2257,9 +1958,11 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 #define UDC_DWC3_INSTART_REARM_RETRIES 6U
 #define UDC_DWC3_INSTART_SETTLE_STEPS  8U
 
-static atomic_t udc_dwc3_in_start_retook;
 static atomic_t udc_dwc3_in_start_exhausted;
 static atomic_t udc_dwc3_in_start_recycled;
+#if !defined(CONFIG_UDC_DWC3_EP_SM)
+static atomic_t udc_dwc3_in_start_retook;
+#endif
 
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
 /*
@@ -2313,6 +2016,7 @@ static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 }
 #endif /* CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE */
 
+#if !defined(CONFIG_UDC_DWC3_EP_SM)
 static void udc_dwc3_in_start_verify(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2367,6 +2071,7 @@ static void udc_dwc3_in_start_verify(const struct device *const dev,
 	atomic_inc(&udc_dwc3_in_start_exhausted);
 #endif
 }
+#endif /* !CONFIG_UDC_DWC3_EP_SM */
 
 static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
@@ -2619,11 +2324,20 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 #endif
 
 	if (!ep_data->xfer_active) {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+			(void)udc_dwc3_doorbell_issue(dev, ep_data, UDC_DWC3_DB_START);
+		} else {
+			udc_dwc3_depcmd_start_xfer(dev, ep_data);
+		}
+#else
 		udc_dwc3_depcmd_start_xfer(dev, ep_data);
+#endif
 		ep_data->xfer_active = true;
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		udc_dwc3_xfer_trace("DEPSTART", ep_data, "post-DepStartXfer");
 #endif
+#if !defined(CONFIG_UDC_DWC3_EP_SM)
 		/*
 		 * Confirm HW actually fetched the freshly-armed TRB; re-nudge if
 		 * the StartXfer doorbell was dropped under UVC-stream contention
@@ -2633,6 +2347,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 			udc_dwc3_in_start_verify(dev, ep_data);
 		}
+#endif
 	} else {
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		if (ep_data->cfg.addr == 0x01) {
@@ -2649,9 +2364,26 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			udc_dwc3_link_trb_ensure(ep_data);
 		}
 		if (out_resume_from_park) {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+				(void)udc_dwc3_doorbell_issue(dev, ep_data,
+							      UDC_DWC3_DB_UPDATE_VERIFY);
+			} else {
+				udc_dwc3_out_rundry_restart(dev, ep_data);
+			}
+#else
 			udc_dwc3_out_rundry_restart(dev, ep_data);
+#endif
 		} else {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+				(void)udc_dwc3_doorbell_issue(dev, ep_data, UDC_DWC3_DB_UPDATE);
+			} else {
+				udc_dwc3_depcmd_update_xfer(dev, ep_data);
+			}
+#else
 			udc_dwc3_depcmd_update_xfer(dev, ep_data);
+#endif
 		}
 	}
 
@@ -3296,7 +3028,6 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 				udc_dwc3_xfer_trace("OUT-DONE-EMPTY", ep_data,
 						    from_inprog ? "inprog" : "complete");
 				udc_dwc3_log_trb_ring(ep_data, "out-done-empty");
-				udc_dwc3_out_ghost_confirm_ring(ep_data, "done-empty");
 			}
 
 			LOG_ERR("xfer-done on EP 0x%02x with empty TRB at tail %u "
@@ -3361,7 +3092,16 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		 */
 		if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && ep_data->xfer_active &&
 		    udc_dwc3_ring_data_hwo_mask(ep_data) != 0U) {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+				(void)udc_dwc3_doorbell_issue(dev, ep_data,
+							      UDC_DWC3_DB_UPDATE_VERIFY);
+			} else {
+				udc_dwc3_out_rundry_restart(dev, ep_data);
+			}
+#else
 			udc_dwc3_out_rundry_restart(dev, ep_data);
+#endif
 		}
 		k_work_submit(&ep_data->work);
 		return;
@@ -3533,6 +3273,7 @@ static unsigned udc_dwc3_retire_sw_done_eps(const struct device *const dev,
  * locking.  When events are delivered normally this poll finds nothing (a cheap
  * HWO test per endpoint) and costs only the wakeup.
  */
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) && !defined(CONFIG_UDC_DWC3_EP_SM)
 static atomic_t udc_dwc3_in_poll_recovered;
 
 static bool udc_dwc3_in_poll_slot_eligible(const struct udc_dwc3_ep_data *const ep_data)
@@ -3597,6 +3338,7 @@ static unsigned udc_dwc3_in_poll_retire_graced(const struct device *const dev)
 
 	return retired;
 }
+#endif /* !CONFIG_UDC_DWC3_EP_SM */
 
 static void udc_dwc3_in_poll_worker(struct k_work *const work)
 {
@@ -3604,6 +3346,10 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 	struct udc_dwc3_data *const priv =
 		CONTAINER_OF(dwork, struct udc_dwc3_data, in_poll_work);
 	const struct device *const dev = priv->dev;
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	(void)udc_dwc3_ep_sm_poll_all(dev);
+#else
 	const unsigned retired = udc_dwc3_in_poll_retire_graced(dev);
 
 	if (retired > 0U) {
@@ -3643,6 +3389,7 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 			last_stuck = stuck;
 		}
 	}
+#endif
 
 	k_work_reschedule(&priv->in_poll_work,
 			  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
@@ -3667,6 +3414,9 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
 		udc_dwc3_note_depevt(evt, false);
 		LOG_DBG("DEPEVT_XFERCOMPLETE");
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		(void)udc_dwc3_ep_sm_depevt(dev, evt);
+#endif
 		udc_dwc3_on_xfer_done_norm(dev, evt);
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS): {
@@ -3684,6 +3434,9 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 			LOG_DBG("DEPEVT_XFERINPROGRESS epn=%u IN (no pop)", epn);
 		} else {
 			LOG_DBG("DEPEVT_XFERINPROGRESS epn=%u OUT", epn);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			(void)udc_dwc3_ep_sm_depevt(dev, evt);
+#endif
 			udc_dwc3_on_xfer_done_norm(dev, evt);
 		}
 		break;
@@ -4148,15 +3901,9 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 			continue;
 		}
 		udc_dwc3_log_ep_trb_ring(ep_data);
-#if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
-		if (ep_data->cfg.addr == 0x01) {
-			udc_dwc3_trb_ring_expect_actual_dump(ep_data, "stall");
-		}
-#endif
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 		if (ep_data->cfg.addr == 0x01) {
 			udc_dwc3_out_acct_log("stall", ep_data);
-			udc_dwc3_out_ghost_confirm_ring(ep_data, "stall");
 		}
 #endif
 	}
@@ -4265,7 +4012,171 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 		udc_dwc3_depcmd_set_stall(dev, ep_data);
 		ep_data->cfg.stat.halted = true;
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+			LOG_WRN("UVC-RESTART: ep_set_halt ep=0x%02x", ep_data->cfg.addr);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+				udc_dwc3_ep_sm_set_state(ep_data, UDC_DWC3_EP_SM_HALTED);
+			}
+#endif
+			if (lattice_in_halt_cb != NULL) {
+				lattice_in_halt_cb(dev, ep_data->cfg.addr);
+			}
+		}
 	}
+
+	return 0;
+}
+
+static int udc_dwc3_in_ensure_xfer_started(const struct device *const dev,
+					   struct udc_dwc3_ep_data *const ep_data)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t depcmd_addr = UDC_DWC3_DEPCMD(ep_data->epn);
+	uint32_t reg = sys_read32(base + depcmd_addr);
+	bool cmderr = false;
+	uint32_t rscidx;
+
+	if ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0U) {
+		LOG_WRN("UVC-RESTART: ensure skip ep=0x%02x depcmd=0x%08x (CMDACT)",
+			ep_data->cfg.addr, reg);
+		return 0;
+	}
+
+	/*
+	 * DEPCMD completion word encodes the last accepted command type in
+	 * bits [3:0] and the active transfer resource in [22:16].  After a
+	 * successful DepStartXfer the type is 0x6 with a non-zero rscidx.
+	 * After DepClearStall (0x5) there is no running transfer even though
+	 * the TRB ring may still be armed (HWO=1) -- the UVC restart wedge.
+	 */
+	if ((reg & 0xFU) == UDC_DWC3_DEPCMD_DEPSTRTXFER &&
+	    FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg) != 0U) {
+		ep_data->xferrscidx = FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
+		ep_data->xfer_active = true;
+		LOG_WRN("UVC-RESTART: ensure skip ep=0x%02x depcmd=0x%08x (StartXfer active)",
+			ep_data->cfg.addr, reg);
+		return 0;
+	}
+
+	if ((reg & 0xFU) != UDC_DWC3_DEPCMD_DEPCSTALL) {
+		LOG_WRN("UVC-RESTART: ensure skip ep=0x%02x depcmd=0x%08x (not ClearStall)",
+			ep_data->cfg.addr, reg);
+		return 0;
+	}
+
+	LOG_WRN("UVC-RESTART: ensure StartXfer ep=0x%02x depcmd_in=0x%08x",
+		ep_data->cfg.addr, reg);
+
+	sys_write32(HI32((uintptr_t)&ep_data->trb_buf[ep_data->head]),
+		    base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
+	sys_write32(LO32((uintptr_t)&ep_data->trb_buf[ep_data->head]),
+		    base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
+
+	rscidx = udc_dwc3_depcmd_status(dev, depcmd_addr, UDC_DWC3_DEPCMD_DEPSTRTXFER,
+					&cmderr);
+	if (cmderr) {
+		reg = sys_read32(base + depcmd_addr);
+		if ((reg & 0xFU) == UDC_DWC3_DEPCMD_DEPSTRTXFER &&
+		    FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg) != 0U) {
+			ep_data->xferrscidx =
+				FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
+			ep_data->xfer_active = true;
+			atomic_inc(&udc_dwc3_clrhalt_rearm);
+			LOG_WRN("UVC-RESTART: ensure recovered ep=0x%02x depcmd=0x%08x",
+				ep_data->cfg.addr, reg);
+			return 0;
+		}
+
+		LOG_WRN("UVC-RESTART: ensure StartXfer CMDERR ep=0x%02x depcmd=0x%08x",
+			ep_data->cfg.addr, reg);
+		return -EALREADY;
+	}
+
+	ep_data->xferrscidx = rscidx;
+	ep_data->xfer_active = true;
+	atomic_inc(&udc_dwc3_clrhalt_rearm);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+		udc_dwc3_ep_sm_set_state(ep_data, UDC_DWC3_EP_SM_ACTIVE);
+	}
+#endif
+	LOG_WRN("UVC-RESTART: ensure StartXfer ok ep=0x%02x rscidx=%u depcmd=0x%08x",
+		ep_data->cfg.addr, rscidx, sys_read32(base + depcmd_addr));
+
+	return 0;
+}
+
+/*
+ * Force a fresh DepStartXfer at UVC stream handoff.
+ *
+ * The RTL uvcmanager only rings DepUpdateXfer doorbells.  On stream restart the
+ * controller may accept UpdateXfer (DEPCMD shows 0x90007) yet never fetch the
+ * armed TRBs -- the manual devmem kick that un-wedged this was always a CPU
+ * DepStartXfer, even when a transfer resource was already allocated.  Unlike
+ * clear-halt recovery we always issue StartXfer here; CMDERR is benign when the
+ * transfer is already running (ACM on a concurrent path).
+ */
+static int udc_dwc3_in_restart_xfer(const struct device *const dev,
+				    struct udc_dwc3_ep_data *const ep_data)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t depcmd_addr = UDC_DWC3_DEPCMD(ep_data->epn);
+	uint32_t reg = sys_read32(base + depcmd_addr);
+	bool cmderr = false;
+	uint32_t rscidx;
+	uint32_t active_rscidx = ep_data->xferrscidx;
+	bool endxfer = false;
+
+	LOG_WRN("UVC-RESTART: in_restart ep=0x%02x depcmd_in=0x%08x rscidx_sw=%u",
+		ep_data->cfg.addr, reg, active_rscidx);
+
+	if ((reg & UDC_DWC3_DEPCMD_CMDACT) == 0U) {
+		const uint32_t depcmd_type = reg & 0xFU;
+		const uint32_t depcmd_rscidx =
+			FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
+
+		if ((depcmd_type == UDC_DWC3_DEPCMD_DEPSTRTXFER ||
+		     depcmd_type == UDC_DWC3_DEPCMD_DEPUPDXFER) &&
+		    depcmd_rscidx != 0U) {
+			active_rscidx = depcmd_rscidx;
+		}
+	}
+
+	/*
+	 * Stream handoff must replace any prior transfer resource, including
+	 * one left by ep_enable trb_norm_init or a stale RTL UpdateXfer.
+	 */
+	if (active_rscidx != 0U) {
+		endxfer = true;
+		(void)udc_dwc3_depcmd_issue(dev, depcmd_addr,
+			UDC_DWC3_DEPCMD_DEPENDXFER | UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+			FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, active_rscidx),
+			&cmderr);
+		if (cmderr) {
+			LOG_WRN("UVC-RESTART: in_restart EndXfer CMDERR ep=0x%02x rscidx=%u",
+				ep_data->cfg.addr, active_rscidx);
+		}
+	}
+
+	sys_write32(HI32((uintptr_t)&ep_data->trb_buf[ep_data->head]),
+		    base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
+	sys_write32(LO32((uintptr_t)&ep_data->trb_buf[ep_data->head]),
+		    base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
+
+	rscidx = udc_dwc3_depcmd_issue(dev, depcmd_addr, UDC_DWC3_DEPCMD_DEPSTRTXFER,
+				       &cmderr);
+	if (cmderr) {
+		LOG_WRN("UVC-RESTART: in_restart StartXfer CMDERR ep=0x%02x endxfer=%d",
+			ep_data->cfg.addr, endxfer);
+		return -EALREADY;
+	}
+
+	ep_data->xferrscidx = rscidx;
+	ep_data->xfer_active = true;
+	atomic_inc(&udc_dwc3_in_stream_rearm);
+	LOG_WRN("UVC-RESTART: in_restart ok ep=0x%02x endxfer=%d rscidx=%u depcmd=0x%08x",
+		ep_data->cfg.addr, endxfer, rscidx, sys_read32(base + depcmd_addr));
 
 	return 0;
 }
@@ -4274,12 +4185,43 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 				  struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t depcmd_addr = UDC_DWC3_DEPCMD(ep_data->epn);
+	uint32_t depcmd_before = sys_read32(base + depcmd_addr);
+	int ensure_ret;
 
 	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_OUT);
 	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_IN);
 
+	LOG_WRN("UVC-RESTART: clear_halt ep=0x%02x depcmd_before=0x%08x",
+		ep_data->cfg.addr, depcmd_before);
+
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) && lattice_in_clear_halt_cb != NULL) {
+		lattice_in_clear_halt_cb(dev, ep_data->cfg.addr);
+	}
+
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
+		udc_dwc3_ep_sm_set_state(ep_data, UDC_DWC3_EP_SM_CLEAR_PENDING);
+	}
+#endif
+
+	/*
+	 * After CLEAR_FEATURE(ENDPOINT_HALT) the DWC3 transfer resource is
+	 * freed (DEPCMD completion shows DepClearStall) even though RTL-
+	 * offloaded UVC TRBs may still be armed (HWO=1).  Re-issue StartXfer
+	 * only when DEPCMD says the last completed command was DepClearStall;
+	 * skip when a StartXfer resource is already active (ACM IN during
+	 * concurrent restart).  uvcmanager_set_stream() calls the same helper
+	 * as a safety net when RTL starts after negotiation.
+	 */
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		ensure_ret = udc_dwc3_in_ensure_xfer_started(dev, ep_data);
+		LOG_WRN("UVC-RESTART: clear_halt ensure ep=0x%02x ret=%d depcmd_after=0x%08x",
+			ep_data->cfg.addr, ensure_ret, sys_read32(base + depcmd_addr));
+	}
 
 	return 0;
 }
@@ -4497,9 +4439,13 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 		return;
 	}
 
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	udc_dwc3_ep_advance(dev, ep_data, UDC_DWC3_EP_ADV_WORKER);
+#else
 	while (udc_dwc3_retire_sw_done(dev, ep_data, "worker")) {
 		;
 	}
+#endif
 
 	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
 		LOG_INF("Processing buffer %p from queue", (void *)buf);
@@ -4614,6 +4560,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 		ep_data = &cfg->ep_data_in[i];
 		k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		udc_dwc3_ep_sm_init(ep_data);
+#endif
 
 		ep_data->dev = dev;
 		ep_data->cfg.addr = USB_EP_DIR_IN | i;
@@ -4638,6 +4587,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 		ep_data = &cfg->ep_data_out[i];
 		k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		udc_dwc3_ep_sm_init(ep_data);
+#endif
 
 		ep_data->dev = dev;
 		ep_data->cfg.addr = USB_EP_DIR_OUT | i;
@@ -4657,6 +4609,138 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	}
 
 	return 0;
+}
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+bool udc_dwc3_int_trb_hwo(const volatile struct udc_dwc3_trb *trb)
+{
+	return udc_dwc3_trb_hwo(trb);
+}
+
+uint32_t udc_dwc3_int_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
+{
+	return udc_dwc3_ring_data_hwo_mask(ep_data);
+}
+
+uint32_t udc_dwc3_int_depcmd_issue(const struct device *dev, uint32_t depcmd_addr,
+				   uint32_t cmd, bool *cmderr)
+{
+	return udc_dwc3_depcmd_issue(dev, depcmd_addr, cmd, cmderr);
+}
+
+void udc_dwc3_int_depcmd_start_xfer(const struct device *dev,
+				    struct udc_dwc3_ep_data *ep_data)
+{
+	udc_dwc3_depcmd_start_xfer(dev, ep_data);
+}
+
+void udc_dwc3_int_depcmd_start_xfer_trb(const struct device *dev,
+					struct udc_dwc3_ep_data *ep_data,
+					struct udc_dwc3_trb *trb)
+{
+	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, trb);
+}
+
+void udc_dwc3_int_depcmd_update_xfer(const struct device *dev,
+				     struct udc_dwc3_ep_data *ep_data)
+{
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+}
+
+void udc_dwc3_int_on_xfer_done_norm(const struct device *dev, uint32_t evt)
+{
+	udc_dwc3_on_xfer_done_norm(dev, evt);
+}
+
+bool udc_dwc3_int_retire_sw_done(const struct device *dev,
+				 struct udc_dwc3_ep_data *ep_data,
+				 const char *via)
+{
+	return udc_dwc3_retire_sw_done(dev, ep_data, via);
+}
+
+void udc_dwc3_int_in_endxfer_recycle(const struct device *dev,
+				     struct udc_dwc3_ep_data *ep_data)
+{
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	udc_dwc3_in_start_endxfer_recycle(dev, ep_data);
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ep_data);
+#endif
+}
+
+void udc_dwc3_int_submit_ep_work(struct udc_dwc3_ep_data *ep_data)
+{
+	k_work_submit(&ep_data->work);
+}
+
+struct udc_dwc3_ep_data *udc_dwc3_int_ep_from_evt(const struct device *dev, uint32_t evt)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+
+	return (epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
+}
+
+const struct udc_dwc3_config *udc_dwc3_int_cfg(const struct device *dev)
+{
+	return dev->config;
+}
+#endif /* CONFIG_UDC_DWC3_EP_SM */
+
+void lattice_usb23_set_in_halt_cb(lattice_usb23_in_halt_fn fn)
+{
+	lattice_in_halt_cb = fn;
+}
+
+void lattice_usb23_set_in_clear_halt_cb(lattice_usb23_in_halt_fn fn)
+{
+	lattice_in_clear_halt_cb = fn;
+}
+
+uint32_t lattice_usb23_read_depcmd(const struct device *dev, uint8_t ep_addr)
+{
+	struct udc_dwc3_ep_data *ep_data = (void *)udc_get_ep_cfg(dev, ep_addr);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	if (ep_data == NULL) {
+		return 0U;
+	}
+
+	return sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
+}
+
+int lattice_usb23_in_ensure_xfer_started(const struct device *dev, uint8_t ep_addr)
+{
+	struct udc_ep_config *const ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_cfg == NULL) {
+		return -ENODEV;
+	}
+
+	if (!USB_EP_DIR_IS_IN(ep_addr)) {
+		return -EINVAL;
+	}
+
+	return udc_dwc3_in_ensure_xfer_started(dev,
+		CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg));
+}
+
+int lattice_usb23_in_restart_xfer(const struct device *dev, uint8_t ep_addr)
+{
+	struct udc_ep_config *const ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_cfg == NULL) {
+		return -ENODEV;
+	}
+
+	if (!USB_EP_DIR_IS_IN(ep_addr)) {
+		return -EINVAL;
+	}
+
+	return udc_dwc3_in_restart_xfer(dev,
+		CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg));
 }
 
 #define UDC_DWC3_DEVICE_DEFINE(n)						\
