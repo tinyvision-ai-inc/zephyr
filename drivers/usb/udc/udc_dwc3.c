@@ -721,47 +721,6 @@ struct udc_dwc3_config {
 };
 
 /*
- * All data specific to one endpoint for use by the driver.
- */
-struct udc_dwc3_ep_data {
-	/* Allow to cast a pointer between ep_data and ep_cfg */
-	struct udc_ep_config cfg;
-	/* Endpoint number (physical address): the logical address is on ep_cfg */
-	int epn;
-	/* A work queue entry to process the buffers to submit on that endpoint */
-	struct k_work work;
-	/* Point back to the device for work queues */
-	const struct device *dev;
-	/* Buffer of pointers to net_buf, with index matching the position in the TRB buffers */
-	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
-	/* Buffer of TRB structures, with index matching the position in the net_buf buffers */
-	struct udc_dwc3_trb *trb_buf;
-	/* Index of the next TRB to receive data in the TRB ring, Link TRB excluded */
-	uint32_t head;
-	uint32_t tail;
-	/* Total size sent from the device to the host for the ongoing transfer */
-	uint32_t total;
-	/* A flag to tell when the ring buffer is full */
-	bool full;
-	/* Given by the hardware for use in endpoint commands */
-	uint32_t xferrscidx;
-	/* MPS-aligned IN data TRB held until chained internal ZLP completes */
-	struct net_buf *chain_buf;
-	/* Next CDC ACM len==0 enqueue is absorbed (ZLP already sent on wire) */
-	bool absorb_cdc_zlp;
-	/* False after an LST-terminated IN transfer until DepStartXfer re-arms the EP */
-	bool xfer_active;
-	/* XFERCOMPLETE events to ignore after try_retire_chained_zlp() popped the ZLP */
-	uint8_t skip_xfer_done_count;
-#if defined(CONFIG_UDC_DWC3_EP_SM)
-	struct udc_dwc3_ep_sm sm;
-#elif defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
-	uint32_t poll_grace_tail;
-	bool poll_grace_armed;
-#endif
-};
-
-/*
  * Data of each instance of the driver, that can be read and written to.
  *
  * Accessed via "udc_get_private(dev)".
@@ -786,6 +745,10 @@ struct udc_dwc3_data {
 	 * event was dropped by the controller/RTL (see the worker for details).
 	 */
 	struct k_work_delayable in_poll_work;
+#endif
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	/* SM poll/depevt deferred until at least one non-control EP is enabled. */
+	atomic_t bulk_eps_live;
 #endif
 };
 
@@ -2666,6 +2629,14 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 	/* Let Zephyr set the device address 0 */
 	udc_submit_event(dev, UDC_EVT_RESET, 0);
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	udc_dwc3_ep_sm_reset_all(dev);
+	atomic_set(&DEV_DATA(dev)->bulk_eps_live, 0);
+# if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+	k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
+# endif
+#endif
 }
 
 static void udc_dwc3_on_connect_done(const struct device *const dev)
@@ -3349,6 +3320,10 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	(void)udc_dwc3_ep_sm_poll_all(dev);
+	if (atomic_get(&priv->bulk_eps_live) > 0) {
+		k_work_reschedule(&priv->in_poll_work,
+				  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+	}
 #else
 	const unsigned retired = udc_dwc3_in_poll_retire_graced(dev);
 
@@ -3389,10 +3364,10 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 			last_stuck = stuck;
 		}
 	}
-#endif
 
 	k_work_reschedule(&priv->in_poll_work,
 			  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+#endif
 }
 #endif /* CONFIG_UDC_DWC3_IN_COMPLETION_POLL */
 
@@ -3987,6 +3962,15 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 
 	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
 
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 &&
+	    atomic_dec(&DEV_DATA(dev)->bulk_eps_live) == 1) {
+# if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+		k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
+# endif
+	}
+#endif
+
 	return 0;
 }
 
@@ -4288,7 +4272,10 @@ static int udc_dwc3_enable(const struct device *const dev)
 	k_work_reschedule(&DEV_DATA(dev)->health_work,
 			  K_MSEC(CONFIG_UDC_DWC3_HEALTH_LOG_INTERVAL_MS));
 #endif
-#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	atomic_set(&DEV_DATA(dev)->bulk_eps_live, 0);
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) && !defined(CONFIG_UDC_DWC3_EP_SM)
 	k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
 			  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
 #endif
@@ -4350,6 +4337,14 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 
 	/* Walk through the list of buffer to enqueue we might have blocked */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		if (atomic_inc(&DEV_DATA(dev)->bulk_eps_live) == 1) {
+# if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
+			k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
+				K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+# endif
+		}
+#endif
 		k_work_submit(&ep_data->work);
 	}
 
@@ -4491,6 +4486,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 #endif
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 	k_work_init_delayable(&priv->in_poll_work, udc_dwc3_in_poll_worker);
+#endif
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	atomic_clear(&priv->bulk_eps_live);
 #endif
 
 	data->caps.rwup = false;
@@ -4683,9 +4681,37 @@ struct udc_dwc3_ep_data *udc_dwc3_int_ep_from_evt(const struct device *dev, uint
 	return (epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
 }
 
-const struct udc_dwc3_config *udc_dwc3_int_cfg(const struct device *dev)
+int udc_dwc3_int_num_in_eps(const struct device *dev)
 {
-	return dev->config;
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	return cfg->num_in_eps;
+}
+
+int udc_dwc3_int_num_out_eps(const struct device *dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	return cfg->num_out_eps;
+}
+
+struct udc_dwc3_ep_data *udc_dwc3_int_ep_in(const struct device *dev, int idx)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	return &cfg->ep_data_in[idx];
+}
+
+struct udc_dwc3_ep_data *udc_dwc3_int_ep_out(const struct device *dev, int idx)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	return &cfg->ep_data_out[idx];
+}
+
+bool udc_dwc3_int_bulk_eps_live(const struct device *dev)
+{
+	return atomic_get(&DEV_DATA(dev)->bulk_eps_live) > 0;
 }
 #endif /* CONFIG_UDC_DWC3_EP_SM */
 

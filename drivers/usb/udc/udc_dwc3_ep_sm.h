@@ -15,6 +15,7 @@
 struct device;
 struct udc_dwc3_ep_data;
 struct udc_dwc3_config;
+struct udc_dwc3_ep_sm;
 
 /** Per-CPU-EP transfer-resource lifecycle (HWO is separate ground truth). */
 enum udc_dwc3_ep_sm_state {
@@ -55,6 +56,8 @@ void udc_dwc3_ep_advance(const struct device *dev,
 			 enum udc_dwc3_ep_adv_reason reason);
 
 unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev);
+
+void udc_dwc3_ep_sm_reset_all(const struct device *dev);
 
 /** DEPEVT fast-path for CPU bulk eps; returns false if caller should handle. */
 bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt);

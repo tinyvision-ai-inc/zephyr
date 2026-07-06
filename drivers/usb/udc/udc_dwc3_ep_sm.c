@@ -17,38 +17,6 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_dwc3_int.h"
 
-/* ep_data layout must match udc_dwc3.c */
-struct udc_dwc3_ep_data {
-	struct udc_ep_config cfg;
-	int epn;
-	struct k_work work;
-	const struct device *dev;
-	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
-	struct udc_dwc3_trb *trb_buf;
-	uint32_t head;
-	uint32_t tail;
-	uint32_t total;
-	bool full;
-	uint32_t xferrscidx;
-	struct net_buf *chain_buf;
-	bool absorb_cdc_zlp;
-	bool xfer_active;
-	uint8_t skip_xfer_done_count;
-#if defined(CONFIG_UDC_DWC3_EP_SM)
-	struct udc_dwc3_ep_sm sm;
-#elif defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
-	uint32_t poll_grace_tail;
-	bool poll_grace_armed;
-#endif
-};
-
-struct udc_dwc3_config {
-	struct udc_dwc3_ep_data *ep_data_in;
-	struct udc_dwc3_ep_data *ep_data_out;
-	uint8_t num_in_eps;
-	uint8_t num_out_eps;
-};
-
 #define UDC_DWC3_TRB_CTRL_HWO BIT(0)
 
 #define UDC_DWC3_RUNDRY_REARM_RETRIES  8U
@@ -246,6 +214,11 @@ void udc_dwc3_ep_advance(const struct device *dev,
 		return;
 	}
 
+	if ((reason == UDC_DWC3_EP_ADV_DEPEVT || reason == UDC_DWC3_EP_ADV_POLL) &&
+	    !udc_dwc3_int_bulk_eps_live(dev)) {
+		return;
+	}
+
 	if (ep_data->cfg.stat.halted &&
 	    ep_data->sm.state != UDC_DWC3_EP_SM_CLEAR_PENDING) {
 		return;
@@ -276,16 +249,29 @@ void udc_dwc3_ep_advance(const struct device *dev,
 	}
 }
 
+void udc_dwc3_ep_sm_reset_all(const struct device *dev)
+{
+	for (int i = 1; i < udc_dwc3_int_num_in_eps(dev); i++) {
+		udc_dwc3_ep_sm_init(udc_dwc3_int_ep_in(dev, i));
+	}
+	for (int i = 1; i < udc_dwc3_int_num_out_eps(dev); i++) {
+		udc_dwc3_ep_sm_init(udc_dwc3_int_ep_out(dev, i));
+	}
+}
+
 unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev)
 {
-	const struct udc_dwc3_config *const cfg = udc_dwc3_int_cfg(dev);
 	unsigned retired = 0U;
 
-	for (int i = 1; i < cfg->num_in_eps; i++) {
-		retired += udc_dwc3_sm_poll_ep(dev, &cfg->ep_data_in[i]);
+	if (!udc_dwc3_int_bulk_eps_live(dev)) {
+		return 0U;
 	}
-	for (int i = 1; i < cfg->num_out_eps; i++) {
-		retired += udc_dwc3_sm_poll_ep(dev, &cfg->ep_data_out[i]);
+
+	for (int i = 1; i < udc_dwc3_int_num_in_eps(dev); i++) {
+		retired += udc_dwc3_sm_poll_ep(dev, udc_dwc3_int_ep_in(dev, i));
+	}
+	for (int i = 1; i < udc_dwc3_int_num_out_eps(dev); i++) {
+		retired += udc_dwc3_sm_poll_ep(dev, udc_dwc3_int_ep_out(dev, i));
 	}
 
 	if (retired > 0U) {
@@ -325,7 +311,11 @@ bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 {
 	struct udc_dwc3_ep_data *ep_data = udc_dwc3_int_ep_from_evt(dev, evt);
 
-	if (!udc_dwc3_ep_sm_is_cpu(ep_data)) {
+	if (!udc_dwc3_int_bulk_eps_live(dev) || !udc_dwc3_ep_sm_is_cpu(ep_data)) {
+		return false;
+	}
+
+	if (!ep_data->xfer_active && ep_data->sm.state == UDC_DWC3_EP_SM_IDLE) {
 		return false;
 	}
 
