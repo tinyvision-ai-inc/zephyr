@@ -527,6 +527,11 @@ static void cdc_acm_update_linestate(struct cdc_acm_uart_data *const data)
 	}
 }
 
+static void cdc_acm_on_control_line_state(struct usbd_class_data *const c_data,
+					  struct usbd_context *const uds_ctx,
+					  struct cdc_acm_uart_data *const data,
+					  const bool was_dtr);
+
 static int usbd_cdc_acm_cth(struct usbd_class_data *const c_data,
 			    const struct usb_setup_packet *const setup,
 			    struct net_buf *const buf)
@@ -576,11 +581,15 @@ static int usbd_cdc_acm_ctd(struct usbd_class_data *const c_data,
 		usbd_msg_pub_device(uds_ctx, USBD_MSG_CDC_ACM_LINE_CODING, dev);
 		return 0;
 
-	case SET_CONTROL_LINE_STATE:
+	case SET_CONTROL_LINE_STATE: {
+		const bool was_dtr = data->line_state_dtr;
+
 		data->line_state = setup->wValue;
 		cdc_acm_update_linestate(data);
+		cdc_acm_on_control_line_state(c_data, uds_ctx, data, was_dtr);
 		usbd_msg_pub_device(uds_ctx, USBD_MSG_CDC_ACM_CONTROL_LINE_STATE, dev);
 		return 0;
+	}
 
 	default:
 		break;
@@ -752,6 +761,7 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
 	if (buf == NULL) {
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 		return;
 	}
 
@@ -763,6 +773,7 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 		LOG_ERR("Failed to enqueue net_buf for 0x%02x",
 			cdc_acm_get_bulk_out(c_data));
 		net_buf_unref(buf);
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
 	}
 }
 
@@ -808,6 +819,52 @@ static void cdc_acm_irq_rx_disable(const struct device *dev)
 	struct cdc_acm_uart_data *const data = dev->data;
 
 	atomic_clear_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED);
+}
+
+/*
+ * Host dropped DTR (serial port closed): cancel in-flight bulk transfers and
+ * clear busy latches so the next open can re-arm OUT. Without this, a stranded
+ * RX_FIFO_BUSY blocks rx_fifo_work forever after echop.py exits.
+ */
+static void cdc_acm_on_control_line_state(struct usbd_class_data *const c_data,
+					    struct usbd_context *const uds_ctx,
+					    struct cdc_acm_uart_data *const data,
+					    const bool was_dtr)
+{
+	if (was_dtr && !data->line_state_dtr) {
+		const uint8_t out_ep = cdc_acm_get_bulk_out(c_data);
+		const uint8_t in_ep = cdc_acm_get_bulk_in(c_data);
+
+		(void)usbd_ep_dequeue(uds_ctx, out_ep);
+		(void)usbd_ep_dequeue(uds_ctx, in_ep);
+
+		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
+		ring_buf_reset(data->rx_fifo.rb);
+		ring_buf_reset(data->tx_fifo.rb);
+		data->zlp_needed = false;
+
+		LOG_DBG("DTR deassert: ACM session torn down");
+		return;
+	}
+
+	if (!was_dtr && data->line_state_dtr) {
+		if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED) ||
+		    atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
+			return;
+		}
+
+		if (atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED)) {
+			cdc_acm_work_submit(&data->rx_fifo_work);
+		}
+
+		if (atomic_test_bit(&data->state, CDC_ACM_IRQ_TX_ENABLED) &&
+		    !ring_buf_is_empty(data->tx_fifo.rb)) {
+			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+		}
+
+		LOG_DBG("DTR assert: ACM session armed");
+	}
 }
 
 static int cdc_acm_fifo_fill(const struct device *dev,
