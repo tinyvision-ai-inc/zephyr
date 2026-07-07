@@ -32,4 +32,111 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
+config UDC_DWC3_HEALTH_LOG
+	bool "Periodic USB health / buffer-leak logging"
+	select NET_BUF_POOL_USAGE
+	help
+	  Periodically log DWC3 driver health: IRQ/event counters, control
+	  endpoint busy state, and the usage of every net_buf pool (how many
+	  buffers are currently claimed vs the maximum ever claimed).
+
+	  This is a debugging aid to track down net_buf leaks that slowly
+	  exhaust a pool and cause the host to re-enumerate the device after
+	  it has been idle, without any processor crash. Watch the per-pool
+	  "used" count: a pool whose "used" only ever grows (and never returns
+	  toward 0 when the bus is idle) is the leaking pool.
+
+	  The same data can be dumped on demand with `tvai_dwc3 mem <device>`.
+
+config UDC_DWC3_HEALTH_LOG_INTERVAL_MS
+	int "Interval between periodic USB health logs (ms)"
+	default 5000
+	depends on UDC_DWC3_HEALTH_LOG
+	help
+	  How often the periodic health snapshot is emitted, in milliseconds.
+
+config UDC_DWC3_DMA_SLOT_DIAG
+	bool "DMA slot usage tracking and IN scrub-at-enqueue"
+	help
+	  Track which 1 KiB NOCACHE slots (sram1) each bulk enqueue/completion
+	  uses, log DMA-SLOT lines, memset 0xA5 on IN enqueue (debug builds only),
+	  and dump slot history plus scrub fingerprints in stall_snapshot().
+
+config UDC_DWC3_XFER_TRACE
+	bool "Anomaly WRN logs for xfer_active / ring-reset / link-TRB hypothesis"
+	help
+	  Emit XFER-TRACE WRN lines when ring_reset or DepStartXfer runs while the
+	  link TRB is still HW-owned, when xfer_active clears with link_hwo set,
+	  or on other ring/HW desync suspects.  Intended for ACM+UVC soak debug.
+
+config UDC_DWC3_WEDGE_LOG
+	bool "Compact WEDGE snapshots on ACM/UVC concurrent failure paths"
+	help
+	  On rare wedge paths (empty TRB xfer-done, OUT run-dry verify exhausted,
+	  etc.) emit a short per-EP ring summary and full stall_snapshot().  Much
+	  less chatty than CONFIG_UDC_DWC3_XFER_TRACE for short soak iterations.
+
+config UDC_DWC3_IN_COMPLETION_POLL
+	bool "Periodic SW-retire poll to recover dropped IN completions"
+	help
+	  On this SoC the bulk IN XferComplete event is not always delivered to
+	  the CPU event ring under multi-stream load: an armed IN TRB is filled
+	  and released by hardware (HWO cleared) but no DEPEVT is posted, so the
+	  transfer never retires and the endpoint wedges even though the CPU is
+	  healthy.  Enable a light periodic poll that reclaims any endpoint whose
+	  tail TRB had HWO cleared without a matching event, breaking the wedge.
+
+	  The poll runs on the system workqueue, serialised with the event and
+	  endpoint workers, and is a cheap per-endpoint HWO test when events are
+	  delivered normally.
+
+config UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US
+	int "Interval between IN completion recovery polls (us)"
+	default 500
+	depends on UDC_DWC3_IN_COMPLETION_POLL
+	help
+	  How often the dropped-IN-completion recovery poll runs, in
+	  microseconds.  Lower values reduce worst-case IN latency on a dropped
+	  event at the cost of more workqueue wakeups.
+
+config UDC_DWC3_EP_SM
+	bool "HWO-ground-truth state machine for CPU bulk endpoints"
+	default y
+	select UDC_DWC3_IN_COMPLETION_POLL
+	help
+	  Unified per-endpoint state machine for CPU-terminated bulk endpoints
+	  (ACM IN/OUT, etc.).  HWO on the tail TRB is ground truth; DEPEVT and
+	  periodic poll are hints.  RTL-offloaded UVC IN endpoints bypass this.
+	  Implies IN_COMPLETION_POLL for the shared periodic HWO poll worker.
+
+config UDC_DWC3_EP_SM_LOG_UNMATCHED
+	bool "Log DEPEVT without matching CPU-EP SM expectation"
+	depends on UDC_DWC3_EP_SM
+	default n
+
+config UDC_DWC3_EP_SM_LOG_PHASE
+	bool "Log EP-SM enumeration phase transitions and premature SM activity"
+	depends on UDC_DWC3_EP_SM
+	default n
+	help
+	  Emit WRN/INF lines when bulk_eps_live changes (enable, reset, first
+	  bulk ep enable, last bulk ep disable) and when doorbell/advance/depevt
+	  would touch CPU bulk endpoints before configuration.  Any premature
+	  line during SET_ADDRESS is a smoking gun for enumeration wedges.
+
+config UDC_DWC3_IN_START_ENDXFER_ESCALATE
+	bool "Escalate a stranded IN StartXfer to EndXfer(ForceRM)+StartXfer"
+	help
+	  When an IN DepStartXfer doorbell is accepted but the controller never
+	  fetches the owned TRB (confirmed on-core under two RTL-driven UVC IN
+	  streams: the tail TRB stays HWO=1 and re-issued DepUpdateXfer commands
+	  complete with no CMDERR yet do not resume it), the inline verify's
+	  UpdateXfer retry budget is exhausted with the pipe still wedged.
+
+	  Enable this to escalate that stranded-start case to the only remaining
+	  databook lever: EndTransfer(ForceRM) to drop the parked transfer
+	  resource, then a fresh StartXfer re-arming the same still-owned TRB.
+	  This is safe only for IN (device-paced); the OUT path deliberately does
+	  not use EndXfer+StartXfer because the restart races host-driven data.
+
 endif # UDC_DWC3
