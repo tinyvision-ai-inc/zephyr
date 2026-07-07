@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <zephyr/sys/atomic.h>
+
 struct device;
 struct udc_dwc3_ep_data;
 struct udc_dwc3_config;
@@ -61,6 +63,16 @@ void udc_dwc3_ep_sm_reset_all(const struct device *dev);
 
 /** DEPEVT fast-path for CPU bulk eps; returns false if caller should handle. */
 bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt);
+
+struct udc_dwc3_in_recovery_stats {
+	atomic_val_t poll_recovered;
+	atomic_val_t start_retook;
+	atomic_val_t start_backoff;
+	atomic_val_t start_recycled;
+	atomic_val_t start_stuck;
+};
+
+void udc_dwc3_ep_sm_in_recovery_get(struct udc_dwc3_in_recovery_stats *stats);
 
 #else /* !CONFIG_UDC_DWC3_EP_SM */
 

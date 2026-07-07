@@ -93,6 +93,13 @@ void udc_dwc3_int_depcmd_start_xfer_trb(const struct device *dev,
 void udc_dwc3_int_depcmd_update_xfer(const struct device *dev,
 				     struct udc_dwc3_ep_data *ep_data);
 
+uint32_t udc_dwc3_int_depcmd_update_xfer_checked(const struct device *dev,
+						 struct udc_dwc3_ep_data *ep_data,
+						 bool *cmderr);
+
+atomic_val_t udc_dwc3_int_in_start_recycled_get(void);
+atomic_val_t udc_dwc3_int_in_start_exhausted_get(void);
+
 void udc_dwc3_int_on_xfer_done_norm(const struct device *dev, uint32_t evt);
 
 bool udc_dwc3_int_retire_sw_done(const struct device *dev,

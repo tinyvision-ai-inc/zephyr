@@ -2080,6 +2080,7 @@ static atomic_t udc_dwc3_in_start_exhausted;
 static atomic_t udc_dwc3_in_start_recycled;
 #if !defined(CONFIG_UDC_DWC3_EP_SM)
 static atomic_t udc_dwc3_in_start_retook;
+static atomic_t udc_dwc3_in_start_backoff;
 #endif
 
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
@@ -2173,10 +2174,7 @@ static void udc_dwc3_in_start_verify(const struct device *const dev,
 		}
 
 		if (cmderr) {
-			/* The controller rejected the nudge, i.e. it already
-			 * considers the transfer running -- the TRB is armed and
-			 * waiting for the host, not stranded.  Stop poking it.
-			 */
+			atomic_inc(&udc_dwc3_in_start_backoff);
 			return;
 		}
 	}
@@ -3574,8 +3572,41 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 	const struct device *const dev = priv->dev;
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-	(void)udc_dwc3_ep_sm_poll_all(dev);
+	const unsigned retired = udc_dwc3_ep_sm_poll_all(dev);
+
 	if (atomic_get(&priv->bulk_eps_live) > 0) {
+		static int64_t last_log;
+		static atomic_val_t last_recovered;
+		static atomic_val_t last_retook;
+		static atomic_val_t last_backoff;
+		static atomic_val_t last_recycled;
+		static atomic_val_t last_stuck;
+		struct udc_dwc3_in_recovery_stats stats;
+		const int64_t now = k_uptime_get();
+
+		udc_dwc3_ep_sm_in_recovery_get(&stats);
+
+		if ((stats.poll_recovered != last_recovered ||
+		     stats.start_retook != last_retook ||
+		     stats.start_backoff != last_backoff ||
+		     stats.start_recycled != last_recycled ||
+		     stats.start_stuck != last_stuck) &&
+		    (now - last_log >= 1000)) {
+			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld "
+				"start-backoff=%ld start-recycled=%ld start-stuck=%ld",
+				(long)stats.poll_recovered, (long)stats.start_retook,
+				(long)stats.start_backoff, (long)stats.start_recycled,
+				(long)stats.start_stuck);
+			last_log = now;
+			last_recovered = stats.poll_recovered;
+			last_retook = stats.start_retook;
+			last_backoff = stats.start_backoff;
+			last_recycled = stats.start_recycled;
+			last_stuck = stats.start_stuck;
+		}
+
+		ARG_UNUSED(retired);
+
 		k_work_reschedule(&priv->in_poll_work,
 				  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
 	}
@@ -3600,21 +3631,26 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 		static atomic_val_t last_retook;
 		static atomic_val_t last_recycled;
 		static atomic_val_t last_stuck;
+		static atomic_val_t last_backoff;
 		const atomic_val_t recovered = atomic_get(&udc_dwc3_in_poll_recovered);
 		const atomic_val_t retook = atomic_get(&udc_dwc3_in_start_retook);
+		const atomic_val_t backoff = atomic_get(&udc_dwc3_in_start_backoff);
 		const atomic_val_t recycled = atomic_get(&udc_dwc3_in_start_recycled);
 		const atomic_val_t stuck = atomic_get(&udc_dwc3_in_start_exhausted);
 		const int64_t now = k_uptime_get();
 
 		if ((recovered != last_recovered || retook != last_retook ||
-		     recycled != last_recycled || stuck != last_stuck) &&
+		     backoff != last_backoff || recycled != last_recycled ||
+		     stuck != last_stuck) &&
 		    (now - last_log >= 1000)) {
 			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld "
-				"start-recycled=%ld start-stuck=%ld",
-				(long)recovered, (long)retook, (long)recycled, (long)stuck);
+				"start-backoff=%ld start-recycled=%ld start-stuck=%ld",
+				(long)recovered, (long)retook, (long)backoff,
+				(long)recycled, (long)stuck);
 			last_log = now;
 			last_recovered = recovered;
 			last_retook = retook;
+			last_backoff = backoff;
 			last_recycled = recycled;
 			last_stuck = stuck;
 		}
@@ -4988,6 +5024,31 @@ void udc_dwc3_int_depcmd_update_xfer(const struct device *dev,
 				     struct udc_dwc3_ep_data *ep_data)
 {
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+}
+
+uint32_t udc_dwc3_int_depcmd_update_xfer_checked(const struct device *dev,
+						 struct udc_dwc3_ep_data *ep_data,
+						 bool *cmderr)
+{
+	uint32_t flags = UDC_DWC3_DEPCMD_DEPUPDXFER;
+
+	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
+
+	return udc_dwc3_depcmd_status(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, cmderr);
+}
+
+atomic_val_t udc_dwc3_int_in_start_recycled_get(void)
+{
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	return atomic_get(&udc_dwc3_in_start_recycled);
+#else
+	return 0;
+#endif
+}
+
+atomic_val_t udc_dwc3_int_in_start_exhausted_get(void)
+{
+	return atomic_get(&udc_dwc3_in_start_exhausted);
 }
 
 void udc_dwc3_int_on_xfer_done_norm(const struct device *dev, uint32_t evt)

@@ -32,9 +32,19 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_DEPEVT_EPN_MASK       GENMASK(5, 1)
 
 static atomic_t udc_dwc3_sm_in_start_retook;
+static atomic_t udc_dwc3_sm_in_start_backoff;
 static atomic_t udc_dwc3_sm_in_start_exhausted;
-static atomic_t udc_dwc3_sm_in_start_recycled;
 static atomic_t udc_dwc3_sm_poll_recovered;
+
+void udc_dwc3_ep_sm_in_recovery_get(struct udc_dwc3_in_recovery_stats *const stats)
+{
+	stats->poll_recovered = atomic_get(&udc_dwc3_sm_poll_recovered);
+	stats->start_retook = atomic_get(&udc_dwc3_sm_in_start_retook);
+	stats->start_backoff = atomic_get(&udc_dwc3_sm_in_start_backoff);
+	stats->start_recycled = udc_dwc3_int_in_start_recycled_get();
+	stats->start_stuck = atomic_get(&udc_dwc3_sm_in_start_exhausted) +
+			     udc_dwc3_int_in_start_exhausted_get();
+}
 
 bool udc_dwc3_ep_sm_is_cpu(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -133,7 +143,9 @@ static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 	}
 
 	for (unsigned int attempt = 0U; attempt < UDC_DWC3_INSTART_REARM_RETRIES; attempt++) {
-		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
+		bool cmderr = false;
+
+		(void)udc_dwc3_int_depcmd_update_xfer_checked(dev, ep_data, &cmderr);
 
 		for (unsigned int step = 0U; step < UDC_DWC3_INSTART_SETTLE_STEPS; step++) {
 			k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
@@ -142,6 +154,11 @@ static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 				ep_data->sm.in_start_reported = false;
 				return;
 			}
+		}
+
+		if (cmderr) {
+			atomic_inc(&udc_dwc3_sm_in_start_backoff);
+			return;
 		}
 	}
 
