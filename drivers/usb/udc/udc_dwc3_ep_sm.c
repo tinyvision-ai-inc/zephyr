@@ -67,6 +67,8 @@ void udc_dwc3_ep_sm_init(struct udc_dwc3_ep_data *ep_data)
 	ep_data->sm.state = UDC_DWC3_EP_SM_IDLE;
 	ep_data->sm.out_rundry_reported = false;
 	ep_data->sm.in_start_reported = false;
+	ep_data->sm.in_start_verify_busy = false;
+	ep_data->sm.tier5_recovering = false;
 	ep_data->sm.poll_grace_armed = false;
 }
 
@@ -134,9 +136,12 @@ static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 {
 	const uint32_t tail = ep_data->tail;
 
+	ep_data->sm.in_start_verify_busy = true;
+
 	for (unsigned int step = 0U; step < UDC_DWC3_INSTART_FAST_STEPS; step++) {
 		if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
 			ep_data->sm.in_start_reported = false;
+			ep_data->sm.in_start_verify_busy = false;
 			return;
 		}
 		k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
@@ -152,12 +157,14 @@ static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 			if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
 				atomic_inc(&udc_dwc3_sm_in_start_retook);
 				ep_data->sm.in_start_reported = false;
+				ep_data->sm.in_start_verify_busy = false;
 				return;
 			}
 		}
 
 		if (cmderr) {
 			atomic_inc(&udc_dwc3_sm_in_start_backoff);
+			ep_data->sm.in_start_verify_busy = false;
 			return;
 		}
 	}
@@ -166,6 +173,7 @@ static void udc_dwc3_sm_in_start_verify(const struct device *dev,
 		ep_data->sm.in_start_reported = true;
 		LOG_ERR("EP-SM: IN-START-REARM ep=0x%02x verify exhausted", ep_data->cfg.addr);
 	}
+	ep_data->sm.in_start_verify_busy = false;
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
 	udc_dwc3_int_in_endxfer_recycle(dev, ep_data);
 #else
@@ -292,6 +300,7 @@ static unsigned udc_dwc3_sm_poll_ep(const struct device *dev,
 
 	ep_data->sm.poll_grace_armed = false;
 	while (udc_dwc3_sm_retire_tail(dev, ep_data, "poll")) {
+		ep_data->sm.in_start_reported = false;
 		retired++;
 	}
 

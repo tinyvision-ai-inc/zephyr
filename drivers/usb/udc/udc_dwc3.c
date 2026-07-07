@@ -219,8 +219,10 @@ static void udc_dwc3_dma_slot_note(const uint8_t ep, const enum udc_dwc3_dma_op 
 static void udc_dwc3_dma_slot_dump_stall(const struct device *const dev);
 #endif /* CONFIG_UDC_DWC3_DMA_SLOT_DIAG */
 
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 static atomic_t udc_dwc3_ss_inact_count;
 static atomic_t udc_dwc3_ss_recov_count;
+#endif
 static atomic_t udc_dwc3_remwk_count;
 
 /* TRB memory buffer fields */
@@ -997,6 +999,7 @@ static void udc_dwc3_unlock(const struct device *const dev)
 /* Sentinel net_buf pointer for driver-owned terminating ZLP TRBs */
 #define UDC_DWC3_ZLP_TRB_MARKER		((struct net_buf *)UINTPTR_MAX)
 
+#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 static void *udc_dwc3_net_buf_data(const struct net_buf *const buf)
 {
 	if (buf == NULL || buf == UDC_DWC3_ZLP_TRB_MARKER) {
@@ -1005,6 +1008,7 @@ static void *udc_dwc3_net_buf_data(const struct net_buf *const buf)
 
 	return buf->data;
 }
+#endif
 
 static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data);
@@ -1043,7 +1047,6 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 			      struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
-	const uint32_t head_idx = ep_data->head;
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available.
@@ -1052,6 +1055,7 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 	if (ep_data->cfg.addr == 0x82 || ep_data->cfg.addr == 0x01) {
+		const uint32_t head_idx = ep_data->head;
 		const uint32_t link_idx = CONFIG_UDC_DWC3_TRB_NUM - 1U;
 
 #if defined(CONFIG_UDC_DWC3_DMA_SLOT_DIAG)
@@ -2105,6 +2109,9 @@ static atomic_t udc_dwc3_in_start_backoff;
  */
 #define UDC_DWC3_INSTART_RECYCLE_STEPS 16U
 
+static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
+					    struct udc_dwc3_ep_data *ep_data);
+
 static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 					      struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2124,8 +2131,15 @@ static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 		k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
 		if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
 			atomic_inc(&udc_dwc3_in_start_recycled);
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+			ep_data->sm.in_start_verify_busy = false;
+#endif
 			return;
 		}
+	}
+
+	if (udc_dwc3_in_start_tier5_recover(dev, ep_data)) {
+		return;
 	}
 
 	atomic_inc(&udc_dwc3_in_start_exhausted);
@@ -3422,6 +3436,12 @@ static bool udc_dwc3_retire_sw_done(const struct device *const dev,
 		return false;
 	}
 
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	if (ep_data->sm.tier5_recovering) {
+		return false;
+	}
+#endif
+
 	if (udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
 		return false;
 	}
@@ -4267,6 +4287,125 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 	udc_dwc3_dma_slot_dump_stall(dev);
 #endif
 }
+
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+static bool udc_dwc3_orphan_has(struct net_buf *const *orphaned, unsigned int n,
+				struct net_buf *const buf)
+{
+	for (unsigned int i = 0U; i < n; i++) {
+		if (orphaned[i] == buf) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool udc_dwc3_orphan_add(struct net_buf **orphaned, unsigned int *n,
+				struct net_buf *const buf, const unsigned int max)
+{
+	if (buf == NULL || buf == UDC_DWC3_ZLP_TRB_MARKER) {
+		return true;
+	}
+
+	if (udc_dwc3_orphan_has(orphaned, *n, buf)) {
+		return true;
+	}
+
+	if (*n >= max) {
+		return false;
+	}
+
+	orphaned[(*n)++] = buf;
+	return true;
+}
+
+/*
+ * Tier-5 IN recovery when EndXfer+StartXfer recycle cannot clear tail HWO.
+ * Detach ring and queued buffers before EndXfer (which can clear HWO and
+ * trigger SW-retire), dedupe orphans, then return each net_buf to the class
+ * exactly once.
+ */
+static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
+					    struct udc_dwc3_ep_data *ep_data)
+{
+	struct net_buf *orphaned[CONFIG_UDC_DWC3_TRB_NUM + 2U];
+	unsigned int n_orphan = 0U;
+	const uint32_t link = CONFIG_UDC_DWC3_TRB_NUM - 1U;
+	struct net_buf *qbuf;
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	ep_data->sm.tier5_recovering = true;
+#endif
+
+	udc_dwc3_lock(dev);
+	udc_dwc3_stall_snapshot(dev);
+
+	for (uint32_t i = 0U; i < link; i++) {
+		struct net_buf *const buf = ep_data->net_buf[i];
+
+		ep_data->net_buf[i] = NULL;
+		udc_dwc3_trb_clear(&ep_data->trb_buf[i]);
+
+		if (!udc_dwc3_orphan_add(orphaned, &n_orphan, buf, ARRAY_SIZE(orphaned))) {
+			LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan ring overflow",
+				ep_data->cfg.addr);
+		}
+
+		if (ep_data->chain_buf == buf) {
+			ep_data->chain_buf = NULL;
+		}
+	}
+
+	if (!udc_dwc3_orphan_add(orphaned, &n_orphan, ep_data->chain_buf,
+				 ARRAY_SIZE(orphaned))) {
+		LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan chain overflow",
+			ep_data->cfg.addr);
+	}
+	ep_data->chain_buf = NULL;
+
+	while ((qbuf = udc_buf_get(&ep_data->cfg)) != NULL) {
+		if (!udc_dwc3_orphan_add(orphaned, &n_orphan, qbuf, ARRAY_SIZE(orphaned))) {
+			LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan queue overflow",
+				ep_data->cfg.addr);
+			break;
+		}
+	}
+
+	for (unsigned int attempt = 0U; attempt < 3U; attempt++) {
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		k_busy_wait(100);
+	}
+
+	udc_dwc3_ep_ring_reset(ep_data);
+	ep_data->xfer_active = false;
+	ep_data->absorb_cdc_zlp = false;
+	ep_data->skip_xfer_done_count = 0U;
+	udc_ep_set_busy(&ep_data->cfg, false);
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	udc_dwc3_ep_sm_set_state(ep_data, UDC_DWC3_EP_SM_IDLE);
+	ep_data->sm.in_start_reported = false;
+	ep_data->sm.in_start_verify_busy = false;
+	ep_data->sm.poll_grace_armed = false;
+#endif
+
+	udc_dwc3_unlock(dev);
+
+	for (unsigned int i = 0U; i < n_orphan; i++) {
+		(void)udc_submit_ep_event(dev, orphaned[i], -ECONNRESET);
+	}
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	ep_data->sm.tier5_recovering = false;
+#endif
+
+	LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x ring nuked, EP worker re-arm",
+		ep_data->cfg.addr);
+	k_work_submit(&ep_data->work);
+	return true;
+}
+#endif /* CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE */
 
 unsigned udc_dwc3_sw_retire_done(const struct device *const dev)
 {

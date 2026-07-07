@@ -29,6 +29,10 @@ struct udc_dwc3_ep_sm {
 	enum udc_dwc3_ep_sm_state state;
 	bool out_rundry_reported;
 	bool in_start_reported;
+	/** Set while sm_in_start_verify runs (blocks concurrent poll retire races). */
+	bool in_start_verify_busy;
+	/** Set during tier-5 IN ring nuke (blocks poll SW-retire on same buf). */
+	bool tier5_recovering;
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) || defined(CONFIG_UDC_DWC3_EP_SM)
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;
