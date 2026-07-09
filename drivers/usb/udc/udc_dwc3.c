@@ -498,6 +498,7 @@ struct udc_dwc3_config {
 	/* Number of hardware endpoint set for input or output */
 	uint8_t num_in_eps;
 	uint8_t num_out_eps;
+	uint8_t *setup;
 };
 
 /*
@@ -910,9 +911,12 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev,
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
+	const bool is_setup = (ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK) ==
+		UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP;
+	void *const dma_addr = is_setup ? (void *)cfg->setup : (void *)buf->data;
 
-	trb[0].addr_lo = LO32((uintptr_t)buf->data);
-	trb[0].addr_hi = HI32((uintptr_t)buf->data);
+	trb[0].addr_lo = LO32((uintptr_t)dma_addr);
+	trb[0].addr_hi = HI32((uintptr_t)dma_addr);
 	trb[0].status = buf->size;
 	trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 
@@ -1360,16 +1364,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	struct net_buf *buf;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
-		struct usb_setup_packet *setup;
-
-		buf = udc_buf_peek(&ep_data->cfg);
-		if (buf == NULL) {
-			LOG_ERR("missing buffer for SETUP packet");
-			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
-			return;
-		}
-
-		setup = (struct usb_setup_packet *)buf->data;
+		struct usb_setup_packet *const setup = (struct usb_setup_packet *)cfg->setup;
 
 		/* Latency optimization: set the address immediately to be able to be able
 		 * to ACK/NAK the first packets from the host with the new address,
@@ -1380,13 +1375,10 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			udc_dwc3_set_address(dev, setup->wValue);
 		}
 
-		/* Update the size to what the hardware reports */
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		LOG_HEXDUMP_DBG(cfg->setup, sizeof(struct usb_setup_packet), "SETUP received");
 
-		LOG_HEXDUMP_DBG(buf->data, buf->len, "SETUP received");
-
-		/* The buffer will directly be taken from the UDC queue */
-		udc_setup_received(dev, NULL);
+		/* The buffer is now managed by the driver */
+		udc_setup_received(dev, cfg->setup);
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
 		if (buf == NULL) {
@@ -2049,6 +2041,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	static struct udc_dwc3_ep_data udc_dwc3_ep_data_o##n			\
 		[DT_INST_PROP(n, num_out_endpoints)];				\
 										\
+	static __nocache uint8_t udc_dwc3_dma_setup_##n			        \
+		[sizeof(struct usb_setup_packet)] __aligned(4);		        \
+	                                                                        \
 	static const struct udc_dwc3_config udc_dwc3_config_##n = {		\
 		DEVICE_MMIO_NAMED_ROM_INIT_BY_NAME(base, DT_DRV_INST(n)),	\
 		.quirk_data = &udc_dwc3_quirk_data_##n,				\
@@ -2063,6 +2058,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		.maximum_speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),\
 		.irq_enable_func = udc_dwc3_irq_enable_func_##n,		\
 		.irq_disable_func = udc_dwc3_irq_disable_func_##n,		\
+		.setup = udc_dwc3_dma_setup_##n,                                \
 	};									\
 										\
 	static struct udc_dwc3_data udc_dwc3_priv_##n = {			\
