@@ -305,6 +305,43 @@ static size_t cdc_acm_get_bulk_mps(struct usbd_class_data *const c_data)
 	return 64U;
 }
 
+/*
+ * Re-arm bulk IN/OUT after a driver-level abort (e.g. UDC tier-5 ring nuke).
+ * Success completions already reschedule these workers; errors did not, which
+ * left TX_FIFO_BUSY cleared but no new enqueue and OUT never re-armed.
+ */
+static void cdc_acm_bulk_recover_after_error(struct usbd_class_data *const c_data,
+					     struct usbd_context *const uds_ctx,
+					     struct cdc_acm_uart_data *const data,
+					     const uint8_t ep, const int err)
+{
+	const uint8_t out_ep = cdc_acm_get_bulk_out(c_data);
+	const uint8_t in_ep = cdc_acm_get_bulk_in(c_data);
+
+	if (ep != out_ep && ep != in_ep) {
+		return;
+	}
+
+	if (err == -ECONNRESET) {
+		(void)usbd_ep_dequeue(uds_ctx, out_ep);
+		(void)usbd_ep_dequeue(uds_ctx, in_ep);
+	}
+
+	if (ep == out_ep &&
+	    atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED)) {
+		cdc_acm_work_submit(&data->rx_fifo_work);
+	}
+
+	if (ep == in_ep &&
+	    (!ring_buf_is_empty(data->tx_fifo.rb) || data->zlp_needed)) {
+		cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+	}
+
+	if (data->cb != NULL) {
+		cdc_acm_work_submit(&data->irq_cb_work);
+	}
+}
+
 static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 				struct net_buf *buf, int err)
 {
@@ -334,6 +371,8 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		if (bi->ep == cdc_acm_get_int_in(c_data)) {
 			k_sem_reset(&data->notif_sem);
 		}
+
+		cdc_acm_bulk_recover_after_error(c_data, uds_ctx, data, bi->ep, err);
 
 		goto ep_request_error;
 	}
