@@ -531,9 +531,8 @@ struct udc_dwc3_ep_data {
 	bool last_xfer_completed;
 	/* Uptime (ms) the current outstanding TRB was pushed */
 	int64_t last_push_uptime;
-	/* Bitmask of TRB slot that was force-completed,
-	 * should an event come in later we 'no-op' */
-	uint8_t recovered_mask;
+	/* A counter for the recovered TRB's */
+	uint8_t recovered_count;
 };
 
 /*
@@ -604,7 +603,8 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
  * every 1ms so a transfer still actively in flight across a couple
  * of ticks is never mistaken for stalled.
  */
-#define UDC_DWC3_STALL_TIMEOUT_MS 5
+#define UDC_DWC3_STALL_IN_TIMEOUT_MS 5
+#define UDC_DWC3_STALL_OUT_TIMEOUT_MS 5
 
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr);
 static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
@@ -664,19 +664,20 @@ static void udc_dwc3_check_stalled_ep(const struct device *const dev,
 	}
 
 	age = k_uptime_get() - ep_data->last_push_uptime;
-	if (age < UDC_DWC3_STALL_TIMEOUT_MS) {
+	if ((USB_EP_DIR_IS_IN(ep_data->cfg.addr) && age < UDC_DWC3_STALL_IN_TIMEOUT_MS)
+	    || (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && age < UDC_DWC3_STALL_OUT_TIMEOUT_MS)) {
 		return;
 	}
 
 	/* Walk from the oldest TRB (not having received an event) forward.
-	 * Only IN endpoints for this.
 	 */
-	while(ep_data->head != ep_data->tail && USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+	while(ep_data->head != ep_data->tail) {
 		volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 
 		if (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) {
 			/* there are cases where the hardware never picks a TRB */
-			if (age > UDC_DWC3_STALL_TIMEOUT_MS) {
+			if ((USB_EP_DIR_IS_IN(ep_data->cfg.addr) && age > UDC_DWC3_STALL_IN_TIMEOUT_MS)
+			    || (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && age > UDC_DWC3_STALL_OUT_TIMEOUT_MS)) {
 				flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
 				flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 
@@ -685,7 +686,7 @@ static void udc_dwc3_check_stalled_ep(const struct device *const dev,
 			break;
 		}
 
-		ep_data->recovered_mask |= BIT(ep_data->tail);
+		ep_data->recovered_count++;
 		LOG_WRN("EP 0x%02x: forcing completion, event must have been missed",
 			ep_data->cfg.addr);
 		udc_dwc3_on_xfer_done_norm(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
@@ -725,10 +726,16 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	barrier_dmem_fence_full();
 }
 
+
 static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
 	struct net_buf *const buf = ep_data->net_buf[ep_data->tail];
+
+	if (buf == NULL) {
+		LOG_ERR("pop: the next TRB is emtpy");
+		return NULL;
+	}
 
 	/* Clear the last TRB */
 	ep_data->net_buf[ep_data->tail] = NULL;
@@ -736,15 +743,9 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 	/* Move to the next position in the ring buffer */
 	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
-	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
-		return NULL;
-	}
-
 	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
 		ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
 
-	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
 
 	return buf;
@@ -1525,8 +1526,8 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
-		if (ep_data->recovered_mask & BIT(idx)) {
-			ep_data->recovered_mask &= ~BIT(idx);
+		if (ep_data->recovered_count > 0) {
+			ep_data->recovered_count--;
 			LOG_DBG("EP 0x%02x: dropping late duplicate completion for "
 				"TRB %u, already recovered earlier", ep_data->cfg.addr, idx);
 		} else {
