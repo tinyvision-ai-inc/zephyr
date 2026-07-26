@@ -470,15 +470,15 @@ const static struct usb_desc_header *lb_fs_desc_##x[] = {			\
 	(struct usb_desc_header *) &lb_desc_##x.if0,				\
 	(struct usb_desc_header *) &lb_desc_##x.if0_in_ep,			\
 	(struct usb_desc_header *) &lb_desc_##x.if0_out_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if1,				\
-	(struct usb_desc_header *) &lb_desc_##x.if1_int_in_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if1_int_out_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0,				\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_in_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_out_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1,				\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_in_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_out_ep,		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1_int_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1_int_out_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_out_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_out_ep,*/		\
 	(struct usb_desc_header *) &lb_desc_##x.nil_desc,			\
 };										\
 										\
@@ -487,15 +487,15 @@ const static struct usb_desc_header *lb_hs_desc_##x[] = {			\
 	(struct usb_desc_header *) &lb_desc_##x.if0,				\
 	(struct usb_desc_header *) &lb_desc_##x.if0_hs_in_ep,			\
 	(struct usb_desc_header *) &lb_desc_##x.if0_hs_out_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if1,				\
-	(struct usb_desc_header *) &lb_desc_##x.if1_int_in_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if1_int_out_ep,			\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0,				\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_in_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_out_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1,				\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_in_ep,		\
-	(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_out_ep,		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1_int_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if1_int_out_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_0_iso_out_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1,*/			\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_in_ep,*/		\
+	/*(struct usb_desc_header *) &lb_desc_##x.if2_1_iso_out_ep,*/		\
 	(struct usb_desc_header *) &lb_desc_##x.nil_desc,			\
 };
 

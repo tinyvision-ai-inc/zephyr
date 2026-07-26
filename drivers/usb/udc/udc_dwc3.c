@@ -64,7 +64,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_DEPEVT_STREAMEVT(epn)				(((epn) << 1) | (0x06 << 6))
 #define UDC_DWC3_DEPEVT_EPCMDCMPLT(epn)				(((epn) << 1) | (0x07 << 6))
 /* For XferNotReady */
-#define UDC_DWC3_DEPEVT_STATUS_B3_MASK				GENMASK(2, 0)
+#define UDC_DWC3_DEPEVT_STATUS_B3_MASK				GENMASK(13, 12)
 #define UDC_DWC3_DEPEVT_STATUS_B3_CONTROL_SETUP			(0x0 << 0)
 #define UDC_DWC3_DEPEVT_STATUS_B3_CONTROL_DATA			(0x1 << 0)
 #define UDC_DWC3_DEPEVT_STATUS_B3_CONTROL_STATUS		(0x2 << 0)
@@ -460,6 +460,9 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define LO32(n)			((uint32_t)((uint64_t)(n) & 0xffffffff))
 #define HI32(n)			((uint32_t)((uint64_t)(n) >> 32))
 
+/* Flags used by (struct ep_data).flags */
+#define UDC_DWC3_EP_FLAG_XFER_ACTIVE				(1U << 0)
+
 /*
  * One DMA transaction request passed from the CPU to the DWC3 core.
  *
@@ -498,6 +501,8 @@ struct udc_dwc3_config {
 	/* Number of hardware endpoint set for input or output */
 	uint8_t num_in_eps;
 	uint8_t num_out_eps;
+	/* Communicate state between IRQs and API functions */
+	atomic_t flags;
 };
 
 /*
@@ -519,12 +524,12 @@ struct udc_dwc3_ep_data {
 	/* Index of the next TRB to receive data in the TRB ring, Link TRB excluded */
 	uint32_t head;
 	uint32_t tail;
-	/* Total size sent from the device to the host for the ongoing transfer */
-	uint32_t total;
 	/* A flag to tell when the ring buffer is full */
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
+	/* */
+	bool enabled;
 };
 
 /*
@@ -538,6 +543,8 @@ struct udc_dwc3_data {
 	uint32_t evt_next;
 	/* Back-reference to parent */
 	const struct device *dev;
+	/* Detect start of non-control endpoints configuration */
+	bool is_after_set_interface;
 };
 
 /*
@@ -711,7 +718,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	case UDC_DWC3_DEPCMD_STATUS_OK:
 		break;
 	case UDC_DWC3_DEPCMD_STATUS_CMDERR:
-		LOG_ERR("endpoint command failed");
+		LOG_ERR("endpoint command 0x%x, addr 0x%x failed", cmd, addr);
 		break;
 	default:
 		LOG_ERR("command failed with unknown status: 0x%08x", reg);
@@ -731,8 +738,10 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 		ep_data->cfg.addr, ep_data->cfg.mps);
 
 	if (ep_data->cfg.stat.enabled) {
+		LOG_INF("UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_MODIFY");
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_MODIFY;
 	} else {
+		LOG_INF("UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_INIT");
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_INIT;
 	}
 
@@ -843,7 +852,7 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 
-	LOG_DBG("DepUpdateXfer done ep=0x%02x addr=0x%08x data=0x%08x",
+	LOG_INF("DepUpdateXfer done ep=0x%02x addr=0x%08x data=0x%08x",
 		ep_data->cfg.addr, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 }
 
@@ -858,21 +867,21 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
+	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
 	ep_data->head = ep_data->tail = 0;
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
-					 struct udc_dwc3_ep_data *const ep_data)
+					 bool is_control)
 {
-	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) > 0;
 	uint32_t flags = 0;
 
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(0), flags);
 
-	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
+	LOG_DBG("DepStartConfig done ep=%s", is_control ? "control" : "non-control");
 }
 
 /*
@@ -961,21 +970,17 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	}
 
 	if (udc_ep_buf_has_zlp(buf)) {
-		LOG_DBG("Buffer has a ZLP flag, terminating the transfer");
+		LOG_INF("Buffer has a ZLP flag, terminating the transfer");
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP;
-		ep_data->total = 0;
 	} else {
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL;
-		ep_data->total += buf->len;
 
-		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
-		    ep_data->total % ep_data->cfg.mps == 0) {
-			LOG_DBG("Buffer is a multiple of %d, continuing this transfer of %u bytes",
-				ep_data->cfg.mps, ep_data->total);
-			ctrl |= UDC_DWC3_TRB_CTRL_CHN;
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) && buf->len % ep_data->cfg.mps == 0) {
+			LOG_INF("Buffer is a multiple of %d, continuing this transfer of %u bytes",
+				ep_data->cfg.mps, buf->len);
+			//ctrl |= UDC_DWC3_TRB_CTRL_CHN;
 		} else {
-			LOG_DBG("End of USB transfer, %u bytes transferred", ep_data->total);
-			ep_data->total = 0;
+			LOG_INF("End of USB transfer, %u bytes transferred", buf->len);
 		}
 	}
 
@@ -1155,14 +1160,14 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
 	sys_write32(reg, base + UDC_DWC3_DEVTEN);
 
-	/* Configure endpoint 0x00 and 0x80 only for now */
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
+	/* Configure control endpoints */
+	udc_dwc3_depcmd_start_config(dev, true);
 }
 
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	LOG_DBG("Going through DWC3 reset logic");
 
@@ -1186,6 +1191,8 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 	/* Perform the USB reset operations manually to improve latency */
 	udc_dwc3_set_address(dev, 0);
+
+	priv->is_after_set_interface = false;
 }
 
 static void udc_dwc3_on_connect_done(const struct device *const dev)
@@ -1305,6 +1312,31 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 	default:
 		LOG_ERR("unknown connection speed");
 	}
+}
+
+static void udc_dwc3_on_set_interface(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	LOG_DBG("SetInterface extra config");
+
+	/* Disable all endpoints but controls */
+	sys_write32(0x3, base + UDC_DWC3_DALEPENA);
+
+	/* Reset transfers */
+	for (int i = 1; i < cfg->num_in_eps; i++) {
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[i], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+	for (int i = 1; i < cfg->num_out_eps; i++) {
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[i], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+
+	/* To trigger a reconfiguration of the TX FIFO */
+	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
+
+	/* Re-initialize resources IDs for non-control endpoints */
+	udc_dwc3_depcmd_start_config(dev, false);
 }
 
 /*
@@ -1500,16 +1532,17 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 {
 	switch (evt) {
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
-		LOG_DBG("DEPEVT_XFERCOMPLETE(0)");
 		udc_dwc3_on_ctrl_out(dev);
 		break;
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(1):
-		LOG_DBG("DEPEVT_XFERCOMPLETE(1)");
 		udc_dwc3_on_ctrl_in(dev);
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
+		LOG_INF("DEPEVT_XFERCOMPLETE");
+		udc_dwc3_on_xfer_done_norm(dev, evt);
+		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
-		LOG_DBG("DEPEVT_XFERINPROGRESS");
+		LOG_INF("DEPEVT_XFERINPROGRESS");
 		udc_dwc3_on_xfer_done_norm(dev, evt);
 		break;
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
@@ -1629,14 +1662,45 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 	return 0;
 }
 
+static int udc_dwc3_ep_enable(const struct device *const dev,
+			      struct udc_ep_config *const ep_cfg)
+{
+	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	LOG_DBG("ep=0x%02x", ep_data->cfg.addr);
+
+	if (priv->is_after_set_interface) {
+		priv->is_after_set_interface = true;
+		udc_dwc3_on_set_interface(dev);
+	}
+
+	udc_dwc3_depcmd_ep_config(dev, ep_data);
+	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
+
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		udc_dwc3_trb_norm_init(dev, ep_data);
+	}
+
+	/* Starting from here, the endpoint can be used */
+	sys_set_bits(base + UDC_DWC3_DALEPENA, UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
+
+	/* Walk through the list of buffer to enqueue we might have blocked */
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
+		k_work_submit(&ep_data->work);
+	}
+
+	return 0;
+}
+
 static int udc_dwc3_ep_disable(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg)
 {
-	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-
-	sys_clear_bit(base + UDC_DWC3_DALEPENA, ep_data->epn);
-
+	/* Reinitializing the endpoints is requiring hardware commands such as DEPSTARTCFG that
+	 * affect all endpoints at once, and therefore cannot be applied per-endpoint (see
+	 * udc_dwc3_on_set_interface()).
+	 */
 	return 0;
 }
 
@@ -1726,7 +1790,7 @@ static int udc_dwc3_enable(const struct device *const dev)
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	int ret;
 
-	LOG_DBG("Enabling DWC3 driver");
+	LOG_INF("Enabling DWC3 driver");
 
 	ret = udc_dwc3_quirk_enable(dev);
 	if (ret != 0) {
@@ -1753,45 +1817,6 @@ static int udc_dwc3_disable(const struct device *const dev)
 	return 0;
 }
 
-/*
- * Hardware Init
- *
- * Prepare the driver and the hardware to being used.
- * This goes through register configuration and register commands.
- */
-
-static int udc_dwc3_ep_enable(const struct device *const dev,
-			      struct udc_ep_config *const ep_cfg)
-{
-	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-
-	LOG_DBG("%s 0x%02x", __func__, ep_data->cfg.addr);
-
-	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
-	udc_dwc3_depcmd_ep_config(dev, ep_data);
-	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
-
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		udc_dwc3_trb_norm_init(dev, ep_data);
-	}
-
-	/* Starting from here, the endpoint can be used */
-	sys_set_bits(base + UDC_DWC3_DALEPENA, UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
-
-	/* Walk through the list of buffer to enqueue we might have blocked */
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		k_work_submit(&ep_data->work);
-	}
-
-	return 0;
-}
-
-/*
- * Prepare and configure most of the parts, if the controller has a way
- * of detecting VBUS activity it should be enabled here.
- * Only udc_dwc3_enable() makes device visible to the host.
- */
 static int udc_dwc3_init(const struct device *const dev)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
