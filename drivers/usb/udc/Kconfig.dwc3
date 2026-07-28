@@ -83,6 +83,43 @@ config UDC_DWC3_IN_PARK_RECOVER_MS
 	  token, so this only needs to be long enough to never fire on a
 	  transfer that is merely waiting for the host to poll the endpoint.
 
+config UDC_DWC3_IN_INPROG_RETIRE
+	bool "Retire CPU-managed IN transfers on XferInProgress"
+	depends on UDC_DWC3_EP_SM
+	help
+	  Treat XferInProgress as a completion for CPU-managed IN endpoints when
+	  hardware has already released the tail descriptor.
+
+	  This controller does not send XferComplete for those endpoints at all:
+	  measured over a full streaming run, the ACM IN endpoint saw zero
+	  XferComplete events and one XferInProgress per transfer. Discarding
+	  XferInProgress therefore throws away the only completion signal there
+	  is, and leaves every transfer to be recovered by the completion poll a
+	  poll interval later -- which is what the poll, the endpoint state
+	  machine and the park recovery all exist to paper over.
+
+	  The ownership test means a burst within a still-owned descriptor is
+	  ignored as before, so this does not reintroduce the premature retire
+	  that made XferInProgress be ignored in the first place. Hardware-managed
+	  endpoints are unaffected.
+
+	  Turn off to restore the previous poll-dependent behaviour.
+
+config UDC_DWC3_LOST_EVT_DIAG
+	bool "Sample the event ring when the poll recovers a lost completion"
+	depends on UDC_DWC3_EP_SM && UDC_DWC3_IN_COMPLETION_POLL
+	help
+	  Read GEVNTCOUNT and the GEVNTSIZ interrupt mask each time the IN
+	  completion poll retires a TRB that hardware released without posting an
+	  event, and report the totals once a second.
+
+	  This answers whether the missing events were never posted by the
+	  controller or were posted and never collected by the CPU -- the former
+	  is unfixable in the driver, the latter is a lost interrupt edge. Every
+	  recovery path here was built without that distinction being known.
+
+	  Diagnostic only; leave it off in production.
+
 config UDC_DWC3_OUT_NOTREADY_RETAKE
 	bool "Retake a bulk OUT transfer resource on XferNotReady"
 	depends on UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE

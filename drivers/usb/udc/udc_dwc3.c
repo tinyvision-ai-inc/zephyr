@@ -268,6 +268,9 @@ static atomic_t udc_dwc3_remwk_count;
 #define UDC_DWC3_DEPEVT_MAX_EPN 16
 static atomic_t udc_dwc3_depevt_complete[UDC_DWC3_DEPEVT_MAX_EPN];
 static atomic_t udc_dwc3_depevt_inprog[UDC_DWC3_DEPEVT_MAX_EPN];
+#if defined(CONFIG_UDC_DWC3_LOST_EVT_DIAG)
+static atomic_t udc_dwc3_sw_retire[UDC_DWC3_DEPEVT_MAX_EPN];
+#endif
 
 static void udc_dwc3_note_depevt(const uint32_t evt, const bool inprog)
 {
@@ -3608,6 +3611,12 @@ static bool udc_dwc3_retire_sw_done(const struct device *const dev,
 		return false;
 	}
 
+#if defined(CONFIG_UDC_DWC3_LOST_EVT_DIAG)
+	if (ep_data->epn >= 0 && ep_data->epn < UDC_DWC3_DEPEVT_MAX_EPN) {
+		atomic_inc(&udc_dwc3_sw_retire[ep_data->epn]);
+	}
+#endif
+
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 	if (ep_data->cfg.addr == 0x01) {
 		udc_dwc3_out_acct_note_silent(dev, ep_data, via);
@@ -3746,6 +3755,119 @@ static unsigned udc_dwc3_in_poll_retire_graced(const struct device *const dev)
 }
 #endif /* !CONFIG_UDC_DWC3_EP_SM */
 
+#if defined(CONFIG_UDC_DWC3_LOST_EVT_DIAG)
+static atomic_t udc_dwc3_lost_evt_samples;
+static atomic_t udc_dwc3_lost_evt_count_nz;
+static atomic_t udc_dwc3_lost_evt_masked;
+static atomic_t udc_dwc3_lost_evt_count_max;
+
+/*
+ * Sample the event ring at the moment the poll recovers a completion that
+ * never arrived as an event.
+ *
+ * Every recovery mechanism in this driver exists because a TRB is released by
+ * HW without a DEPEVT reaching the CPU, but "never posted" and "posted and
+ * never collected" call for completely different fixes and nothing so far has
+ * distinguished them.  Three outcomes separate cleanly here:
+ *
+ *   count>0, mask set    the event is sitting in the ring with interrupts
+ *                        masked -- a lost interrupt edge, ours to fix
+ *   count>0, mask clear  posted, ring not drained yet -- worker latency
+ *   count==0             HW released the TRB and posted nothing at all,
+ *                        which no amount of driver work can recover
+ *
+ * The counters are sampled rather than logged per event: recoveries run into
+ * the hundreds per minute under streaming load, and logging each one would
+ * perturb the very timing being measured.
+ */
+static void udc_dwc3_lost_evt_sample(const struct device *const dev)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t count = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0));
+	const uint32_t siz = sys_read32(base + UDC_DWC3_GEVNTSIZ(0));
+
+	atomic_inc(&udc_dwc3_lost_evt_samples);
+
+	if (count > 0U) {
+		atomic_inc(&udc_dwc3_lost_evt_count_nz);
+	}
+
+	if (siz & UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK) {
+		atomic_inc(&udc_dwc3_lost_evt_masked);
+	}
+
+	if ((atomic_val_t)count > atomic_get(&udc_dwc3_lost_evt_count_max)) {
+		atomic_set(&udc_dwc3_lost_evt_count_max, (atomic_val_t)count);
+	}
+}
+
+static void udc_dwc3_lost_evt_report_eps(const struct device *dev);
+
+static void udc_dwc3_lost_evt_report(const struct device *const dev)
+{
+	static int64_t last_log;
+	static atomic_val_t last_samples;
+	const atomic_val_t samples = atomic_get(&udc_dwc3_lost_evt_samples);
+	const int64_t now = k_uptime_get();
+
+	if (samples == last_samples || (now - last_log) < 1000) {
+		return;
+	}
+
+	last_log = now;
+	last_samples = samples;
+
+	LOG_WRN("lost-evt: polls=%ld count_nz=%ld masked=%ld count_max=%ld",
+		(long)samples, (long)atomic_get(&udc_dwc3_lost_evt_count_nz),
+		(long)atomic_get(&udc_dwc3_lost_evt_masked),
+		(long)atomic_get(&udc_dwc3_lost_evt_count_max));
+
+	udc_dwc3_lost_evt_report_eps(dev);
+}
+
+/*
+ * Per-endpoint breakdown that separates a missing event from a late one.
+ *
+ * An event that is merely late still arrives after the poll has retired the
+ * descriptor, and the driver counts that arrival as stale (skip_xfer_done).
+ * So a stale count tracking the poll-retire count means the events are being
+ * delivered too slowly -- ours to fix -- while poll retires with no matching
+ * stale arrivals mean the event was never generated at all.
+ */
+static void udc_dwc3_lost_evt_report_eps(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	for (int dir = 0; dir < 2; dir++) {
+		const int num = dir ? cfg->num_in_eps : cfg->num_out_eps;
+
+		for (int i = 1; i < num; i++) {
+			struct udc_dwc3_ep_data *const ep_data =
+				dir ? &cfg->ep_data_in[i] : &cfg->ep_data_out[i];
+			const int epn = ep_data->epn;
+			long sw;
+
+			if (ep_data->trb_buf == NULL || epn < 0 ||
+			    epn >= UDC_DWC3_DEPEVT_MAX_EPN) {
+				continue;
+			}
+
+			sw = (long)atomic_get(&udc_dwc3_sw_retire[epn]);
+			if (sw == 0) {
+				continue;
+			}
+
+			LOG_WRN("lost-evt ep=0x%02x: evt_cmpl=%ld evt_inprog=%ld "
+				"sw_retire=%ld stale=%u",
+				ep_data->cfg.addr,
+				(long)atomic_get(&udc_dwc3_depevt_complete[epn]),
+				(long)atomic_get(&udc_dwc3_depevt_inprog[epn]),
+				sw, ep_data->skip_xfer_done_count);
+		}
+	}
+}
+#endif /* CONFIG_UDC_DWC3_LOST_EVT_DIAG */
+
 static void udc_dwc3_in_poll_worker(struct k_work *const work)
 {
 	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
@@ -3755,6 +3877,13 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	const unsigned retired = udc_dwc3_ep_sm_poll_all(dev);
+
+#if defined(CONFIG_UDC_DWC3_LOST_EVT_DIAG)
+	if (retired > 0U) {
+		udc_dwc3_lost_evt_sample(dev);
+	}
+	udc_dwc3_lost_evt_report(dev);
+#endif
 
 	if (atomic_get(&priv->bulk_eps_live) > 0) {
 		static int64_t last_log;
@@ -3902,6 +4031,35 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		 * delivery); ignoring it leaves rx_busy stuck (phase0 @ ~3s).
 		 */
 		if (epn & 1) {
+#if defined(CONFIG_UDC_DWC3_IN_INPROG_RETIRE) && defined(CONFIG_UDC_DWC3_EP_SM)
+			const struct udc_dwc3_config *const cfg = dev->config;
+			struct udc_dwc3_ep_data *const in_ep = &cfg->ep_data_in[epn >> 1];
+
+			/*
+			 * On this controller XferComplete never arrives for the
+			 * CPU-managed IN endpoints -- measured across a full run,
+			 * evt_cmpl was 0 while evt_inprog matched the transfer
+			 * count one for one.  Ignoring XferInProgress therefore
+			 * discards the only completion signal there is, and every
+			 * transfer has to be rediscovered a poll interval later.
+			 *
+			 * Retire here only once HW has actually released the tail,
+			 * which is the same test the poll applies; a burst within a
+			 * still-owned TRB fails it and is ignored exactly as before,
+			 * so the premature pop this branch was guarding against
+			 * still cannot happen.  Hardware-managed endpoints (UVC)
+			 * keep the original behaviour untouched.
+			 */
+			if (udc_dwc3_ep_sm_is_cpu(in_ep) && in_ep->trb_buf != NULL &&
+			    in_ep->net_buf[in_ep->tail] != NULL &&
+			    !udc_dwc3_trb_hwo(&in_ep->trb_buf[in_ep->tail])) {
+				if (udc_dwc3_ep_sm_depevt(dev, evt)) {
+					break;
+				}
+				udc_dwc3_on_xfer_done_norm(dev, evt);
+				break;
+			}
+#endif
 			LOG_DBG("DEPEVT_XFERINPROGRESS epn=%u IN (no pop)", epn);
 		} else {
 			LOG_DBG("DEPEVT_XFERINPROGRESS epn=%u OUT", epn);
