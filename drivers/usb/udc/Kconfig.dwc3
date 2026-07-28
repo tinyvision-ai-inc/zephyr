@@ -32,6 +32,101 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
+config UDC_DWC3_EP_STALL_LOG
+	bool "Watchdog log for CPU IN endpoints that stop retiring buffers"
+	depends on UDC_DWC3_EP_SM
+	help
+	  Report the full ring fingerprint of any CPU-managed IN endpoint whose
+	  tail buffer has been pending, unchanged, for longer than
+	  UDC_DWC3_EP_STALL_LOG_MS.
+
+	  The wedge and run-dry logs only fire on paths the driver recognises
+	  as broken. An endpoint that simply stops making progress -- tail
+	  buffer never retired, no completion event, no doorbell error -- is
+	  otherwise silent. That is the "CDC ACM shell went quiet mid-output"
+	  symptom, and it cannot be diagnosed with a shell command because the
+	  shell is the casualty. This watchdog puts the evidence on the boot
+	  console instead.
+
+config UDC_DWC3_EP_STALL_LOG_MS
+	int "Pending time before an endpoint is reported stalled (ms)"
+	default 1500
+	depends on UDC_DWC3_EP_STALL_LOG
+	help
+	  Must comfortably exceed the worst-case legitimate time a buffer can
+	  sit armed. Only endpoints with a queued buffer are considered, and
+	  OUT is excluded: an OUT endpoint armed with nothing to receive is
+	  idle by design and indistinguishable from a wedged one.
+
+config UDC_DWC3_IN_PARK_RECOVER
+	bool "Recover an IN endpoint whose armed TRB is never fetched"
+	depends on UDC_DWC3_EP_SM && UDC_DWC3_IN_START_ENDXFER_ESCALATE
+	help
+	  Re-arm a CPU-managed IN endpoint whose tail TRB has stayed owned by
+	  hardware, as the only owned TRB in the ring, for longer than
+	  UDC_DWC3_IN_PARK_RECOVER_MS.
+
+	  That state is what a dropped doorbell leaves behind, and no other
+	  mechanism can see it: the completion poll only retires TRBs hardware
+	  has released, no completion event is ever generated, and the run-dry
+	  nudge is OUT-only. Without this the pipe stays dead permanently.
+
+	  Recovery re-presents the same slot, which is safe on IN because the
+	  transfer is device-paced and nothing has reached the wire yet.
+
+config UDC_DWC3_IN_PARK_RECOVER_MS
+	int "Time an IN TRB may stay unfetched before re-arming (ms)"
+	default 250
+	depends on UDC_DWC3_IN_PARK_RECOVER
+	help
+	  A healthy IN TRB is consumed within microseconds of the next host
+	  token, so this only needs to be long enough to never fire on a
+	  transfer that is merely waiting for the host to poll the endpoint.
+
+config UDC_DWC3_OUT_NOTREADY_RETAKE
+	bool "Retake a bulk OUT transfer resource on XferNotReady"
+	depends on UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE
+	help
+	  Enable the XferNotReady event on bulk OUT endpoints and, when one
+	  arrives while the tail TRB is armed and hardware-owned, drop and retake
+	  the transfer resource with EndXfer(ForceRM)+StartXfer.
+
+	  XferNotReady means the host tried to send and HW had no transfer ready.
+	  Seeing it against an armed TRB means HW is refusing data it has a
+	  buffer for, which is a StartXfer doorbell that was accepted and then
+	  dropped. Nothing else reports that condition: a wedged OUT endpoint and
+	  an idle one are identical in the ring, so without this event the only
+	  detector is a timer that cannot tell them apart and therefore has to
+	  churn transfer resources on healthy endpoints to catch the sick ones.
+
+config UDC_DWC3_OUT_STALL_REFRESH
+	bool "Re-ring the doorbell on an OUT endpoint that stops progressing"
+	depends on UDC_DWC3_EP_SM && UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE
+	help
+	  Periodically reissue UpdateXfer on a CPU-managed OUT endpoint whose
+	  tail slot has not moved for UDC_DWC3_OUT_STALL_REFRESH_MS, escalating
+	  to EndXfer(ForceRM)+StartXfer once a few refreshes have changed nothing.
+
+	  A class keeps a fixed number of OUT transfers armed and only arms a
+	  replacement when one completes, so a single dropped completion caps it
+	  permanently and host writes NAK forever. The run-dry path cannot catch
+	  that (it needs a re-arm into a drained ring, which can no longer
+	  happen) and neither can the completion poll (it needs HWO cleared).
+
+	  UpdateXfer is a no-op on a healthy endpoint, so refreshing an idle
+	  pipe is harmless; that matters because an armed OUT endpoint with no
+	  host data is idle by design and cannot be told apart from a wedged one.
+
+config UDC_DWC3_OUT_STALL_REFRESH_MS
+	int "Time without OUT progress before re-ringing the doorbell (ms)"
+	default 1000
+	depends on UDC_DWC3_OUT_STALL_REFRESH
+	help
+	  Also the interval between refreshes, so the escalation to EndXfer lands
+	  at a few times this value. Costs one endpoint command per interval per
+	  idle OUT endpoint. Lowering it shortens a wedge but makes the escalation
+	  race live host writes more often; raising it does the reverse.
+
 config UDC_DWC3_HEALTH_LOG
 	bool "Periodic USB health / buffer-leak logging"
 	select NET_BUF_POOL_USAGE
@@ -138,5 +233,26 @@ config UDC_DWC3_IN_START_ENDXFER_ESCALATE
 	  resource, then a fresh StartXfer re-arming the same still-owned TRB.
 	  This is safe only for IN (device-paced); the OUT path deliberately does
 	  not use EndXfer+StartXfer because the restart races host-driven data.
+
+config UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE
+	bool "Escalate a stranded OUT run-dry to EndXfer(ForceRM)+StartXfer"
+	depends on UDC_DWC3_EP_SM
+	help
+	  When an OUT bulk endpoint runs dry and parks, this IP silently drops the
+	  DepUpdateXfer used to resume it (see udc_dwc3_out_rundry_restart): the
+	  command completes with no CMDERR yet HW never re-fetches the owned TRB,
+	  so the tail TRB stays HWO=1 and the pipe wedges permanently once the
+	  UpdateXfer verify+spin budget is exhausted.  This is the EP-SM OUT-RUNDRY
+	  failure observed on the CDC ACM shell-input endpoint under concurrent
+	  RTL-driven UVC streaming.
+
+	  Enable this to escalate that already-wedged case to EndTransfer(ForceRM)
+	  + a fresh StartXfer re-arming the same still-owned TRB.  EndXfer+StartXfer
+	  was historically avoided on OUT because a mid-stream restart can race
+	  host-driven incoming data; this escalation fires ONLY from a confirmed
+	  parked state (ring fully drained, no in-flight packet) and ONLY after the
+	  UpdateXfer budget is spent, i.e. when the pipe is already dead.  It is
+	  therefore strictly no-worse: it either re-fetches the TRB (pipe recovered)
+	  or leaves the same wedged state.
 
 endif # UDC_DWC3

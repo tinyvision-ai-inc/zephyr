@@ -120,6 +120,8 @@ static const char *udc_dwc3_sm_doorbell_str(enum udc_dwc3_doorbell_cmd cmd)
 		return "update";
 	case UDC_DWC3_DB_UPDATE_VERIFY:
 		return "update_verify";
+	case UDC_DWC3_DB_UPDATE_VERIFY_IN:
+		return "update_verify_in";
 	default:
 		return "?";
 	}
@@ -214,6 +216,22 @@ static void udc_dwc3_sm_out_update_verify(const struct device *dev,
 		}
 	}
 
+#if defined(CONFIG_UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE)
+	/*
+	 * UpdateXfer is a dead lever from the parked state on this IP; the pipe
+	 * is now wedged.  Escalate to EndXfer(ForceRM)+StartXfer as a last resort
+	 * (strictly no-worse -- see udc_dwc3_out_rundry_endxfer_recycle).
+	 */
+	if (udc_dwc3_int_out_endxfer_recycle(dev, ep_data)) {
+		ep_data->sm.out_rundry_reported = false;
+		while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-recycle")) {
+			;
+		}
+		udc_dwc3_int_submit_ep_work(ep_data);
+		return;
+	}
+#endif
+
 	if (!ep_data->sm.out_rundry_reported) {
 		ep_data->sm.out_rundry_reported = true;
 		LOG_ERR("EP-SM: OUT-RUNDRY ep=0x%02x update verify exhausted tail=%u "
@@ -255,6 +273,11 @@ int udc_dwc3_doorbell_issue(const struct device *dev,
 		break;
 	case UDC_DWC3_DB_UPDATE_VERIFY:
 		udc_dwc3_sm_out_update_verify(dev, ep_data);
+		break;
+	case UDC_DWC3_DB_UPDATE_VERIFY_IN:
+		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
+		ep_data->sm.in_start_reported = false;
+		udc_dwc3_sm_in_start_verify(dev, ep_data);
 		break;
 	default:
 		return -EINVAL;
@@ -402,6 +425,260 @@ unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev)
 
 	return retired;
 }
+
+bool udc_dwc3_ep_sm_any_pending(const struct device *const dev)
+{
+	for (int i = 1; i < udc_dwc3_int_num_in_eps(dev); i++) {
+		struct udc_dwc3_ep_data *const ep_data = udc_dwc3_int_ep_in(dev, i);
+
+		if (udc_dwc3_ep_sm_is_cpu(ep_data) && ep_data->trb_buf != NULL &&
+		    ep_data->net_buf[ep_data->tail] != NULL) {
+			return true;
+		}
+	}
+	for (int i = 1; i < udc_dwc3_int_num_out_eps(dev); i++) {
+		struct udc_dwc3_ep_data *const ep_data = udc_dwc3_int_ep_out(dev, i);
+
+		if (udc_dwc3_ep_sm_is_cpu(ep_data) && ep_data->trb_buf != NULL &&
+		    ep_data->net_buf[ep_data->tail] != NULL) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+#if defined(CONFIG_UDC_DWC3_EP_STALL_LOG) || defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER) || \
+	defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
+static atomic_t udc_dwc3_sm_in_park_recovered;
+
+/*
+ * Watchdog on tail-slot progress for CPU endpoints.
+ *
+ * A buffer sitting at the tail with HWO=1 means SW handed the TRB to HW and HW
+ * has not finished it.  HW only acts on a TRB after a doorbell, so a dropped
+ * doorbell leaves exactly this state -- and it is invisible to every other
+ * mechanism here: sm_poll_ep() requires HWO=0 before it will retire anything,
+ * the DEPEVT path never fires (there is no completion), and the OUT run-dry
+ * nudge is OUT-only.  The pipe is then dead for good.
+ *
+ * For IN that state is also recoverable: the transfer is device-paced, the TRB
+ * and its data are ours, and nothing has been put on the wire, so re-presenting
+ * the same slot with EndXfer(ForceRM)+StartXfer is safe (the same reasoning as
+ * udc_dwc3_in_start_endxfer_recycle, which this reuses via the IN verify).
+ * Only escalate once the slot has been unchanged for the configured window: a
+ * healthy IN TRB is consumed within microseconds of the next host token, so a
+ * slot idle for that long is not merely waiting.
+ *
+ * OUT is deliberately excluded entirely.  An armed OUT TRB legitimately sits at
+ * HWO=1 for as long as the host has nothing to send -- the steady state of an
+ * idle shell input pipe -- so it is indistinguishable here from a wedge and
+ * would only produce noise.  The genuine OUT wedge has its own detection and
+ * recovery already (udc_dwc3_sm_out_update_verify).
+ */
+/*
+ * OUT half of the watchdog.
+ *
+ * OUT cannot use the IN rule ("tail owned by HW for too long"), because an
+ * armed OUT TRB legitimately stays owned for as long as the host has nothing
+ * to send -- the steady state of an idle shell input pipe.  What is *not*
+ * legitimate is the class being unable to make progress: it keeps
+ * CONFIG_USBD_CDC_ACM_RX_OUTSTANDING transfers armed and only arms a
+ * replacement when one completes, so a single dropped completion caps it
+ * permanently and the host's writes just NAK forever.  Neither the run-dry
+ * path (which needs a re-arm into a drained ring to trigger) nor the poll
+ * (which needs HWO=0) can see that.
+ *
+ * So nudge instead of diagnose, in two steps.  First UpdateXfer, which is the
+ * databook-sanctioned way to tell HW about the TRB list and a no-op on a
+ * healthy endpoint.  If several of those change nothing, drop and retake the
+ * transfer resource with EndXfer(ForceRM)+StartXfer, which is what actually
+ * clears the wedge -- UpdateXfer alone was measured not to.
+ *
+ * Both steps run against endpoints that may be merely idle, because an armed
+ * OUT TRB with no host data looks identical to a wedged one; there is no state
+ * here that separates them.  UpdateXfer is free.  The recycle is not: if a
+ * packet lands in the microseconds between the decision and the EndXfer, HW
+ * may have ACKed data that ForceRM then discards.  That window is the price of
+ * recovering a pipe that is otherwise dead forever, and it is reached only
+ * after seconds of no progress.
+ */
+#define UDC_DWC3_OUT_REFRESH_ESCALATE_AFTER 3U
+
+static void udc_dwc3_sm_watchdog_out(const struct device *const dev,
+				     struct udc_dwc3_ep_data *const ep_data,
+				     struct net_buf *const buf,
+				     const int64_t pending_ms)
+{
+#if defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
+	if (pending_ms < CONFIG_UDC_DWC3_OUT_STALL_REFRESH_MS) {
+		return;
+	}
+
+	/*
+	 * Nothing armed at all, which an enabled class should never allow.  The
+	 * controller cannot fix it -- arming is the class's job and it has
+	 * evidently lost track of an outstanding transfer -- so report once and
+	 * leave the ring alone.
+	 */
+	if (buf == NULL) {
+		if (!ep_data->sm.stall_reported) {
+			ep_data->sm.stall_reported = true;
+			LOG_ERR("EP-OUT-UNARMED ep=0x%02x %lldms head=%u tail=%u "
+				"hwo_mask=0x%x active=%d -- class has nothing armed",
+				ep_data->cfg.addr, (long long)pending_ms, ep_data->head,
+				ep_data->tail, udc_dwc3_int_ring_data_hwo_mask(ep_data),
+				ep_data->xfer_active ? 1 : 0);
+		}
+		return;
+	}
+
+	if (ep_data->sm.out_refresh_count < UDC_DWC3_OUT_REFRESH_ESCALATE_AFTER) {
+		ep_data->sm.out_refresh_count++;
+		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
+		/* Restart the interval; a real completion resets the count too. */
+		ep_data->sm.stall_since = k_uptime_get();
+		return;
+	}
+
+	LOG_DBG("EP-OUT-RETAKE ep=0x%02x %lldms head=%u tail=%u hwo_mask=0x%x "
+		"ctrl=0x%08x status=0x%08x size=%u active=%d",
+		ep_data->cfg.addr, (long long)pending_ms, ep_data->head, ep_data->tail,
+		udc_dwc3_int_ring_data_hwo_mask(ep_data), ep_data->trb_buf[ep_data->tail].ctrl,
+		ep_data->trb_buf[ep_data->tail].status, buf->size,
+		ep_data->xfer_active ? 1 : 0);
+
+	/*
+	 * Re-arms the tail unconditionally; the return only reports whether the
+	 * TRB was consumed straight away, which for an idle OUT it never is.
+	 */
+	if (udc_dwc3_int_out_endxfer_recycle(dev, ep_data)) {
+		ep_data->sm.out_rundry_reported = false;
+		while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-retake")) {
+			;
+		}
+		udc_dwc3_int_submit_ep_work(ep_data);
+	}
+
+	ep_data->sm.out_refresh_count = 0U;
+	ep_data->sm.stall_since = k_uptime_get();
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ep_data);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(pending_ms);
+#endif
+}
+
+static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
+				    struct udc_dwc3_ep_data *const ep_data)
+{
+	const int64_t now = k_uptime_get();
+	const uint32_t tail = ep_data->tail;
+	struct net_buf *buf;
+	int64_t pending_ms;
+	bool is_in;
+
+	if (!udc_dwc3_ep_sm_is_cpu(ep_data) || ep_data->trb_buf == NULL) {
+		return;
+	}
+
+	is_in = USB_EP_DIR_IS_IN(ep_data->cfg.addr);
+	buf = ep_data->net_buf[tail];
+
+	/* IN with nothing armed has nothing to send: idle, not stalled. */
+	if (is_in && buf == NULL) {
+		ep_data->sm.stall_since = 0;
+		ep_data->sm.stall_reported = false;
+		return;
+	}
+
+	/* Any movement of the tail slot restarts the observation window. */
+	if (ep_data->sm.stall_since == 0 || ep_data->sm.stall_tail != tail ||
+	    ep_data->sm.stall_buf != buf) {
+		ep_data->sm.stall_since = now;
+		ep_data->sm.stall_tail = tail;
+		ep_data->sm.stall_buf = buf;
+		ep_data->sm.stall_reported = false;
+		ep_data->sm.out_refresh_count = 0U;
+		return;
+	}
+
+	pending_ms = now - ep_data->sm.stall_since;
+
+	if (!is_in) {
+		udc_dwc3_sm_watchdog_out(dev, ep_data, buf, pending_ms);
+		return;
+	}
+
+#if defined(CONFIG_UDC_DWC3_EP_STALL_LOG)
+	if (!ep_data->sm.stall_reported && pending_ms >= CONFIG_UDC_DWC3_EP_STALL_LOG_MS) {
+		ep_data->sm.stall_reported = true;
+		LOG_ERR("EP-STALL ep=0x%02x %lldms state=%d head=%u tail=%u full=%d active=%d "
+			"hwo_mask=0x%x ctrl=0x%08x status=0x%08x len=%u size=%u chain=%d skip=%u",
+			ep_data->cfg.addr, (long long)pending_ms, (int)ep_data->sm.state,
+			ep_data->head, tail, ep_data->full ? 1 : 0,
+			ep_data->xfer_active ? 1 : 0,
+			udc_dwc3_int_ring_data_hwo_mask(ep_data),
+			ep_data->trb_buf[tail].ctrl, ep_data->trb_buf[tail].status,
+			buf->len, buf->size, ep_data->chain_buf != NULL ? 1 : 0,
+			ep_data->skip_xfer_done_count);
+	}
+#endif
+
+#if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
+	if (pending_ms < CONFIG_UDC_DWC3_IN_PARK_RECOVER_MS) {
+		return;
+	}
+
+	/* Only the stuck tail may be owned; anything else is a live transfer. */
+	if (udc_dwc3_int_ring_data_hwo_mask(ep_data) != BIT(tail)) {
+		return;
+	}
+
+	/* Do not race the inline verify or the tier-5 ring rebuild. */
+	if (ep_data->sm.in_start_verify_busy || ep_data->sm.tier5_recovering) {
+		return;
+	}
+
+	atomic_inc(&udc_dwc3_sm_in_park_recovered);
+	LOG_WRN("EP-SM: IN-PARK ep=0x%02x stuck %lldms, re-arming tail=%u",
+		ep_data->cfg.addr, (long long)pending_ms, tail);
+
+	ep_data->sm.in_start_reported = false;
+	udc_dwc3_sm_in_start_verify(dev, ep_data);
+
+	/* Restart the window so a failed recovery is re-attempted, not spun on. */
+	ep_data->sm.stall_since = now;
+	ep_data->sm.stall_reported = false;
+
+	if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
+		while (udc_dwc3_sm_retire_tail(dev, ep_data, "in-park")) {
+			;
+		}
+		udc_dwc3_int_submit_ep_work(ep_data);
+	}
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(pending_ms);
+#endif
+}
+
+void udc_dwc3_ep_sm_watchdog(const struct device *const dev)
+{
+	for (int i = 1; i < udc_dwc3_int_num_in_eps(dev); i++) {
+		udc_dwc3_sm_watchdog_ep(dev, udc_dwc3_int_ep_in(dev, i));
+	}
+	for (int i = 1; i < udc_dwc3_int_num_out_eps(dev); i++) {
+		udc_dwc3_sm_watchdog_ep(dev, udc_dwc3_int_ep_out(dev, i));
+	}
+}
+#else
+void udc_dwc3_ep_sm_watchdog(const struct device *const dev)
+{
+	ARG_UNUSED(dev);
+}
+#endif /* EP_STALL_LOG || IN_PARK_RECOVER || OUT_STALL_REFRESH */
 
 bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)
 {

@@ -40,6 +40,8 @@ enum udc_dwc3_doorbell_cmd {
 	UDC_DWC3_DB_UPDATE,
 	/** OUT run-dry / park: UpdateXfer + HWO fetch verify. */
 	UDC_DWC3_DB_UPDATE_VERIFY,
+	/** IN resume into a parked ring: UpdateXfer + HWO fetch verify. */
+	UDC_DWC3_DB_UPDATE_VERIFY_IN,
 };
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
@@ -58,6 +60,12 @@ void udc_dwc3_ep_advance(const struct device *dev,
 			 enum udc_dwc3_ep_adv_reason reason);
 
 unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev);
+
+/** Tail-progress watchdog: report, and recover, endpoints that stop retiring. */
+void udc_dwc3_ep_sm_watchdog(const struct device *dev);
+
+/** True if any CPU endpoint still holds a queued buffer. */
+bool udc_dwc3_ep_sm_any_pending(const struct device *dev);
 
 void udc_dwc3_ep_sm_reset_all(const struct device *dev);
 
@@ -117,6 +125,17 @@ static inline unsigned udc_dwc3_ep_sm_poll_all(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 	return 0U;
+}
+
+static inline void udc_dwc3_ep_sm_watchdog(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+}
+
+static inline bool udc_dwc3_ep_sm_any_pending(const struct device *dev)
+{
+	ARG_UNUSED(dev);
+	return false;
 }
 
 static inline bool udc_dwc3_ep_sm_depevt(const struct device *dev, uint32_t evt)

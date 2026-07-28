@@ -37,6 +37,13 @@ struct udc_dwc3_ep_sm {
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;
 #endif
+	/** Tail-progress watchdog, see udc_dwc3_ep_sm_watchdog(). */
+	int64_t stall_since;
+	uint32_t stall_tail;
+	struct net_buf *stall_buf;
+	bool stall_reported;
+	/** Consecutive OUT doorbell refreshes with no progress. */
+	uint8_t out_refresh_count;
 };
 
 /*
@@ -112,6 +119,9 @@ bool udc_dwc3_int_retire_sw_done(const struct device *dev,
 
 void udc_dwc3_int_in_endxfer_recycle(const struct device *dev,
 				     struct udc_dwc3_ep_data *ep_data);
+
+bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,
+				      struct udc_dwc3_ep_data *ep_data);
 
 void udc_dwc3_int_submit_ep_work(struct udc_dwc3_ep_data *ep_data);
 

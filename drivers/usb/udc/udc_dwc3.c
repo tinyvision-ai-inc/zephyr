@@ -908,6 +908,8 @@ struct udc_dwc3_data {
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	/* SM poll/depevt deferred until at least one non-control EP is enabled. */
 	atomic_t bulk_eps_live;
+	/* Rate-limit for the "poll would have stopped with work pending" report. */
+	bool poll_live_zero_reported;
 #endif
 };
 
@@ -1880,7 +1882,20 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Per-endpoint events */
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
-	/* UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN is useful for debugging */
+
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+	/*
+	 * XferNotReady on a bulk OUT endpoint means the host tried to send and
+	 * HW had no transfer ready to take it.  That is the only direct evidence
+	 * the controller offers that a StartXfer doorbell went missing, and
+	 * without it a wedged OUT pipe is indistinguishable from an idle one --
+	 * leaving a timer as the only detector, which cannot tell the two apart.
+	 */
+	if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+	    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) == USB_EP_TYPE_BULK) {
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+	}
+#endif
 
 	/* This is the usb protocol endpoint number, but the data encoding
 	 * we chose for physical endpoint number is the same as this
@@ -2150,6 +2165,59 @@ static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 #endif
 }
 #endif /* CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE */
+
+#if defined(CONFIG_UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE)
+static atomic_t udc_dwc3_out_rundry_recycled;
+static atomic_t udc_dwc3_out_rundry_recycle_failed;
+
+/*
+ * Last-resort recovery for an OUT endpoint stranded by the run-dry park-window
+ * UpdateXfer drop (see udc_dwc3_out_rundry_restart).  Invoked ONLY after the
+ * UpdateXfer verify+spin budget in udc_dwc3_sm_out_update_verify is fully
+ * exhausted -- i.e. the tail TRB is still HWO=1, HW has parked, and the pipe
+ * would otherwise stay permanently wedged.
+ *
+ * From this confirmed-parked state the ring is fully drained and there is no
+ * in-flight host packet, so the historical "EndXfer+StartXfer races host data
+ * and corrupts OUT" hazard does not apply: any byte the host sends during the
+ * tiny end->start window simply NAKs and the host retries.  And because we only
+ * reach here when the alternative is a dead pipe, this is strictly no-worse: it
+ * either re-fetches the owned TRB (pipe recovered) or leaves the same state.
+ *
+ * Mirrors the IN lever (udc_dwc3_in_start_endxfer_recycle) but leaves the ring
+ * pointers intact so the normal XferComplete path retires the slot afterwards.
+ * Returns true iff HW fetched the re-armed tail TRB.
+ */
+static bool udc_dwc3_out_rundry_endxfer_recycle(const struct device *const dev,
+						struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t tail = ep_data->tail;
+
+	/* Drop the parked transfer resource. */
+	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			UDC_DWC3_DEPCMD_DEPENDXFER | UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+			FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx));
+
+	/*
+	 * Re-arm the same still-owned tail TRB.  StartXfer allocates a fresh
+	 * transfer resource and refreshes ep_data->xferrscidx.
+	 */
+	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, &ep_data->trb_buf[tail]);
+
+	for (unsigned int step = 0U; step < UDC_DWC3_RUNDRY_SETTLE_STEPS; step++) {
+		k_busy_wait(UDC_DWC3_RUNDRY_SETTLE_US);
+		if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
+			atomic_inc(&udc_dwc3_out_rundry_recycled);
+			LOG_WRN("EP-SM: OUT-RUNDRY-RECYCLE ep=0x%02x recovered via "
+				"EndXfer(ForceRM)+StartXfer", ep_data->cfg.addr);
+			return true;
+		}
+	}
+
+	atomic_inc(&udc_dwc3_out_rundry_recycle_failed);
+	return false;
+}
+#endif /* CONFIG_UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE */
 
 #if !defined(CONFIG_UDC_DWC3_EP_SM)
 static void udc_dwc3_in_start_verify(const struct device *const dev,
@@ -2444,9 +2512,26 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	 * recycle instead.  Sampled before the push, while the ring is still
 	 * empty.
 	 */
+	const bool resume_from_park =
+		ep_data->xfer_active && udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
 	const bool out_resume_from_park =
-		USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && ep_data->xfer_active &&
-		udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
+		resume_from_park && USB_EP_DIR_IS_OUT(ep_data->cfg.addr);
+	/*
+	 * IN hits the very same park: the ring drains whenever the class layer
+	 * pauses (between shell writes), and the plain UpdateXfer below is then
+	 * dropped exactly as it is on OUT, stranding the TRB at HWO=1 with no
+	 * mechanism left to notice (see udc_dwc3_sm_watchdog_ep).  Verify the
+	 * fetch on this path instead of firing and forgetting.  Under UVC
+	 * streaming the ACM IN ring drains far more often -- the video endpoints
+	 * monopolise the controller -- which is why this only shows up loaded.
+	 *
+	 * The verify inspects the tail slot, so it only applies when the slot
+	 * just pushed *is* the tail.  A tail left behind on an already-completed
+	 * slot is the poll's job; once it retires, the watchdog covers the rest.
+	 */
+	const uint32_t push_slot = ep_data->head;
+	const bool in_resume_from_park =
+		resume_from_park && USB_EP_DIR_IS_IN(ep_data->cfg.addr);
 
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
@@ -2509,7 +2594,12 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		} else {
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 			if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
-				(void)udc_dwc3_doorbell_issue(dev, ep_data, UDC_DWC3_DB_UPDATE);
+				const bool verify = in_resume_from_park &&
+						    ep_data->tail == push_slot;
+
+				(void)udc_dwc3_doorbell_issue(dev, ep_data,
+					verify ? UDC_DWC3_DB_UPDATE_VERIFY_IN
+					       : UDC_DWC3_DB_UPDATE);
 			} else {
 				udc_dwc3_depcmd_update_xfer(dev, ep_data);
 			}
@@ -3153,6 +3243,54 @@ static void udc_dwc3_on_xfer_not_ready(const struct device *const dev,
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+static atomic_t udc_dwc3_out_notready_retaken;
+
+/*
+ * The host tried to send on a bulk OUT endpoint and HW had nothing ready.
+ *
+ * If the ring is genuinely empty this is routine -- the class simply has not
+ * armed a replacement yet, and the host will retry.  What is not routine is
+ * seeing it while the tail TRB is armed and hardware-owned: HW is refusing
+ * data it has a buffer for, which only happens when the StartXfer doorbell for
+ * that TRB was accepted and then dropped.  The transfer resource is stale, so
+ * drop and retake it.
+ *
+ * Doing this from the event rather than a timer is what makes it safe.  There
+ * is real host traffic in flight by definition, so no data is being discarded
+ * from an idle pipe, and it costs nothing when the pipe is healthy -- as
+ * opposed to an unconditional periodic EndXfer, which churns transfer
+ * resources on every quiet endpoint forever.
+ */
+static void udc_dwc3_on_xfer_not_ready_norm(const struct device *const dev,
+					    const uint32_t evt)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+	struct udc_dwc3_ep_data *const ep_data =
+		(epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
+
+	if (ep_data->trb_buf == NULL || USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		return;
+	}
+
+	if (ep_data->net_buf[ep_data->tail] == NULL ||
+	    !udc_dwc3_trb_hwo(&ep_data->trb_buf[ep_data->tail])) {
+		LOG_DBG("OUT-NOTREADY ep=0x%02x unarmed, host will retry",
+			ep_data->cfg.addr);
+		return;
+	}
+
+	atomic_inc(&udc_dwc3_out_notready_retaken);
+	LOG_WRN("OUT-NOTREADY ep=0x%02x armed but not taken, retaking "
+		"(tail=%u hwo_mask=0x%x active=%d)",
+		ep_data->cfg.addr, ep_data->tail,
+		udc_dwc3_ring_data_hwo_mask(ep_data), ep_data->xfer_active ? 1 : 0);
+
+	udc_dwc3_out_rundry_endxfer_recycle(dev, ep_data);
+}
+#endif /* CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE */
+
 static void udc_dwc3_on_xfer_done(const struct device *const dev,
 				  struct udc_dwc3_ep_data *const ep_data)
 {
@@ -3189,6 +3327,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	const bool chn = !!(trb->ctrl & UDC_DWC3_TRB_CTRL_CHN);
 	const bool lst = !!(trb->ctrl & UDC_DWC3_TRB_CTRL_LST);
 	const bool from_inprog = ((evt & GENMASK(7, 6)) == (0x2U << 6));
+	uint32_t trb_status_done = 0U;
 	struct net_buf *buf;
 	int ret;
 
@@ -3348,6 +3487,20 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		return;
 	}
 
+	/*
+	 * Latch the HW writeback BEFORE pop_trb(), which calls udc_dwc3_trb_clear()
+	 * and zeroes the slot.  The OUT length below is derived from the residual
+	 * BUFSIZ in this field; reading it after the clear yields 0, i.e. "the host
+	 * filled the whole buffer", so every OUT transfer over-reported its length
+	 * and the class layer was handed the untouched tail of the buffer as if it
+	 * were received data.  On CDC ACM that stale tail is previously transmitted
+	 * shell output, which the shell then executed as input (its own prompt and
+	 * replies coming back as "command not found"), while the oversized length
+	 * overran the RX ring ("RX ring buffer full" / "RX buffer to small").
+	 * HWO is already clear at this point, so the writeback is final.
+	 */
+	trb_status_done = trb->status;
+
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
@@ -3382,9 +3535,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		ep_data->chain_buf = NULL;
 	}
 
-	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
-	    (lst || (FIELD_GET(UDC_DWC3_TRB_CTRL_TRBCTL_MASK, trb->ctrl) ==
-		     UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP))) {
+	/*
+	 * Only LST terminates the transfer here.  The historical NORMAL_ZLP term
+	 * read trb->ctrl after pop_trb() had already cleared the slot, so it was
+	 * always false; the IN re-arm path below was tuned around that.  Enabling
+	 * it (via the latched TRBCTL) makes IN absorb the CDC ACM flush ZLP and
+	 * drop xfer_active early, which stops shell output reaching the host --
+	 * so it stays disabled deliberately.
+	 */
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) && lst) {
 		ep_data->absorb_cdc_zlp = true;
 		ep_data->xfer_active = false;
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
@@ -3410,7 +3569,10 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		const uint32_t residual =
+			FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status_done);
+
+		buf->len = (residual <= buf->size) ? (buf->size - residual) : 0U;
 	}
 
 	ret = udc_submit_ep_event(dev, buf, 0);
@@ -3627,6 +3789,27 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 
 		ARG_UNUSED(retired);
 
+		udc_dwc3_ep_sm_watchdog(dev);
+
+		k_work_reschedule(&priv->in_poll_work,
+				  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
+	} else if (udc_dwc3_ep_sm_any_pending(dev)) {
+		/*
+		 * bulk_eps_live gates every recovery lever: poll_all() and
+		 * ep_sm_depevt() both bail out when it is zero, and this worker
+		 * stops rescheduling itself.  Reaching that state while a CPU
+		 * endpoint still holds a queued buffer means nothing will ever
+		 * retire it -- the pipe is dead until some unrelated endpoint
+		 * gets enabled again.  Keep polling so the buffer can retire,
+		 * and say so once.
+		 */
+		if (!priv->poll_live_zero_reported) {
+			priv->poll_live_zero_reported = true;
+			LOG_ERR("EP-SM: poll stopped with live=0 while CPU eps still pending");
+		}
+
+		udc_dwc3_ep_sm_watchdog(dev);
+
 		k_work_reschedule(&priv->in_poll_work,
 				  K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
 	}
@@ -3735,6 +3918,11 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
 		udc_dwc3_on_xfer_not_ready(dev, evt);
 		break;
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
+		udc_dwc3_on_xfer_not_ready_norm(dev, evt);
+		break;
+#endif
 	case UDC_DWC3_DEVT_DISCONNEVT:
 		LOG_INF("DEVT_DISCONNEVT");
 		break;
@@ -4466,9 +4654,25 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		const atomic_val_t live = atomic_dec(&DEV_DATA(dev)->bulk_eps_live);
+		/*
+		 * Saturating decrement.  atomic_dec() returns the PREVIOUS value, so
+		 * the counter reaches zero on the 1 -> 0 transition.  A plain
+		 * atomic_dec() here also went negative whenever more disables than
+		 * enables were seen -- which USBRST guarantees, since it force-clears
+		 * the counter (see udc_dwc3_on_reset) while endpoints are still
+		 * enabled.  A negative count never satisfies bulk_eps_live > 0 again,
+		 * which permanently silences the EP-SM: poll_all() and depevt() both
+		 * bail out early, so CPU-managed endpoints (the CDC ACM shell pipes)
+		 * lose every completion and wedge for good.
+		 */
+		atomic_val_t live = atomic_get(&DEV_DATA(dev)->bulk_eps_live);
 
-		if (live == 0) {
+		while (live > 0 &&
+		       !atomic_cas(&DEV_DATA(dev)->bulk_eps_live, live, live - 1)) {
+			live = atomic_get(&DEV_DATA(dev)->bulk_eps_live);
+		}
+
+		if (live == 1) {
 # if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 			k_work_cancel_delayable(&DEV_DATA(dev)->in_poll_work);
 # endif
@@ -4851,16 +5055,22 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 		{
+			/*
+			 * atomic_inc() returns the PREVIOUS value, so the first
+			 * bulk endpoint is the one that sees 0.  Testing for 1
+			 * armed the poll only on the second endpoint, and after
+			 * a USBRST force-clear it could miss the restart.
+			 */
 			const atomic_val_t live = atomic_inc(&DEV_DATA(dev)->bulk_eps_live);
 
-			if (live == 1) {
+			if (live == 0) {
 # if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 				k_work_reschedule(&DEV_DATA(dev)->in_poll_work,
 					K_USEC(CONFIG_UDC_DWC3_IN_COMPLETION_POLL_INTERVAL_US));
 # endif
 # if defined(CONFIG_UDC_DWC3_EP_SM_LOG_PHASE)
 				LOG_WRN("EP-SM: first bulk ep=0x%02x live=%ld poll start",
-					ep_data->cfg.addr, (long)live);
+					ep_data->cfg.addr, (long)live + 1);
 # endif
 			}
 		}
@@ -5210,6 +5420,18 @@ void udc_dwc3_int_in_endxfer_recycle(const struct device *dev,
 #else
 	ARG_UNUSED(dev);
 	ARG_UNUSED(ep_data);
+#endif
+}
+
+bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,
+				      struct udc_dwc3_ep_data *ep_data)
+{
+#if defined(CONFIG_UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE)
+	return udc_dwc3_out_rundry_endxfer_recycle(dev, ep_data);
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ep_data);
+	return false;
 #endif
 }
 
