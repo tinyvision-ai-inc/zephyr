@@ -959,7 +959,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
-	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO;
+	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
 
 	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
