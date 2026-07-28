@@ -83,6 +83,30 @@ config UDC_DWC3_IN_PARK_RECOVER_MS
 	  token, so this only needs to be long enough to never fire on a
 	  transfer that is merely waiting for the host to poll the endpoint.
 
+config UDC_DWC3_EP0_RESCUE
+	bool "Tick the EP0 recovery poll independently of event arrival"
+	depends on UDC_DWC3_IN_COMPLETION_POLL
+	help
+	  Run the EP0 deferred-completion poll from the periodic worker as well
+	  as at the end of each event batch.
+
+	  EP0 defers a completion whose descriptor is still owned by hardware and
+	  leaves the poll to retire it, but that poll only runs after an event
+	  batch, so it cannot rescue anything unless another event arrives. When
+	  the controller drops the follow-up completion and the bus is otherwise
+	  quiet -- during UVC stream teardown and restart, for instance -- the
+	  transfer stays stranded until the host times it out at five seconds,
+	  which is the -110 seen on UVC probe control requests.
+
+config UDC_DWC3_EP0_RESCUE_MS
+	int "Interval for the independent EP0 rescue tick (ms)"
+	default 10
+	depends on UDC_DWC3_EP0_RESCUE
+	help
+	  Keep this well below the host's control transfer timeout and well above
+	  the bulk poll interval. Driving EP0 recovery at the bulk poll rate was
+	  measured to starve the endpoint workers.
+
 config UDC_DWC3_IN_INPROG_RETIRE
 	bool "Retire CPU-managed IN transfers on XferInProgress"
 	depends on UDC_DWC3_EP_SM

@@ -3902,6 +3902,34 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 	udc_dwc3_lost_evt_report(dev);
 #endif
 
+#if defined(CONFIG_UDC_DWC3_EP0_RESCUE)
+	{
+		/*
+		 * EP0 defers a completion whose TRB is still owned and relies on
+		 * udc_dwc3_ep0_poll_all() to pick it up -- but that only runs at
+		 * the end of an event batch, so it needs another event to arrive
+		 * before it can rescue anything.  On a controller that drops
+		 * completions, a deferred control transfer can therefore sit
+		 * until unrelated traffic happens past, and if the bus goes quiet
+		 * (both video streams being torn down and restarted, say) nothing
+		 * comes, and the host fails the transfer at its five second
+		 * timeout -- the -110 that kills UVC negotiation.
+		 *
+		 * Tick it independently of events. Deliberately slow: an earlier
+		 * attempt to drive this from the 500us bulk poll starved the
+		 * endpoint workers, and rescuing within tens of milliseconds is
+		 * still orders of magnitude inside the host's timeout.
+		 */
+		static int64_t last_ep0_rescue;
+		const int64_t now = k_uptime_get();
+
+		if ((now - last_ep0_rescue) >= CONFIG_UDC_DWC3_EP0_RESCUE_MS) {
+			last_ep0_rescue = now;
+			udc_dwc3_ep0_poll_all(dev);
+		}
+	}
+#endif
+
 	if (atomic_get(&priv->bulk_eps_live) > 0) {
 		static int64_t last_log;
 		static atomic_val_t last_recovered;
