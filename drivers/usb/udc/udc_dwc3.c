@@ -26,6 +26,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
 #include "udc_dwc3_int.h"
+#include "udc_dwc3_arm.h"
 
 static atomic_t udc_dwc3_hwirq_count;
 static atomic_t udc_dwc3_poll_count;
@@ -2142,7 +2143,7 @@ static atomic_t udc_dwc3_in_start_backoff;
  */
 #define UDC_DWC3_INSTART_RECYCLE_STEPS 16U
 
-static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
+static bool udc_dwc3_in_pipe_rebuild(const struct device *const dev,
 					    struct udc_dwc3_ep_data *ep_data);
 
 /*
@@ -2190,31 +2191,31 @@ static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 	 * default ~160 us window is not always enough for a fresh StartXfer to
 	 * fetch under UVC load.
 	 */
-	if (ep_data->sm.post_tier5_arm) {
+	if (ep_data->sm.arm_after_rebuild) {
 		settle_steps = 64U;
 		settle_us = 50U;
-		ep_data->sm.post_tier5_arm = false;
+		ep_data->sm.arm_after_rebuild = false;
 	}
 #endif
 
 	if (udc_dwc3_in_start_endxfer_retry(dev, ep_data, settle_steps, settle_us)) {
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-		ep_data->sm.in_start_verify_busy = false;
+		ep_data->sm.arm_verify_busy = false;
 #endif
 		LOG_WRN("IN-ARM: ep=0x%02x OK path=recycle (EndXfer+StartXfer, HWO cleared)",
 			ep_data->cfg.addr);
 		return;
 	}
 
-	LOG_ERR("IN-ARM: ep=0x%02x recycle still hwo=1 — escalating to TIER5",
+	LOG_ERR("IN-ARM: ep=0x%02x recycle still hwo=1 — escalating to PIPE-REBUILD",
 		ep_data->cfg.addr);
 
-	if (udc_dwc3_in_start_tier5_recover(dev, ep_data)) {
+	if (udc_dwc3_in_pipe_rebuild(dev, ep_data)) {
 		return;
 	}
 
 	atomic_inc(&udc_dwc3_in_start_exhausted);
-	LOG_ERR("IN-ARM: ep=0x%02x RECYCLE failed (TIER5 unavailable)",
+	LOG_ERR("IN-ARM: ep=0x%02x RECYCLE failed (PIPE-REBUILD unavailable)",
 		ep_data->cfg.addr);
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 	udc_dwc3_xfer_trace("IN-START-RECYCLE", ep_data, "endxfer+start failed");
@@ -2636,7 +2637,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		 * mark the transfer active again -- that would make the retry
 		 * worker take the UpdateXfer path against a dead transfer resource,
 		 * which is the stranded HWO=1 / IN-START-REARM signature after a
-		 * successful TIER5 re-queue.
+		 * successful pipe-rebuild re-queue.
 		 */
 		if (ep_data->requeue_gen != start_gen) {
 			return 0;
@@ -3655,8 +3656,8 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	udc_dwc3_on_xfer_done(dev, ep_data);
 
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
-	/* Forward progress: spend the tier-5 retry budget per wedge, not per boot */
-	ep_data->tier5_requeues = 0U;
+	/* Forward progress: spend the rebuild retry budget per wedge, not per boot */
+	ep_data->rebuild_attempts = 0U;
 #endif
 
 	/* For buffers coming from the host, update the size actually received */
@@ -3691,7 +3692,7 @@ static bool udc_dwc3_retire_sw_done(const struct device *const dev,
 	}
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-	if (ep_data->sm.tier5_recovering) {
+	if (ep_data->sm.rebuild_in_progress) {
 		return false;
 	}
 #endif
@@ -4852,16 +4853,14 @@ static bool udc_dwc3_orphan_add(struct net_buf **orphaned, unsigned int *n,
 	return true;
 }
 
-/* Consecutive tier-5 re-queues allowed before the request is failed to the class */
-#define UDC_DWC3_TIER5_REQUEUE_MAX 3U
+/* Consecutive pipe rebuilds allowed before the request is failed to the class */
+#define UDC_DWC3_PIPE_REBUILD_MAX 3U
 
 /*
- * Tier-5 IN recovery when EndXfer+StartXfer recycle cannot clear tail HWO.
- * Detach ring and queued buffers before EndXfer (which can clear HWO and
- * trigger SW-retire), dedupe orphans, then return each net_buf to the class
- * exactly once.
+ * Pipe rebuild: EndXfer recycle could not clear tail HWO.  Nuke the ring,
+ * re-queue untouched buffers (bounded), then arm again with after_rebuild policy.
  */
-static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
+static bool udc_dwc3_in_pipe_rebuild(const struct device *const dev,
 					    struct udc_dwc3_ep_data *ep_data)
 {
 	struct net_buf *orphaned[CONFIG_UDC_DWC3_TRB_NUM + 2U];
@@ -4872,7 +4871,7 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	bool requeue;
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-	ep_data->sm.tier5_recovering = true;
+	ep_data->sm.rebuild_in_progress = true;
 #endif
 
 	udc_dwc3_lock(dev);
@@ -4897,7 +4896,7 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 		udc_dwc3_trb_clear(&ep_data->trb_buf[i]);
 
 		if (!udc_dwc3_orphan_add(orphaned, &n_orphan, buf, ARRAY_SIZE(orphaned))) {
-			LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan ring overflow",
+			LOG_ERR("IN-ARM: PIPE-REBUILD ep=0x%02x orphan ring overflow",
 				ep_data->cfg.addr);
 		}
 
@@ -4908,7 +4907,7 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 
 	if (!udc_dwc3_orphan_add(orphaned, &n_orphan, ep_data->chain_buf,
 				 ARRAY_SIZE(orphaned))) {
-		LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan chain overflow",
+		LOG_ERR("IN-ARM: PIPE-REBUILD ep=0x%02x orphan chain overflow",
 			ep_data->cfg.addr);
 	}
 	if (ep_data->chain_buf != NULL) {
@@ -4919,7 +4918,7 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 
 	while ((qbuf = udc_buf_get(&ep_data->cfg)) != NULL) {
 		if (!udc_dwc3_orphan_add(orphaned, &n_orphan, qbuf, ARRAY_SIZE(orphaned))) {
-			LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan queue overflow",
+			LOG_ERR("IN-ARM: PIPE-REBUILD ep=0x%02x orphan queue overflow",
 				ep_data->cfg.addr);
 			break;
 		}
@@ -4938,8 +4937,8 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	udc_dwc3_ep_sm_set_state(ep_data, UDC_DWC3_EP_SM_IDLE);
-	ep_data->sm.in_start_reported = false;
-	ep_data->sm.in_start_verify_busy = false;
+	ep_data->sm.arm_fail_logged = false;
+	ep_data->sm.arm_verify_busy = false;
 	ep_data->sm.poll_grace_armed = false;
 #endif
 
@@ -4953,7 +4952,7 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	 * reports the error rather than re-arming forever.
 	 */
 	requeue = !partially_sent && n_orphan > 0U &&
-		  ep_data->tier5_requeues < UDC_DWC3_TIER5_REQUEUE_MAX;
+		  ep_data->rebuild_attempts < UDC_DWC3_PIPE_REBUILD_MAX;
 	/*
 	 * The queue was drained above either way, so a caller holding a buffer it
 	 * peeked before this ran must not treat it as still being the queue head.
@@ -4961,18 +4960,17 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	ep_data->requeue_gen++;
 
 	if (requeue) {
-		ep_data->tier5_requeues++;
+		ep_data->rebuild_attempts++;
 		for (unsigned int i = 0U; i < n_orphan; i++) {
 			udc_buf_put(&ep_data->cfg, orphaned[i]);
 		}
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 		/*
-		 * CPU-managed IN only (HW-offload EPs never reach tier-5).  The
-		 * next StartXfer verify uses the hardened post-tier5 settle path.
+		 * CPU-managed IN only.  Next StartXfer uses after_rebuild policy.
 		 */
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
 		    udc_dwc3_ep_sm_is_cpu(ep_data)) {
-			ep_data->sm.post_tier5_arm = true;
+			ep_data->sm.arm_after_rebuild = true;
 		}
 #endif
 	}
@@ -4980,29 +4978,29 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	udc_dwc3_unlock(dev);
 
 	if (!requeue) {
+		/*
+		 * Budget exhausted or partial send: stall the EP so the host
+		 * sees PIPE/STALL instead of a ghost HWO=1 soft wedge.
+		 */
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+			udc_dwc3_arm_give_up(dev, ep_data, "pipe-rebuild-drop");
+		}
 		for (unsigned int i = 0U; i < n_orphan; i++) {
 			(void)udc_submit_ep_event(dev, orphaned[i], -ECONNRESET);
 		}
 	}
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
-	ep_data->sm.tier5_recovering = false;
+	ep_data->sm.rebuild_in_progress = false;
 #endif
 
-	LOG_ERR("IN-ARM: ep=0x%02x TIER5 ring nuked, %s (%u buf, retry %u) "
-		"— next arm uses post5 policy",
+	LOG_ERR("IN-ARM: ep=0x%02x PIPE-REBUILD %s (%u buf, attempt %u)",
 		ep_data->cfg.addr, requeue ? "re-queued" : "dropped", n_orphan,
-		ep_data->tier5_requeues);
+		ep_data->rebuild_attempts);
 	k_work_submit(&ep_data->work);
 	if (requeue) {
-		/*
-		 * Brief pause after the EndXfer storm so the shared DEPCMD path
-		 * can settle before the worker's StartXfer.  Then ask the class
-		 * to re-feed if its TX path went idle (no-op when the re-queued
-		 * buffer is still considered in-flight).
-		 */
 		k_busy_wait(200);
-		udc_dwc3_cpu_in_tier5_kick(ep_data->cfg.addr);
+		udc_dwc3_cpu_in_rebuild_kick(ep_data->cfg.addr);
 	}
 	return true;
 }
@@ -5893,9 +5891,22 @@ bool udc_dwc3_int_in_endxfer_retry(const struct device *dev,
 #endif
 }
 
-__weak void udc_dwc3_cpu_in_tier5_kick(uint8_t ep_addr)
+__weak void udc_dwc3_cpu_in_rebuild_kick(uint8_t ep_addr)
 {
 	ARG_UNUSED(ep_addr);
+}
+
+void udc_dwc3_int_cpu_ep_halt(const struct device *dev,
+			      struct udc_dwc3_ep_data *ep_data)
+{
+	if (dev == NULL || ep_data == NULL) {
+		return;
+	}
+
+	udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	udc_dwc3_depcmd_set_stall(dev, ep_data);
+	ep_data->cfg.stat.halted = true;
+	ep_data->xfer_active = false;
 }
 
 bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,

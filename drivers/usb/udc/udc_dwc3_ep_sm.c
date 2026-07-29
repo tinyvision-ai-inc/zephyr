@@ -17,6 +17,7 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
 #include "udc_dwc3_int.h"
+#include "udc_dwc3_arm.h"
 
 #define UDC_DWC3_TRB_CTRL_HWO BIT(0)
 
@@ -24,82 +25,24 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_RUNDRY_SETTLE_STEPS   16U
 #define UDC_DWC3_RUNDRY_SETTLE_US      50U
 
-#define UDC_DWC3_INSTART_SETTLE_US     10U
-#define UDC_DWC3_INSTART_FAST_STEPS    8U
-#define UDC_DWC3_INSTART_REARM_RETRIES 6U
-#define UDC_DWC3_INSTART_SETTLE_STEPS  8U
-#define UDC_DWC3_INSTART_RECYCLE_STEPS 16U
-
-/* Hardened settle for the first StartXfer after a tier-5 re-queue. */
-#define UDC_DWC3_INSTART_POST_TIER5_SETTLE_US     50U
-#define UDC_DWC3_INSTART_POST_TIER5_FAST_STEPS    40U
-#define UDC_DWC3_INSTART_POST_TIER5_RETRIES       12U
-#define UDC_DWC3_INSTART_POST_TIER5_SETTLE_STEPS  40U
-#define UDC_DWC3_INSTART_POST_TIER5_RECYCLE_STEPS 64U
-
 #define UDC_DWC3_DEPEVT_EPN_MASK       GENMASK(5, 1)
 
 /* How long an IN endpoint may sit with a queued buffer and an empty ring. */
 #define UDC_DWC3_SM_IDLE_QUEUED_MS     50
 
-static atomic_t udc_dwc3_sm_in_start_retook;
-static atomic_t udc_dwc3_sm_in_start_backoff;
 static atomic_t udc_dwc3_sm_in_start_exhausted;
 static atomic_t udc_dwc3_sm_poll_recovered;
-static atomic_t udc_dwc3_sm_in_arm_ok_fast;
-static atomic_t udc_dwc3_sm_in_arm_ok_nudge;
-static atomic_t udc_dwc3_sm_in_arm_nudge_sum;
-static atomic_t udc_dwc3_sm_in_arm_nudge_max;
-static atomic_t udc_dwc3_sm_in_arm_fail;
-
-static void udc_dwc3_sm_arm_note_nudge_max(unsigned int nudges)
-{
-	atomic_val_t cur;
-
-	do {
-		cur = atomic_get(&udc_dwc3_sm_in_arm_nudge_max);
-		if ((atomic_val_t)nudges <= cur) {
-			return;
-		}
-	} while (!atomic_cas(&udc_dwc3_sm_in_arm_nudge_max, cur, (atomic_val_t)nudges));
-}
-
-/*
- * Record one StartXfer verify outcome.
- * nudges = UpdateXfer count after the initial DepStartXfer until HWO cleared.
- * path: "fast" | "update" | "post5-restart"
- */
-static void udc_dwc3_sm_arm_ok(struct udc_dwc3_ep_data *ep_data,
-			       unsigned int nudges, const char *path)
-{
-	if (nudges == 0U) {
-		atomic_inc(&udc_dwc3_sm_in_arm_ok_fast);
-		LOG_DBG("IN-ARM: ep=0x%02x OK path=%s start_db=1 update_db=0",
-			ep_data->cfg.addr, path);
-		return;
-	}
-
-	atomic_inc(&udc_dwc3_sm_in_arm_ok_nudge);
-	atomic_add(&udc_dwc3_sm_in_arm_nudge_sum, (atomic_val_t)nudges);
-	udc_dwc3_sm_arm_note_nudge_max(nudges);
-	/* Nudged arms are the interesting soak signal — keep visible at WRN. */
-	LOG_WRN("IN-ARM: ep=0x%02x OK path=%s start_db=1 update_db=%u (HWO cleared)",
-		ep_data->cfg.addr, path, nudges);
-}
 
 void udc_dwc3_ep_sm_in_recovery_get(struct udc_dwc3_in_recovery_stats *const stats)
 {
 	stats->poll_recovered = atomic_get(&udc_dwc3_sm_poll_recovered);
-	stats->start_retook = atomic_get(&udc_dwc3_sm_in_start_retook);
-	stats->start_backoff = atomic_get(&udc_dwc3_sm_in_start_backoff);
 	stats->start_recycled = udc_dwc3_int_in_start_recycled_get();
 	stats->start_stuck = atomic_get(&udc_dwc3_sm_in_start_exhausted) +
 			     udc_dwc3_int_in_start_exhausted_get();
-	stats->arm_ok_fast = atomic_get(&udc_dwc3_sm_in_arm_ok_fast);
-	stats->arm_ok_nudge = atomic_get(&udc_dwc3_sm_in_arm_ok_nudge);
-	stats->arm_nudge_sum = atomic_get(&udc_dwc3_sm_in_arm_nudge_sum);
-	stats->arm_nudge_max = atomic_get(&udc_dwc3_sm_in_arm_nudge_max);
-	stats->arm_fail = atomic_get(&udc_dwc3_sm_in_arm_fail);
+	udc_dwc3_arm_stats_get(stats);
+	/* Soak scripts historically treated nudge count as start_retook. */
+	stats->start_retook = stats->arm_ok_nudge;
+	stats->start_backoff = 0;
 }
 
 bool udc_dwc3_ep_sm_is_cpu(const struct udc_dwc3_ep_data *ep_data)
@@ -129,10 +72,10 @@ void udc_dwc3_ep_sm_init(struct udc_dwc3_ep_data *ep_data)
 {
 	ep_data->sm.state = UDC_DWC3_EP_SM_IDLE;
 	ep_data->sm.out_rundry_reported = false;
-	ep_data->sm.in_start_reported = false;
-	ep_data->sm.in_start_verify_busy = false;
-	ep_data->sm.tier5_recovering = false;
-	ep_data->sm.post_tier5_arm = false;
+	ep_data->sm.arm_fail_logged = false;
+	ep_data->sm.arm_verify_busy = false;
+	ep_data->sm.rebuild_in_progress = false;
+	ep_data->sm.arm_after_rebuild = false;
 	ep_data->sm.poll_grace_armed = false;
 }
 
@@ -197,92 +140,29 @@ static bool udc_dwc3_sm_retire_tail(const struct device *dev,
 				    struct udc_dwc3_ep_data *ep_data,
 				    const char *via);
 
-static void udc_dwc3_sm_in_start_verify(const struct device *dev,
-					struct udc_dwc3_ep_data *ep_data)
+/*
+ * Verify (and escalate) after a CPU-managed IN doorbell.
+ * Policy: after_rebuild if the ring was just nuked; else normal.
+ * On STUCK, escalate to EndXfer recycle / pipe rebuild (existing path).
+ */
+static void udc_dwc3_sm_arm_in(const struct device *dev,
+			       struct udc_dwc3_ep_data *ep_data,
+			       enum udc_dwc3_arm_op op)
 {
-	const uint32_t tail = ep_data->tail;
-	const bool post_tier5 = ep_data->sm.post_tier5_arm;
-	const unsigned int settle_us = post_tier5 ?
-		UDC_DWC3_INSTART_POST_TIER5_SETTLE_US : UDC_DWC3_INSTART_SETTLE_US;
-	const unsigned int fast_steps = post_tier5 ?
-		UDC_DWC3_INSTART_POST_TIER5_FAST_STEPS : UDC_DWC3_INSTART_FAST_STEPS;
-	const unsigned int rearm_retries = post_tier5 ?
-		UDC_DWC3_INSTART_POST_TIER5_RETRIES : UDC_DWC3_INSTART_REARM_RETRIES;
-	const unsigned int settle_steps = post_tier5 ?
-		UDC_DWC3_INSTART_POST_TIER5_SETTLE_STEPS : UDC_DWC3_INSTART_SETTLE_STEPS;
-	unsigned int update_db = 0U;
+	const struct udc_dwc3_arm_policy *policy = ep_data->sm.arm_after_rebuild ?
+		udc_dwc3_arm_policy_in_after_rebuild() :
+		udc_dwc3_arm_policy_in_normal();
+	enum udc_dwc3_arm_result result;
 
-	ep_data->sm.in_start_verify_busy = true;
+	ep_data->sm.arm_fail_logged = false;
+	result = udc_dwc3_arm_transfer(dev, ep_data, op, policy);
 
-	for (unsigned int step = 0U; step < fast_steps; step++) {
-		if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
-			udc_dwc3_sm_arm_ok(ep_data, 0U, post_tier5 ? "post5-fast" : "fast");
-			ep_data->sm.in_start_reported = false;
-			ep_data->sm.in_start_verify_busy = false;
-			ep_data->sm.post_tier5_arm = false;
-			return;
-		}
-		k_busy_wait(settle_us);
+	if (udc_dwc3_arm_ok(result) || result == UDC_DWC3_ARM_BACKOFF) {
+		return;
 	}
 
-	for (unsigned int attempt = 0U; attempt < rearm_retries; attempt++) {
-		bool cmderr = false;
-
-		(void)udc_dwc3_int_depcmd_update_xfer_checked(dev, ep_data, &cmderr);
-		update_db++;
-
-		for (unsigned int step = 0U; step < settle_steps; step++) {
-			k_busy_wait(settle_us);
-			if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
-				atomic_inc(&udc_dwc3_sm_in_start_retook);
-				udc_dwc3_sm_arm_ok(ep_data, update_db,
-						   post_tier5 ? "post5-update" : "update");
-				ep_data->sm.in_start_reported = false;
-				ep_data->sm.in_start_verify_busy = false;
-				ep_data->sm.post_tier5_arm = false;
-				return;
-			}
-		}
-
-		if (cmderr) {
-			atomic_inc(&udc_dwc3_sm_in_start_backoff);
-			LOG_WRN("IN-ARM: ep=0x%02x BACKOFF after update_db=%u CMDERR "
-				"post5=%u hwo=1",
-				ep_data->cfg.addr, update_db, post_tier5 ? 1U : 0U);
-			ep_data->sm.in_start_verify_busy = false;
-			return;
-		}
-	}
-
-	/*
-	 * After a tier-5 re-queue, give one more EndXfer(ForceRM)+StartXfer with
-	 * a long settle before declaring verify exhausted.  Only reached when the
-	 * extended UpdateXfer window above still left HWO=1.
-	 */
-	if (post_tier5) {
-		ep_data->sm.post_tier5_arm = false;
-		LOG_WRN("IN-ARM: ep=0x%02x POST5-RESTART after update_db=%u still hwo=1",
-			ep_data->cfg.addr, update_db);
-		if (udc_dwc3_int_in_endxfer_retry(dev, ep_data,
-						  UDC_DWC3_INSTART_POST_TIER5_RECYCLE_STEPS,
-						  UDC_DWC3_INSTART_POST_TIER5_SETTLE_US)) {
-			/* Extra StartXfer counts as another start doorbell; updates already spent. */
-			udc_dwc3_sm_arm_ok(ep_data, update_db, "post5-restart");
-			ep_data->sm.in_start_reported = false;
-			ep_data->sm.in_start_verify_busy = false;
-			return;
-		}
-	}
-
-	atomic_inc(&udc_dwc3_sm_in_arm_fail);
-	if (!ep_data->sm.in_start_reported) {
-		ep_data->sm.in_start_reported = true;
-		LOG_ERR("IN-ARM: ep=0x%02x FAIL verify exhausted update_db=%u post5=%u "
-			"hwo=1 (escalating)",
-			ep_data->cfg.addr, update_db, post_tier5 ? 1U : 0U);
-	}
-	ep_data->sm.in_start_verify_busy = false;
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	/* STUCK: EndXfer recycle → may escalate into pipe rebuild. */
 	udc_dwc3_int_in_endxfer_recycle(dev, ep_data);
 #else
 	atomic_inc(&udc_dwc3_sm_in_start_exhausted);
@@ -367,11 +247,11 @@ int udc_dwc3_doorbell_issue(const struct device *dev,
 
 	switch (cmd) {
 	case UDC_DWC3_DB_START:
-		udc_dwc3_int_depcmd_start_xfer(dev, ep_data);
 		ep_data->sm.state = UDC_DWC3_EP_SM_ACTIVE;
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
-			ep_data->sm.in_start_reported = false;
-			udc_dwc3_sm_in_start_verify(dev, ep_data);
+			udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_START);
+		} else {
+			udc_dwc3_int_depcmd_start_xfer(dev, ep_data);
 		}
 		break;
 	case UDC_DWC3_DB_UPDATE:
@@ -381,9 +261,7 @@ int udc_dwc3_doorbell_issue(const struct device *dev,
 		udc_dwc3_sm_out_update_verify(dev, ep_data);
 		break;
 	case UDC_DWC3_DB_UPDATE_VERIFY_IN:
-		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
-		ep_data->sm.in_start_reported = false;
-		udc_dwc3_sm_in_start_verify(dev, ep_data);
+		udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_UPDATE);
 		break;
 	default:
 		return -EINVAL;
@@ -429,7 +307,7 @@ static unsigned udc_dwc3_sm_poll_ep(const struct device *dev,
 
 	ep_data->sm.poll_grace_armed = false;
 	while (udc_dwc3_sm_retire_tail(dev, ep_data, "poll")) {
-		ep_data->sm.in_start_reported = false;
+		ep_data->sm.arm_fail_logged = false;
 		retired++;
 	}
 
@@ -792,8 +670,8 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 		return;
 	}
 
-	/* Do not race the inline verify or the tier-5 ring rebuild. */
-	if (ep_data->sm.in_start_verify_busy || ep_data->sm.tier5_recovering) {
+	/* Do not race an in-progress arm verify or pipe rebuild. */
+	if (ep_data->sm.arm_verify_busy || ep_data->sm.rebuild_in_progress) {
 		return;
 	}
 
@@ -801,8 +679,7 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 	LOG_WRN("EP-SM: IN-PARK ep=0x%02x stuck %lldms, re-arming tail=%u",
 		ep_data->cfg.addr, (long long)pending_ms, tail);
 
-	ep_data->sm.in_start_reported = false;
-	udc_dwc3_sm_in_start_verify(dev, ep_data);
+	udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_UPDATE);
 
 	/* Restart the window so a failed recovery is re-attempted, not spun on. */
 	ep_data->sm.stall_since = now;

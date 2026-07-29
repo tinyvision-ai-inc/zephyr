@@ -28,17 +28,17 @@ struct udc_dwc3_trb {
 struct udc_dwc3_ep_sm {
 	enum udc_dwc3_ep_sm_state state;
 	bool out_rundry_reported;
-	bool in_start_reported;
-	/** Set while sm_in_start_verify runs (blocks concurrent poll retire races). */
-	bool in_start_verify_busy;
-	/** Set during tier-5 IN ring nuke (blocks poll SW-retire on same buf). */
-	bool tier5_recovering;
+	/** Suppress duplicate IN-ARM STUCK logs until a successful arm. */
+	bool arm_fail_logged;
+	/** Set while udc_dwc3_arm_transfer runs (blocks poll SW-retire races). */
+	bool arm_verify_busy;
+	/** Set during pipe rebuild / ring nuke (blocks poll SW-retire). */
+	bool rebuild_in_progress;
 	/**
-	 * Next StartXfer verify is the first arm after a tier-5 re-queue.
-	 * Use a longer HWO settle and one extra EndXfer+StartXfer before
-	 * declaring verify exhausted (CPU-managed IN only).
+	 * Next arm uses policy_in_after_rebuild (longer settle + allow Restart).
+	 * Set when a pipe rebuild re-queues buffers.
 	 */
-	bool post_tier5_arm;
+	bool arm_after_rebuild;
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) || defined(CONFIG_UDC_DWC3_EP_SM)
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;
@@ -89,8 +89,8 @@ struct udc_dwc3_ep_data {
 	/* XFERCOMPLETE events to ignore after try_retire_chained_zlp() popped the ZLP */
 	uint8_t skip_xfer_done_count;
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
-	/* Buffers re-queued by tier-5 recovery, bounding retries on a dead endpoint */
-	uint8_t tier5_requeues;
+	/** Pipe-rebuild requeues so far; cleared after a verified-OK arm. */
+	uint8_t rebuild_attempts;
 	/*
 	 * Bumped whenever recovery reshuffles the queue.  Recovery can run from
 	 * inside the arm path, so a caller that is holding a peeked buffer has to
@@ -152,11 +152,15 @@ bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,
 				      struct udc_dwc3_ep_data *ep_data);
 
 /**
- * Optional class hook after tier-5 re-queues a CPU-managed IN buffer.
+ * Optional class hook after a pipe rebuild re-queues a CPU-managed IN buffer.
  * Default weak stub in udc_dwc3.c; applications may provide a strong
  * definition (e.g. cdc_raw_kick_tx_if_ready).
  */
-void udc_dwc3_cpu_in_tier5_kick(uint8_t ep_addr);
+void udc_dwc3_cpu_in_rebuild_kick(uint8_t ep_addr);
+
+/** EndXfer(ForceRM) + DepSetStall for a CPU-managed EP (host-safe give-up). */
+void udc_dwc3_int_cpu_ep_halt(const struct device *dev,
+			      struct udc_dwc3_ep_data *ep_data);
 
 void udc_dwc3_int_submit_ep_work(struct udc_dwc3_ep_data *ep_data);
 
