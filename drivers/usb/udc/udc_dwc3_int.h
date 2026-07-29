@@ -33,6 +33,12 @@ struct udc_dwc3_ep_sm {
 	bool in_start_verify_busy;
 	/** Set during tier-5 IN ring nuke (blocks poll SW-retire on same buf). */
 	bool tier5_recovering;
+	/**
+	 * Next StartXfer verify is the first arm after a tier-5 re-queue.
+	 * Use a longer HWO settle and one extra EndXfer+StartXfer before
+	 * declaring verify exhausted (CPU-managed IN only).
+	 */
+	bool post_tier5_arm;
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) || defined(CONFIG_UDC_DWC3_EP_SM)
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;
@@ -136,8 +142,21 @@ bool udc_dwc3_int_retire_sw_done(const struct device *dev,
 void udc_dwc3_int_in_endxfer_recycle(const struct device *dev,
 				     struct udc_dwc3_ep_data *ep_data);
 
+/** EndXfer(ForceRM)+StartXfer with a caller-chosen settle; no tier-5 escalate. */
+bool udc_dwc3_int_in_endxfer_retry(const struct device *dev,
+				   struct udc_dwc3_ep_data *ep_data,
+				   unsigned int settle_steps,
+				   unsigned int settle_us);
+
 bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,
 				      struct udc_dwc3_ep_data *ep_data);
+
+/**
+ * Optional class hook after tier-5 re-queues a CPU-managed IN buffer.
+ * Default weak stub in udc_dwc3.c; applications may provide a strong
+ * definition (e.g. cdc_raw_kick_tx_if_ready).
+ */
+void udc_dwc3_cpu_in_tier5_kick(uint8_t ep_addr);
 
 void udc_dwc3_int_submit_ep_work(struct udc_dwc3_ep_data *ep_data);
 

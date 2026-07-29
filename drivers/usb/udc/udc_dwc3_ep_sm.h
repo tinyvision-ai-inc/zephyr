@@ -78,6 +78,16 @@ struct udc_dwc3_in_recovery_stats {
 	atomic_val_t start_backoff;
 	atomic_val_t start_recycled;
 	atomic_val_t start_stuck;
+	/** StartXfer verify: HWO cleared with no UpdateXfer nudge. */
+	atomic_val_t arm_ok_fast;
+	/** StartXfer verify: HWO cleared only after >=1 UpdateXfer. */
+	atomic_val_t arm_ok_nudge;
+	/** Sum of UpdateXfer nudges across successful nudged arms. */
+	atomic_val_t arm_nudge_sum;
+	/** Max UpdateXfer nudges needed for a single successful arm. */
+	atomic_val_t arm_nudge_max;
+	/** Verify exhausted (before/without successful recycle). */
+	atomic_val_t arm_fail;
 };
 
 void udc_dwc3_ep_sm_in_recovery_get(struct udc_dwc3_in_recovery_stats *stats);

@@ -2145,8 +2145,14 @@ static atomic_t udc_dwc3_in_start_backoff;
 static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 					    struct udc_dwc3_ep_data *ep_data);
 
-static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
-					      struct udc_dwc3_ep_data *const ep_data)
+/*
+ * EndXfer(ForceRM)+StartXfer with a caller-chosen settle window.  Returns true
+ * iff HW fetched the re-armed tail TRB.  Does not escalate to tier-5.
+ */
+static bool udc_dwc3_in_start_endxfer_retry(const struct device *const dev,
+					    struct udc_dwc3_ep_data *const ep_data,
+					    unsigned int settle_steps,
+					    unsigned int settle_us)
 {
 	const uint32_t tail = ep_data->tail;
 
@@ -2160,23 +2166,55 @@ static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
 	 */
 	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, &ep_data->trb_buf[tail]);
 
-	for (unsigned int step = 0U; step < UDC_DWC3_INSTART_RECYCLE_STEPS; step++) {
-		k_busy_wait(UDC_DWC3_INSTART_SETTLE_US);
+	for (unsigned int step = 0U; step < settle_steps; step++) {
+		k_busy_wait(settle_us);
 		if (!udc_dwc3_trb_hwo(&ep_data->trb_buf[tail])) {
 			atomic_inc(&udc_dwc3_in_start_recycled);
-#if defined(CONFIG_UDC_DWC3_EP_SM)
-			ep_data->sm.in_start_verify_busy = false;
-#endif
-			return;
+			return true;
 		}
 	}
+
+	return false;
+}
+
+static void udc_dwc3_in_start_endxfer_recycle(const struct device *const dev,
+					      struct udc_dwc3_ep_data *const ep_data)
+{
+	unsigned int settle_steps = UDC_DWC3_INSTART_RECYCLE_STEPS;
+	unsigned int settle_us = UDC_DWC3_INSTART_SETTLE_US;
+
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+	/*
+	 * First arm after a tier-5 re-queue gets a longer settle: the EndXfer
+	 * storm that rebuilt the ring leaves the shared DEPCMD path hot, and the
+	 * default ~160 us window is not always enough for a fresh StartXfer to
+	 * fetch under UVC load.
+	 */
+	if (ep_data->sm.post_tier5_arm) {
+		settle_steps = 64U;
+		settle_us = 50U;
+		ep_data->sm.post_tier5_arm = false;
+	}
+#endif
+
+	if (udc_dwc3_in_start_endxfer_retry(dev, ep_data, settle_steps, settle_us)) {
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		ep_data->sm.in_start_verify_busy = false;
+#endif
+		LOG_WRN("IN-ARM: ep=0x%02x OK path=recycle (EndXfer+StartXfer, HWO cleared)",
+			ep_data->cfg.addr);
+		return;
+	}
+
+	LOG_ERR("IN-ARM: ep=0x%02x recycle still hwo=1 — escalating to TIER5",
+		ep_data->cfg.addr);
 
 	if (udc_dwc3_in_start_tier5_recover(dev, ep_data)) {
 		return;
 	}
 
 	atomic_inc(&udc_dwc3_in_start_exhausted);
-	LOG_ERR("EP-SM: IN-START-RECYCLE ep=0x%02x EndXfer+StartXfer failed",
+	LOG_ERR("IN-ARM: ep=0x%02x RECYCLE failed (TIER5 unavailable)",
 		ep_data->cfg.addr);
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
 	udc_dwc3_xfer_trace("IN-START-RECYCLE", ep_data, "endxfer+start failed");
@@ -2568,6 +2606,9 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 #endif
 
 	if (!ep_data->xfer_active) {
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+		const uint8_t start_gen = ep_data->requeue_gen;
+#endif
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 		if (udc_dwc3_ep_sm_is_cpu(ep_data)) {
 			(void)udc_dwc3_doorbell_issue(dev, ep_data, UDC_DWC3_DB_START);
@@ -2576,10 +2617,6 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		}
 #else
 		udc_dwc3_depcmd_start_xfer(dev, ep_data);
-#endif
-		ep_data->xfer_active = true;
-#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
-		udc_dwc3_xfer_trace("DEPSTART", ep_data, "post-DepStartXfer");
 #endif
 #if !defined(CONFIG_UDC_DWC3_EP_SM)
 		/*
@@ -2591,6 +2628,23 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 			udc_dwc3_in_start_verify(dev, ep_data);
 		}
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+		/*
+		 * Tier-5 recovery can run inside the Start verify above: it nukes
+		 * the ring, re-queues the buffers, and clears xfer_active.  Do not
+		 * mark the transfer active again -- that would make the retry
+		 * worker take the UpdateXfer path against a dead transfer resource,
+		 * which is the stranded HWO=1 / IN-START-REARM signature after a
+		 * successful TIER5 re-queue.
+		 */
+		if (ep_data->requeue_gen != start_gen) {
+			return 0;
+		}
+#endif
+		ep_data->xfer_active = true;
+#if defined(CONFIG_UDC_DWC3_XFER_TRACE)
+		udc_dwc3_xfer_trace("DEPSTART", ep_data, "post-DepStartXfer");
 #endif
 	} else {
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
@@ -3955,6 +4009,9 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 		static atomic_val_t last_backoff;
 		static atomic_val_t last_recycled;
 		static atomic_val_t last_stuck;
+		static atomic_val_t last_ok_fast;
+		static atomic_val_t last_ok_nudge;
+		static atomic_val_t last_arm_fail;
 		struct udc_dwc3_in_recovery_stats stats;
 		const int64_t now = k_uptime_get();
 
@@ -3964,10 +4021,18 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 		     stats.start_retook != last_retook ||
 		     stats.start_backoff != last_backoff ||
 		     stats.start_recycled != last_recycled ||
-		     stats.start_stuck != last_stuck) &&
+		     stats.start_stuck != last_stuck ||
+		     stats.arm_ok_fast != last_ok_fast ||
+		     stats.arm_ok_nudge != last_ok_nudge ||
+		     stats.arm_fail != last_arm_fail) &&
 		    (now - last_log >= 1000)) {
-			LOG_WRN("in-recovery: lost-compl=%ld start-retook=%ld "
-				"start-backoff=%ld start-recycled=%ld start-stuck=%ld",
+			LOG_WRN("IN-ARM-STATS: ok_fast=%ld ok_nudge=%ld nudge_sum=%ld "
+				"nudge_max=%ld fail=%ld | in-recovery: lost-compl=%ld "
+				"start-retook=%ld start-backoff=%ld start-recycled=%ld "
+				"start-stuck=%ld",
+				(long)stats.arm_ok_fast, (long)stats.arm_ok_nudge,
+				(long)stats.arm_nudge_sum, (long)stats.arm_nudge_max,
+				(long)stats.arm_fail,
 				(long)stats.poll_recovered, (long)stats.start_retook,
 				(long)stats.start_backoff, (long)stats.start_recycled,
 				(long)stats.start_stuck);
@@ -3977,6 +4042,9 @@ static void udc_dwc3_in_poll_worker(struct k_work *const work)
 			last_backoff = stats.start_backoff;
 			last_recycled = stats.start_recycled;
 			last_stuck = stats.start_stuck;
+			last_ok_fast = stats.arm_ok_fast;
+			last_ok_nudge = stats.arm_ok_nudge;
+			last_arm_fail = stats.arm_fail;
 		}
 
 		ARG_UNUSED(retired);
@@ -4897,6 +4965,16 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 		for (unsigned int i = 0U; i < n_orphan; i++) {
 			udc_buf_put(&ep_data->cfg, orphaned[i]);
 		}
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		/*
+		 * CPU-managed IN only (HW-offload EPs never reach tier-5).  The
+		 * next StartXfer verify uses the hardened post-tier5 settle path.
+		 */
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+		    udc_dwc3_ep_sm_is_cpu(ep_data)) {
+			ep_data->sm.post_tier5_arm = true;
+		}
+#endif
 	}
 
 	udc_dwc3_unlock(dev);
@@ -4911,10 +4989,21 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	ep_data->sm.tier5_recovering = false;
 #endif
 
-	LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x ring nuked, %s (%u buf, retry %u)",
+	LOG_ERR("IN-ARM: ep=0x%02x TIER5 ring nuked, %s (%u buf, retry %u) "
+		"— next arm uses post5 policy",
 		ep_data->cfg.addr, requeue ? "re-queued" : "dropped", n_orphan,
 		ep_data->tier5_requeues);
 	k_work_submit(&ep_data->work);
+	if (requeue) {
+		/*
+		 * Brief pause after the EndXfer storm so the shared DEPCMD path
+		 * can settle before the worker's StartXfer.  Then ask the class
+		 * to re-feed if its TX path went idle (no-op when the re-queued
+		 * buffer is still considered in-flight).
+		 */
+		k_busy_wait(200);
+		udc_dwc3_cpu_in_tier5_kick(ep_data->cfg.addr);
+	}
 	return true;
 }
 #endif /* CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE */
@@ -5786,6 +5875,27 @@ void udc_dwc3_int_in_endxfer_recycle(const struct device *dev,
 	ARG_UNUSED(dev);
 	ARG_UNUSED(ep_data);
 #endif
+}
+
+bool udc_dwc3_int_in_endxfer_retry(const struct device *dev,
+				   struct udc_dwc3_ep_data *ep_data,
+				   unsigned int settle_steps,
+				   unsigned int settle_us)
+{
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	return udc_dwc3_in_start_endxfer_retry(dev, ep_data, settle_steps, settle_us);
+#else
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ep_data);
+	ARG_UNUSED(settle_steps);
+	ARG_UNUSED(settle_us);
+	return false;
+#endif
+}
+
+__weak void udc_dwc3_cpu_in_tier5_kick(uint8_t ep_addr)
+{
+	ARG_UNUSED(ep_addr);
 }
 
 bool udc_dwc3_int_out_endxfer_recycle(const struct device *dev,
