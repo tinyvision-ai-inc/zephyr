@@ -1845,6 +1845,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t param0 = 0;
 	uint32_t param1 = 0;
+	uint32_t burst = 0U;
 
 	LOG_INF("configuring endpoint 0x%02x with wMaxPacketSize=%u",
 		ep_data->cfg.addr, ep_data->cfg.mps);
@@ -1861,12 +1862,14 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 		break;
 	case USB_EP_TYPE_BULK:
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_EPTYPE_BULK;
+		burst = 15U;
 		break;
 	case USB_EP_TYPE_INTERRUPT:
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_EPTYPE_INT;
 		break;
 	case USB_EP_TYPE_ISO:
 		param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_EPTYPE_ISOC;
+		burst = 15U;
 		break;
 	default:
 		CODE_UNREACHABLE;
@@ -1875,8 +1878,13 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Max Packet Size according to the USB descriptor configuration */
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
-	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
-	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 15);
+	/*
+	 * BRSTSIZ has to agree with the bMaxBurst the endpoint companion
+	 * descriptor advertised, otherwise the controller bursts more packets
+	 * than the host agreed to accept.  The classes advertise 15 on bulk and
+	 * isochronous endpoints and 0 on control and interrupt ones.
+	 */
+	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, burst);
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
@@ -3587,6 +3595,11 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	udc_dwc3_on_xfer_done(dev, ep_data);
 
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	/* Forward progress: spend the tier-5 retry budget per wedge, not per boot */
+	ep_data->tier5_requeues = 0U;
+#endif
+
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
 		const uint32_t residual =
@@ -4307,6 +4320,36 @@ static const char *udc_dwc3_linkstate_str(const uint32_t dsts)
 	}
 }
 
+/*
+ * DEPCFG points each IN endpoint at TxFIFO number (addr & 0x7f), so a composite
+ * device reaches FIFO 4 (CDC-RAW IN).  GTXFIFOSIZn is left at the hard IP
+ * defaults, and an endpoint aimed at a FIFO with no depth behind it retires its
+ * TRBs while the payload never reaches the wire.  Report the layout of every
+ * FIFO an endpoint can select, plus the RAM the IP actually provides.
+ */
+static bool udc_dwc3_fifo_snapshot_done;
+
+static void udc_dwc3_dump_fifo_cfg(const struct device *const dev, const char *const tag)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	for (unsigned int i = 0U; i < 6U; i++) {
+		const uint32_t txf = sys_read32(base + UDC_DWC3_GTXFIFOSIZ(i));
+
+		LOG_WRN("fifosiz(%s): GTXFIFOSIZ[%u]=0x%08x start=%u dep=%u", tag, i, txf,
+			(uint32_t)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFSTADDR_MASK, txf),
+			(uint32_t)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK, txf));
+	}
+
+	LOG_WRN("fifosiz(%s): GRXFIFOSIZ[0]=0x%08x dep=%u GHWPARAMS7=0x%08x GHWPARAMS3=0x%08x",
+		tag,
+		sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0)),
+		(uint32_t)FIELD_GET(UDC_DWC3_GRXFIFOSIZ_RXFDEP_MASK,
+				    sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0))),
+		sys_read32(base + UDC_DWC3_GHWPARAMS7),
+		sys_read32(base + UDC_DWC3_GHWPARAMS3));
+}
+
 #if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
 static void udc_dwc3_log_pools(void)
 {
@@ -4349,21 +4392,7 @@ static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *c
 		sys_read32(base + UDC_DWC3_GTXTHRCFG),
 		udc_dwc3_linkstate_str(dsts), dsts);
 
-	LOG_INF("fifosiz(%s): GTXFIFOSIZ[0]=0x%08x[dep=%u] [1]=0x%08x[dep=%u] "
-		"[2]=0x%08x[dep=%u] GRXFIFOSIZ[0]=0x%08x[dep=%u]",
-		tag,
-		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0)),
-		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0)) &
-			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
-		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1)),
-		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1)) &
-			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
-		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2)),
-		(uint32_t)(sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2)) &
-			   UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK),
-		sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0)),
-		(uint32_t)(sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0)) &
-			   UDC_DWC3_GRXFIFOSIZ_RXFDEP_MASK));
+	udc_dwc3_dump_fifo_cfg(dev, tag);
 }
 
 static void udc_dwc3_log_health(const struct device *const dev)
@@ -4601,6 +4630,12 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 	LOG_ERR("STALL-EVTRING gevntcount=%u evt_next=%u",
 		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)), priv->evt_next);
 
+	/* Report the FIFO layout on the first wedge; see udc_dwc3_dump_fifo_cfg(). */
+	if (!udc_dwc3_fifo_snapshot_done) {
+		udc_dwc3_fifo_snapshot_done = true;
+		udc_dwc3_dump_fifo_cfg(dev, "wedge");
+	}
+
 	for (int epn = 0; epn < UDC_DWC3_DEPEVT_MAX_EPN; epn++) {
 		const uint32_t complete = (uint32_t)atomic_get(&udc_dwc3_depevt_complete[epn]);
 		const uint32_t inprog = (uint32_t)atomic_get(&udc_dwc3_depevt_inprog[epn]);
@@ -4711,6 +4746,9 @@ static bool udc_dwc3_orphan_add(struct net_buf **orphaned, unsigned int *n,
 	return true;
 }
 
+/* Consecutive tier-5 re-queues allowed before the request is failed to the class */
+#define UDC_DWC3_TIER5_REQUEUE_MAX 3U
+
 /*
  * Tier-5 IN recovery when EndXfer+StartXfer recycle cannot clear tail HWO.
  * Detach ring and queued buffers before EndXfer (which can clear HWO and
@@ -4724,6 +4762,8 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	unsigned int n_orphan = 0U;
 	const uint32_t link = CONFIG_UDC_DWC3_TRB_NUM - 1U;
 	struct net_buf *qbuf;
+	bool partially_sent = false;
+	bool requeue;
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	ep_data->sm.tier5_recovering = true;
@@ -4734,6 +4774,18 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 
 	for (uint32_t i = 0U; i < link; i++) {
 		struct net_buf *const buf = ep_data->net_buf[i];
+
+		/*
+		 * A TRB whose remaining count still equals the full request was
+		 * never touched by the controller: nothing reached the wire, so
+		 * the buffer may be sent again.  Anything else was partially
+		 * transmitted and must not be repeated.
+		 */
+		if (buf != NULL && buf != UDC_DWC3_ZLP_TRB_MARKER &&
+		    FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK,
+			      ep_data->trb_buf[i].status) != buf->len) {
+			partially_sent = true;
+		}
 
 		ep_data->net_buf[i] = NULL;
 		udc_dwc3_trb_clear(&ep_data->trb_buf[i]);
@@ -4752,6 +4804,10 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 				 ARRAY_SIZE(orphaned))) {
 		LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x orphan chain overflow",
 			ep_data->cfg.addr);
+	}
+	if (ep_data->chain_buf != NULL) {
+		/* Half of an MPS-aligned data+ZLP pair: the data may be on the wire. */
+		partially_sent = true;
 	}
 	ep_data->chain_buf = NULL;
 
@@ -4781,18 +4837,39 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	ep_data->sm.poll_grace_armed = false;
 #endif
 
+	/*
+	 * The wedge this recovers from is a dropped doorbell: the TRB is armed and
+	 * the controller never fetches it, so the request never reached the host.
+	 * Failing it back to the class loses the payload for good because no layer
+	 * above retransmits, which is what turns a transient controller hiccup into
+	 * a host-visible timeout.  Re-queue instead whenever the ring proves nothing
+	 * was transmitted, and keep a retry budget so a genuinely dead endpoint still
+	 * reports the error rather than re-arming forever.
+	 */
+	requeue = !partially_sent && n_orphan > 0U &&
+		  ep_data->tier5_requeues < UDC_DWC3_TIER5_REQUEUE_MAX;
+	if (requeue) {
+		ep_data->tier5_requeues++;
+		for (unsigned int i = 0U; i < n_orphan; i++) {
+			udc_buf_put(&ep_data->cfg, orphaned[i]);
+		}
+	}
+
 	udc_dwc3_unlock(dev);
 
-	for (unsigned int i = 0U; i < n_orphan; i++) {
-		(void)udc_submit_ep_event(dev, orphaned[i], -ECONNRESET);
+	if (!requeue) {
+		for (unsigned int i = 0U; i < n_orphan; i++) {
+			(void)udc_submit_ep_event(dev, orphaned[i], -ECONNRESET);
+		}
 	}
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	ep_data->sm.tier5_recovering = false;
 #endif
 
-	LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x ring nuked, EP worker re-arm",
-		ep_data->cfg.addr);
+	LOG_ERR("EP-SM: IN-START-TIER5 ep=0x%02x ring nuked, %s (%u buf, retry %u)",
+		ep_data->cfg.addr, requeue ? "re-queued" : "dropped", n_orphan,
+		ep_data->tier5_requeues);
 	k_work_submit(&ep_data->work);
 	return true;
 }
@@ -5566,6 +5643,11 @@ bool udc_dwc3_int_trb_hwo(const volatile struct udc_dwc3_trb *trb)
 uint32_t udc_dwc3_int_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
 {
 	return udc_dwc3_ring_data_hwo_mask(ep_data);
+}
+
+uint32_t udc_dwc3_int_trb_remaining(const struct udc_dwc3_trb *const trb)
+{
+	return FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
 }
 
 uint32_t udc_dwc3_int_depcmd_issue(const struct device *dev, uint32_t depcmd_addr,

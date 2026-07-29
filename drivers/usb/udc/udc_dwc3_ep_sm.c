@@ -577,6 +577,7 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 	const uint32_t tail = ep_data->tail;
 	struct net_buf *buf;
 	int64_t pending_ms;
+	uint32_t remaining;
 	bool is_in;
 
 	if (!udc_dwc3_ep_sm_is_cpu(ep_data) || ep_data->trb_buf == NULL) {
@@ -593,12 +594,20 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 		return;
 	}
 
-	/* Any movement of the tail slot restarts the observation window. */
+	remaining = udc_dwc3_int_trb_remaining(&ep_data->trb_buf[tail]);
+
+	/*
+	 * Any movement restarts the observation window.  Tracking the TRB's
+	 * remaining count as well as the slot catches a transfer the controller
+	 * is still draining byte by byte, which a slot comparison alone reads as
+	 * stuck.
+	 */
 	if (ep_data->sm.stall_since == 0 || ep_data->sm.stall_tail != tail ||
-	    ep_data->sm.stall_buf != buf) {
+	    ep_data->sm.stall_buf != buf || ep_data->sm.stall_remaining != remaining) {
 		ep_data->sm.stall_since = now;
 		ep_data->sm.stall_tail = tail;
 		ep_data->sm.stall_buf = buf;
+		ep_data->sm.stall_remaining = remaining;
 		ep_data->sm.stall_reported = false;
 		ep_data->sm.out_refresh_count = 0U;
 		return;
@@ -631,8 +640,15 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 		return;
 	}
 
-	/* Only the stuck tail may be owned; anything else is a live transfer. */
-	if (udc_dwc3_int_ring_data_hwo_mask(ep_data) != BIT(tail)) {
+	/*
+	 * The tail must still be owned by the controller.  TRBs behind it may be
+	 * owned too: on a multi-buffer endpoint such as the CDC-RAW bulk reader
+	 * the whole queue is armed at once, and those trailing TRBs are waiting
+	 * on the stuck head rather than evidence of a live transfer.  Progress is
+	 * judged by the tail's remaining count above, which has not moved for the
+	 * whole window by the time we get here.
+	 */
+	if ((udc_dwc3_int_ring_data_hwo_mask(ep_data) & BIT(tail)) == 0U) {
 		return;
 	}
 

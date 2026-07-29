@@ -41,6 +41,8 @@ struct udc_dwc3_ep_sm {
 	int64_t stall_since;
 	uint32_t stall_tail;
 	struct net_buf *stall_buf;
+	/** Bytes the controller still owed on the tail TRB when the window opened. */
+	uint32_t stall_remaining;
 	bool stall_reported;
 	/** Consecutive OUT doorbell refreshes with no progress. */
 	uint8_t out_refresh_count;
@@ -80,6 +82,10 @@ struct udc_dwc3_ep_data {
 	bool xfer_active;
 	/* XFERCOMPLETE events to ignore after try_retire_chained_zlp() popped the ZLP */
 	uint8_t skip_xfer_done_count;
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	/* Buffers re-queued by tier-5 recovery, bounding retries on a dead endpoint */
+	uint8_t tier5_requeues;
+#endif
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	struct udc_dwc3_ep_sm sm;
 #elif defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
@@ -90,6 +96,9 @@ struct udc_dwc3_ep_data {
 
 bool udc_dwc3_int_trb_hwo(const volatile struct udc_dwc3_trb *trb);
 uint32_t udc_dwc3_int_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data);
+
+/** Bytes the controller has not yet consumed from @p trb. */
+uint32_t udc_dwc3_int_trb_remaining(const struct udc_dwc3_trb *trb);
 
 uint32_t udc_dwc3_int_depcmd_issue(const struct device *dev, uint32_t depcmd_addr,
 				   uint32_t cmd, bool *cmderr);
