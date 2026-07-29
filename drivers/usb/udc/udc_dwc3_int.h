@@ -85,6 +85,13 @@ struct udc_dwc3_ep_data {
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
 	/* Buffers re-queued by tier-5 recovery, bounding retries on a dead endpoint */
 	uint8_t tier5_requeues;
+	/*
+	 * Bumped whenever recovery reshuffles the queue.  Recovery can run from
+	 * inside the arm path, so a caller that is holding a peeked buffer has to
+	 * notice that the queue moved under it before it treats that buffer as
+	 * consumed.
+	 */
+	uint8_t requeue_gen;
 #endif
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	struct udc_dwc3_ep_sm sm;

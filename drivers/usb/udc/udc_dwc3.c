@@ -29,6 +29,11 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 static atomic_t udc_dwc3_hwirq_count;
 static atomic_t udc_dwc3_poll_count;
+/* Event counted by hardware whose word had not reached the ring yet. */
+static atomic_t udc_dwc3_evt_unlanded_count;
+
+/* Microsecond steps to wait for a counted event's posted write to land. */
+#define UDC_DWC3_EVT_LANDING_STEPS 64U
 static atomic_t udc_dwc3_evt_count;
 static atomic_t udc_dwc3_evt_overflow_count;
 static atomic_t udc_dwc3_ctrl_setup_count;
@@ -4237,10 +4242,42 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 	 * Drain every event currently posted to the ring.
 	 */
 	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0U) {
-		const uint32_t evt = cfg->evt_buf[priv->evt_next];
+		uint32_t evt = cfg->evt_buf[priv->evt_next];
+
+		/*
+		 * GEVNTCOUNT says an event has been counted, which is not the same
+		 * as its word having reached the ring: the write is posted, and on
+		 * this SoC it can trail the counter.  Zero is never a valid event,
+		 * so consuming it would ack an entry that has not arrived and leave
+		 * this index permanently ahead of hardware -- from then on every
+		 * read returns zero, no real event is ever seen again, and the
+		 * device is dead while still logging.  Wait for the write instead,
+		 * and if it has not landed leave the entry unacked; the resubmit
+		 * below picks it up on the next pass.
+		 */
+		if (evt == 0U) {
+			for (unsigned int i = 0U; i < UDC_DWC3_EVT_LANDING_STEPS; i++) {
+				k_busy_wait(1);
+				evt = cfg->evt_buf[priv->evt_next];
+				if (evt != 0U) {
+					break;
+				}
+			}
+
+			if (evt == 0U) {
+				atomic_inc(&udc_dwc3_evt_unlanded_count);
+				break;
+			}
+		}
 
 		atomic_inc(&udc_dwc3_evt_count);
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+
+		/*
+		 * Clear the slot so the next pass around the ring can tell an
+		 * arrived event from a stale one.
+		 */
+		cfg->evt_buf[priv->evt_next] = 0U;
 
 		/* Move to next event entry for both hardware and software */
 		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
@@ -4627,8 +4664,9 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 		udc_dwc3_linkstate_str(dsts), dsts,
 		sys_read32(base + UDC_DWC3_DALEPENA));
 
-	LOG_ERR("STALL-EVTRING gevntcount=%u evt_next=%u",
-		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)), priv->evt_next);
+	LOG_ERR("STALL-EVTRING gevntcount=%u evt_next=%u unlanded=%u",
+		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)), priv->evt_next,
+		(uint32_t)atomic_get(&udc_dwc3_evt_unlanded_count));
 
 	/* Report the FIFO layout on the first wedge; see udc_dwc3_dump_fifo_cfg(). */
 	if (!udc_dwc3_fifo_snapshot_done) {
@@ -4848,6 +4886,12 @@ static bool udc_dwc3_in_start_tier5_recover(const struct device *const dev,
 	 */
 	requeue = !partially_sent && n_orphan > 0U &&
 		  ep_data->tier5_requeues < UDC_DWC3_TIER5_REQUEUE_MAX;
+	/*
+	 * The queue was drained above either way, so a caller holding a buffer it
+	 * peeked before this ran must not treat it as still being the queue head.
+	 */
+	ep_data->requeue_gen++;
+
 	if (requeue) {
 		ep_data->tier5_requeues++;
 		for (unsigned int i = 0U; i < n_orphan; i++) {
@@ -5468,6 +5512,10 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 #endif
 
 	while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+		const uint8_t requeue_gen = ep_data->requeue_gen;
+#endif
+
 		LOG_INF("Processing buffer %p from queue", (void *)buf);
 
 		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
@@ -5475,6 +5523,23 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 			LOG_DBG("abort: No more room for buffer");
 			break;
 		}
+
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+		/*
+		 * A dropped StartXfer doorbell is recovered from inside the arm
+		 * above, and that recovery empties the ring and puts the buffers
+		 * back on this queue -- including the one being armed here.  It
+		 * still reports success, so consuming the queue head now would
+		 * throw away the copy recovery just re-queued, leaving the
+		 * transfer neither armed nor queued and the class waiting for a
+		 * completion that can no longer come.  Recovery submits this
+		 * worker again, so leave the queue to that pass.
+		 */
+		if (ep_data->requeue_gen != requeue_gen) {
+			LOG_DBG("re-queued during arm, leaving buffer for the retry");
+			break;
+		}
+#endif
 
 		LOG_DBG("success: Buffer enqueued");
 
