@@ -722,12 +722,12 @@ static __maybe_unused int cdc_acm_send_notification(const struct device *dev,
 	int ret;
 
 	if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED)) {
-		LOG_INF("USB configuration is not enabled");
+		LOG_DBG("USB configuration is not enabled");
 		return -EACCES;
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB support is suspended (FIXME)");
+		LOG_DBG("USB support is suspended (FIXME)");
 		return -EACCES;
 	}
 
@@ -774,7 +774,7 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB support is suspended (FIXME: submit rwup)");
+		LOG_DBG("USB support is suspended (FIXME: submit rwup)");
 		return;
 	}
 
@@ -826,7 +826,7 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED) ||
 	    atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB configuration is not enabled or suspended");
+		LOG_DBG("USB configuration is not enabled or suspended");
 		return;
 	}
 
@@ -872,7 +872,7 @@ static void cdc_acm_irq_tx_enable(const struct device *dev)
 	atomic_set_bit(&data->state, CDC_ACM_IRQ_TX_ENABLED);
 
 	if (ring_buf_space_get(data->tx_fifo.rb)) {
-		LOG_INF("tx_en: trigger irq_cb_work");
+		LOG_DBG("tx_en: trigger irq_cb_work");
 		cdc_acm_work_submit(&data->irq_cb_work);
 	}
 }
@@ -892,7 +892,7 @@ static void cdc_acm_irq_rx_enable(const struct device *dev)
 
 	/* Permit buffer to be drained regardless of USB state */
 	if (!ring_buf_is_empty(data->rx_fifo.rb)) {
-		LOG_INF("rx_en: trigger irq_cb_work");
+		LOG_DBG("rx_en: trigger irq_cb_work");
 		cdc_acm_work_submit(&data->irq_cb_work);
 	}
 
@@ -997,7 +997,13 @@ static int cdc_acm_fifo_read(const struct device *dev,
 	struct cdc_acm_uart_data *const data = dev->data;
 	uint32_t len;
 
-	LOG_INF("UART dev %p size %d length %u",
+	/*
+	 * Applications may poll this in a tight loop while waiting for data, so
+	 * it must stay at debug level: with synchronous logging on a slow
+	 * console, one line per call outruns the UART and blocks the caller,
+	 * which starves the handler that re-arms the bulk OUT endpoint.
+	 */
+	LOG_DBG("UART dev %p size %d length %u",
 		dev, size, ring_buf_size_get(data->rx_fifo.rb));
 
 	if (!check_wq_ctx(dev)) {
