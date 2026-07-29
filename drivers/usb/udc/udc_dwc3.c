@@ -2230,7 +2230,7 @@ static atomic_t udc_dwc3_out_rundry_recycle_failed;
 /*
  * Last-resort recovery for an OUT endpoint stranded by the run-dry park-window
  * UpdateXfer drop (see udc_dwc3_out_rundry_restart).  Invoked ONLY after the
- * UpdateXfer verify+spin budget in udc_dwc3_sm_out_update_verify is fully
+ * UpdateXfer verify budget in udc_dwc3_sm_arm_out (out_rundry policy) is fully
  * exhausted -- i.e. the tail TRB is still HWO=1, HW has parked, and the pipe
  * would otherwise stay permanently wedged.
  *
@@ -4979,15 +4979,15 @@ static bool udc_dwc3_in_pipe_rebuild(const struct device *const dev,
 
 	if (!requeue) {
 		/*
-		 * Budget exhausted or partial send: stall the EP so the host
-		 * sees PIPE/STALL instead of a ghost HWO=1 soft wedge.
+		 * Budget exhausted: fail buffers to the class.  Do not SetStall
+		 * here — stalling ACM/CDC during configure wedges enumeration.
+		 * Host sees -ECONNRESET / short read; ClearHalt can recover.
 		 */
-		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
-			udc_dwc3_arm_give_up(dev, ep_data, "pipe-rebuild-drop");
-		}
 		for (unsigned int i = 0U; i < n_orphan; i++) {
 			(void)udc_submit_ep_event(dev, orphaned[i], -ECONNRESET);
 		}
+		LOG_ERR("IN-ARM: ep=0x%02x PIPE-REBUILD dropped %u buf (no halt)",
+			ep_data->cfg.addr, n_orphan);
 	}
 
 #if defined(CONFIG_UDC_DWC3_EP_SM)

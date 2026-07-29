@@ -21,10 +21,6 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #define UDC_DWC3_TRB_CTRL_HWO BIT(0)
 
-#define UDC_DWC3_RUNDRY_REARM_RETRIES  8U
-#define UDC_DWC3_RUNDRY_SETTLE_STEPS   16U
-#define UDC_DWC3_RUNDRY_SETTLE_US      50U
-
 #define UDC_DWC3_DEPEVT_EPN_MASK       GENMASK(5, 1)
 
 /* How long an IN endpoint may sit with a queued buffer and an empty ring. */
@@ -141,9 +137,10 @@ static bool udc_dwc3_sm_retire_tail(const struct device *dev,
 				    const char *via);
 
 /*
- * Verify (and escalate) after a CPU-managed IN doorbell.
+ * Verify after a CPU-managed IN doorbell.
  * Policy: after_rebuild if the ring was just nuked; else normal.
- * On STUCK, escalate to EndXfer recycle / pipe rebuild (existing path).
+ * On STUCK leave the TRB armed — EndXfer/rebuild is for the watchdog /
+ * explicit escalate paths (eager recycle breaks ACM enum).
  */
 static void udc_dwc3_sm_arm_in(const struct device *dev,
 			       struct udc_dwc3_ep_data *ep_data,
@@ -161,66 +158,55 @@ static void udc_dwc3_sm_arm_in(const struct device *dev,
 		return;
 	}
 
-#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
-	/* STUCK: EndXfer recycle → may escalate into pipe rebuild. */
-	udc_dwc3_int_in_endxfer_recycle(dev, ep_data);
-#else
-	atomic_inc(&udc_dwc3_sm_in_start_exhausted);
-#endif
+	/*
+	 * STUCK after StartXfer: HWO still 1.  Do NOT EndXfer/recycle here —
+	 * that tears down a TRB that may simply be waiting for the host (or a
+	 * brief EP0 window).  Pipe rebuild stays behind the recycle path used
+	 * by the long-running watchdog / explicit escalate callers.
+	 *
+	 * Escalating every STUCK arm was observed to break enumeration when ACM
+	 * IN was armed before the host started draining it.
+	 */
+	LOG_WRN("IN-ARM: ep=0x%02x STUCK left armed (no EndXfer); watchdog may escalate",
+		ep_data->cfg.addr);
 }
 
-static void udc_dwc3_sm_out_update_verify(const struct device *dev,
-					  struct udc_dwc3_ep_data *ep_data)
+/*
+ * OUT arm: park (Start) uses EXPECT_ARMED; run-dry (Update) expects HWO clear
+ * and may EndXfer-recycle inside arm_transfer. On HWO clear, retire + kick work.
+ */
+static void udc_dwc3_sm_arm_out(const struct device *dev,
+				struct udc_dwc3_ep_data *ep_data,
+				enum udc_dwc3_arm_op op)
 {
+	const struct udc_dwc3_arm_policy *policy = (op == UDC_DWC3_ARM_UPDATE) ?
+		udc_dwc3_arm_policy_out_rundry() :
+		udc_dwc3_arm_policy_out_park();
+	enum udc_dwc3_arm_result result;
 	const uint32_t tail = ep_data->tail;
 
-	for (unsigned int attempt = 0U; attempt < UDC_DWC3_RUNDRY_REARM_RETRIES; attempt++) {
-		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
+	ep_data->sm.arm_fail_logged = false;
+	result = udc_dwc3_arm_transfer(dev, ep_data, op, policy);
 
-		for (unsigned int step = 0U; step < UDC_DWC3_RUNDRY_SETTLE_STEPS; step++) {
-			k_busy_wait(UDC_DWC3_RUNDRY_SETTLE_US);
-			if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
-				ep_data->sm.out_rundry_reported = false;
-				while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-verify")) {
-					;
-				}
-				udc_dwc3_int_submit_ep_work(ep_data);
-				return;
-			}
-		}
-	}
-
-	for (unsigned int step = 0U; step < 32U; step++) {
-		k_busy_wait(UDC_DWC3_RUNDRY_SETTLE_US);
+	if (udc_dwc3_arm_ok(result)) {
 		if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
 			ep_data->sm.out_rundry_reported = false;
-			while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-spin")) {
+			while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-arm")) {
 				;
 			}
 			udc_dwc3_int_submit_ep_work(ep_data);
-			return;
 		}
-	}
-
-#if defined(CONFIG_UDC_DWC3_OUT_RUNDRY_ENDXFER_ESCALATE)
-	/*
-	 * UpdateXfer is a dead lever from the parked state on this IP; the pipe
-	 * is now wedged.  Escalate to EndXfer(ForceRM)+StartXfer as a last resort
-	 * (strictly no-worse -- see udc_dwc3_out_rundry_endxfer_recycle).
-	 */
-	if (udc_dwc3_int_out_endxfer_recycle(dev, ep_data)) {
-		ep_data->sm.out_rundry_reported = false;
-		while (udc_dwc3_sm_retire_tail(dev, ep_data, "out-recycle")) {
-			;
-		}
-		udc_dwc3_int_submit_ep_work(ep_data);
 		return;
 	}
-#endif
 
+	if (result == UDC_DWC3_ARM_BACKOFF) {
+		return;
+	}
+
+	/* Run-dry STUCK after Update + optional OUT recycle. */
 	if (!ep_data->sm.out_rundry_reported) {
 		ep_data->sm.out_rundry_reported = true;
-		LOG_ERR("EP-SM: OUT-RUNDRY ep=0x%02x update verify exhausted tail=%u "
+		LOG_ERR("OUT-ARM: ep=0x%02x RUNDRY exhausted tail=%u "
 			"ctl=0x%08x sts=0x%08x hwo=%d head=%u active=%d",
 			ep_data->cfg.addr, tail, ep_data->trb_buf[tail].ctrl,
 			ep_data->trb_buf[tail].status,
@@ -251,14 +237,14 @@ int udc_dwc3_doorbell_issue(const struct device *dev,
 		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 			udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_START);
 		} else {
-			udc_dwc3_int_depcmd_start_xfer(dev, ep_data);
+			udc_dwc3_sm_arm_out(dev, ep_data, UDC_DWC3_ARM_START);
 		}
 		break;
 	case UDC_DWC3_DB_UPDATE:
 		udc_dwc3_int_depcmd_update_xfer(dev, ep_data);
 		break;
 	case UDC_DWC3_DB_UPDATE_VERIFY:
-		udc_dwc3_sm_out_update_verify(dev, ep_data);
+		udc_dwc3_sm_arm_out(dev, ep_data, UDC_DWC3_ARM_UPDATE);
 		break;
 	case UDC_DWC3_DB_UPDATE_VERIFY_IN:
 		udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_UPDATE);
@@ -458,7 +444,7 @@ static atomic_t udc_dwc3_sm_in_park_recovered;
  * HWO=1 for as long as the host has nothing to send -- the steady state of an
  * idle shell input pipe -- so it is indistinguishable here from a wedge and
  * would only produce noise.  The genuine OUT wedge has its own detection and
- * recovery already (udc_dwc3_sm_out_update_verify).
+ * recovery already (udc_dwc3_sm_arm_out / out_rundry policy).
  */
 /*
  * OUT half of the watchdog.
