@@ -609,6 +609,9 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
 #define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
 
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr);
+static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
+static int udc_dwc3_ep_resume(const struct device *const dev,
+			      struct udc_dwc3_ep_data *const ep_data);
 
 /* Shut down the controller completely  */
 static int udc_dwc3_shutdown(const struct device *const dev)
@@ -817,7 +820,7 @@ static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
-	LOG_INF("DepClearStall ep=0x%02x", ep_data->cfg.addr);
+	LOG_WRN("DepClearStall ep=0x%02x", ep_data->cfg.addr);
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCSTALL);
 }
@@ -891,7 +894,7 @@ static void udc_dwc3_depcmd_start_config(const struct device *const dev,
  * Update command).
  */
 
-static void udc_dwc3_trb_norm_init(const struct device *const dev,
+static void udc_dwc3_trb_nonctrl_init(const struct device *const dev,
 				   struct udc_dwc3_ep_data *const ep_data)
 {
 	volatile struct udc_dwc3_trb *trb = ep_data->trb_buf;
@@ -1306,11 +1309,11 @@ static void udc_dwc3_on_link_state_event(const struct device *const dev)
 	}
 }
 
-static void udc_dwc3_on_set_interface(const struct device *const dev)
+static void udc_dwc3_on_set_config_or_interface(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 
-	LOG_DBG("SetInterface extra init");
+	LOG_DBG("SetConfiguration or SetInterface extra init");
 
 	/* To trigger a reconfiguration of the TX FIFO */
 	udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0]);
@@ -1471,13 +1474,48 @@ static void udc_dwc3_on_xfer_done(const struct device *const dev,
 	}
 }
 
-static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
-				       const uint32_t evt)
+#define UDC_DWC3_EP_DATA_FROM_EPN(cfg, epn) \
+	(((epn) & 1) ? &(cfg)->ep_data_in[(epn) >> 1] : &(cfg)->ep_data_out[(epn) >> 1])
+
+
+static void udc_dwc3_on_xfer_error_nonctrl(const struct device *const dev, const uint32_t evt)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
-	struct udc_dwc3_ep_data *const ep_data =
-		(epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
+	struct udc_dwc3_ep_data *const ep_data = UDC_DWC3_EP_DATA_FROM_EPN(cfg, epn);
+	struct net_buf *buf;
+	int ret;
+
+	buf = udc_dwc3_pop_trb(dev, ep_data);
+	if (buf == NULL) {
+		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+		return;
+	}
+
+	ret = udc_submit_ep_event(dev, buf, -ECANCELED);
+	if (ret != 0) {
+		LOG_ERR("Failed to report error event for buf %p", buf);
+		return;
+	}
+
+	ret = udc_dwc3_ep_disable(dev, &ep_data->cfg);
+	if (ret != 0) {
+		LOG_ERR("Failed to resume endpoint 0x%02x", ep_data->cfg.addr);
+		return;
+	}
+
+	ret = udc_dwc3_ep_resume(dev, ep_data);
+	if (ret != 0) {
+		LOG_ERR("Failed to resume endpoint 0x%02x", ep_data->cfg.addr);
+		return;
+	}
+}
+
+static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const uint32_t evt)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+	struct udc_dwc3_ep_data *const ep_data = UDC_DWC3_EP_DATA_FROM_EPN(cfg, epn);
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
 	int ret;
@@ -1489,7 +1527,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		return;
 	}
 
-	LOG_WRN("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
+	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
 	udc_dwc3_on_xfer_done(dev, ep_data);
 
 	/* For buffers coming from the host, update the size actually received */
@@ -1522,12 +1560,12 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_ctrl_in(dev);
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
-		LOG_INF("DEPEVT_XFERCOMPLETE(n)");
-		udc_dwc3_on_xfer_done_norm(dev, evt);
+		LOG_ERR("DEPEVT_XFERCOMPLETE(n)");
+		udc_dwc3_on_xfer_error_nonctrl(dev, evt);
 		break;
 	case LISTIFY(30, NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
 		LOG_INF("DEPEVT_XFERINPROGRESS(n)");
-		udc_dwc3_on_xfer_done_norm(dev, evt);
+		udc_dwc3_on_xfer_done_nonctrl(dev, evt);
 		break;
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
@@ -1644,31 +1682,18 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 	return 0;
 }
 
-static int udc_dwc3_ep_enable(const struct device *const dev,
-			      struct udc_ep_config *const ep_cfg)
+static int udc_dwc3_ep_resume(const struct device *const dev,
+			      struct udc_dwc3_ep_data *const ep_data)
 {
-	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct net_buf *buf;
 	int ret;
-
-	LOG_DBG("ep 0x%02x, first ep 0x%02x", ep_data->cfg.addr, priv->first_ep);
-
-	if (USB_EP_GET_IDX(ep_cfg->addr) > 0) {
-		if (priv->first_ep == 0) {
-			priv->first_ep = ep_cfg->addr;
-		}
-		if (ep_cfg->addr == priv->first_ep) {
-			udc_dwc3_on_set_interface(dev);
-		}
-	}
 
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
 	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
 
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		udc_dwc3_trb_norm_init(dev, ep_data);
+		udc_dwc3_trb_nonctrl_init(dev, ep_data);
 	}
 
 	/* Starting from here, the endpoint can be used */
@@ -1695,8 +1720,26 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	return 0;
 }
 
-static int udc_dwc3_ep_disable(const struct device *const dev,
-			       struct udc_ep_config *const ep_cfg)
+static int udc_dwc3_ep_enable(const struct device *const dev, struct udc_ep_config *const ep_cfg)
+{
+	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	LOG_DBG("ep 0x%02x, first ep 0x%02x", ep_data->cfg.addr, priv->first_ep);
+
+	if (USB_EP_GET_IDX(ep_cfg->addr) > 0) {
+		if (priv->first_ep == 0) {
+			priv->first_ep = ep_cfg->addr;
+		}
+		if (ep_cfg->addr == priv->first_ep) {
+			udc_dwc3_on_set_config_or_interface(dev);
+		}
+	}
+
+	return udc_dwc3_ep_resume(dev, ep_data);
+}
+
+static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -1742,20 +1785,15 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
-	/* TODO: empty the buffers from the queue */
-
 	switch (ep_data->cfg.addr) {
 	case USB_CONTROL_EP_IN:
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 		/* The datasheet says to only set stall the OUT direction */
 		ep_data = &cfg->ep_data_out[0];
 		__fallthrough;
 	case USB_CONTROL_EP_OUT:
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 		udc_dwc3_depcmd_set_stall(dev, ep_data);
 		break;
 	default:
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 		udc_dwc3_depcmd_set_stall(dev, ep_data);
 		ep_data->cfg.stat.halted = true;
 	}
@@ -1773,6 +1811,13 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
+
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
+		//udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	}
+
+	/* Resume halted previously transfers */
+	k_work_submit(&ep_data->work);
 
 	return 0;
 }
