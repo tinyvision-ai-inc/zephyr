@@ -422,8 +422,21 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		/* RX transfer completion */
 		size_t done;
 
-		LOG_HEXDUMP_INF(buf->data, buf->len, "");
+		LOG_HEXDUMP_DBG(buf->data, buf->len, "");
 		done = ring_buf_put(data->rx_fifo.rb, buf->data, buf->len);
+		if (done != buf->len) {
+			/*
+			 * The transfer has already been acknowledged to the host,
+			 * so anything that does not fit is lost with no way to ask
+			 * for it again.  cdc_acm_rx_fifo_handler() only arms a
+			 * transfer when the FIFO has room for every outstanding
+			 * one, so reaching this means that accounting is wrong
+			 * rather than that the reader is merely slow.
+			 */
+			LOG_ERR("RX FIFO overflow on 0x%02x, dropped %u of %u bytes",
+				bi->ep, buf->len - done, buf->len);
+		}
+
 		if (done && data->cb) {
 			cdc_acm_work_submit(&data->irq_cb_work);
 		}

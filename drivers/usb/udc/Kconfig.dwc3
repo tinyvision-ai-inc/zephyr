@@ -265,6 +265,24 @@ config UDC_DWC3_EP_SM
 	  periodic poll are hints.  RTL-offloaded UVC IN endpoints bypass this.
 	  Implies IN_COMPLETION_POLL for the shared periodic HWO poll worker.
 
+config UDC_DWC3_EP_SM_HW_IN_EP_MASK
+	hex "IN endpoints offloaded to the RTL video path"
+	default 0x18
+	depends on UDC_DWC3_EP_SM
+	help
+	  Bitmask of IN endpoint numbers whose transfers the RTL drives, so the
+	  state machine must leave them alone: bit 3 means endpoint 0x83, bit 4
+	  means 0x84, and so on.  The default 0x18 covers 0x83 and 0x84, the
+	  video streams on a two-camera TinyCLUNX.
+
+	  This has to match the actual descriptor layout.  An endpoint listed
+	  here that a class terminates in software is excluded from the retire
+	  poll, the tail watchdog and the XferInProgress retire, which together
+	  are the only things that complete a transfer on a controller that
+	  never raises XferComplete: hardware clears HWO, nothing retires the
+	  buffer, and the pipe dies silently after one transfer.  An endpoint
+	  left out of the mask that the RTL does drive gets managed twice.
+
 config UDC_DWC3_EP_SM_LOG_UNMATCHED
 	bool "Log DEPEVT without matching CPU-EP SM expectation"
 	depends on UDC_DWC3_EP_SM

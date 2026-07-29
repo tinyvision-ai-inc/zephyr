@@ -15,6 +15,7 @@
 
 LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
+#include "udc_common.h"
 #include "udc_dwc3_int.h"
 
 #define UDC_DWC3_TRB_CTRL_HWO BIT(0)
@@ -30,6 +31,9 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_INSTART_RECYCLE_STEPS 16U
 
 #define UDC_DWC3_DEPEVT_EPN_MASK       GENMASK(5, 1)
+
+/* How long an IN endpoint may sit with a queued buffer and an empty ring. */
+#define UDC_DWC3_SM_IDLE_QUEUED_MS     50
 
 static atomic_t udc_dwc3_sm_in_start_retook;
 static atomic_t udc_dwc3_sm_in_start_backoff;
@@ -54,8 +58,15 @@ bool udc_dwc3_ep_sm_is_cpu(const struct udc_dwc3_ep_data *ep_data)
 		return false;
 	}
 
-	/* Video stream bulk IN endpoints — not managed by this SM. */
-	if (addr == 0x83 || addr == 0x84) {
+	/*
+	 * IN endpoints the RTL drives are not ours to manage.  Which addresses
+	 * those are depends on the descriptor layout of the application, so it
+	 * comes from Kconfig rather than being assumed: a composite device can
+	 * put a software-terminated bulk endpoint at an address that carries
+	 * video on another board.
+	 */
+	if (USB_EP_DIR_IS_IN(addr) &&
+	    (CONFIG_UDC_DWC3_EP_SM_HW_IN_EP_MASK & BIT(USB_EP_GET_IDX(addr))) != 0U) {
 		return false;
 	}
 
@@ -587,10 +598,44 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 	is_in = USB_EP_DIR_IS_IN(ep_data->cfg.addr);
 	buf = ep_data->net_buf[tail];
 
-	/* IN with nothing armed has nothing to send: idle, not stalled. */
+	/*
+	 * Nothing armed at the tail.  That is genuinely idle only when the queue
+	 * is empty as well: every doorbell path is driven from an armed TRB, so a
+	 * buffer waiting behind an empty ring has nothing left to start it, and
+	 * tier-5 recovery hands a buffer back to the queue in exactly this shape.
+	 * Treating that as idle strands the transfer, and with it the class that
+	 * is waiting for its completion.
+	 */
 	if (is_in && buf == NULL) {
-		ep_data->sm.stall_since = 0;
-		ep_data->sm.stall_reported = false;
+		if (ep_data->xfer_active || udc_buf_peek(&ep_data->cfg) == NULL) {
+			ep_data->sm.stall_since = 0;
+			ep_data->sm.stall_reported = false;
+			return;
+		}
+
+		if (ep_data->sm.stall_since == 0 || ep_data->sm.stall_buf != NULL ||
+		    ep_data->sm.stall_tail != tail) {
+			ep_data->sm.stall_since = now;
+			ep_data->sm.stall_tail = tail;
+			ep_data->sm.stall_buf = NULL;
+			ep_data->sm.stall_remaining = 0U;
+			ep_data->sm.stall_reported = false;
+			return;
+		}
+
+		if ((now - ep_data->sm.stall_since) < UDC_DWC3_SM_IDLE_QUEUED_MS) {
+			return;
+		}
+
+		/* Restart the window so the kick is rate-limited, not a spin. */
+		ep_data->sm.stall_since = now;
+		if (!ep_data->sm.stall_reported) {
+			ep_data->sm.stall_reported = true;
+			LOG_ERR("EP-SM: IDLE-QUEUED ep=0x%02x queued buffer with empty ring",
+				ep_data->cfg.addr);
+		}
+
+		udc_dwc3_int_submit_ep_work(ep_data);
 		return;
 	}
 
