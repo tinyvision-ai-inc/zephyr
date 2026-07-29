@@ -812,7 +812,7 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)
 {
-	LOG_WRN("DepSetStall: ep=0x%02x", ep_data->cfg.addr);
+	LOG_DBG("DepSetStall: ep=0x%02x", ep_data->cfg.addr);
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSETSTALL);
 }
@@ -820,7 +820,7 @@ static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
-	LOG_WRN("DepClearStall ep=0x%02x", ep_data->cfg.addr);
+	LOG_DBG("DepClearStall ep=0x%02x", ep_data->cfg.addr);
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCSTALL);
 }
@@ -1806,15 +1806,14 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
-	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_OUT);
-	__ASSERT_NO_MSG(ep_data->cfg.addr != USB_CONTROL_EP_IN);
+	LOG_INF("Clearing stall for ep 0x%02x", ep_cfg->addr);
+
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
+		return 0;
+	}
 
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
-
-	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		//udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-	}
 
 	/* Resume halted previously transfers */
 	k_work_submit(&ep_data->work);
