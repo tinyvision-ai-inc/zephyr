@@ -13,6 +13,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/usb/udc.h>
+#include <zephyr/sys/barrier.h>
 #include <zephyr/sys/device_mmio.h>
 #include <zephyr/sys/util.h>
 
@@ -310,7 +311,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GCOREID_CORE_MASK				GENMASK(31, 16)
 #define UDC_DWC3_GCOREID_REL_MASK				GENMASK(15, 0)
 
-/* USB Globa Status register */
+/* USB Global Status register */
 #define UDC_DWC3_GSTS						0xc118
 #define UDC_DWC3_GSTS_CBELT_MASK				GENMASK(31, 20)
 #define UDC_DWC3_GSTS_SSIC_IP					BIT(11)
@@ -526,6 +527,12 @@ struct udc_dwc3_ep_data {
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
+	/* Last transfer was completed */
+	bool last_xfer_completed;
+	/* Uptime (ms) the current outstanding TRB was pushed */
+	int64_t last_push_uptime;
+	/* A counter for the recovered TRB's */
+	uint8_t recovered_count;
 };
 
 /*
@@ -592,7 +599,18 @@ UDC_DWC3_QUIRK_FUNC_DEFINE(shutdown);
 #define DEV_CFG(dev) ((const struct udc_dwc3_config *)(dev->config))
 #define DEV_DATA(dev) ((struct udc_dwc3_data *)udc_get_private(dev))
 
+/* Must be well above one polling tick the lattice_usb23_worker reschedules
+ * every 1ms so a transfer still actively in flight across a couple
+ * of ticks is never mistaken for stalled.
+ */
+#define UDC_DWC3_STALL_IN_TIMEOUT_MS 5
+#define UDC_DWC3_STALL_OUT_TIMEOUT_MS 5
+
 static int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr);
+static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
+				       const uint32_t evt);
+static uint32_t udc_dwc3_depcmd(const struct device *const dev,
+				const uint32_t addr, const uint32_t cmd);
 
 /* Shut down the controller completely  */
 static int udc_dwc3_shutdown(const struct device *const dev)
@@ -634,6 +652,47 @@ void udc_dwc3_ring_inc(uint32_t *const nump, const uint32_t size)
 	*nump = (num >= size) ? 0 : num;
 }
 
+static void udc_dwc3_check_stalled_ep(const struct device *const dev,
+				      struct udc_dwc3_ep_data *const ep_data)
+{
+	int64_t age;
+	uint32_t flags = 0;
+
+	/* Nothing outstanding on this endpoint */
+	if (ep_data->head == ep_data->tail || ep_data->last_xfer_completed) {
+		return;
+	}
+
+	age = k_uptime_get() - ep_data->last_push_uptime;
+	if ((USB_EP_DIR_IS_IN(ep_data->cfg.addr) && age < UDC_DWC3_STALL_IN_TIMEOUT_MS)
+	    || (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && age < UDC_DWC3_STALL_OUT_TIMEOUT_MS)) {
+		return;
+	}
+
+	/* Walk from the oldest TRB (not having received an event) forward.
+	 */
+	while(ep_data->head != ep_data->tail) {
+		volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
+
+		if (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) {
+			/* there are cases where the hardware never picks a TRB */
+			if ((USB_EP_DIR_IS_IN(ep_data->cfg.addr) && age > UDC_DWC3_STALL_IN_TIMEOUT_MS)
+			    || (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && age > UDC_DWC3_STALL_OUT_TIMEOUT_MS)) {
+				flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
+				flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
+
+				udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+			}
+			break;
+		}
+
+		ep_data->recovered_count++;
+		LOG_WRN("EP 0x%02x: forcing completion, event must have been missed",
+			ep_data->cfg.addr);
+		udc_dwc3_on_xfer_done_norm(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
+	}
+}
+
 static void udc_dwc3_push_trb(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data,
 			      struct net_buf *const buf, const uint32_t ctrl)
@@ -662,12 +721,21 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 
 	/* If the head touches the tail after we add something, we are full */
 	ep_data->full = (ep_data->head == ep_data->tail);
+	ep_data->last_xfer_completed = false;
+	ep_data->last_push_uptime = k_uptime_get();
+	barrier_dmem_fence_full();
 }
+
 
 static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
 	struct net_buf *const buf = ep_data->net_buf[ep_data->tail];
+
+	if (buf == NULL) {
+		LOG_ERR("pop: the next TRB is emtpy");
+		return NULL;
+	}
 
 	/* Clear the last TRB */
 	ep_data->net_buf[ep_data->tail] = NULL;
@@ -675,15 +743,9 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 	/* Move to the next position in the ring buffer */
 	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
-	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
-		return NULL;
-	}
-
 	LOG_DBG("POP %u EP 0x%02x, buf %p, data %p",
 		ep_data->tail, ep_data->cfg.addr, (void *)buf, (void *)buf->data);
 
-	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
 
 	return buf;
@@ -1458,15 +1520,23 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		(epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
+	const uint32_t idx = ep_data->tail;
 	int ret;
 
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
-		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+		if (ep_data->recovered_count > 0) {
+			ep_data->recovered_count--;
+			LOG_DBG("EP 0x%02x: dropping late duplicate completion for "
+				"TRB %u, already recovered earlier", ep_data->cfg.addr, idx);
+		} else {
+			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+		}
 		return;
 	}
 
+	ep_data->last_xfer_completed = true;
 	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
 	udc_dwc3_on_xfer_done(dev, ep_data);
 
@@ -1563,12 +1633,23 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
-		/* Dispatch the even directly from IRQ */
+		/* Dispatch the event directly from IRQ */
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
 		/* Move to next event entry for both hardware and software */
 		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
 		udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+	}
+
+	/* Recovery pass, run only after any real pending events above have
+	* already been drained this tick.
+	*/
+	for (int i = 1; i < cfg->num_in_eps; i++) {
+		udc_dwc3_check_stalled_ep(dev, &cfg->ep_data_in[i]);
+	}
+
+	for (int i = 1; i < cfg->num_out_eps; i++) {
+		udc_dwc3_check_stalled_ep(dev, &cfg->ep_data_out[i]);
 	}
 
 	/* Allow further interrupts */
@@ -1578,7 +1659,7 @@ static void udc_dwc3_irq_handler(void *const ptr)
 /*
  * UDC API
  *
- * Interface called by Zehpyr from the upper levels of abstractions.
+ * Interface called by Zephyr from the upper levels of abstractions.
  */
 
 static int udc_dwc3_ep_enqueue(const struct device *const dev,
