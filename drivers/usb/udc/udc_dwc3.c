@@ -5434,6 +5434,9 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 	return 0;
 }
 
+static int udc_dwc3_in_restart_xfer(const struct device *const dev,
+				    struct udc_dwc3_ep_data *const ep_data);
+
 static int udc_dwc3_in_ensure_xfer_started(const struct device *const dev,
 					   struct udc_dwc3_ep_data *const ep_data)
 {
@@ -5482,21 +5485,24 @@ static int udc_dwc3_in_ensure_xfer_started(const struct device *const dev,
 	rscidx = udc_dwc3_depcmd_status(dev, depcmd_addr, UDC_DWC3_DEPCMD_DEPSTRTXFER,
 					&cmderr);
 	if (cmderr) {
+		/*
+		 * A refused StartXfer cannot be recognised from the command type
+		 * and resource index alone: the type is whatever was just
+		 * written, and the index still holds the resource of the
+		 * transfer that ran before.  Both look exactly like a start that
+		 * worked, which is how a stream that never resumed came to be
+		 * reported as recovered.
+		 *
+		 * The refusal itself says the endpoint still owns a resource,
+		 * since ClearStall does not release one, so retire it and start
+		 * again rather than leaving the endpoint armed with nothing
+		 * fetching its TRBs.
+		 */
 		reg = sys_read32(base + depcmd_addr);
-		if ((reg & 0xFU) == UDC_DWC3_DEPCMD_DEPSTRTXFER &&
-		    FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg) != 0U) {
-			ep_data->xferrscidx =
-				FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
-			ep_data->xfer_active = true;
-			atomic_inc(&udc_dwc3_clrhalt_rearm);
-			LOG_WRN("UVC-RESTART: ensure recovered ep=0x%02x depcmd=0x%08x",
-				ep_data->cfg.addr, reg);
-			return 0;
-		}
-
-		LOG_WRN("UVC-RESTART: ensure StartXfer CMDERR ep=0x%02x depcmd=0x%08x",
+		LOG_WRN("UVC-RESTART: ensure StartXfer CMDERR ep=0x%02x depcmd=0x%08x, retrying",
 			ep_data->cfg.addr, reg);
-		return -EALREADY;
+
+		return udc_dwc3_in_restart_xfer(dev, ep_data);
 	}
 
 	ep_data->xferrscidx = rscidx;
