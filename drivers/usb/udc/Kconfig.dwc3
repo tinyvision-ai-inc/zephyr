@@ -211,6 +211,19 @@ config UDC_DWC3_HEALTH_LOG_INTERVAL_MS
 	help
 	  How often the periodic health snapshot is emitted, in milliseconds.
 
+config UDC_DWC3_HEALTH_LOG_WARN
+	bool "Emit the periodic health line at warning level"
+	depends on UDC_DWC3_HEALTH_LOG
+	help
+	  Raise the periodic health line to warning level so it survives a
+	  build whose driver log level is set to warning.
+
+	  Every other line this driver emits is produced by USB activity, so a
+	  console that goes quiet cannot distinguish a dead link from a dead
+	  processor.  This line comes from a timer instead, which makes that
+	  distinction: if it keeps arriving, the processor is running and the
+	  link state it reports is the state the link is stuck in.
+
 config UDC_DWC3_DMA_SLOT_DIAG
 	bool "DMA slot usage tracking and IN scrub-at-enqueue"
 	help

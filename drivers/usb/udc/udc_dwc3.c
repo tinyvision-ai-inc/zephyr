@@ -4435,6 +4435,9 @@ static const char *udc_dwc3_linkstate_str(const uint32_t dsts)
  */
 static bool udc_dwc3_fifo_snapshot_done;
 
+/** Set once the per-endpoint ring dump has been emitted; see stall_snapshot(). */
+static bool udc_dwc3_ring_snapshot_done;
+
 static void udc_dwc3_dump_fifo_cfg(const struct device *const dev, const char *const tag)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -4457,6 +4460,12 @@ static void udc_dwc3_dump_fifo_cfg(const struct device *const dev, const char *c
 }
 
 #if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG_WARN)
+#define UDC_DWC3_LOG_HEALTH(...) LOG_WRN(__VA_ARGS__)
+#else
+#define UDC_DWC3_LOG_HEALTH(...) LOG_INF(__VA_ARGS__)
+#endif
+
 static void udc_dwc3_log_pools(void)
 {
 	STRUCT_SECTION_FOREACH(net_buf_pool, pool) {
@@ -4501,14 +4510,61 @@ static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *c
 	udc_dwc3_dump_fifo_cfg(dev, tag);
 }
 
+/*
+ * State of one endpoint that still owes somebody a completion.
+ *
+ * A transfer can go missing in two shapes that look identical from outside the
+ * driver -- the class waits forever either way -- but need opposite fixes: the
+ * buffer is armed in a TRB the controller never fetches, or it is sitting in the
+ * queue with nothing armed to start it.  "armed" and "queued" below tell those
+ * apart, and the tier-5 counters say whether recovery has already given up on it.
+ */
+static void udc_dwc3_log_ep_owed(struct udc_dwc3_ep_data *const ep_data)
+{
+	const struct udc_dwc3_trb *tail_trb;
+	struct net_buf *armed;
+	bool queued;
+
+	if (ep_data->cfg.addr == USB_CONTROL_EP_IN || ep_data->cfg.addr == USB_CONTROL_EP_OUT ||
+	    ep_data->trb_buf == NULL) {
+		return;
+	}
+
+	armed = ep_data->net_buf[ep_data->tail];
+	queued = udc_buf_peek(&ep_data->cfg) != NULL;
+
+	if (!queued && armed == NULL && !ep_data->xfer_active) {
+		/* Idle with nothing outstanding: nobody is waiting on this one. */
+		return;
+	}
+
+	tail_trb = &ep_data->trb_buf[ep_data->tail];
+
+	UDC_DWC3_LOG_HEALTH("owed ep=0x%02x armed=%d queued=%d active=%d busy=%d "
+		"head=%u tail=%u hwo=%d rem=%u sm=%d t5=%u gen=%u",
+		ep_data->cfg.addr, armed != NULL, (int)queued, (int)ep_data->xfer_active,
+		(int)udc_ep_is_busy(&ep_data->cfg), ep_data->head, ep_data->tail,
+		(int)udc_dwc3_int_trb_hwo(tail_trb), udc_dwc3_int_trb_remaining(tail_trb),
+#if defined(CONFIG_UDC_DWC3_EP_SM)
+		(int)ep_data->sm.state,
+#else
+		-1,
+#endif
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+		ep_data->tier5_requeues, ep_data->requeue_gen);
+#else
+		0U, 0U);
+#endif
+}
+
 static void udc_dwc3_log_health(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
 
-	LOG_INF("health %s: hwirq=%u poll=%u evt=%u rst=%u | setup=%u ctrlin=%u ctrlout=%u "
-		"norm=%u enobufs=%u | ep0 in_busy=%d out_busy=%d evtcnt=%u | "
+	UDC_DWC3_LOG_HEALTH("health %s: hwirq=%u poll=%u evt=%u rst=%u | setup=%u ctrlin=%u "
+		"ctrlout=%u norm=%u enobufs=%u | ep0 in_busy=%d out_busy=%d evtcnt=%u | "
 		"ep0 fixed=%u mismatch=%u setuppend=%u trberr=%u | "
 		"ssinact=%u ssrecov=%u remwk=%u | link=%s dsts=0x%08x",
 		dev->name,
@@ -4544,6 +4600,14 @@ static void udc_dwc3_log_health(const struct device *const dev)
 		(uint32_t)atomic_get(&udc_dwc3_out_done_empty),
 		(uint32_t)atomic_get(&udc_dwc3_out_acct_defer_hwo));
 #endif
+
+	for (uint8_t i = 0U; i < cfg->num_in_eps; i++) {
+		udc_dwc3_log_ep_owed(&cfg->ep_data_in[i]);
+	}
+
+	for (uint8_t i = 0U; i < cfg->num_out_eps; i++) {
+		udc_dwc3_log_ep_owed(&cfg->ep_data_out[i]);
+	}
 
 	udc_dwc3_log_pools();
 }
@@ -4775,6 +4839,22 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 				epn, depcmd, par0, par1, par2);
 		}
 	}
+
+	/*
+	 * The per-endpoint ring dump is around ninety lines.  Under
+	 * CONFIG_LOG_MODE_MINIMAL that is emitted synchronously, so on a 153600
+	 * baud console it holds the calling thread for roughly 600 ms -- and this
+	 * runs from recovery, which a dropped doorbell can trigger several times a
+	 * second.  Whatever else the application was doing stops for that whole
+	 * time, which is long enough to lose data the device is mid-way through
+	 * reading from a sensor, turning a recovered controller hiccup into
+	 * corrupted payload.  The rings look the same on every repeat wedge, so
+	 * dump them once and leave the summary lines above as the running record.
+	 */
+	if (udc_dwc3_ring_snapshot_done) {
+		return;
+	}
+	udc_dwc3_ring_snapshot_done = true;
 
 	for (int i = 0; i < cfg->num_in_eps; i++) {
 		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[i];
