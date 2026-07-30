@@ -224,6 +224,53 @@ config UDC_DWC3_HEALTH_LOG_WARN
 	  distinction: if it keeps arriving, the processor is running and the
 	  link state it reports is the state the link is stuck in.
 
+config UDC_DWC3_LINK_ESCAPE
+	bool "Break out of a stuck SuperSpeed link by reconnecting"
+	depends on UDC_DWC3_HEALTH_LOG
+	help
+	  Recover from a SuperSpeed link that has stopped carrying traffic
+	  without failing outright.
+
+	  The link can settle into alternating U0 and Recovery many times a
+	  second: it retrains, errors immediately, and retrains again, so no
+	  transfer ever completes.  Because it never reaches SS.Inactive the
+	  host is never told anything is wrong -- the device stays enumerated
+	  and its endpoints stay present while moving no data, which is why
+	  only a power cycle clears it.
+
+	  When the periodic health check sees events arriving with no transfer
+	  and no control progress behind them, drop the run/stop bit briefly.
+	  The host sees a disconnect and re-enumerates, so the link retrains
+	  from scratch instead of staying in limbo.  This is a last resort
+	  against an unrecoverable state, not a substitute for a link that
+	  stays up.
+
+config UDC_DWC3_LINK_ESCAPE_MAX
+	int "Reconnect attempts allowed"
+	default 5
+	depends on UDC_DWC3_LINK_ESCAPE
+	help
+	  Give up after this many attempts, so a link that cannot be rescued
+	  is left alone rather than bounced forever.
+
+config UDC_DWC3_LINK_ESCAPE_DOWN_MS
+	int "How long to hold the disconnect (ms)"
+	default 200
+	depends on UDC_DWC3_LINK_ESCAPE
+	help
+	  The device has to be absent long enough for the host to register a
+	  disconnect rather than a glitch.
+
+config UDC_DWC3_LINK_ESCAPE_COOLDOWN
+	int "Health intervals to ignore after reconnecting"
+	default 5
+	depends on UDC_DWC3_LINK_ESCAPE
+	help
+	  Reset and connect events arrive with no transfers yet behind them,
+	  which looks exactly like the wedge being detected.  Ignore that many
+	  intervals after a reconnect so enumeration is not mistaken for a
+	  wedge and interrupted by another one.
+
 config UDC_DWC3_DMA_SLOT_DIAG
 	bool "DMA slot usage tracking and IN scrub-at-enqueue"
 	help

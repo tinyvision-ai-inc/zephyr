@@ -42,6 +42,56 @@ static atomic_t udc_dwc3_ctrl_in_count;
 static atomic_t udc_dwc3_ctrl_out_count;
 static atomic_t udc_dwc3_norm_done_count;
 static atomic_t udc_dwc3_enobufs_count;
+
+#if defined(CONFIG_UDC_DWC3_HEALTH_LOG)
+/*
+ * Which event words arrived during the last health interval.
+ *
+ * A wedge has been observed where the driver consumes ~144 valid events per
+ * second while no SETUP reaches EP0 and no transfer completes, and the device
+ * never recovers.  Neither the XferComplete nor the XferInProgress counters move
+ * during it, so those events are of some type nothing currently records and the
+ * only open question is which.  The tally is cleared every interval so that at
+ * wedge time it holds just the events making up the wedge, rather than being
+ * swamped by the traffic that preceded it.
+ *
+ * Only the masked identity is tallied -- that is what handle_event() dispatches
+ * on, and endpoint and type both decode from it -- while the last full word is
+ * kept separately for its status bits.
+ */
+#define UDC_DWC3_EVT_TALLY_SLOTS 8U
+
+static struct {
+	uint16_t evt;
+	uint16_t hits;
+} udc_dwc3_evt_tally[UDC_DWC3_EVT_TALLY_SLOTS];
+static uint16_t udc_dwc3_evt_tally_missed;
+static uint32_t udc_dwc3_evt_tally_last_raw;
+
+static void udc_dwc3_evt_tally_note(const uint32_t raw, const uint16_t evt)
+{
+	udc_dwc3_evt_tally_last_raw = raw;
+
+	for (unsigned int i = 0U; i < UDC_DWC3_EVT_TALLY_SLOTS; i++) {
+		if (udc_dwc3_evt_tally[i].hits == 0U) {
+			udc_dwc3_evt_tally[i].evt = evt;
+			udc_dwc3_evt_tally[i].hits = 1U;
+			return;
+		}
+
+		if (udc_dwc3_evt_tally[i].evt == evt) {
+			if (udc_dwc3_evt_tally[i].hits < UINT16_MAX) {
+				udc_dwc3_evt_tally[i].hits++;
+			}
+			return;
+		}
+	}
+
+	udc_dwc3_evt_tally_missed++;
+}
+#else
+#define udc_dwc3_evt_tally_note(raw, evt) do { } while (0)
+#endif /* CONFIG_UDC_DWC3_HEALTH_LOG */
 static atomic_t udc_dwc3_usbrst_count;
 
 #if defined(CONFIG_UDC_DWC3_XFER_TRACE)
@@ -4340,6 +4390,7 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 		}
 
 		atomic_inc(&udc_dwc3_evt_count);
+		udc_dwc3_evt_tally_note(evt, (uint16_t)(evt & UDC_DWC3_EVT_MASK));
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
 		/*
@@ -4558,6 +4609,171 @@ static void udc_dwc3_log_ep_owed(struct udc_dwc3_ep_data *const ep_data)
 #endif
 }
 
+/* Defined below, and the wedge report wants its register and TRB dump. */
+void udc_dwc3_stall_snapshot(const struct device *dev);
+
+/*
+ * Events consumed with nothing to show for them.
+ *
+ * The failure this catches: every endpoint stops at once -- no SETUP at EP0, no
+ * bulk or isochronous completion, video included -- while the controller keeps
+ * posting valid events that the driver dutifully handles and acknowledges.  It
+ * does not recover without a power cycle, and so far it has only been visible by
+ * diffing health counters after the fact.  Report it the moment it starts, and
+ * name the events responsible.
+ *
+ * The threshold is well under the ~144 events/s measured during a wedge, and far
+ * above an idle interval.  Requiring every per-endpoint transfer event to be
+ * frozen as well as setup and norm is what makes this specific: an interval that
+ * genuinely streams posts XferInProgress or XferComplete somewhere, whether or
+ * not that endpoint feeds the norm counter, so live video cannot be mistaken for
+ * a wedge.
+ */
+#define UDC_DWC3_WEDGE_EVT_MIN 50U
+
+#if defined(CONFIG_UDC_DWC3_LINK_ESCAPE)
+/*
+ * Drop off the bus and come back, so a link that is stuck retraining has to
+ * start over from RX.Detect.
+ *
+ * This is the same disconnect the run/stop bit performs at udc_disable(), and
+ * the host handles it as an unplug: it re-enumerates, and the reset that follows
+ * rebuilds endpoint state through the path a cable replug already exercises.
+ * Nothing gentler works, because the controller never reports a link failure --
+ * from its point of view it is in U0 every time anyone looks.
+ */
+#define UDC_DWC3_LINK_ESCAPE_HALT_MS 500U
+
+/*
+ * Run/stop is a request, not an action: the controller finishes what it is doing
+ * and reports the result in DEVCTRLHLT.  Driving the bit the other way before
+ * that lands leaves it neither running nor stopped.
+ */
+static bool udc_dwc3_wait_halted(const mm_reg_t base, const bool want_halted)
+{
+	for (unsigned int i = 0U; i < UDC_DWC3_LINK_ESCAPE_HALT_MS; i++) {
+		const bool halted = (sys_read32(base + UDC_DWC3_DSTS) &
+				     UDC_DWC3_DSTS_DEVCTRLHLT) != 0U;
+
+		if (halted == want_halted) {
+			return true;
+		}
+
+		k_msleep(1);
+	}
+
+	return false;
+}
+
+static void udc_dwc3_link_escape(const struct device *const dev)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+
+	if (!udc_dwc3_wait_halted(base, true)) {
+		LOG_ERR("LINK-ESCAPE: no halt after stop, dsts=0x%08x",
+			sys_read32(base + UDC_DWC3_DSTS));
+	}
+
+	/* Stay away long enough that the host port treats this as an unplug. */
+	k_msleep(CONFIG_UDC_DWC3_LINK_ESCAPE_DOWN_MS);
+
+	sys_set_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+
+	if (!udc_dwc3_wait_halted(base, false)) {
+		LOG_ERR("LINK-ESCAPE: still halted after start, dsts=0x%08x",
+			sys_read32(base + UDC_DWC3_DSTS));
+	}
+}
+#endif /* CONFIG_UDC_DWC3_LINK_ESCAPE */
+
+static uint32_t udc_dwc3_depevt_total(void)
+{
+	uint32_t total = 0U;
+
+	for (int epn = 0; epn < UDC_DWC3_DEPEVT_MAX_EPN; epn++) {
+		total += (uint32_t)atomic_get(&udc_dwc3_depevt_complete[epn]);
+		total += (uint32_t)atomic_get(&udc_dwc3_depevt_inprog[epn]);
+	}
+
+	return total;
+}
+
+static void udc_dwc3_check_wedge(const struct device *const dev)
+{
+	static uint32_t prev_evt;
+	static uint32_t prev_setup;
+	static uint32_t prev_norm;
+	static uint32_t prev_depevt;
+	static bool primed;
+	static bool reported;
+#if defined(CONFIG_UDC_DWC3_LINK_ESCAPE)
+	static uint8_t escapes;
+	static uint8_t cooldown;
+#endif
+
+	const uint32_t evt = (uint32_t)atomic_get(&udc_dwc3_evt_count);
+	const uint32_t setup = (uint32_t)atomic_get(&udc_dwc3_ctrl_setup_count);
+	const uint32_t norm = (uint32_t)atomic_get(&udc_dwc3_norm_done_count);
+	const uint32_t depevt = udc_dwc3_depevt_total();
+	bool wedged = primed && (evt - prev_evt) >= UDC_DWC3_WEDGE_EVT_MIN &&
+		      setup == prev_setup && norm == prev_norm && depevt == prev_depevt;
+
+#if defined(CONFIG_UDC_DWC3_LINK_ESCAPE)
+	if (cooldown > 0U) {
+		cooldown--;
+		wedged = false;
+	}
+#endif
+
+	if (wedged && !reported) {
+		reported = true;
+
+		LOG_ERR("WEDGE: %u events consumed, no setup, no completion; last raw evt=0x%08x",
+			evt - prev_evt, udc_dwc3_evt_tally_last_raw);
+
+		for (unsigned int i = 0U; i < UDC_DWC3_EVT_TALLY_SLOTS; i++) {
+			if (udc_dwc3_evt_tally[i].hits == 0U) {
+				break;
+			}
+
+			LOG_ERR("WEDGE-EVT evt=0x%03x hits=%u", udc_dwc3_evt_tally[i].evt,
+				udc_dwc3_evt_tally[i].hits);
+		}
+
+		if (udc_dwc3_evt_tally_missed != 0U) {
+			LOG_ERR("WEDGE-EVT %u more did not fit the tally",
+				udc_dwc3_evt_tally_missed);
+		}
+
+		udc_dwc3_stall_snapshot(dev);
+	}
+
+	prev_evt = evt;
+	prev_setup = setup;
+	prev_norm = norm;
+	prev_depevt = depevt;
+	primed = true;
+
+	memset(udc_dwc3_evt_tally, 0, sizeof(udc_dwc3_evt_tally));
+	udc_dwc3_evt_tally_missed = 0U;
+
+#if defined(CONFIG_UDC_DWC3_LINK_ESCAPE)
+	if (wedged && escapes < CONFIG_UDC_DWC3_LINK_ESCAPE_MAX) {
+		escapes++;
+
+		LOG_ERR("LINK-ESCAPE %u/%u: reconnecting so the link retrains from scratch",
+			escapes, CONFIG_UDC_DWC3_LINK_ESCAPE_MAX);
+
+		udc_dwc3_link_escape(dev);
+
+		cooldown = CONFIG_UDC_DWC3_LINK_ESCAPE_COOLDOWN;
+		primed = false;
+	}
+#endif
+}
+
 static void udc_dwc3_log_health(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -4611,6 +4827,7 @@ static void udc_dwc3_log_health(const struct device *const dev)
 	}
 
 	udc_dwc3_log_pools();
+	udc_dwc3_check_wedge(dev);
 }
 
 static void udc_dwc3_health_worker(struct k_work *const work)
