@@ -35,6 +35,22 @@ static atomic_t udc_dwc3_evt_unlanded_count;
 
 /* Microsecond steps to wait for a counted event's posted write to land. */
 #define UDC_DWC3_EVT_LANDING_STEPS 64U
+
+/*
+ * Consecutive drain passes that may find a counted event missing before the read
+ * index is treated as drifted rather than early.
+ *
+ * A posted write lands in microseconds, and the landing wait above already
+ * covers that, so a pass that still finds nothing is not waiting on the bus. A
+ * streak of them is the signature of an index that is ahead of hardware, which
+ * never resolves on its own. Twenty passes is a fraction of a second at the poll
+ * rate and far beyond any write latency, and the streak resets on every event
+ * consumed, so live traffic cannot accumulate one.
+ */
+#define UDC_DWC3_EVT_UNLANDED_RESYNC 20U
+
+/* Times the read index had to be realigned with hardware. */
+static atomic_t udc_dwc3_evt_resync_count;
 static atomic_t udc_dwc3_evt_count;
 static atomic_t udc_dwc3_evt_overflow_count;
 static atomic_t udc_dwc3_ctrl_setup_count;
@@ -947,6 +963,8 @@ struct udc_dwc3_data {
 	DEVICE_MMIO_NAMED_RAM(base);
 	/* Index within trb where to queue new TRBs */
 	uint32_t evt_next;
+	/* Consecutive drain passes that found a counted event's word missing */
+	uint32_t evt_unlanded_streak;
 	/* Back-reference to parent */
 	const struct device *dev;
 	/* Drains the DWC3 event buffer in thread context (mutexes are illegal in ISRs) */
@@ -2932,6 +2950,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 
 	/* Setup the event buffer address, size and start event reception */
 	memset((void *)cfg->evt_buf, 0, CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
+	/* The core reset above returns hardware to the base of the ring, and the
+	 * buffer has just been cleared, so the read index has to start there too.
+	 * It only happens to be zero today because this runs once before any event
+	 * arrives; a second call from anywhere would strand the index mid-ring. */
+	DEV_DATA(dev)->evt_next = 0U;
+	DEV_DATA(dev)->evt_unlanded_streak = 0U;
 	sys_write32(HI32((uintptr_t)cfg->evt_buf), base + UDC_DWC3_GEVNTADR_HI(0));
 	sys_write32(LO32((uintptr_t)cfg->evt_buf), base + UDC_DWC3_GEVNTADR_LO(0));
 	sys_write32(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t), base + UDC_DWC3_GEVNTSIZ(0));
@@ -4349,6 +4373,63 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	k_work_submit(&priv->event_work);
 }
 
+/*
+ * Realign the event read index with hardware after it has drifted ahead.
+ *
+ * The drain loop refuses to consume a zero word, because acking an entry that
+ * has not arrived is precisely what puts the index permanently ahead. That is
+ * right for a write still in flight, but it leaves no way out once the index is
+ * already ahead: the count stays non-zero, the slot stays zero, and every pass
+ * reads the same zero while the device remains enumerated and looks healthy.
+ * Seen on this hardware with GEVNTCOUNT pinned at 4 for eight minutes across
+ * 24,000 polls -- not one event consumed, every endpoint still armed, link in
+ * U0 -- which presents to the host as a control command that never answers.
+ *
+ * Consumed slots are zeroed, so any non-zero word in the ring is an event
+ * hardware posted that nobody has taken, and its position is where hardware
+ * actually is. Resume from the first one found.
+ *
+ * Finding none means the counted word is not in memory and never will be. Give
+ * back one entry so the count can drain instead of blocking on it forever; the
+ * next genuine event then lands somewhere in the ring and the scan above finds
+ * it. One discarded event costs a retry, whereas holding the count costs the
+ * device until someone power cycles it.
+ */
+static void udc_dwc3_evt_resync(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t from = priv->evt_next;
+	/* Report the first few and then only count them, so a repeating realignment
+	 * cannot bury the traffic that explains it. */
+	const bool report = atomic_inc(&udc_dwc3_evt_resync_count) < 8;
+
+	priv->evt_unlanded_streak = 0U;
+
+	for (uint32_t i = 0U; i < CONFIG_UDC_DWC3_EVENTS_NUM; i++) {
+		const uint32_t idx = (from + i) % CONFIG_UDC_DWC3_EVENTS_NUM;
+
+		if (cfg->evt_buf[idx] != 0U) {
+			priv->evt_next = idx;
+
+			if (report) {
+				LOG_ERR("EVT-RESYNC idx %u -> %u gevntcount=%u", from, idx,
+					sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)));
+			}
+
+			return;
+		}
+	}
+
+	sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+
+	if (report) {
+		LOG_ERR("EVT-RESYNC idx %u ring empty, released one entry, gevntcount=%u", from,
+			sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)));
+	}
+}
+
 /* Drain the DWC3 event buffer from thread context (mutex-safe). */
 static void udc_dwc3_event_worker(struct k_work *const work)
 {
@@ -4385,10 +4466,17 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 
 			if (evt == 0U) {
 				atomic_inc(&udc_dwc3_evt_unlanded_count);
+				priv->evt_unlanded_streak++;
+
+				if (priv->evt_unlanded_streak >= UDC_DWC3_EVT_UNLANDED_RESYNC) {
+					udc_dwc3_evt_resync(dev);
+				}
+
 				break;
 			}
 		}
 
+		priv->evt_unlanded_streak = 0U;
 		atomic_inc(&udc_dwc3_evt_count);
 		udc_dwc3_evt_tally_note(evt, (uint16_t)(evt & UDC_DWC3_EVT_MASK));
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
@@ -5015,9 +5103,10 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 		udc_dwc3_linkstate_str(dsts), dsts,
 		sys_read32(base + UDC_DWC3_DALEPENA));
 
-	LOG_ERR("STALL-EVTRING gevntcount=%u evt_next=%u unlanded=%u",
+	LOG_ERR("STALL-EVTRING gevntcount=%u evt_next=%u unlanded=%u resync=%u",
 		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)), priv->evt_next,
-		(uint32_t)atomic_get(&udc_dwc3_evt_unlanded_count));
+		(uint32_t)atomic_get(&udc_dwc3_evt_unlanded_count),
+		(uint32_t)atomic_get(&udc_dwc3_evt_resync_count));
 
 	/* Report the FIFO layout on the first wedge; see udc_dwc3_dump_fifo_cfg(). */
 	if (!udc_dwc3_fifo_snapshot_done) {
