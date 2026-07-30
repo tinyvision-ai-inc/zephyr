@@ -26,6 +26,14 @@ LOG_MODULE_DECLARE(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 /* How long an IN endpoint may sit with a queued buffer and an empty ring. */
 #define UDC_DWC3_SM_IDLE_QUEUED_MS     50
 
+/*
+ * Failed IN-PARK re-arms before the watchdog stops nudging and recycles the
+ * transfer resource.  Each attempt costs one park window, so this multiplies
+ * CONFIG_UDC_DWC3_IN_PARK_RECOVER_MS into the total time a class waits: keep
+ * the product inside whatever the application treats as a transfer timeout.
+ */
+#define UDC_DWC3_SM_PARK_ESCALATE_FAILS 2U
+
 static atomic_t udc_dwc3_sm_in_start_exhausted;
 static atomic_t udc_dwc3_sm_poll_recovered;
 
@@ -72,6 +80,7 @@ void udc_dwc3_ep_sm_init(struct udc_dwc3_ep_data *ep_data)
 	ep_data->sm.arm_verify_busy = false;
 	ep_data->sm.rebuild_in_progress = false;
 	ep_data->sm.arm_after_rebuild = false;
+	ep_data->sm.park_rearm_fails = 0U;
 	ep_data->sm.poll_grace_armed = false;
 }
 
@@ -142,9 +151,9 @@ static bool udc_dwc3_sm_retire_tail(const struct device *dev,
  * On STUCK leave the TRB armed — EndXfer/rebuild is for the watchdog /
  * explicit escalate paths (eager recycle breaks ACM enum).
  */
-static void udc_dwc3_sm_arm_in(const struct device *dev,
-			       struct udc_dwc3_ep_data *ep_data,
-			       enum udc_dwc3_arm_op op)
+static enum udc_dwc3_arm_result udc_dwc3_sm_arm_in(const struct device *dev,
+						   struct udc_dwc3_ep_data *ep_data,
+						   enum udc_dwc3_arm_op op)
 {
 	const struct udc_dwc3_arm_policy *policy = ep_data->sm.arm_after_rebuild ?
 		udc_dwc3_arm_policy_in_after_rebuild() :
@@ -155,7 +164,7 @@ static void udc_dwc3_sm_arm_in(const struct device *dev,
 	result = udc_dwc3_arm_transfer(dev, ep_data, op, policy);
 
 	if (udc_dwc3_arm_ok(result) || result == UDC_DWC3_ARM_BACKOFF) {
-		return;
+		return result;
 	}
 
 	/*
@@ -169,6 +178,8 @@ static void udc_dwc3_sm_arm_in(const struct device *dev,
 	 */
 	LOG_WRN("IN-ARM: ep=0x%02x STUCK left armed (no EndXfer); watchdog may escalate",
 		ep_data->cfg.addr);
+
+	return result;
 }
 
 /*
@@ -665,11 +676,39 @@ static void udc_dwc3_sm_watchdog_ep(const struct device *const dev,
 	LOG_WRN("EP-SM: IN-PARK ep=0x%02x stuck %lldms, re-arming tail=%u",
 		ep_data->cfg.addr, (long long)pending_ms, tail);
 
-	udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_UPDATE);
+	if (!udc_dwc3_arm_ok(udc_dwc3_sm_arm_in(dev, ep_data, UDC_DWC3_ARM_UPDATE)) &&
+	    ep_data->sm.park_rearm_fails < UINT8_MAX) {
+		ep_data->sm.park_rearm_fails++;
+	}
 
 	/* Restart the window so a failed recovery is re-attempted, not spun on. */
 	ep_data->sm.stall_since = now;
 	ep_data->sm.stall_reported = false;
+
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	/*
+	 * UpdateXfer is the only lever tried so far, and on this IP it is a dead
+	 * one once the controller has parked: it is refused, or accepted and
+	 * ignored, and the tail stays owned.  Recycling the transfer resource
+	 * (EndXfer+StartXfer, then a ring rebuild) is what actually gets the
+	 * buffer moving again, so escalate rather than nudge forever.
+	 *
+	 * Escalation belongs here and not in the arm ladder.  An IN TRB that
+	 * hardware still owns milliseconds after the doorbell usually just means
+	 * the host has not sent an IN token yet -- the normal state of a console
+	 * pipe, and of ACM IN during set_configuration, where tearing the
+	 * resource down prevents enumeration. Only elapsed time with no movement
+	 * separates that from a doorbell the controller dropped, and only this
+	 * path has measured it.
+	 */
+	if (ep_data->sm.park_rearm_fails >= UDC_DWC3_SM_PARK_ESCALATE_FAILS) {
+		ep_data->sm.park_rearm_fails = 0U;
+		LOG_ERR("EP-SM: IN-PARK ep=0x%02x nudges spent, recycling resource",
+			ep_data->cfg.addr);
+		udc_dwc3_int_in_endxfer_recycle(dev, ep_data);
+		return;
+	}
+#endif
 
 	if (!udc_dwc3_int_trb_hwo(&ep_data->trb_buf[tail])) {
 		while (udc_dwc3_sm_retire_tail(dev, ep_data, "in-park")) {

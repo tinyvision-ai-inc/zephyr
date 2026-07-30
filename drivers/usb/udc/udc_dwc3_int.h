@@ -39,6 +39,12 @@ struct udc_dwc3_ep_sm {
 	 * Set when a pipe rebuild re-queues buffers.
 	 */
 	bool arm_after_rebuild;
+	/**
+	 * Consecutive IN-PARK re-arms that left the tail owned by hardware.
+	 * Cleared by any verified-OK arm; bounds how long the watchdog nudges
+	 * before it recycles the transfer resource outright.
+	 */
+	uint8_t park_rearm_fails;
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL) || defined(CONFIG_UDC_DWC3_EP_SM)
 	uint32_t poll_grace_tail;
 	bool poll_grace_armed;

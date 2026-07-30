@@ -181,6 +181,7 @@ static void arm_record_ok(struct udc_dwc3_ep_data *ep_data, unsigned int nudges,
 #if defined(CONFIG_UDC_DWC3_EP_SM)
 	ep_data->sm.arm_fail_logged = false;
 	ep_data->sm.arm_after_rebuild = false;
+	ep_data->sm.park_rearm_fails = 0U;
 #endif
 }
 

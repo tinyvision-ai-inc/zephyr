@@ -4517,7 +4517,8 @@ static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *c
  * driver -- the class waits forever either way -- but need opposite fixes: the
  * buffer is armed in a TRB the controller never fetches, or it is sitting in the
  * queue with nothing armed to start it.  "armed" and "queued" below tell those
- * apart, and the tier-5 counters say whether recovery has already given up on it.
+ * apart, and the rebuild counters say whether recovery has already given up on
+ * it.
  */
 static void udc_dwc3_log_ep_owed(struct udc_dwc3_ep_data *const ep_data)
 {
@@ -4541,7 +4542,7 @@ static void udc_dwc3_log_ep_owed(struct udc_dwc3_ep_data *const ep_data)
 	tail_trb = &ep_data->trb_buf[ep_data->tail];
 
 	UDC_DWC3_LOG_HEALTH("owed ep=0x%02x armed=%d queued=%d active=%d busy=%d "
-		"head=%u tail=%u hwo=%d rem=%u sm=%d t5=%u gen=%u",
+		"head=%u tail=%u hwo=%d rem=%u sm=%d rebuild=%u gen=%u",
 		ep_data->cfg.addr, armed != NULL, (int)queued, (int)ep_data->xfer_active,
 		(int)udc_ep_is_busy(&ep_data->cfg), ep_data->head, ep_data->tail,
 		(int)udc_dwc3_int_trb_hwo(tail_trb), udc_dwc3_int_trb_remaining(tail_trb),
@@ -4551,7 +4552,7 @@ static void udc_dwc3_log_ep_owed(struct udc_dwc3_ep_data *const ep_data)
 		-1,
 #endif
 #if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
-		ep_data->tier5_requeues, ep_data->requeue_gen);
+		ep_data->rebuild_attempts, ep_data->requeue_gen);
 #else
 		0U, 0U);
 #endif
