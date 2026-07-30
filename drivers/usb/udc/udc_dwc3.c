@@ -4630,7 +4630,9 @@ static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *c
 	const uint32_t dctl = sys_read32(base + UDC_DWC3_DCTL);
 	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
 
-	LOG_INF("linkcfg(%s): GUSB3PIPECTL=0x%08x GCTL=0x%08x GUSB2PHYCFG=0x%08x "
+	/* At warning level, like the FIFO dump beside it: this is only ever reached
+	 * from a wedge, where the driver's info level is compiled out. */
+	LOG_WRN("linkcfg(%s): GUSB3PIPECTL=0x%08x GCTL=0x%08x GUSB2PHYCFG=0x%08x "
 		"DCTL=0x%08x DEVTEN=0x%08x DCFG=0x%08x",
 		tag,
 		sys_read32(base + UDC_DWC3_GUSB3PIPECTL),
@@ -4639,7 +4641,7 @@ static void udc_dwc3_dump_link_cfg(const struct device *const dev, const char *c
 		dctl,
 		sys_read32(base + UDC_DWC3_DEVTEN),
 		sys_read32(base + UDC_DWC3_DCFG));
-	LOG_INF("linkcfg(%s): U1[init=%d accept=%d] U2[init=%d accept=%d] GTXTHRCFG=0x%08x link=%s dsts=0x%08x",
+	LOG_WRN("linkcfg(%s): U1[init=%d accept=%d] U2[init=%d accept=%d] GTXTHRCFG=0x%08x link=%s dsts=0x%08x",
 		tag,
 		!!(dctl & UDC_DWC3_DCTL_INITU1ENA), !!(dctl & UDC_DWC3_DCTL_ACCEPTU1ENA),
 		!!(dctl & UDC_DWC3_DCTL_INITU2ENA), !!(dctl & UDC_DWC3_DCTL_ACCEPTU2ENA),
@@ -4760,8 +4762,24 @@ static void udc_dwc3_link_escape(const struct device *const dev)
 	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
 
 	if (!udc_dwc3_wait_halted(base, true)) {
-		LOG_ERR("LINK-ESCAPE: no halt after stop, dsts=0x%08x",
+		/*
+		 * Measured on this hardware: during a storm the core never asserts
+		 * DEVCTRLHLT at all, through ten seconds of waiting on every one of
+		 * five attempts.
+		 *
+		 * Continuing anyway is what makes this destructive rather than merely
+		 * useless. Returning run/stop to a core that never stopped left the
+		 * device off the bus and resetting two to three times a second, still
+		 * climbing long after the attempts gave up and never addressed again --
+		 * so a device that was frozen but present became one that was not
+		 * there at all, with its ACM nodes gone from the host.
+		 *
+		 * Put it back the way it was and give up.
+		 */
+		LOG_ERR("LINK-ESCAPE: no halt after stop, dsts=0x%08x, abandoning",
 			sys_read32(base + UDC_DWC3_DSTS));
+		sys_set_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+		return;
 	}
 
 	/* Stay away long enough that the host port treats this as an unplug. */
@@ -5108,10 +5126,19 @@ void udc_dwc3_stall_snapshot(const struct device *const dev)
 		(uint32_t)atomic_get(&udc_dwc3_evt_unlanded_count),
 		(uint32_t)atomic_get(&udc_dwc3_evt_resync_count));
 
-	/* Report the FIFO layout on the first wedge; see udc_dwc3_dump_fifo_cfg(). */
+	/*
+	 * Report the link and FIFO configuration on the first wedge.
+	 *
+	 * The link half decides whether a storm of link state changes is the link's
+	 * own doing or something that was asked for. A failed U1 or U2 exit is routed
+	 * to Recovery when GUSB3PIPECTL bit 25 is set, which with low power enabled
+	 * produces exactly the endless U0/Recovery alternation seen here; if the
+	 * U1/U2 bits are clear instead, that explanation is gone and the remaining
+	 * suspects are the PHY settings printed beside them.
+	 */
 	if (!udc_dwc3_fifo_snapshot_done) {
 		udc_dwc3_fifo_snapshot_done = true;
-		udc_dwc3_dump_fifo_cfg(dev, "wedge");
+		udc_dwc3_dump_link_cfg(dev, "wedge");
 	}
 
 	for (int epn = 0; epn < UDC_DWC3_DEPEVT_MAX_EPN; epn++) {
