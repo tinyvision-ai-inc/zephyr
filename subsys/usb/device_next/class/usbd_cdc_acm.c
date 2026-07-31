@@ -741,7 +741,8 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 	}
 
 	if (ring_buf_space_get(data->rx_fifo.rb) < cdc_acm_get_bulk_mps(c_data)) {
-		LOG_INF("RX buffer to small, throttle");
+		LOG_DBG("RX buffer too small, throttle (space %u < mps)",
+			ring_buf_space_get(data->rx_fifo.rb));
 		return;
 	}
 
@@ -831,7 +832,7 @@ static int cdc_acm_fifo_fill(const struct device *dev,
 		data->tx_fifo.altered = true;
 	}
 
-	LOG_INF("UART dev %p, len %d, remaining space %u",
+	LOG_DBG("UART dev %p, len %d, remaining space %u",
 		dev, len, ring_buf_space_get(data->tx_fifo.rb));
 
 	return done;
@@ -844,7 +845,7 @@ static int cdc_acm_fifo_read(const struct device *dev,
 	struct cdc_acm_uart_data *const data = dev->data;
 	uint32_t len;
 
-	LOG_INF("UART dev %p size %d length %u",
+	LOG_DBG("UART dev %p size %d length %u",
 		dev, size, ring_buf_size_get(data->rx_fifo.rb));
 
 	if (!check_wq_ctx(dev)) {
