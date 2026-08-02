@@ -538,6 +538,10 @@ struct udc_dwc3_data {
 	uint32_t evt_next;
 	/* Back-reference to parent */
 	const struct device *dev;
+	/* Bottom-half: drain event ring in thread context (UDC mutex) */
+	struct k_sem evt_sem;
+	struct k_thread evt_thread;
+	k_thread_stack_t *evt_stack;
 };
 
 /*
@@ -757,7 +761,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
 	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
-	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 15);
+	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 0);
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
@@ -919,6 +923,108 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev,
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
 
+/*
+ * Bounce large EP0 IN through uncached SRAM. Must be volatile: otherwise the
+ * compiler can DCE memcpy/patch stores because only the DMA address is
+ * consumed in C (hardware reads the payload).
+ */
+static __nocache volatile uint8_t udc_dwc3_ep0_in_bounce[2048] __aligned(64);
+
+/*
+ * Lattice USB23 EP0 has been observed to deliver config blobs where a few
+ * UVC VS fields are OR-corrupted on the wire (e.g. 640x480 -> 642x484,
+ * wTotalLength 0x0072 -> 0x0272) even when the source buffer was correct.
+ * Re-assert BA81 frame geometry and VS input-header fields in the bounce
+ * buffer immediately before DMA.
+ */
+static void udc_dwc3_ep0_patch_uvc_config(volatile uint8_t *buf, size_t len)
+{
+	for (size_t i = 0; i + 13 <= len; i++) {
+		uint8_t bl = buf[i];
+		uint8_t ep;
+
+		/* VS Input Header: subtype 1 with bulk EP 0x81/0x82 (not VC header) */
+		if (bl < 13 || (size_t)bl + i > len || buf[i + 1] != 0x24 ||
+		    buf[i + 2] != 0x01) {
+			continue;
+		}
+		ep = buf[i + 6];
+		if (ep != 0x81 && ep != 0x82) {
+			continue;
+		}
+
+		buf[i + 5] = 0x00; /* wTotalLength high (clear OR corruption) */
+		buf[i + 7] = 0x00; /* bmInfo */
+		buf[i + 9] = 0x00; /* bStillCaptureMethod */
+		/* Both UVC functions use OT id 5; keep VS link consistent. */
+		buf[i + 8] = 0x05;
+	}
+
+	/* Bulk EP: Soft-IP OR-corrupts bDescriptorType 0x05 -> 0x07 at some offs */
+	for (size_t i = 0; i + 7 <= len; i++) {
+		if (buf[i] == 0x07 && (buf[i + 1] == 0x05 || buf[i + 1] == 0x07) &&
+		    (buf[i + 2] == 0x81 || buf[i + 2] == 0x82) &&
+		    (buf[i + 3] == 0x02 || buf[i + 3] == 0x06)) {
+			buf[i + 1] = 0x05; /* USB_DESC_ENDPOINT */
+			buf[i + 3] = 0x02; /* bulk */
+		}
+	}
+
+	for (size_t i = 0; i + 27 <= len; i++) {
+		/* Uncompressed format with BA81 GUID */
+		if (!(buf[i] == 0x1b && buf[i + 1] == 0x24 && buf[i + 2] == 0x04 &&
+		      buf[i + 5] == 'B' && buf[i + 6] == 'A' && buf[i + 7] == '8' &&
+		      buf[i + 8] == '1')) {
+			continue;
+		}
+
+		uint8_t nframes = buf[i + 4];
+		size_t p = i + buf[i];
+		uint8_t fi = 1;
+
+		while (nframes-- > 0 && p + 9 <= len && buf[p] != 0) {
+			/* Accept type 0x24 or corrupted 0x26 */
+			if ((buf[p + 1] == 0x24 || buf[p + 1] == 0x26) &&
+			    buf[p + 2] == 0x05) {
+				uint16_t w = buf[p + 5] | ((uint16_t)buf[p + 6] << 8);
+				uint16_t h = buf[p + 7] | ((uint16_t)buf[p + 8] << 8);
+
+				buf[p + 1] = 0x24;
+				buf[p + 3] = fi;
+				if (h == 1080 || h == 1084 || w == 1920 || w == 1924 ||
+				    (w & ~0x4U) == 1920) {
+					buf[p + 5] = (uint8_t)(1920);
+					buf[p + 6] = (uint8_t)(1920 >> 8);
+					buf[p + 7] = (uint8_t)(1080);
+					buf[p + 8] = (uint8_t)(1080 >> 8);
+				} else if (h == 480 || h == 484 || w == 640 || w == 642 ||
+					   w == 644 || (w & ~0x6U) == 640) {
+					buf[p + 5] = (uint8_t)(640);
+					buf[p + 6] = (uint8_t)(640 >> 8);
+					buf[p + 7] = (uint8_t)(480);
+					buf[p + 8] = (uint8_t)(480 >> 8);
+				} else if (h == 720 || w == 1280 || w == 1284 ||
+					   (w & ~0x4U) == 1280) {
+					buf[p + 5] = (uint8_t)(1280);
+					buf[p + 6] = (uint8_t)(1280 >> 8);
+					buf[p + 7] = (uint8_t)(720);
+					buf[p + 8] = (uint8_t)(720 >> 8);
+				}
+				fi++;
+			}
+			p += buf[p];
+		}
+	}
+}
+
+static void udc_dwc3_ep0_copy_to_bounce(volatile uint8_t *dst, const uint8_t *src,
+					size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		dst[i] = src[i];
+	}
+}
+
 static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 				 struct net_buf *const buf,
 				 const uint32_t ctrl)
@@ -926,11 +1032,56 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
+	const uint8_t *dma_data = buf->data;
+	uint32_t dma_len = buf->len;
+
+	memset((void *)trb, 0, sizeof(*trb) * CONFIG_UDC_DWC3_TRB_NUM);
+
+	if (buf->len > 0 && buf->len <= sizeof(udc_dwc3_ep0_in_bounce) &&
+	    (ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK) ==
+		    UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
+		/*
+		 * Keep EP0 DMA 64-byte aligned (DWC3 requirement). Offset 64
+		 * relocates the payload in nocache SRAM; UVC geometry fields
+		 * still sit on odd byte lanes by USB descriptor layout.
+		 */
+		enum { EP0_BOUNCE_OFF = 64 };
+		volatile uint8_t *payload = &udc_dwc3_ep0_in_bounce[EP0_BOUNCE_OFF];
+
+		__ASSERT_NO_MSG(buf->len + EP0_BOUNCE_OFF <= sizeof(udc_dwc3_ep0_in_bounce));
+		udc_dwc3_ep0_copy_to_bounce(payload, buf->data, buf->len);
+		udc_dwc3_ep0_patch_uvc_config(payload, buf->len);
+		/* Volatile read-back keeps patch stores from being DCE'd. */
+		if (buf->len > 200) {
+			uint16_t w = 0;
+			uint16_t h = 0;
+
+			for (size_t i = 0; i + 27 <= buf->len; i++) {
+				if (payload[i] == 0x1b && payload[i + 1] == 0x24 &&
+				    payload[i + 2] == 0x04 && payload[i + 5] == 'B') {
+					size_t p = i + payload[i];
+
+					if (p + 9 <= buf->len) {
+						w = payload[p + 5] |
+						    ((uint16_t)payload[p + 6] << 8);
+						h = payload[p + 7] |
+						    ((uint16_t)payload[p + 8] << 8);
+					}
+					break;
+				}
+			}
+			LOG_INF("EP0 bounce UVC frm1 %ux%u len=%u off=%u", w, h, buf->len,
+				EP0_BOUNCE_OFF);
+		}
+		compiler_barrier();
+		dma_data = (const uint8_t *)payload;
+		dma_len = buf->len;
+	}
 
 	if (udc_ep_buf_has_zlp(buf)) {
-		trb[0].addr_lo = LO32((uintptr_t)buf->data);
-		trb[0].addr_hi = HI32((uintptr_t)buf->data);
-		trb[0].status = buf->len;
+		trb[0].addr_lo = LO32((uintptr_t)dma_data);
+		trb[0].addr_hi = HI32((uintptr_t)dma_data);
+		trb[0].status = dma_len;
 		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
 
 		trb[1].addr_lo = 0;
@@ -938,10 +1089,14 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 		trb[1].status = 0;
 		trb[1].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	} else {
-		trb[0].addr_lo = LO32((uintptr_t)buf->data);
-		trb[0].addr_hi = HI32((uintptr_t)buf->data);
-		trb[0].status = buf->len;
+		trb[0].addr_lo = LO32((uintptr_t)dma_data);
+		trb[0].addr_hi = HI32((uintptr_t)dma_data);
+		trb[0].status = dma_len;
 		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+	}
+
+	if (dma_len > 200) {
+		LOG_INF("EP0 TRB addr=0x%08x len=%u", trb[0].addr_lo, dma_len);
 	}
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
@@ -1095,7 +1250,14 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
 
-	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
+	/*
+	 * Program GTXTHRCFG TX threshold (omitted in the initial port). Buffer
+	 * USBTXPKTCNT packets before each SS burst to avoid TX FIFO underrun.
+	 */
+	reg = UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL;
+	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBTXPKTCNT_MASK, 3);
+	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBMAXTXBURSTSIZE_MASK, 4);
+	sys_write32(reg, base + UDC_DWC3_GTXTHRCFG);
 
 	/* Read the chip identification */
 	reg = sys_read32(base + UDC_DWC3_GCOREID);
@@ -1106,7 +1268,21 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 
 	/* Letting GUID unchanged */
 	/* Letting GUSB2PHYCFG and GUSB3PIPECTL unchanged */
-	/* Letting GRXFIFOSIZ unchanged */
+	/* Letting GRXFIFOSIZ / GTXFIFOSIZn at IP defaults */
+
+	LOG_INF("GTXTHRCFG=0x%08x GTXFIFOSIZ[0]=0x%08x[dep=%u] [1]=0x%08x[dep=%u] "
+		"[2]=0x%08x[dep=%u] GHWPARAMS7=0x%08x",
+		sys_read32(base + UDC_DWC3_GTXTHRCFG),
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0)),
+		(uint32_t)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK,
+				    sys_read32(base + UDC_DWC3_GTXFIFOSIZ(0))),
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1)),
+		(uint32_t)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK,
+				    sys_read32(base + UDC_DWC3_GTXFIFOSIZ(1))),
+		sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2)),
+		(uint32_t)FIELD_GET(UDC_DWC3_GTXFIFOSIZ_TXFDEP_MASK,
+				    sys_read32(base + UDC_DWC3_GTXFIFOSIZ(2))),
+		sys_read32(base + UDC_DWC3_GHWPARAMS7));
 
 	/* Setup the event buffer address, size and start event reception */
 	memset((void *)cfg->evt_buf, 0, CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
@@ -1330,6 +1506,13 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 		buf->len = 0;
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL STATUS packet sent");
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
+		const uint32_t residual =
+			FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, ep_data->trb_buf[0].status);
+
+		if (residual != 0) {
+			LOG_WRN("CTRL DATA IN short: requested %u residual %u (sent %u)",
+				buf->len, residual, buf->len - residual);
+		}
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA packet sent");
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		LOG_ERR("Unexpected SETUP IN packet");
@@ -1558,29 +1741,50 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	}
 }
 
+static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
+{
+	const struct device *const dev = arg1;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	while (true) {
+		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+		k_sem_take(&priv->evt_sem, K_FOREVER);
+
+		while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
+			const uint32_t evt = cfg->evt_buf[priv->evt_next];
+
+			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+
+			/* Move to next event entry for both hardware and software */
+			sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+			udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+		}
+
+		/* Allow further interrupts */
+		sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	}
+}
+
 static void udc_dwc3_irq_handler(void *const ptr)
 {
 	const struct device *const dev = ptr;
-	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	/* disable further interrupts until all events are processed */
+	/*
+	 * Mask event interrupts and wake the dedicated bottom-half thread.
+	 * udc_setup_received() (and other UDC helpers) take the UDC mutex and
+	 * must not run in ISR context. A dedicated high-priority thread is
+	 * used instead of the system workqueue so large control transfers are
+	 * not delayed.
+	 */
 	sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
-
-	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
-		const uint32_t evt = cfg->evt_buf[priv->evt_next];
-
-		/* Dispatch the even directly from IRQ */
-		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
-
-		/* Move to next event entry for both hardware and software */
-		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
-		udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
-	}
-
-	/* Allow further interrupts */
-	sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	k_sem_give(&priv->evt_sem);
 }
 
 /*
@@ -1903,6 +2107,12 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	DEVICE_MMIO_NAMED_MAP(dev, base, K_MEM_CACHE_NONE);
 
 	k_mutex_init(&data->mutex);
+	k_sem_init(&DEV_DATA(dev)->evt_sem, 0, K_SEM_MAX_LIMIT);
+	k_thread_create(&DEV_DATA(dev)->evt_thread, DEV_DATA(dev)->evt_stack,
+			CONFIG_UDC_DWC3_THREAD_STACK_SIZE,
+			udc_dwc3_evt_thread, (void *)dev, NULL, NULL,
+			K_PRIO_COOP(CONFIG_UDC_DWC3_THREAD_PRIORITY), 0, K_NO_WAIT);
+	k_thread_name_set(&DEV_DATA(dev)->evt_thread, "udc_dwc3");
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
@@ -2065,8 +2275,12 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		.irq_disable_func = udc_dwc3_irq_disable_func_##n,		\
 	};									\
 										\
+	K_THREAD_STACK_DEFINE(udc_dwc3_evt_stack_##n,				\
+			      CONFIG_UDC_DWC3_THREAD_STACK_SIZE);		\
+										\
 	static struct udc_dwc3_data udc_dwc3_priv_##n = {			\
 		.dev = DEVICE_DT_INST_GET(n),					\
+		.evt_stack = udc_dwc3_evt_stack_##n,				\
 	};									\
 										\
 	static struct udc_data udc_data_##n = {					\

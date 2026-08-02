@@ -32,4 +32,20 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
+config UDC_DWC3_THREAD_STACK_SIZE
+	int "DWC3 event thread stack size"
+	default 2048
+	help
+	  Stack size for the bottom-half thread that drains the DWC3 event
+	  ring. Event handling must run in thread context because helpers
+	  such as udc_setup_received() take the UDC mutex.
+
+config UDC_DWC3_THREAD_PRIORITY
+	int "DWC3 event thread priority"
+	default 2
+	help
+	  Cooperative priority for the DWC3 event thread. Keep this high so
+	  control transfers (e.g. large configuration descriptors) are not
+	  delayed by the system workqueue.
+
 endif # UDC_DWC3

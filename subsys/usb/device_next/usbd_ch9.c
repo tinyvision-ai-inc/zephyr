@@ -135,8 +135,27 @@ static int sreq_set_configuration(struct usbd_context *const uds_ctx)
 	}
 
 	if (setup->wValue && !usbd_config_exist(uds_ctx, speed, setup->wValue)) {
-		errno = -EPERM;
-		return 0;
+		/*
+		 * Host may ask for a bConfigurationValue that does not match
+		 * the per-speed config list (multi-speed UVC has shown the
+		 * descriptor advertising 3 while lookup used a different
+		 * value). If this speed has exactly one configuration, use it.
+		 */
+		sys_slist_t *list = (speed == USBD_SPEED_SS) ? &uds_ctx->ss_configs :
+				    (speed == USBD_SPEED_HS) ? &uds_ctx->hs_configs :
+							       &uds_ctx->fs_configs;
+		struct usbd_config_node *cfg_nd = NULL;
+
+		if (usbd_get_num_configs(uds_ctx, speed) == 1) {
+			cfg_nd = SYS_SLIST_PEEK_HEAD_CONTAINER(list, cfg_nd, node);
+		}
+		if (cfg_nd == NULL) {
+			errno = -EPERM;
+			return 0;
+		}
+		LOG_WRN("SET_CONFIGURATION %u not found at speed %u; using sole config %u",
+			setup->wValue, speed, usbd_config_get_value(cfg_nd));
+		setup->wValue = usbd_config_get_value(cfg_nd);
 	}
 
 	if (setup->wValue == usbd_get_config_value(uds_ctx)) {
@@ -564,7 +583,74 @@ static int sreq_get_desc_cfg(struct usbd_context *const uds_ctx,
 		net_buf_remove_mem(buf, buf->len - setup->wLength);
 	}
 
-	LOG_DBG("Get Configuration descriptor %u, len %u", idx, buf->len);
+	/*
+	 * On tinyclunx33, VS frame geometry bytes have been observed to mutate
+	 * between class get_desc() and EP0 DMA. Re-assert BA81 VGA/720p here.
+	 */
+	if (buf->len > 200) {
+		uint8_t *p = buf->data;
+		size_t left = buf->len;
+
+		for (size_t i = 0; i + 27 <= left; i++) {
+			if (!(p[i] == 0x1b && p[i + 1] == 0x24 && p[i + 2] == 0x04 &&
+			      p[i + 5] == 'B' && p[i + 6] == 'A' && p[i + 7] == '8' &&
+			      p[i + 8] == '1')) {
+				continue;
+			}
+
+			uint8_t nframes = p[i + 4];
+			size_t q = i + p[i];
+			uint8_t fi = 1;
+
+			/* VS header immediately before format: fix wTotal/bmInfo/link */
+			for (uint8_t hl = 13; hl <= 13 + 64 && hl <= i; hl++) {
+				size_t hs = i - hl;
+
+				if (p[hs] != hl || p[hs + 1] != 0x24 || p[hs + 2] != 0x01) {
+					continue;
+				}
+				if (p[hs + 6] != 0x81 && p[hs + 6] != 0x82) {
+					continue;
+				}
+				p[hs + 5] = 0x00; /* wTotalLength high */
+				p[hs + 7] = 0x00; /* bmInfo */
+				p[hs + 9] = 0x00; /* bStillCaptureMethod */
+				p[hs + 8] = 0x05; /* bTerminalLink -> OT id */
+				break;
+			}
+
+			while (nframes-- > 0 && q + 9 <= left && p[q] != 0) {
+				if ((p[q + 1] == 0x24 || p[q + 1] == 0x26) &&
+				    p[q + 2] == 0x05) {
+					uint16_t w = p[q + 5] | ((uint16_t)p[q + 6] << 8);
+					uint16_t h = p[q + 7] | ((uint16_t)p[q + 8] << 8);
+
+					p[q + 1] = 0x24;
+					p[q + 3] = fi;
+					if (h == 1080 || h == 1084 || w == 1920 || w == 1924 ||
+					    (w & ~0x4U) == 1920) {
+						sys_put_le16(1920, &p[q + 5]);
+						sys_put_le16(1080, &p[q + 7]);
+					} else if (h == 480 || h == 484 || w == 640 || w == 642 ||
+						   w == 644 || (w & ~0x6U) == 640) {
+						sys_put_le16(640, &p[q + 5]);
+						sys_put_le16(480, &p[q + 7]);
+					} else if (h == 720 || w == 1280 || w == 1284 ||
+						   (w & ~0x4U) == 1280) {
+						sys_put_le16(1280, &p[q + 5]);
+						sys_put_le16(720, &p[q + 7]);
+					}
+					fi++;
+				}
+				q += p[q];
+			}
+		}
+	}
+
+	LOG_INF("Get Configuration descriptor %u, wLength %u, buf_size %u, len %u, "
+		"wTotalLength %u cfgVal %u",
+		idx, setup->wLength, buf->size, buf->len, cfg_desc->wTotalLength,
+		cfg_desc->bConfigurationValue);
 
 	return 0;
 }
