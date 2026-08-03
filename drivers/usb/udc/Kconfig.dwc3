@@ -57,4 +57,52 @@ config UDC_DWC3_HW_IN_EP_MASK
 	  bit 5 means endpoint 0x85.  Without this, the Soft-IP driver pops
 	  phantom buffers from the ring and races the hardware stream.
 
+config UDC_DWC3_IN_RECOVER_EP_MASK
+	hex "IN endpoint indices eligible for Soft-IP IN recovery"
+	default 0x10
+	help
+	  Bitmask of IN endpoint indices the completion-poll / park paths may
+	  touch.  On Soft-IP FLIR UAB, ACM claims 0x81/0x82 first and CDC-RAW
+	  bulk IN lands at 0x84 (bit 4).  Do not include ACM endpoints: those
+	  sit armed waiting for a host token and EndXfer recycle breaks SRP.
+	  Never include HW_IN bits (see UDC_DWC3_HW_IN_EP_MASK).
+
+config UDC_DWC3_IN_COMPLETION_POLL
+	bool "Poll for dropped IN completions"
+	help
+	  Under concurrent UVC + CDC bulk, this Soft-IP controller sometimes
+	  clears HWO on a CPU-managed IN TRB without posting a DEPEVT.  The
+	  event thread then never retires the buffer and the class stops
+	  enqueueing.  When enabled, each event-thread wake (including the
+	  100 ms lost-wakeup timeout) reclaims waiting slots whose HWO has
+	  been clear for a grace interval.  Limited to
+	  UDC_DWC3_IN_RECOVER_EP_MASK.
+
+config UDC_DWC3_IN_PARK_RECOVER
+	bool "Recover an IN endpoint whose armed TRB is never fetched"
+	help
+	  Re-arm a CPU-managed IN endpoint whose tail TRB stays owned by
+	  hardware with no remaining-count progress for longer than
+	  UDC_DWC3_IN_PARK_RECOVER_MS.  That is the signature of a dropped
+	  UpdateXfer doorbell under UVC load (CDC-RAW IN 0x84).  Limited to
+	  UDC_DWC3_IN_RECOVER_EP_MASK so quiet ACM pipes are not recycled.
+
+config UDC_DWC3_IN_PARK_RECOVER_MS
+	int "Time an IN TRB may stay unfetched before re-arming (ms)"
+	default 100
+	depends on UDC_DWC3_IN_PARK_RECOVER
+	help
+	  Keep this below the host bulk-read stall timeout and long enough
+	  that a quiet host poll of ACM/CDC-RAW does not look like a park.
+
+config UDC_DWC3_IN_START_ENDXFER_ESCALATE
+	bool "Escalate parked IN with EndXfer(ForceRM)+StartXfer"
+	depends on UDC_DWC3_IN_PARK_RECOVER
+	default y
+	help
+	  After a few failed UpdateXfer nudges, tear the transfer resource
+	  and re-Start the same still-owned tail TRB.  Ring head/tail are
+	  left intact so the class completion path stays in sync.  Do not
+	  use the ordinary DepEndXfer helper (it zeroes the ring).
+
 endif # UDC_DWC3

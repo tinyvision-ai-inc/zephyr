@@ -829,26 +829,45 @@ static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCSTALL);
 }
 
-static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
-				       struct udc_dwc3_ep_data *const ep_data)
+static void udc_dwc3_depcmd_start_xfer_trb(const struct device *const dev,
+					   struct udc_dwc3_ep_data *const ep_data,
+					   volatile struct udc_dwc3_trb *const start)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
-	/* Make sure the device is in U0 state, assuming TX FIFO is empty */
-	reg = sys_read32(base + UDC_DWC3_DCTL);
-	reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
-	reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
-	sys_write32(reg, base + UDC_DWC3_DCTL);
+	/*
+	 * REMOTEWAKEUP from U0 is illegal and can drop SS to Inactive.  Only
+	 * request it when the link is already in a low-power state.
+	 */
+	reg = sys_read32(base + UDC_DWC3_DSTS);
+	if ((reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) == UDC_DWC3_DSTS_CONNECTSPD_SS) {
+		const uint32_t lnkst = reg & UDC_DWC3_DSTS_USBLNKST_MASK;
 
-	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
-	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
+		if (lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U1 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U2 ||
+		    lnkst == UDC_DWC3_DSTS_USBLNKST_USB3_U3) {
+			reg = sys_read32(base + UDC_DWC3_DCTL);
+			reg &= ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
+			reg |= UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP;
+			sys_write32(reg, base + UDC_DWC3_DCTL);
+		}
+	}
+
+	sys_write32(HI32((uintptr_t)start), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
+	sys_write32(LO32((uintptr_t)start), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
 	ep_data->xferrscidx =
 		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSTRTXFER);
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 		ep_data->cfg.addr, ep_data->xferrscidx);
+}
+
+static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
+				       struct udc_dwc3_ep_data *const ep_data)
+{
+	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, ep_data->trb_buf);
 }
 
 static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
@@ -1725,6 +1744,99 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	k_work_submit(&ep_data->work);
 }
 
+#if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
+/*
+ * Slim IN-park recover for Soft-IP CDC-RAW bulk IN (mask bit → 0x84).
+ * Kept small: the whole UDC library is RAM-relocated into a 64 KiB budget.
+ */
+#define UDC_DWC3_IN_PARK_ESCALATE_FAILS 2U
+
+static int64_t udc_dwc3_park_since;
+static uint32_t udc_dwc3_park_tail;
+static uint32_t udc_dwc3_park_remain;
+static uint8_t udc_dwc3_park_fails;
+
+static void udc_dwc3_in_recover_tick(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const uint8_t idx = (uint8_t)__builtin_ctz(CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK);
+	struct udc_dwc3_ep_data *ep_data;
+	volatile struct udc_dwc3_trb *trb;
+	struct net_buf *buf;
+	uint32_t remain;
+	int64_t now;
+	uint32_t tail;
+
+	if (CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK == 0U || idx >= cfg->num_in_eps) {
+		return;
+	}
+
+	ep_data = &cfg->ep_data_in[idx];
+	if (ep_data->trb_buf == NULL || udc_dwc3_ep_is_hw_in(ep_data)) {
+		return;
+	}
+
+	tail = ep_data->tail;
+	buf = ep_data->net_buf[tail];
+	if (buf == NULL) {
+		udc_dwc3_park_since = 0;
+		return;
+	}
+
+	trb = &ep_data->trb_buf[tail];
+	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+		/* Lost completion: HW released without a matching DEPEVT. */
+		now = k_uptime_get();
+		if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail) {
+			udc_dwc3_park_since = now;
+			udc_dwc3_park_tail = tail;
+			return;
+		}
+		if ((now - udc_dwc3_park_since) >= 50) {
+			printk("IN-RECOVER: retire ep=0x%02x\n", ep_data->cfg.addr);
+			udc_dwc3_on_xfer_done_norm(dev,
+				UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
+			udc_dwc3_park_since = 0;
+			udc_dwc3_park_fails = 0U;
+		}
+		return;
+	}
+
+	remain = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+	now = k_uptime_get();
+	if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail ||
+	    udc_dwc3_park_remain != remain) {
+		udc_dwc3_park_since = now;
+		udc_dwc3_park_tail = tail;
+		udc_dwc3_park_remain = remain;
+		return;
+	}
+
+	if ((now - udc_dwc3_park_since) < CONFIG_UDC_DWC3_IN_PARK_RECOVER_MS) {
+		return;
+	}
+
+	printk("IN-RECOVER: park ep=0x%02x nudge\n", ep_data->cfg.addr);
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	udc_dwc3_park_fails++;
+	udc_dwc3_park_since = now;
+
+#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
+	if (udc_dwc3_park_fails >= UDC_DWC3_IN_PARK_ESCALATE_FAILS) {
+		udc_dwc3_park_fails = 0U;
+		printk("IN-RECOVER: recycle ep=0x%02x\n", ep_data->cfg.addr);
+		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+				UDC_DWC3_DEPCMD_DEPENDXFER |
+				UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+				FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
+					   ep_data->xferrscidx));
+		/* Leave head/tail; re-Start the same parked TRB. */
+		udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, trb);
+	}
+#endif
+}
+#endif /* CONFIG_UDC_DWC3_IN_PARK_RECOVER */
+
 #define NORMAL_EP(n, fn) fn(n + 2)
 
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt)
@@ -1802,21 +1914,49 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 
 	while (true) {
 		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+		int ret;
 
-		k_sem_take(&priv->evt_sem, K_FOREVER);
-
-		while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
-			const uint32_t evt = cfg->evt_buf[priv->evt_next];
-
-			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
-
-			/* Move to next event entry for both hardware and software */
-			sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
-			udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+		/*
+		 * The finite timeout is a self-healing backstop: if a wakeup is
+		 * ever lost while the event interrupt is masked, the thread
+		 * still drains the ring shortly after instead of wedging the
+		 * whole controller (seen on FLIR UAB after ~90 s of concurrent
+		 * UVC streaming + CDC bulk: GEVNTCOUNT pending, mask set,
+		 * thread asleep, device dead until manual unmask).
+		 */
+		ret = k_sem_take(&priv->evt_sem, K_MSEC(100));
+		if (ret == -EAGAIN &&
+		    sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0 &&
+		    (sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) & UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK)) {
+			LOG_WRN("event ring serviced by timeout backstop (lost wakeup)");
 		}
 
-		/* Allow further interrupts */
-		sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+		do {
+			while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
+				const uint32_t evt = cfg->evt_buf[priv->evt_next];
+
+				udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+
+				/* Move to next event entry for both hardware and software */
+				sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+				udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+			}
+
+			/*
+			 * Allow further interrupts. Plain write (not RMW: the
+			 * ISR's set_bits could interleave with a read-modify-
+			 * write here), then re-check the count: an event that
+			 * landed just before the unmask is picked up by the
+			 * loop instead of being stranded behind a masked
+			 * interrupt.
+			 */
+			sys_write32(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t),
+				    base + UDC_DWC3_GEVNTSIZ(0));
+		} while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0);
+
+#if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
+		udc_dwc3_in_recover_tick(dev);
+#endif
 	}
 }
 
