@@ -542,6 +542,13 @@ struct udc_dwc3_data {
 	struct k_sem evt_sem;
 	struct k_thread evt_thread;
 	k_thread_stack_t *evt_stack;
+	/*
+	 * Non-control transfer resources allocated for the current config.
+	 * DEPSTARTCFG(rsc_idx=2) must run once when the first bulk/interrupt
+	 * endpoint is enabled; without it StartXfer fails with no resource
+	 * and the RTL UVC manager never gets a usable doorbell index.
+	 */
+	bool startcfg_nonctrl_done;
 };
 
 /*
@@ -706,9 +713,16 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
+	uint32_t spins = 0U;
+
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 	do {
 		reg = sys_read32(base + addr);
+		if (++spins > 1000000U) {
+			LOG_ERR("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x",
+				addr, cmd, reg);
+			break;
+		}
 	} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0);
 
 	switch (reg & UDC_DWC3_DEPCMD_STATUS_MASK) {
@@ -865,18 +879,23 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	ep_data->head = ep_data->tail = 0;
 }
 
+/*
+ * DEPSTARTCFG allocates the pool of transfer resources the endpoints draw on.
+ * Issue rsc_idx=0 after reset (control), and rsc_idx=2 once when the first
+ * non-control endpoint is enabled for the selected configuration.
+ */
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
-					 struct udc_dwc3_ep_data *const ep_data)
+					 struct udc_dwc3_ep_data *const ep_data,
+					 const uint32_t rsc_idx)
 {
-	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) > 0;
 	uint32_t flags = 0;
 
-	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
+	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, rsc_idx);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 
-	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
+	LOG_INF("DepStartConfig done ep=0x%02x rsc_idx=%u", ep_data->cfg.addr, rsc_idx);
 }
 
 /*
@@ -928,7 +947,7 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev,
  * compiler can DCE memcpy/patch stores because only the DMA address is
  * consumed in C (hardware reads the payload).
  */
-static __nocache volatile uint8_t udc_dwc3_ep0_in_bounce[2048] __aligned(64);
+static __nocache volatile uint8_t udc_dwc3_ep0_in_bounce[1408] __aligned(64);
 
 /*
  * Lattice USB23 EP0 has been observed to deliver config blobs where a few
@@ -1037,18 +1056,19 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 
 	memset((void *)trb, 0, sizeof(*trb) * CONFIG_UDC_DWC3_TRB_NUM);
 
-	if (buf->len > 0 && buf->len <= sizeof(udc_dwc3_ep0_in_bounce) &&
+	/*
+	 * Keep EP0 DMA 64-byte aligned (DWC3 requirement). Offset 64 relocates
+	 * the payload in nocache SRAM; UVC geometry fields still sit on odd
+	 * byte lanes by USB descriptor layout.
+	 */
+	enum { EP0_BOUNCE_OFF = 64 };
+
+	if (buf->len > 0 &&
+	    buf->len + EP0_BOUNCE_OFF <= sizeof(udc_dwc3_ep0_in_bounce) &&
 	    (ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK) ==
 		    UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
-		/*
-		 * Keep EP0 DMA 64-byte aligned (DWC3 requirement). Offset 64
-		 * relocates the payload in nocache SRAM; UVC geometry fields
-		 * still sit on odd byte lanes by USB descriptor layout.
-		 */
-		enum { EP0_BOUNCE_OFF = 64 };
 		volatile uint8_t *payload = &udc_dwc3_ep0_in_bounce[EP0_BOUNCE_OFF];
 
-		__ASSERT_NO_MSG(buf->len + EP0_BOUNCE_OFF <= sizeof(udc_dwc3_ep0_in_bounce));
 		udc_dwc3_ep0_copy_to_bounce(payload, buf->data, buf->len);
 		udc_dwc3_ep0_patch_uvc_config(payload, buf->len);
 		/* Volatile read-back keeps patch stores from being DCE'd. */
@@ -1236,8 +1256,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg = UDC_DWC3_DCTL_CSFTRST;
 	reg |= FIELD_PREP(UDC_DWC3_DCTL_LPM_NYET_THRES_MASK, 15);
 	sys_write32(reg, base + UDC_DWC3_DCTL);
-	while (sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_CSFTRST) {
-		continue;
+	for (uint32_t spins = 0U; sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_CSFTRST;) {
+		if (++spins > 1000000U) {
+			LOG_ERR("DCTL.CSFTRST never cleared: 0x%08x",
+				sys_read32(base + UDC_DWC3_DCTL));
+			break;
+		}
 	}
 
 	/* Enable AXI64 bursts for various sizes expected */
@@ -1332,9 +1356,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
 	sys_write32(reg, base + UDC_DWC3_DEVTEN);
 
-	/* Configure endpoint 0x00 and 0x80 only for now */
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
+	/*
+	 * Control endpoint pool only. Non-control resources are allocated when
+	 * the first of those endpoints is enabled after SET_CONFIGURATION.
+	 */
+	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0], 0U);
+	DEV_DATA(dev)->startcfg_nonctrl_done = false;
 }
 
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
@@ -1342,6 +1369,9 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 
 	LOG_DBG("Going through DWC3 reset logic");
+
+	/* Host will re-enumerate; non-control pool must be reallocated. */
+	DEV_DATA(dev)->startcfg_nonctrl_done = false;
 
 	/* Reset all ongoing transfers on non-control IN endpoints */
 	for (int epn = 1; epn < cfg->num_in_eps; epn++) {
@@ -1640,6 +1670,17 @@ static void udc_dwc3_on_xfer_done(const struct device *const dev,
 	}
 }
 
+static bool udc_dwc3_ep_is_hw_in(const struct udc_dwc3_ep_data *ep_data)
+{
+	const uint8_t addr = ep_data->cfg.addr;
+
+	if (!USB_EP_DIR_IS_IN(addr)) {
+		return false;
+	}
+
+	return (CONFIG_UDC_DWC3_HW_IN_EP_MASK & BIT(USB_EP_GET_IDX(addr))) != 0U;
+}
+
 static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 				       const uint32_t evt)
 {
@@ -1650,6 +1691,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
 	int ret;
+
+	/*
+	 * RTL-owned UVC IN: uvcmanager writes TRBs and rings UpdateXfer.  There
+	 * is no software net_buf on the ring; retiring here races the hardware
+	 * and produces host-side EPROTO (-71).
+	 */
+	if (udc_dwc3_ep_is_hw_in(ep_data)) {
+		return;
+	}
 
 	/* Clear the TRB that triggered the event */
 	buf = udc_dwc3_pop_trb(dev, ep_data);
@@ -1971,11 +2021,29 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	LOG_DBG("%s 0x%02x", __func__, ep_data->cfg.addr);
 
 	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
+
+	/*
+	 * Allocate the non-control transfer resource pool before configuring
+	 * the first endpoint that needs it. DEPSTARTCFG reassigns the whole
+	 * pool, so this runs once per configuration.
+	 */
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 &&
+	    !DEV_DATA(dev)->startcfg_nonctrl_done) {
+		const struct udc_dwc3_config *const cfg = dev->config;
+
+		DEV_DATA(dev)->startcfg_nonctrl_done = true;
+		udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0], 2U);
+		printk("dwc3: DEPSTARTCFG non-control pool (first ep=0x%02x)\n",
+		       ep_data->cfg.addr);
+	}
+
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
 	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
 
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		udc_dwc3_trb_norm_init(dev, ep_data);
+		printk("dwc3: ep_enable 0x%02x StartXfer xferrscidx=0x%x\n",
+		       ep_data->cfg.addr, ep_data->xferrscidx);
 	}
 
 	/* Starting from here, the endpoint can be used */
