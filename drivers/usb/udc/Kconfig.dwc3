@@ -48,4 +48,13 @@ config UDC_DWC3_THREAD_PRIORITY
 	  control transfers (e.g. large configuration descriptors) are not
 	  delayed by the system workqueue.
 
+config UDC_DWC3_HW_IN_EP_MASK
+	hex "IN endpoints offloaded to the RTL video path"
+	default 0x0
+	help
+	  Bitmask of IN endpoint indices whose TRBs the RTL (uvcmanager) drives.
+	  Software must ignore XferComplete/XferInProgress on those endpoints:
+	  bit 5 means endpoint 0x85.  Without this, the Soft-IP driver pops
+	  phantom buffers from the ring and races the hardware stream.
+
 endif # UDC_DWC3
