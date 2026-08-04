@@ -908,6 +908,22 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 }
 
 /*
+ * EndXfer(ForceRM) without wiping the TRB ring. Used by Soft-IP IN park
+ * recycle so the still-owned tail TRB can be StartXfer'd again.
+ */
+static void udc_dwc3_depcmd_end_xfer_keep_ring(const struct device *const dev,
+					       struct udc_dwc3_ep_data *const ep_data)
+{
+	uint32_t flags = UDC_DWC3_DEPCMD_HIPRI_FORCERM;
+
+	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
+	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
+
+	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	ep_data->xfer_active = false;
+}
+
+/*
  * DEPSTARTCFG allocates the pool of transfer resources the endpoints draw on.
  * Issue rsc_idx=0 after reset (control), and rsc_idx=2 once when the first
  * non-control endpoint is enabled for the selected configuration.
@@ -1808,11 +1824,14 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 /*
  * Soft-IP IN recover under concurrent UVC (per IN_RECOVER_EP_MASK bit):
- *  1) Retire lost completions (HWO cleared, no DEPEVT) — safe for ACM IN too.
- *  2) UpdateXfer nudge when remain stalls — CDC-RAW IN only. ACM IN sits
- *     HWO=1 waiting for a host token; nudging that path breaks SRP.
+ *  1) Retire lost completions (HWO cleared, no DEPEVT).
+ *  2) UpdateXfer nudge when remain stalls — CDC-RAW IN only (not ACM).
+ *  3) After several failed nudges, EndXfer(ForceRM)+StartXfer on the same
+ *     tail TRB (ring indices preserved). OUT must never use this path.
  */
 #define UDC_DWC3_IN_PARK_COOLDOWN_MS 500
+#define UDC_DWC3_IN_PARK_RECYCLE_AFTER 3
+#define UDC_DWC3_IN_RECYCLE_COOLDOWN_MS 800
 /* Soft-IP FLIR: ACM bulk IN is 0x82 (bit 2). Nudge only non-ACM recover EPs. */
 #define UDC_DWC3_IN_NUDGE_EP_MASK \
 	(CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK & ~BIT(2))
@@ -1822,6 +1841,7 @@ struct udc_dwc3_in_park_state {
 	int64_t cooldown_until;
 	uint32_t tail;
 	uint32_t remain;
+	uint8_t nudges;
 };
 
 static struct udc_dwc3_in_park_state udc_dwc3_park[32];
@@ -1858,6 +1878,7 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 	buf = ep_data->net_buf[tail];
 	if (buf == NULL) {
 		park->since = 0;
+		park->nudges = 0;
 		return;
 	}
 
@@ -1873,12 +1894,14 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 			udc_dwc3_on_xfer_done_norm(dev,
 				UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
 			park->since = 0;
+			park->nudges = 0;
 		}
 		return;
 	}
 
 	if (!allow_nudge) {
 		park->since = 0;
+		park->nudges = 0;
 		return;
 	}
 
@@ -1887,6 +1910,7 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 		park->since = now;
 		park->tail = tail;
 		park->remain = remain;
+		park->nudges = 0;
 		return;
 	}
 
@@ -1894,8 +1918,23 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 		return;
 	}
 
+	if (park->nudges >= UDC_DWC3_IN_PARK_RECYCLE_AFTER) {
+		printk("IN-RECOVER: recycle ep=0x%02x remain=%u\n",
+		       ep_data->cfg.addr, remain);
+		udc_dwc3_depcmd_end_xfer_keep_ring(dev, ep_data);
+		if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+			trb->ctrl |= UDC_DWC3_TRB_CTRL_HWO;
+		}
+		udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, trb);
+		park->nudges = 0;
+		park->since = now;
+		park->cooldown_until = now + UDC_DWC3_IN_RECYCLE_COOLDOWN_MS;
+		return;
+	}
+
 	printk("IN-RECOVER: park ep=0x%02x nudge\n", ep_data->cfg.addr);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	park->nudges++;
 	park->since = now;
 	park->cooldown_until = now + UDC_DWC3_IN_PARK_COOLDOWN_MS;
 }
