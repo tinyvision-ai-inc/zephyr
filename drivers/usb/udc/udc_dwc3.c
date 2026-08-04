@@ -1601,8 +1601,8 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 
 	buf = udc_buf_get(&ep_data->cfg);
 	if (buf == NULL) {
-		LOG_ERR("Failed to get a buffer for ep 0x%02x", ep_data->cfg.addr);
-		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+		/* Stale EP0 completion under UVC — do not raise UDC_EVT_ERROR. */
+		LOG_WRN("CTRL IN completion with no buffer");
 		return;
 	}
 
@@ -1652,8 +1652,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		buf = udc_buf_peek(&ep_data->cfg);
 		if (buf == NULL) {
-			LOG_ERR("missing buffer for SETUP packet");
-			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+			LOG_WRN("missing buffer for SETUP packet");
 			return;
 		}
 
@@ -1678,8 +1677,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
 		if (buf == NULL) {
-			LOG_ERR("Failed to get a buffer for ep 0x%02x", ep_data->cfg.addr);
-			udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+			LOG_WRN("CTRL OUT completion with no buffer");
 			return;
 		}
 
@@ -1816,31 +1814,39 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 /*
- * Soft-IP CDC-RAW IN (0x84) recover under concurrent UVC:
- *  1) Retire lost completions (HWO cleared, no DEPEVT).
- *  2) At most one UpdateXfer nudge per cooldown when remain stalls.
- *     No EndXfer escalate (that wedged DEPCMD and killed video/ACM).
+ * Soft-IP IN recover under concurrent UVC (per IN_RECOVER_EP_MASK bit):
+ *  1) Retire lost completions (HWO cleared, no DEPEVT) — safe for ACM IN too.
+ *  2) UpdateXfer nudge when remain stalls — CDC-RAW IN only. ACM IN sits
+ *     HWO=1 waiting for a host token; nudging that path breaks SRP.
  */
-/* Gentle: allow another UpdateXfer sooner once prior nudge had a chance. */
 #define UDC_DWC3_IN_PARK_COOLDOWN_MS 500
+/* Soft-IP FLIR: ACM bulk IN is 0x82 (bit 2). Nudge only non-ACM recover EPs. */
+#define UDC_DWC3_IN_NUDGE_EP_MASK \
+	(CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK & ~BIT(2))
 
-static int64_t udc_dwc3_park_since;
-static int64_t udc_dwc3_park_cooldown_until;
-static uint32_t udc_dwc3_park_tail;
-static uint32_t udc_dwc3_park_remain;
+struct udc_dwc3_in_park_state {
+	int64_t since;
+	int64_t cooldown_until;
+	uint32_t tail;
+	uint32_t remain;
+};
 
-static void udc_dwc3_in_recover_tick(const struct device *const dev)
+static struct udc_dwc3_in_park_state udc_dwc3_park[32];
+
+static void udc_dwc3_in_recover_one(const struct device *const dev,
+				    const uint8_t idx)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
-	const uint8_t idx = (uint8_t)__builtin_ctz(CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK);
 	struct udc_dwc3_ep_data *ep_data;
+	struct udc_dwc3_in_park_state *park;
 	volatile struct udc_dwc3_trb *trb;
 	struct net_buf *buf;
 	uint32_t remain;
 	int64_t now;
 	uint32_t tail;
+	const bool allow_nudge = (UDC_DWC3_IN_NUDGE_EP_MASK & BIT(idx)) != 0U;
 
-	if (CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK == 0U || idx >= cfg->num_in_eps) {
+	if (idx >= cfg->num_in_eps || idx >= ARRAY_SIZE(udc_dwc3_park)) {
 		return;
 	}
 
@@ -1849,52 +1855,68 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 		return;
 	}
 
+	park = &udc_dwc3_park[idx];
 	now = k_uptime_get();
-	if (now < udc_dwc3_park_cooldown_until) {
+	if (now < park->cooldown_until) {
 		return;
 	}
 
 	tail = ep_data->tail;
 	buf = ep_data->net_buf[tail];
 	if (buf == NULL) {
-		udc_dwc3_park_since = 0;
+		park->since = 0;
 		return;
 	}
 
 	trb = &ep_data->trb_buf[tail];
 	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
-		/* Lost completion: HW released without a matching DEPEVT. */
-		if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail) {
-			udc_dwc3_park_since = now;
-			udc_dwc3_park_tail = tail;
+		if (park->since == 0 || park->tail != tail) {
+			park->since = now;
+			park->tail = tail;
 			return;
 		}
-		if ((now - udc_dwc3_park_since) >= 50) {
+		if ((now - park->since) >= 50) {
 			printk("IN-RECOVER: retire ep=0x%02x\n", ep_data->cfg.addr);
 			udc_dwc3_on_xfer_done_norm(dev,
 				UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
-			udc_dwc3_park_since = 0;
+			park->since = 0;
 		}
+		return;
+	}
+
+	if (!allow_nudge) {
+		park->since = 0;
 		return;
 	}
 
 	remain = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
-	if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail ||
-	    udc_dwc3_park_remain != remain) {
-		udc_dwc3_park_since = now;
-		udc_dwc3_park_tail = tail;
-		udc_dwc3_park_remain = remain;
+	if (park->since == 0 || park->tail != tail || park->remain != remain) {
+		park->since = now;
+		park->tail = tail;
+		park->remain = remain;
 		return;
 	}
 
-	if ((now - udc_dwc3_park_since) < CONFIG_UDC_DWC3_IN_PARK_RECOVER_MS) {
+	if ((now - park->since) < CONFIG_UDC_DWC3_IN_PARK_RECOVER_MS) {
 		return;
 	}
 
 	printk("IN-RECOVER: park ep=0x%02x nudge\n", ep_data->cfg.addr);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
-	udc_dwc3_park_since = now;
-	udc_dwc3_park_cooldown_until = now + UDC_DWC3_IN_PARK_COOLDOWN_MS;
+	park->since = now;
+	park->cooldown_until = now + UDC_DWC3_IN_PARK_COOLDOWN_MS;
+}
+
+static void udc_dwc3_in_recover_tick(const struct device *const dev)
+{
+	uint32_t mask = CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK;
+
+	while (mask != 0U) {
+		const uint8_t idx = (uint8_t)__builtin_ctz(mask);
+
+		mask &= ~BIT(idx);
+		udc_dwc3_in_recover_one(dev, idx);
+	}
 }
 #endif /* CONFIG_UDC_DWC3_IN_PARK_RECOVER */
 
