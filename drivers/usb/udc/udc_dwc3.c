@@ -1151,12 +1151,13 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 }
 
 /*
- * OUT run-dry park resume (LiteX Defect 2 / Soft-IP under UVC).
+ * OUT run-dry park resume (LiteX Defect 2, interrupt path).
  *
- * When the OUT ring empties, the transfer resource is finished. Keeping
- * xfer_active and ringing DepUpdateXfer is often a silent no-op under UVC
- * DepCmd load (BULK_WRITE crawl/stall). Do NOT EndXfer: that wedges CMDACT.
- * Clear xfer_active and DepStartXfer the newly pushed TRB instead.
+ * When the ring empties between OUT packets, DWC3 parks the endpoint. On this
+ * IP a DepUpdateXfer in that window is often silently dropped under UVC.
+ * Do NOT EndXfer / DepStartXfer here: Soft-IP + UVC wedges CMDACT, and
+ * StartXfer while the resource is still live returns CMDERR storms. Single
+ * UpdateXfer; the OUT-RECOVER nudge retries if remain stalls mid-write.
  */
 static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -1172,17 +1173,10 @@ static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_da
 	return mask;
 }
 
-static bool udc_dwc3_ring_has_net_buf(const struct udc_dwc3_ep_data *ep_data)
+static void udc_dwc3_out_rundry_restart(const struct device *const dev,
+					struct udc_dwc3_ep_data *const ep_data)
 {
-	const uint32_t n = CONFIG_UDC_DWC3_TRB_NUM - 1U;
-
-	for (uint32_t i = 0U; i < n; i++) {
-		if (ep_data->net_buf[i] != NULL) {
-			return true;
-		}
-	}
-
-	return false;
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 }
 
 static int udc_dwc3_trb_bulk(const struct device *const dev,
@@ -1217,20 +1211,16 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		}
 	}
 
-	/*
-	 * Empty data ring + stale xfer_active: controller has finished the
-	 * prior transfer. Force StartXfer (not UpdateXfer) after the push.
-	 */
-	if (ep_data->xfer_active && USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
-	    udc_dwc3_ring_data_hwo_mask(ep_data) == 0U) {
-		printk("OUT-PARK: start ep=0x%02x\n", ep_data->cfg.addr);
-		ep_data->xfer_active = false;
-	}
+	const bool out_resume_from_park =
+		ep_data->xfer_active && USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
+		udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
 
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 
 	if (!ep_data->xfer_active) {
 		udc_dwc3_depcmd_start_xfer(dev, ep_data);
+	} else if (out_resume_from_park) {
+		udc_dwc3_out_rundry_restart(dev, ep_data);
 	} else {
 		udc_dwc3_depcmd_update_xfer(dev, ep_data);
 	}
@@ -1809,15 +1799,6 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	ret = udc_submit_ep_event(dev, buf, 0);
 	if (ret != 0) {
 		LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
-	}
-
-	/*
-	 * OUT ring drained: transfer resource is done. Next enqueue must
-	 * DepStartXfer; a stale xfer_active leads to dropped UpdateXfer.
-	 */
-	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
-	    !udc_dwc3_ring_has_net_buf(ep_data)) {
-		ep_data->xfer_active = false;
 	}
 
 	/* We just made some room for a new buffer, check if something more to enqueue */
