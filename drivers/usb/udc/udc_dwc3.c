@@ -714,6 +714,53 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
  * is reset whenever the command completes.
  */
 
+#if CONFIG_UDC_DWC3_HW_IN_EP_MASK != 0
+/*
+ * The DEPCMD engine is shared across all endpoints, and on Soft-IP it has two
+ * masters: this driver, and the uvcmanager RTL which rings DepUpdateXfer
+ * directly into DEPCMD(hw_ep) for every video TRB (~40k/s at 60 fps). There
+ * is no arbiter; overlapping commands are dropped or jam CMDACT (observed:
+ * CDC-RAW IN park + frozen video + "DEPCMD never completed" storms).
+ *
+ * Serialize the software side: wait for the doorbell endpoint(s) to go idle
+ * immediately before issuing our command. This shrinks the collision window
+ * from the full command execution time to the read-to-write gap (~100 ns vs
+ * a ~25 us doorbell period).
+ */
+static void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
+{
+	static uint32_t caught;
+	uint32_t hw_mask = CONFIG_UDC_DWC3_HW_IN_EP_MASK;
+
+	while (hw_mask != 0U) {
+		const uint8_t idx = (uint8_t)__builtin_ctz(hw_mask);
+		const uint32_t hw_addr = UDC_DWC3_DEPCMD(idx * 2U + 1U);
+		uint32_t spins = 0U;
+		bool was_busy = false;
+
+		hw_mask &= ~BIT(idx);
+
+		while ((sys_read32(base + hw_addr) & UDC_DWC3_DEPCMD_CMDACT) != 0U) {
+			was_busy = true;
+			if (++spins > 1000000U) {
+				printk("DEPCMD guard: doorbell ep DEPCMD 0x%03x stuck busy\n",
+				       hw_addr);
+				break;
+			}
+		}
+
+		if (was_busy && (++caught % 256U) == 1U) {
+			printk("DEPCMD guard: avoided doorbell collision (n=%u)\n", caught);
+		}
+	}
+}
+#else
+static inline void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
+{
+	ARG_UNUSED(base);
+}
+#endif
+
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 				const uint32_t addr, const uint32_t cmd)
 {
@@ -722,12 +769,24 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 
 	uint32_t spins = 0U;
 
+	udc_dwc3_depcmd_hw_doorbell_sync(base);
+
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 	do {
 		reg = sys_read32(base + addr);
 		if (++spins > 1000000U) {
+#if CONFIG_UDC_DWC3_HW_IN_EP_MASK != 0
+			const uint8_t hw_idx =
+				(uint8_t)__builtin_ctz(CONFIG_UDC_DWC3_HW_IN_EP_MASK);
+			const uint32_t hw_addr = UDC_DWC3_DEPCMD(hw_idx * 2U + 1U);
+
+			LOG_ERR("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x "
+				"doorbell[0x%03x]=0x%08x",
+				addr, cmd, reg, hw_addr, sys_read32(base + hw_addr));
+#else
 			LOG_ERR("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x",
 				addr, cmd, reg);
+#endif
 			break;
 		}
 	} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0);
@@ -904,22 +963,6 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
 	ep_data->head = ep_data->tail = 0;
-	ep_data->xfer_active = false;
-}
-
-/*
- * EndXfer(ForceRM) without wiping the TRB ring. Used by Soft-IP IN park
- * recycle so the still-owned tail TRB can be StartXfer'd again.
- */
-static void udc_dwc3_depcmd_end_xfer_keep_ring(const struct device *const dev,
-					       struct udc_dwc3_ep_data *const ep_data)
-{
-	uint32_t flags = UDC_DWC3_DEPCMD_HIPRI_FORCERM;
-
-	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
-	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
-
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 	ep_data->xfer_active = false;
 }
 
@@ -1823,15 +1866,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 /*
- * Soft-IP IN recover under concurrent UVC (per IN_RECOVER_EP_MASK bit):
- *  1) Retire lost completions (HWO cleared, no DEPEVT).
- *  2) UpdateXfer nudge when remain stalls — CDC-RAW IN only (not ACM).
- *  3) After several failed nudges, EndXfer(ForceRM)+StartXfer on the same
- *     tail TRB (ring indices preserved). OUT must never use this path.
+ * Soft-IP IN recover under concurrent UVC (CDC-RAW IN only):
+ *  - UpdateXfer nudge only; never EndXfer (CMDACT wedge) and never
+ *    software-retire lost completions (retire→desync observed before park).
+ *  - Keep nudges rare: DEPCMD is shared with UVC HW_IN; spam freezes video
+ *    (same frame) and then bulk READ/ACM die together.
  */
-#define UDC_DWC3_IN_PARK_COOLDOWN_MS 500
-#define UDC_DWC3_IN_PARK_RECYCLE_AFTER 3
-#define UDC_DWC3_IN_RECYCLE_COOLDOWN_MS 800
+#define UDC_DWC3_IN_PARK_COOLDOWN_MS 2000
+#define UDC_DWC3_IN_PARK_NUDGE_CAP 3
+#define UDC_DWC3_IN_PARK_BACKOFF_MS 30000
 /* Soft-IP FLIR: ACM bulk IN is 0x82 (bit 2). Nudge only non-ACM recover EPs. */
 #define UDC_DWC3_IN_NUDGE_EP_MASK \
 	(CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK & ~BIT(2))
@@ -1845,6 +1888,15 @@ struct udc_dwc3_in_park_state {
 };
 
 static struct udc_dwc3_in_park_state udc_dwc3_park[32];
+
+static bool udc_dwc3_depcmd_is_idle(const struct device *const dev,
+				    const uint8_t epn)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t reg = sys_read32(base + UDC_DWC3_DEPCMD(epn));
+
+	return (reg & UDC_DWC3_DEPCMD_CMDACT) == 0U;
+}
 
 static void udc_dwc3_in_recover_one(const struct device *const dev,
 				    const uint8_t idx)
@@ -1883,19 +1935,10 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 	}
 
 	trb = &ep_data->trb_buf[tail];
+	/* Do not software-retire HWO=0 — wait for real DEPEVT only. */
 	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
-		if (park->since == 0 || park->tail != tail) {
-			park->since = now;
-			park->tail = tail;
-			return;
-		}
-		if ((now - park->since) >= 50) {
-			printk("IN-RECOVER: retire ep=0x%02x\n", ep_data->cfg.addr);
-			udc_dwc3_on_xfer_done_norm(dev,
-				UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
-			park->since = 0;
-			park->nudges = 0;
-		}
+		park->since = 0;
+		park->nudges = 0;
 		return;
 	}
 
@@ -1918,21 +1961,22 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 		return;
 	}
 
-	if (park->nudges >= UDC_DWC3_IN_PARK_RECYCLE_AFTER) {
-		printk("IN-RECOVER: recycle ep=0x%02x remain=%u\n",
-		       ep_data->cfg.addr, remain);
-		udc_dwc3_depcmd_end_xfer_keep_ring(dev, ep_data);
-		if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
-			trb->ctrl |= UDC_DWC3_TRB_CTRL_HWO;
-		}
-		udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, trb);
+	if (park->nudges >= UDC_DWC3_IN_PARK_NUDGE_CAP) {
+		printk("IN-RECOVER: backoff ep=0x%02x remain=%u nudges=%u\n",
+		       ep_data->cfg.addr, remain, park->nudges);
 		park->nudges = 0;
 		park->since = now;
-		park->cooldown_until = now + UDC_DWC3_IN_RECYCLE_COOLDOWN_MS;
+		park->cooldown_until = now + UDC_DWC3_IN_PARK_BACKOFF_MS;
 		return;
 	}
 
-	printk("IN-RECOVER: park ep=0x%02x nudge\n", ep_data->cfg.addr);
+	if (!udc_dwc3_depcmd_is_idle(dev, ep_data->epn)) {
+		park->cooldown_until = now + UDC_DWC3_IN_PARK_COOLDOWN_MS;
+		return;
+	}
+
+	printk("IN-RECOVER: park ep=0x%02x nudge remain=%u n=%u\n",
+	       ep_data->cfg.addr, remain, park->nudges);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 	park->nudges++;
 	park->since = now;
