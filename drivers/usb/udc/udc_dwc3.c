@@ -523,6 +523,12 @@ struct udc_dwc3_ep_data {
 	uint32_t total;
 	/* A flag to tell when the ring buffer is full */
 	bool full;
+	/*
+	 * True while a DepStartXfer resource is live. Soft-IP starts once at
+	 * ep_enable; when the ring runs dry under UVC the next UpdateXfer is
+	 * silently dropped (LiteX OUT-RUNDRY), so re-arm must verify.
+	 */
+	bool xfer_active;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
 };
@@ -859,6 +865,7 @@ static void udc_dwc3_depcmd_start_xfer_trb(const struct device *const dev,
 
 	ep_data->xferrscidx =
 		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSTRTXFER);
+	ep_data->xfer_active = true;
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 		ep_data->cfg.addr, ep_data->xferrscidx);
@@ -896,6 +903,7 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
 	ep_data->head = ep_data->tail = 0;
+	ep_data->xfer_active = false;
 }
 
 /*
@@ -1141,6 +1149,38 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
 
+/*
+ * OUT run-dry park resume (LiteX Defect 2, interrupt path).
+ *
+ * When the ring empties between OUT packets, DWC3 parks the endpoint. On this
+ * hard IP a DepUpdateXfer in that window is often silently dropped under UVC.
+ * Do NOT busy-wait for HWO clear: the host may not have submitted the next
+ * URB yet, so HWO=1 for tens of ms is normal and a short settle falsely
+ * "exhausts" and leaves the pipe stranded (BULK_WRITE dies ~5 KiB in).
+ * Double-doorbell instead; a later completion path / host retry can still
+ * progress if the first UpdateXfer stuck.
+ */
+static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
+{
+	uint32_t mask = 0U;
+	const uint32_t n = CONFIG_UDC_DWC3_TRB_NUM - 1U;
+
+	for (uint32_t i = 0U; i < n; i++) {
+		if ((ep_data->trb_buf[i].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+			mask |= BIT(i);
+		}
+	}
+
+	return mask;
+}
+
+static void udc_dwc3_out_rundry_restart(const struct device *const dev,
+					struct udc_dwc3_ep_data *const ep_data)
+{
+	/* Single UpdateXfer: a second doorbell races UVC RTL DepCmd under load. */
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+}
+
 static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
@@ -1173,8 +1213,24 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		}
 	}
 
+	/*
+	 * Sample before push: empty data ring + live transfer resource means
+	 * the controller has parked and the next UpdateXfer needs verify.
+	 */
+	const bool resume_from_park =
+		ep_data->xfer_active && udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
+	const bool out_resume_from_park =
+		resume_from_park && USB_EP_DIR_IS_OUT(ep_data->cfg.addr);
+
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
-	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+
+	if (!ep_data->xfer_active) {
+		udc_dwc3_depcmd_start_xfer(dev, ep_data);
+	} else if (out_resume_from_park) {
+		udc_dwc3_out_rundry_restart(dev, ep_data);
+	} else {
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	}
 
 	return 0;
 }
@@ -1730,7 +1786,11 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
-		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
+		/*
+		 * Under UVC the controller posts occasional DEPEVTs with no
+		 * matching CPU net_buf (stale / HW-IN bleed). Raising
+		 * UDC_EVT_ERROR here used to take ACM down mid-SRP.
+		 */
 		return;
 	}
 
