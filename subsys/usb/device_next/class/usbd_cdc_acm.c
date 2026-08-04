@@ -46,8 +46,22 @@ LOG_MODULE_REGISTER(usbd_cdc_acm, CONFIG_USBD_CDC_ACM_LOG_LEVEL);
 #define CDC_ACM_CLASS_SUSPENDED		1
 #define CDC_ACM_IRQ_RX_ENABLED		2
 #define CDC_ACM_IRQ_TX_ENABLED		3
-#define CDC_ACM_RX_FIFO_BUSY		4
+/* Bit 4 was CDC_ACM_RX_FIFO_BUSY, replaced by the rx_outstanding counter. */
 #define CDC_ACM_TX_FIFO_BUSY		5
+
+/*
+ * Number of OUT (host->device) transfers kept armed on the bulk OUT endpoint.
+ *
+ * DWC3 parks an endpoint when it retires a transfer and finds the next TRB
+ * still CPU-owned ("run dry").  On the CrossLink-NX hard IP the databook resume
+ * (DepUpdateXfer) issued in that park window is silently dropped, and
+ * EndXfer(ForceRM)+StartXfer does not un-park it either, so the endpoint wedges
+ * permanently and host->device data stops flowing (EP-SM "OUT-RUNDRY ... update
+ * verify exhausted" on the shell input endpoint).  Arming more than one
+ * transfer keeps the ring non-empty across a retirement, so the park condition
+ * never arises in the first place.
+ */
+#define CDC_ACM_RX_OUTSTANDING		CONFIG_USBD_CDC_ACM_RX_OUTSTANDING
 
 struct cdc_acm_uart_fifo {
 	struct ring_buf *rb;
@@ -134,15 +148,42 @@ struct cdc_acm_uart_data {
 	/* USBD CDC ACM RX fifo work */
 	struct k_work rx_fifo_work;
 	atomic_t state;
+	/* Number of OUT transfers currently armed on the bulk OUT endpoint */
+	atomic_t rx_outstanding;
 	struct k_sem notif_sem;
 	struct k_spinlock lock;
 };
 
 static void cdc_acm_irq_rx_enable(const struct device *dev);
 
+/*
+ * Saturating release of one armed OUT transfer.
+ *
+ * cdc_acm_dtr_dropped() resets the counter to zero while transfers are still in
+ * flight; the error completions that follow the dequeue must not drive it
+ * negative.  A negative count makes the arming loop believe it is below the
+ * target forever, so it over-arms and drains the endpoint buffer pool -- after
+ * which bulk IN can no longer allocate and all shell output is silently lost.
+ */
+static void cdc_acm_rx_outstanding_release(struct cdc_acm_uart_data *const data)
+{
+	atomic_val_t cur = atomic_get(&data->rx_outstanding);
+
+	while (cur > 0 && !atomic_cas(&data->rx_outstanding, cur, cur - 1)) {
+		cur = atomic_get(&data->rx_outstanding);
+	}
+}
+
 #if CONFIG_USBD_CDC_ACM_BUF_POOL
+/*
+ * Concurrent consumers per instance: CDC_ACM_RX_OUTSTANDING armed OUT transfers,
+ * one bulk IN transfer, and one interrupt IN notification.  Add spare capacity on
+ * top: a transfer whose completion the controller drops keeps its buffer for good,
+ * and with an exactly-sized pool the first such loss starves bulk IN permanently
+ * (buf_alloc then fails forever and all shell output is silently dropped).
+ */
 UDC_BUF_POOL_DEFINE(cdc_acm_ep_pool,
-		    DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
+		    DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * (CDC_ACM_RX_OUTSTANDING + 4),
 		    USBD_MAX_BULK_MPS, sizeof(struct udc_buf_info), NULL);
 
 static struct net_buf *cdc_acm_buf_alloc(struct usbd_class_data *const c_data,
@@ -184,7 +225,7 @@ static int usbd_cdc_acm_init_wq(void)
 	k_work_queue_init(&cdc_acm_work_q);
 	k_work_queue_start(&cdc_acm_work_q, cdc_acm_stack,
 			   K_KERNEL_STACK_SIZEOF(cdc_acm_stack),
-			   CONFIG_SYSTEM_WORKQUEUE_PRIORITY, NULL);
+			   CONFIG_USBD_CDC_ACM_WORKQUEUE_PRIORITY, NULL);
 	k_thread_name_set(&cdc_acm_work_q.thread, "cdc_acm_work_q");
 
 	return 0;
@@ -305,6 +346,43 @@ static size_t cdc_acm_get_bulk_mps(struct usbd_class_data *const c_data)
 	return 64U;
 }
 
+/*
+ * Re-arm bulk IN/OUT after a driver-level abort (e.g. UDC tier-5 ring nuke).
+ * Success completions already reschedule these workers; errors did not, which
+ * left TX_FIFO_BUSY cleared but no new enqueue and OUT never re-armed.
+ */
+static void cdc_acm_bulk_recover_after_error(struct usbd_class_data *const c_data,
+					     struct usbd_context *const uds_ctx,
+					     struct cdc_acm_uart_data *const data,
+					     const uint8_t ep, const int err)
+{
+	const uint8_t out_ep = cdc_acm_get_bulk_out(c_data);
+	const uint8_t in_ep = cdc_acm_get_bulk_in(c_data);
+
+	if (ep != out_ep && ep != in_ep) {
+		return;
+	}
+
+	if (err == -ECONNRESET) {
+		(void)usbd_ep_dequeue(uds_ctx, out_ep);
+		(void)usbd_ep_dequeue(uds_ctx, in_ep);
+	}
+
+	if (ep == out_ep &&
+	    atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED)) {
+		cdc_acm_work_submit(&data->rx_fifo_work);
+	}
+
+	if (ep == in_ep &&
+	    (!ring_buf_is_empty(data->tx_fifo.rb) || data->zlp_needed)) {
+		cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+	}
+
+	if (data->cb != NULL) {
+		cdc_acm_work_submit(&data->irq_cb_work);
+	}
+}
+
 static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 				struct net_buf *buf, int err)
 {
@@ -324,7 +402,7 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		}
 
 		if (bi->ep == cdc_acm_get_bulk_out(c_data)) {
-			atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+			cdc_acm_rx_outstanding_release(data);
 		}
 
 		if (bi->ep == cdc_acm_get_bulk_in(c_data)) {
@@ -335,6 +413,8 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 			k_sem_reset(&data->notif_sem);
 		}
 
+		cdc_acm_bulk_recover_after_error(c_data, uds_ctx, data, bi->ep, err);
+
 		goto ep_request_error;
 	}
 
@@ -342,13 +422,26 @@ static int usbd_cdc_acm_request(struct usbd_class_data *const c_data,
 		/* RX transfer completion */
 		size_t done;
 
-		LOG_HEXDUMP_INF(buf->data, buf->len, "");
+		LOG_HEXDUMP_DBG(buf->data, buf->len, "");
 		done = ring_buf_put(data->rx_fifo.rb, buf->data, buf->len);
+		if (done != buf->len) {
+			/*
+			 * The transfer has already been acknowledged to the host,
+			 * so anything that does not fit is lost with no way to ask
+			 * for it again.  cdc_acm_rx_fifo_handler() only arms a
+			 * transfer when the FIFO has room for every outstanding
+			 * one, so reaching this means that accounting is wrong
+			 * rather than that the reader is merely slow.
+			 */
+			LOG_ERR("RX FIFO overflow on 0x%02x, dropped %u of %u bytes",
+				bi->ep, buf->len - done, buf->len);
+		}
+
 		if (done && data->cb) {
 			cdc_acm_work_submit(&data->irq_cb_work);
 		}
 
-		atomic_clear_bit(&data->state, CDC_ACM_RX_FIFO_BUSY);
+		cdc_acm_rx_outstanding_release(data);
 		cdc_acm_work_submit(&data->rx_fifo_work);
 	}
 
@@ -527,6 +620,11 @@ static void cdc_acm_update_linestate(struct cdc_acm_uart_data *const data)
 	}
 }
 
+static void cdc_acm_on_control_line_state(struct usbd_class_data *const c_data,
+					  struct usbd_context *const uds_ctx,
+					  struct cdc_acm_uart_data *const data,
+					  const bool was_dtr);
+
 static int usbd_cdc_acm_cth(struct usbd_class_data *const c_data,
 			    const struct usb_setup_packet *const setup,
 			    struct net_buf *const buf)
@@ -576,11 +674,15 @@ static int usbd_cdc_acm_ctd(struct usbd_class_data *const c_data,
 		usbd_msg_pub_device(uds_ctx, USBD_MSG_CDC_ACM_LINE_CODING, dev);
 		return 0;
 
-	case SET_CONTROL_LINE_STATE:
+	case SET_CONTROL_LINE_STATE: {
+		const bool was_dtr = data->line_state_dtr;
+
 		data->line_state = setup->wValue;
 		cdc_acm_update_linestate(data);
+		cdc_acm_on_control_line_state(c_data, uds_ctx, data, was_dtr);
 		usbd_msg_pub_device(uds_ctx, USBD_MSG_CDC_ACM_CONTROL_LINE_STATE, dev);
 		return 0;
+	}
 
 	default:
 		break;
@@ -633,12 +735,12 @@ static __maybe_unused int cdc_acm_send_notification(const struct device *dev,
 	int ret;
 
 	if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED)) {
-		LOG_INF("USB configuration is not enabled");
+		LOG_DBG("USB configuration is not enabled");
 		return -EACCES;
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB support is suspended (FIXME)");
+		LOG_DBG("USB support is suspended (FIXME)");
 		return -EACCES;
 	}
 
@@ -685,7 +787,7 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	}
 
 	if (atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB support is suspended (FIXME: submit rwup)");
+		LOG_DBG("USB support is suspended (FIXME: submit rwup)");
 		return;
 	}
 
@@ -696,6 +798,7 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 
 	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_in(c_data));
 	if (buf == NULL) {
+		LOG_DBG("TX buffer pool exhausted, retry in 1ms");
 		atomic_clear_bit(&data->state, CDC_ACM_TX_FIFO_BUSY);
 		cdc_acm_work_schedule(&data->tx_fifo_work, K_MSEC(1));
 		return;
@@ -736,33 +839,42 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED) ||
 	    atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
-		LOG_INF("USB configuration is not enabled or suspended");
+		LOG_DBG("USB configuration is not enabled or suspended");
 		return;
 	}
 
-	if (ring_buf_space_get(data->rx_fifo.rb) < cdc_acm_get_bulk_mps(c_data)) {
-		LOG_INF("RX buffer to small, throttle");
-		return;
-	}
+	/*
+	 * Top the endpoint up to CDC_ACM_RX_OUTSTANDING armed transfers.  Every
+	 * armed transfer needs somewhere to land, so the RX FIFO must have room
+	 * for all of them; otherwise throttle and retry once the shell drains it.
+	 */
+	while (atomic_get(&data->rx_outstanding) < CDC_ACM_RX_OUTSTANDING) {
+		const size_t armed = (size_t)atomic_get(&data->rx_outstanding);
 
-	if (atomic_test_and_set_bit(&data->state, CDC_ACM_RX_FIFO_BUSY)) {
-		LOG_WRN("RX transfer already in progress");
-		return;
-	}
+		if (ring_buf_space_get(data->rx_fifo.rb) <
+		    (armed + 1U) * cdc_acm_get_bulk_mps(c_data)) {
+			LOG_DBG("RX buffer to small, throttle");
+			return;
+		}
 
-	buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
-	if (buf == NULL) {
-		return;
-	}
+		buf = cdc_acm_buf_alloc(c_data, cdc_acm_get_bulk_out(c_data));
+		if (buf == NULL) {
+			return;
+		}
 
-	/* Shrink the buffer size if operating on a full speed bus */
-	buf->size = MIN(cdc_acm_get_bulk_mps(c_data), buf->size);
+		/* Shrink the buffer size if operating on a full speed bus */
+		buf->size = MIN(cdc_acm_get_bulk_mps(c_data), buf->size);
 
-	ret = usbd_ep_enqueue(c_data, buf);
-	if (ret) {
-		LOG_ERR("Failed to enqueue net_buf for 0x%02x",
-			cdc_acm_get_bulk_out(c_data));
-		net_buf_unref(buf);
+		atomic_inc(&data->rx_outstanding);
+
+		ret = usbd_ep_enqueue(c_data, buf);
+		if (ret) {
+			LOG_ERR("Failed to enqueue net_buf for 0x%02x",
+				cdc_acm_get_bulk_out(c_data));
+			net_buf_unref(buf);
+			atomic_dec(&data->rx_outstanding);
+			return;
+		}
 	}
 }
 
@@ -773,7 +885,7 @@ static void cdc_acm_irq_tx_enable(const struct device *dev)
 	atomic_set_bit(&data->state, CDC_ACM_IRQ_TX_ENABLED);
 
 	if (ring_buf_space_get(data->tx_fifo.rb)) {
-		LOG_INF("tx_en: trigger irq_cb_work");
+		LOG_DBG("tx_en: trigger irq_cb_work");
 		cdc_acm_work_submit(&data->irq_cb_work);
 	}
 }
@@ -793,12 +905,12 @@ static void cdc_acm_irq_rx_enable(const struct device *dev)
 
 	/* Permit buffer to be drained regardless of USB state */
 	if (!ring_buf_is_empty(data->rx_fifo.rb)) {
-		LOG_INF("rx_en: trigger irq_cb_work");
+		LOG_DBG("rx_en: trigger irq_cb_work");
 		cdc_acm_work_submit(&data->irq_cb_work);
 	}
 
-	if (!atomic_test_bit(&data->state, CDC_ACM_RX_FIFO_BUSY)) {
-		LOG_INF("rx_en: trigger rx_fifo_work");
+	if (atomic_get(&data->rx_outstanding) < CDC_ACM_RX_OUTSTANDING) {
+		LOG_DBG("rx_en: trigger rx_fifo_work");
 		cdc_acm_work_submit(&data->rx_fifo_work);
 	}
 }
@@ -808,6 +920,60 @@ static void cdc_acm_irq_rx_disable(const struct device *dev)
 	struct cdc_acm_uart_data *const data = dev->data;
 
 	atomic_clear_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED);
+}
+
+/*
+ * Track the host opening and closing the serial port (DTR assert/deassert) so a
+ * new session starts from empty FIFOs, and so OUT is topped back up on open.
+ */
+static void cdc_acm_on_control_line_state(struct usbd_class_data *const c_data,
+					    struct usbd_context *const uds_ctx,
+					    struct cdc_acm_uart_data *const data,
+					    const bool was_dtr)
+{
+	if (was_dtr && !data->line_state_dtr) {
+		/*
+		 * Discard the buffered session data, but deliberately leave the bulk
+		 * endpoints armed.
+		 *
+		 * Dequeuing here issues EndXfer on the OUT pipe, and on this DWC3
+		 * hard IP an ended OUT transfer cannot be reliably restarted (the
+		 * same limitation behind the EP-SM OUT-RUNDRY wedge). Tearing the
+		 * pipe down on every port close therefore left the endpoint dead for
+		 * every subsequent open: the first host session worked and all later
+		 * ones saw a silent shell.
+		 *
+		 * The already-armed transfers stay valid across the close/open, so
+		 * rx_outstanding must keep matching them -- resetting it here would
+		 * make the arming loop add duplicates and exhaust the buffer pool.
+		 * TX_FIFO_BUSY is likewise left alone; if its IN completion was
+		 * dropped, the driver's IN-completion poll retires it.
+		 */
+		ring_buf_reset(data->rx_fifo.rb);
+		ring_buf_reset(data->tx_fifo.rb);
+		data->zlp_needed = false;
+
+		LOG_DBG("DTR deassert: ACM session buffers flushed, pipes kept armed");
+		return;
+	}
+
+	if (!was_dtr && data->line_state_dtr) {
+		if (!atomic_test_bit(&data->state, CDC_ACM_CLASS_ENABLED) ||
+		    atomic_test_bit(&data->state, CDC_ACM_CLASS_SUSPENDED)) {
+			return;
+		}
+
+		if (atomic_test_bit(&data->state, CDC_ACM_IRQ_RX_ENABLED)) {
+			cdc_acm_work_submit(&data->rx_fifo_work);
+		}
+
+		if (atomic_test_bit(&data->state, CDC_ACM_IRQ_TX_ENABLED) &&
+		    !ring_buf_is_empty(data->tx_fifo.rb)) {
+			cdc_acm_work_schedule(&data->tx_fifo_work, K_NO_WAIT);
+		}
+
+		LOG_DBG("DTR assert: ACM session armed");
+	}
 }
 
 static int cdc_acm_fifo_fill(const struct device *dev,
@@ -831,7 +997,7 @@ static int cdc_acm_fifo_fill(const struct device *dev,
 		data->tx_fifo.altered = true;
 	}
 
-	LOG_INF("UART dev %p, len %d, remaining space %u",
+	LOG_DBG("UART dev %p, len %d, remaining space %u",
 		dev, len, ring_buf_space_get(data->tx_fifo.rb));
 
 	return done;
@@ -844,7 +1010,13 @@ static int cdc_acm_fifo_read(const struct device *dev,
 	struct cdc_acm_uart_data *const data = dev->data;
 	uint32_t len;
 
-	LOG_INF("UART dev %p size %d length %u",
+	/*
+	 * Applications may poll this in a tight loop while waiting for data, so
+	 * it must stay at debug level: with synchronous logging on a slow
+	 * console, one line per call outruns the UART and blocks the caller,
+	 * which starves the handler that re-arms the bulk OUT endpoint.
+	 */
+	LOG_DBG("UART dev %p size %d length %u",
 		dev, size, ring_buf_size_get(data->rx_fifo.rb));
 
 	if (!check_wq_ctx(dev)) {

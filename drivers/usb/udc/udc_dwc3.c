@@ -1720,7 +1720,14 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		return;
 	}
 
-	/* Clear the TRB that triggered the event */
+	/*
+	 * Latch TRB status before retiring the ring slot. Soft-IP pop_trb()
+	 * does not zero the TRB today, but LiteX soak proved reading residual
+	 * after clear yields MPS-sized garbage into CDC ACM (shell fed its
+	 * own prompt). Keep the latch + underflow guard for both trees.
+	 */
+	const uint32_t trb_status_done = trb->status;
+
 	buf = udc_dwc3_pop_trb(dev, ep_data);
 	if (buf == NULL) {
 		udc_submit_event(dev, UDC_EVT_ERROR, -ENOBUFS);
@@ -1732,7 +1739,10 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		const uint32_t residual =
+			FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status_done);
+
+		buf->len = (residual <= buf->size) ? (buf->size - residual) : 0U;
 	}
 
 	ret = udc_submit_ep_event(dev, buf, 0);
@@ -1751,7 +1761,8 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
  *  2) At most one UpdateXfer nudge per cooldown when remain stalls.
  *     No EndXfer escalate (that wedged DEPCMD and killed video/ACM).
  */
-#define UDC_DWC3_IN_PARK_COOLDOWN_MS 2000
+/* Gentle: allow another UpdateXfer sooner once prior nudge had a chance. */
+#define UDC_DWC3_IN_PARK_COOLDOWN_MS 500
 
 static int64_t udc_dwc3_park_since;
 static int64_t udc_dwc3_park_cooldown_until;

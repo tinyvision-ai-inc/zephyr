@@ -16,6 +16,23 @@ config USBD_CDC_ACM_CLASS
 
 if USBD_CDC_ACM_CLASS
 
+config USBD_CDC_ACM_RX_OUTSTANDING
+	int "Number of OUT transfers kept armed on the bulk OUT endpoint"
+	default 2
+	range 1 8
+	help
+	  How many host-to-device transfers the class keeps armed at once.
+
+	  With 1 the ring goes empty every time a transfer retires. Controllers
+	  that park an endpoint on such a "run dry" event then need an explicit
+	  resume, which is unreliable on some DWC3 hard IP (the DepUpdateXfer is
+	  silently dropped and the endpoint wedges, so host-to-device data stops
+	  flowing). Keeping 2 or more armed avoids the park condition entirely.
+
+	  Each armed transfer consumes one buffer of the endpoint pool and needs
+	  a matching amount of free space in the RX FIFO, so raising this also
+	  wants a larger UART RX ring buffer.
+
 config USBD_CDC_ACM_WORKQUEUE
 	bool "Use dedicated workqueue in CDC ACM"
 	help
@@ -28,6 +45,23 @@ config USBD_CDC_ACM_STACK_SIZE
 	default 1024
 	help
 	  USB CDC ACM workqueue stack size.
+
+config USBD_CDC_ACM_WORKQUEUE_PRIORITY
+	int "USB CDC ACM workqueue thread priority"
+	depends on USBD_CDC_ACM_WORKQUEUE
+	default SYSTEM_WORKQUEUE_PRIORITY
+	help
+	  Thread priority of the dedicated CDC ACM workqueue.  Defaults to the
+	  system workqueue priority for backwards compatibility.
+
+	  The CDC ACM handlers re-submit their own work to keep the bulk IN
+	  pipe full, so the workqueue can stay continuously runnable under load.
+	  If it runs at a cooperative priority equal to the UDC driver's
+	  workqueue, it can never yield to it, starving the endpoint worker that
+	  arms and retires the IN transfers it depends on — a livelock (the CDC
+	  IN pipe wedges and the CPU is pegged in cdc_acm_work_q).  Set a
+	  preemptible priority (>= 0) so the cooperative UDC workqueue can
+	  preempt it and make forward progress.
 
 config USBD_CDC_ACM_BUF_POOL
 	bool "Use dedicated buffer pool"
