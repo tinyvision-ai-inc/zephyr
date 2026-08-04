@@ -1151,14 +1151,12 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 }
 
 /*
- * OUT run-dry park resume (LiteX Defect 2, interrupt path).
+ * OUT run-dry park resume (LiteX Defect 2 / Soft-IP under UVC).
  *
- * When the ring empties between OUT packets, DWC3 parks the endpoint. On this
- * IP a DepUpdateXfer in that window is often silently dropped under UVC.
- * Do NOT EndXfer here: under Soft-IP + UVC, EndXfer/StartXfer on OUT wedges
- * DEPCMD (CMDACT stuck) and kills video/ACM. Do NOT busy-wait for HWO clear
- * (host URB gaps). Single UpdateXfer; a later completion / host retry can
- * still progress if the first doorbell was dropped.
+ * When the OUT ring empties, the transfer resource is finished. Keeping
+ * xfer_active and ringing DepUpdateXfer is often a silent no-op under UVC
+ * DepCmd load (BULK_WRITE crawl/stall). Do NOT EndXfer: that wedges CMDACT.
+ * Clear xfer_active and DepStartXfer the newly pushed TRB instead.
  */
 static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -1174,10 +1172,17 @@ static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_da
 	return mask;
 }
 
-static void udc_dwc3_out_rundry_restart(const struct device *const dev,
-					struct udc_dwc3_ep_data *const ep_data)
+static bool udc_dwc3_ring_has_net_buf(const struct udc_dwc3_ep_data *ep_data)
 {
-	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	const uint32_t n = CONFIG_UDC_DWC3_TRB_NUM - 1U;
+
+	for (uint32_t i = 0U; i < n; i++) {
+		if (ep_data->net_buf[i] != NULL) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 static int udc_dwc3_trb_bulk(const struct device *const dev,
@@ -1213,19 +1218,19 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	}
 
 	/*
-	 * Sample before push: empty data ring + live transfer resource means
-	 * the controller has parked and the next UpdateXfer is the resume path.
+	 * Empty data ring + stale xfer_active: controller has finished the
+	 * prior transfer. Force StartXfer (not UpdateXfer) after the push.
 	 */
-	const bool out_resume_from_park =
-		ep_data->xfer_active && USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
-		udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
+	if (ep_data->xfer_active && USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
+	    udc_dwc3_ring_data_hwo_mask(ep_data) == 0U) {
+		printk("OUT-PARK: start ep=0x%02x\n", ep_data->cfg.addr);
+		ep_data->xfer_active = false;
+	}
 
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 
 	if (!ep_data->xfer_active) {
 		udc_dwc3_depcmd_start_xfer(dev, ep_data);
-	} else if (out_resume_from_park) {
-		udc_dwc3_out_rundry_restart(dev, ep_data);
 	} else {
 		udc_dwc3_depcmd_update_xfer(dev, ep_data);
 	}
@@ -1806,6 +1811,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
 	}
 
+	/*
+	 * OUT ring drained: transfer resource is done. Next enqueue must
+	 * DepStartXfer; a stale xfer_active leads to dropped UpdateXfer.
+	 */
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
+	    !udc_dwc3_ring_has_net_buf(ep_data)) {
+		ep_data->xfer_active = false;
+	}
+
 	/* We just made some room for a new buffer, check if something more to enqueue */
 	k_work_submit(&ep_data->work);
 }
@@ -1914,6 +1928,86 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 
 		mask &= ~BIT(idx);
 		udc_dwc3_in_recover_one(dev, idx);
+	}
+}
+
+/*
+ * OUT UpdateXfer nudge when a bulk write has started (remain < size) then
+ * stalls with HWO stuck. Idle ACM/CDC-RAW OUT arms (remain == size) are
+ * left alone so quiet pipes do not spam DepCmd.
+ */
+#define UDC_DWC3_OUT_PARK_COOLDOWN_MS 300
+#define UDC_DWC3_OUT_PARK_STALL_MS    200
+
+struct udc_dwc3_out_park_state {
+	int64_t since;
+	int64_t cooldown_until;
+	uint32_t tail;
+	uint32_t remain;
+};
+
+static struct udc_dwc3_out_park_state udc_dwc3_out_park[16];
+
+static void udc_dwc3_out_recover_tick(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	for (uint8_t idx = 1U; idx < cfg->num_out_eps &&
+			       idx < ARRAY_SIZE(udc_dwc3_out_park); idx++) {
+		struct udc_dwc3_ep_data *ep_data = &cfg->ep_data_out[idx];
+		struct udc_dwc3_out_park_state *park = &udc_dwc3_out_park[idx];
+		volatile struct udc_dwc3_trb *trb;
+		struct net_buf *buf;
+		uint32_t remain;
+		int64_t now;
+		uint32_t tail;
+
+		if (ep_data->trb_buf == NULL || !ep_data->xfer_active) {
+			park->since = 0;
+			continue;
+		}
+
+		now = k_uptime_get();
+		if (now < park->cooldown_until) {
+			continue;
+		}
+
+		tail = ep_data->tail;
+		buf = ep_data->net_buf[tail];
+		if (buf == NULL) {
+			park->since = 0;
+			continue;
+		}
+
+		trb = &ep_data->trb_buf[tail];
+		if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+			park->since = 0;
+			continue;
+		}
+
+		remain = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		/* Quiet armed OUT (no bytes yet) — do not nudge. */
+		if (remain >= buf->size) {
+			park->since = 0;
+			continue;
+		}
+
+		if (park->since == 0 || park->tail != tail || park->remain != remain) {
+			park->since = now;
+			park->tail = tail;
+			park->remain = remain;
+			continue;
+		}
+
+		if ((now - park->since) < UDC_DWC3_OUT_PARK_STALL_MS) {
+			continue;
+		}
+
+		printk("OUT-RECOVER: nudge ep=0x%02x remain=%u\n",
+		       ep_data->cfg.addr, remain);
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+		park->since = now;
+		park->cooldown_until = now + UDC_DWC3_OUT_PARK_COOLDOWN_MS;
 	}
 }
 #endif /* CONFIG_UDC_DWC3_IN_PARK_RECOVER */
@@ -2037,6 +2131,7 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 		udc_dwc3_in_recover_tick(dev);
+		udc_dwc3_out_recover_tick(dev);
 #endif
 	}
 }
