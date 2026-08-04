@@ -1157,7 +1157,7 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
  * IP a DepUpdateXfer in that window is often silently dropped under UVC.
  * Do NOT EndXfer / DepStartXfer here: Soft-IP + UVC wedges CMDACT, and
  * StartXfer while the resource is still live returns CMDERR storms. Single
- * UpdateXfer; the OUT-RECOVER nudge retries if remain stalls mid-write.
+ * UpdateXfer only.
  */
 static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -1912,85 +1912,6 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 	}
 }
 
-/*
- * OUT UpdateXfer nudge when a bulk write has started (remain < size) then
- * stalls with HWO stuck. Idle ACM/CDC-RAW OUT arms (remain == size) are
- * left alone so quiet pipes do not spam DepCmd.
- */
-#define UDC_DWC3_OUT_PARK_COOLDOWN_MS 300
-#define UDC_DWC3_OUT_PARK_STALL_MS    200
-
-struct udc_dwc3_out_park_state {
-	int64_t since;
-	int64_t cooldown_until;
-	uint32_t tail;
-	uint32_t remain;
-};
-
-static struct udc_dwc3_out_park_state udc_dwc3_out_park[16];
-
-static void udc_dwc3_out_recover_tick(const struct device *const dev)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	for (uint8_t idx = 1U; idx < cfg->num_out_eps &&
-			       idx < ARRAY_SIZE(udc_dwc3_out_park); idx++) {
-		struct udc_dwc3_ep_data *ep_data = &cfg->ep_data_out[idx];
-		struct udc_dwc3_out_park_state *park = &udc_dwc3_out_park[idx];
-		volatile struct udc_dwc3_trb *trb;
-		struct net_buf *buf;
-		uint32_t remain;
-		int64_t now;
-		uint32_t tail;
-
-		if (ep_data->trb_buf == NULL || !ep_data->xfer_active) {
-			park->since = 0;
-			continue;
-		}
-
-		now = k_uptime_get();
-		if (now < park->cooldown_until) {
-			continue;
-		}
-
-		tail = ep_data->tail;
-		buf = ep_data->net_buf[tail];
-		if (buf == NULL) {
-			park->since = 0;
-			continue;
-		}
-
-		trb = &ep_data->trb_buf[tail];
-		if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
-			park->since = 0;
-			continue;
-		}
-
-		remain = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
-		/* Quiet armed OUT (no bytes yet) — do not nudge. */
-		if (remain >= buf->size) {
-			park->since = 0;
-			continue;
-		}
-
-		if (park->since == 0 || park->tail != tail || park->remain != remain) {
-			park->since = now;
-			park->tail = tail;
-			park->remain = remain;
-			continue;
-		}
-
-		if ((now - park->since) < UDC_DWC3_OUT_PARK_STALL_MS) {
-			continue;
-		}
-
-		printk("OUT-RECOVER: nudge ep=0x%02x remain=%u\n",
-		       ep_data->cfg.addr, remain);
-		udc_dwc3_depcmd_update_xfer(dev, ep_data);
-		park->since = now;
-		park->cooldown_until = now + UDC_DWC3_OUT_PARK_COOLDOWN_MS;
-	}
-}
 #endif /* CONFIG_UDC_DWC3_IN_PARK_RECOVER */
 
 #define NORMAL_EP(n, fn) fn(n + 2)
@@ -2112,7 +2033,7 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 		udc_dwc3_in_recover_tick(dev);
-		udc_dwc3_out_recover_tick(dev);
+		/* OUT-RECOVER nudge disabled: DepCmd contention under UVC. */
 #endif
 	}
 }
