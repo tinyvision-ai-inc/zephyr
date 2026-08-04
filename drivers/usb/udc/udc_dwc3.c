@@ -692,7 +692,8 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
 	udc_dwc3_ring_inc(&ep_data->tail, CONFIG_UDC_DWC3_TRB_NUM - 1);
 
 	if (buf == NULL) {
-		LOG_ERR("pop: the next TRB is emtpy");
+		LOG_WRN("pop: empty TRB ep=0x%02x tail=%u", ep_data->cfg.addr,
+			ep_data->tail);
 		return NULL;
 	}
 
@@ -1150,15 +1151,16 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 }
 
 /*
- * OUT run-dry park resume (LiteX Defect 2, interrupt path).
+ * OUT run-dry park resume (LiteX Defect 2 / Soft-IP under UVC).
  *
- * When the ring empties between OUT packets, DWC3 parks the endpoint. On this
- * hard IP a DepUpdateXfer in that window is often silently dropped under UVC.
- * Do NOT busy-wait for HWO clear: the host may not have submitted the next
- * URB yet, so HWO=1 for tens of ms is normal and a short settle falsely
- * "exhausts" and leaves the pipe stranded (BULK_WRITE dies ~5 KiB in).
- * Double-doorbell instead; a later completion path / host retry can still
- * progress if the first UpdateXfer stuck.
+ * When the OUT ring empties between host packets, DWC3 parks the transfer
+ * resource. A DepUpdateXfer in that window is often silently dropped while
+ * UVC RTL owns DepCmd — BULK_WRITE then crawls to a host timeout and ACM
+ * dies on WRITE_END. Busy-waiting for HWO is wrong (host URB gaps).
+ *
+ * Recycle instead: EndXfer(ForceRM) while the ring is still empty, then
+ * push the new TRB and StartXfer. Safe because there is no in-flight OUT
+ * DMA when HWO mask is zero.
  */
 static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -1174,20 +1176,13 @@ static uint32_t udc_dwc3_ring_data_hwo_mask(const struct udc_dwc3_ep_data *ep_da
 	return mask;
 }
 
-static void udc_dwc3_out_rundry_restart(const struct device *const dev,
-					struct udc_dwc3_ep_data *const ep_data)
-{
-	/* Single UpdateXfer: a second doorbell races UVC RTL DepCmd under load. */
-	udc_dwc3_depcmd_update_xfer(dev, ep_data);
-}
-
 static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
 
-	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
+	LOG_DBG("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
 
 	if (ep_data->full) {
@@ -1215,19 +1210,26 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 
 	/*
 	 * Sample before push: empty data ring + live transfer resource means
-	 * the controller has parked and the next UpdateXfer needs verify.
+	 * the controller has parked. Recycle OUT before installing the TRB so
+	 * EndXfer's head/tail reset cannot drop the new buffer.
 	 */
-	const bool resume_from_park =
-		ep_data->xfer_active && udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
 	const bool out_resume_from_park =
-		resume_from_park && USB_EP_DIR_IS_OUT(ep_data->cfg.addr);
+		ep_data->xfer_active && USB_EP_DIR_IS_OUT(ep_data->cfg.addr) &&
+		udc_dwc3_ring_data_hwo_mask(ep_data) == 0U;
+
+	if (out_resume_from_park) {
+		printk("OUT-PARK: recycle ep=0x%02x\n", ep_data->cfg.addr);
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		for (uint32_t i = 0U; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
+			ep_data->net_buf[i] = NULL;
+		}
+		ep_data->full = false;
+	}
 
 	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 
 	if (!ep_data->xfer_active) {
 		udc_dwc3_depcmd_start_xfer(dev, ep_data);
-	} else if (out_resume_from_park) {
-		udc_dwc3_out_rundry_restart(dev, ep_data);
 	} else {
 		udc_dwc3_depcmd_update_xfer(dev, ep_data);
 	}
