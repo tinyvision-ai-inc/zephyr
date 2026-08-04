@@ -1746,15 +1746,17 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 /*
- * Slim IN-park recover for Soft-IP CDC-RAW bulk IN (mask bit → 0x84).
- * Kept small: the whole UDC library is RAM-relocated into a 64 KiB budget.
+ * Soft-IP CDC-RAW IN (0x84) recover under concurrent UVC:
+ *  1) Retire lost completions (HWO cleared, no DEPEVT).
+ *  2) At most one UpdateXfer nudge per cooldown when remain stalls.
+ *     No EndXfer escalate (that wedged DEPCMD and killed video/ACM).
  */
-#define UDC_DWC3_IN_PARK_ESCALATE_FAILS 2U
+#define UDC_DWC3_IN_PARK_COOLDOWN_MS 2000
 
 static int64_t udc_dwc3_park_since;
+static int64_t udc_dwc3_park_cooldown_until;
 static uint32_t udc_dwc3_park_tail;
 static uint32_t udc_dwc3_park_remain;
-static uint8_t udc_dwc3_park_fails;
 
 static void udc_dwc3_in_recover_tick(const struct device *const dev)
 {
@@ -1776,6 +1778,11 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 		return;
 	}
 
+	now = k_uptime_get();
+	if (now < udc_dwc3_park_cooldown_until) {
+		return;
+	}
+
 	tail = ep_data->tail;
 	buf = ep_data->net_buf[tail];
 	if (buf == NULL) {
@@ -1786,7 +1793,6 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 	trb = &ep_data->trb_buf[tail];
 	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
 		/* Lost completion: HW released without a matching DEPEVT. */
-		now = k_uptime_get();
 		if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail) {
 			udc_dwc3_park_since = now;
 			udc_dwc3_park_tail = tail;
@@ -1797,13 +1803,11 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 			udc_dwc3_on_xfer_done_norm(dev,
 				UDC_DWC3_DEPEVT_XFERCOMPLETE(ep_data->epn));
 			udc_dwc3_park_since = 0;
-			udc_dwc3_park_fails = 0U;
 		}
 		return;
 	}
 
 	remain = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
-	now = k_uptime_get();
 	if (udc_dwc3_park_since == 0 || udc_dwc3_park_tail != tail ||
 	    udc_dwc3_park_remain != remain) {
 		udc_dwc3_park_since = now;
@@ -1818,22 +1822,8 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 
 	printk("IN-RECOVER: park ep=0x%02x nudge\n", ep_data->cfg.addr);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
-	udc_dwc3_park_fails++;
 	udc_dwc3_park_since = now;
-
-#if defined(CONFIG_UDC_DWC3_IN_START_ENDXFER_ESCALATE)
-	if (udc_dwc3_park_fails >= UDC_DWC3_IN_PARK_ESCALATE_FAILS) {
-		udc_dwc3_park_fails = 0U;
-		printk("IN-RECOVER: recycle ep=0x%02x\n", ep_data->cfg.addr);
-		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
-				UDC_DWC3_DEPCMD_DEPENDXFER |
-				UDC_DWC3_DEPCMD_HIPRI_FORCERM |
-				FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
-					   ep_data->xferrscidx));
-		/* Leave head/tail; re-Start the same parked TRB. */
-		udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, trb);
-	}
-#endif
+	udc_dwc3_park_cooldown_until = now + UDC_DWC3_IN_PARK_COOLDOWN_MS;
 }
 #endif /* CONFIG_UDC_DWC3_IN_PARK_RECOVER */
 
