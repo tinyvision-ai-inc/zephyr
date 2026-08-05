@@ -12,6 +12,7 @@
 #include <stdbool.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/device_mmio.h>
 #include <zephyr/sys/util.h>
@@ -722,11 +723,101 @@ static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
  * is no arbiter; overlapping commands are dropped or jam CMDACT (observed:
  * CDC-RAW IN park + frozen video + "DEPCMD never completed" storms).
  *
- * Serialize the software side: wait for the doorbell endpoint(s) to go idle
- * immediately before issuing our command. This shrinks the collision window
- * from the full command execution time to the read-to-write gap (~100 ns vs
- * a ~25 us doorbell period).
+ * Waiting for CMDACT idle alone is not enough — the RTL can still ring while
+ * our command is executing (soak: 3/10 pass then bulk+video die together).
+ * Gating CONTINUE only shrank the window (7/10) since it races the FSM.
+ *
+ * The RTL now provides a real arbitration handshake: setting HALT_DOORBELL
+ * makes the TRB FSM finish any in-flight doorbell, then park; it asserts
+ * HALT_ACK, which hardware-guarantees no DEPCMD writes from the uvcmanager
+ * until HALT_DOORBELL is cleared. Video data keeps flowing into the FIFO;
+ * only the doorbell is deferred, so this is not a stream stop / UVC quiet.
  */
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(uvcmanager0), okay)
+#define UDC_DWC3_UVCMGR_BASE ((mm_reg_t)DT_REG_ADDR(DT_NODELABEL(uvcmanager0)))
+#else
+#define UDC_DWC3_UVCMGR_BASE ((mm_reg_t)0xb4000000U)
+#endif
+#define UDC_DWC3_UVCMGR_CONTROL_STATUS			0x0010U
+#define UDC_DWC3_UVCMGR_CONTROL_HALT_DOORBELL		BIT(15)
+#define UDC_DWC3_UVCMGR_CONTROL_HALT_ACK		BIT(16)
+
+/* Nesting depth of the halt request. Tracked CPU-side (not via the register
+ * bit): CONTROL_STATUS is RMW'd by other code without our lock, so a stale
+ * write-back could re-assert bit 15; if we treated a set bit as "outer
+ * holder", one stale write would make every later pause a no-op and park the
+ * uvcmanager doorbell forever (observed: sts=0x1c005, video dead at start).
+ * Only touched with interrupts locked.
+ */
+static uint32_t udc_dwc3_uvcmgr_halt_depth;
+
+/* Ack is due in well under a microsecond; this is a fault bound, not a budget. */
+#define UDC_DWC3_UVCMGR_HALT_TIMEOUT_US 50U
+
+/* Must be called with interrupts locked (CONTROL_STATUS RMW vs other threads). */
+static bool udc_dwc3_uvcmgr_pause_doorbell(void)
+{
+	static uint32_t timeouts;
+	const mm_reg_t ubase = UDC_DWC3_UVCMGR_BASE;
+	uint32_t sts;
+
+	if (udc_dwc3_uvcmgr_halt_depth++ != 0U) {
+		/* Already held by an outer caller */
+		return false;
+	}
+
+	sts = sys_read32(ubase + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+	sys_write32(sts | UDC_DWC3_UVCMGR_CONTROL_HALT_DOORBELL,
+		    ubase + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+
+	/* The FSM acks as soon as it has no doorbell command outstanding, which
+	 * retires on hardware alone -- so the ack is due within a fraction of a
+	 * microsecond.
+	 *
+	 * Bound the wait in real time and give up rather than spin: we hold
+	 * irq_lock() here, so a spin that outlives its welcome cannot be
+	 * rescued by anything else in the system (an earlier RTL revision that
+	 * only acked from idle states waited on the video TRB stream, which
+	 * needs the very interrupts we have locked -- that deadlocked the whole
+	 * SoC, console included). Proceeding unarbitrated risks one DEPCMD
+	 * collision; hanging risks everything.
+	 */
+	const uint32_t deadline = k_cycle_get_32() +
+		(uint32_t)((uint64_t)sys_clock_hw_cycles_per_sec() *
+			   UDC_DWC3_UVCMGR_HALT_TIMEOUT_US / 1000000U);
+
+	do {
+		sts = sys_read32(ubase + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+		if ((sts & UDC_DWC3_UVCMGR_CONTROL_HALT_ACK) != 0U) {
+			return true;
+		}
+	} while ((int32_t)(k_cycle_get_32() - deadline) < 0);
+
+	if ((++timeouts % 256U) == 1U) {
+		printk("DEPCMD guard: uvcmanager halt not acked (n=%u sts=0x%08x)\n",
+		       timeouts, sts);
+	}
+
+	return true;
+}
+
+static void udc_dwc3_uvcmgr_resume_doorbell(const bool paused)
+{
+	const mm_reg_t ubase = UDC_DWC3_UVCMGR_BASE;
+	uint32_t sts;
+
+	__ASSERT_NO_MSG(udc_dwc3_uvcmgr_halt_depth > 0U);
+	udc_dwc3_uvcmgr_halt_depth--;
+
+	if (!paused) {
+		return;
+	}
+
+	sts = sys_read32(ubase + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+	sys_write32(sts & ~UDC_DWC3_UVCMGR_CONTROL_HALT_DOORBELL,
+		    ubase + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+}
+
 static void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
 {
 	static uint32_t caught;
@@ -755,6 +846,16 @@ static void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
 	}
 }
 #else
+static inline bool udc_dwc3_uvcmgr_pause_doorbell(void)
+{
+	return false;
+}
+
+static inline void udc_dwc3_uvcmgr_resume_doorbell(const bool paused)
+{
+	ARG_UNUSED(paused);
+}
+
 static inline void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
 {
 	ARG_UNUSED(base);
@@ -766,9 +867,14 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
-
 	uint32_t spins = 0U;
+	unsigned int key = irq_lock();
+	const bool uvcmgr_paused = udc_dwc3_uvcmgr_pause_doorbell();
 
+	/* The last hardware doorbell may still be executing in the command
+	 * engine after HALT_ACK; wait for its CMDACT to clear. No new one can
+	 * arrive while halted.
+	 */
 	udc_dwc3_depcmd_hw_doorbell_sync(base);
 
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
@@ -780,16 +886,23 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 				(uint8_t)__builtin_ctz(CONFIG_UDC_DWC3_HW_IN_EP_MASK);
 			const uint32_t hw_addr = UDC_DWC3_DEPCMD(hw_idx * 2U + 1U);
 
-			LOG_ERR("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x "
-				"doorbell[0x%03x]=0x%08x",
-				addr, cmd, reg, hw_addr, sys_read32(base + hw_addr));
+			/* printk, not LOG_ERR: this fires with interrupts locked,
+			 * and if it repeats the log thread never runs, so a
+			 * deferred message is lost exactly when it matters.
+			 */
+			printk("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x "
+			       "doorbell[0x%03x]=0x%08x\n",
+			       addr, cmd, reg, hw_addr, sys_read32(base + hw_addr));
 #else
-			LOG_ERR("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x",
-				addr, cmd, reg);
+			printk("DEPCMD 0x%03x never completed: cmd 0x%08x reg 0x%08x\n",
+			       addr, cmd, reg);
 #endif
 			break;
 		}
 	} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0);
+
+	udc_dwc3_uvcmgr_resume_doorbell(uvcmgr_paused);
+	irq_unlock(key);
 
 	switch (reg & UDC_DWC3_DEPCMD_STATUS_MASK) {
 	case UDC_DWC3_DEPCMD_STATUS_OK:
