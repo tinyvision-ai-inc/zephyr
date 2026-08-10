@@ -78,6 +78,27 @@ config UDC_DWC3_IN_COMPLETION_POLL
 	  been clear for a grace interval.  Limited to
 	  UDC_DWC3_IN_RECOVER_EP_MASK.
 
+config UDC_DWC3_OUT_COMPLETION_POLL
+	bool "Poll for dropped OUT completions"
+	help
+	  Mirror of UDC_DWC3_IN_COMPLETION_POLL for CPU-managed bulk OUT.
+	  Under Soft-IP isochronous UVC the controller clears HWO on a CDC OUT
+	  TRB without posting a DEPEVT, so the received packet is never handed
+	  to the class.  The slot is only retired when the next OUT completes,
+	  which leaves the pipe permanently one transfer behind: the host times
+	  out waiting for its reply and then receives the previous one.  When
+	  enabled, each event-thread wake retires waiting OUT slots whose HWO
+	  has been clear for a grace interval.
+
+config UDC_DWC3_OUT_COMPLETION_POLL_TICKS
+	int "Grace event-thread wakes before retiring an OUT completion"
+	default 8
+	depends on UDC_DWC3_OUT_COMPLETION_POLL
+	help
+	  Wakes of the 100 ms event-thread timeout that HWO must stay clear
+	  before a software retire.  Too short races a live DEPEVT and desyncs
+	  the ring, which is the same trade-off tuned for the IN poll.
+
 config UDC_DWC3_IN_PARK_RECOVER
 	bool "Recover an IN endpoint whose armed TRB is never fetched"
 	help
@@ -104,5 +125,29 @@ config UDC_DWC3_IN_START_ENDXFER_ESCALATE
 	  and re-Start the same still-owned tail TRB.  Ring head/tail are
 	  left intact so the class completion path stays in sync.  Do not
 	  use the ordinary DepEndXfer helper (it zeroes the ring).
+
+config UDC_DWC3_OUT_NOTREADY_RETAKE
+	bool "Retake bulk OUT on XferNotReady (armed TRB ignored)"
+	help
+	  Enable XferNotReady events on bulk OUT endpoints.  When one arrives
+	  while the tail TRB is armed and HWO, the StartXfer doorbell was
+	  dropped: EndXfer(ForceRM)+StartXfer retakes the resource without
+	  clearing the ring.  Without this, host Write timeout on ACM OUT
+	  under UVC can wedge the host xHCI controller.
+
+config UDC_DWC3_OUT_STALL_REFRESH
+	bool "Refresh/retake a stalled bulk OUT (timer backstop)"
+	depends on UDC_DWC3_OUT_NOTREADY_RETAKE
+	help
+	  Soft-IP often never posts XferNotReady for a wedged ACM OUT.  Every
+	  UDC_DWC3_OUT_STALL_REFRESH_MS, UpdateXfer the armed OUT tail; after a
+	  few no-progress refreshes, EndXfer(ForceRM)+StartXfer.  UpdateXfer is
+	  a no-op on a healthy idle OUT; recycle only runs after the pipe has
+	  been stuck for multiple intervals (same trade-off as dual soak).
+
+config UDC_DWC3_OUT_STALL_REFRESH_MS
+	int "OUT stall observation window (ms)"
+	default 250
+	depends on UDC_DWC3_OUT_STALL_REFRESH
 
 endif # UDC_DWC3
