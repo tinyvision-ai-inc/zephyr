@@ -32,27 +32,11 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
-config UDC_DWC3_HEALTH_LOG
-	bool "Periodic USB health / buffer-leak logging"
-	select NET_BUF_POOL_USAGE
+config UDC_DWC3_SHELL
+	bool "Debug shell for inspecting DWC3 internals"
+	depends on SHELL
 	help
-	  Periodically log DWC3 driver health: IRQ/event counters, control
-	  endpoint busy state, and the usage of every net_buf pool (how many
-	  buffers are currently claimed vs the maximum ever claimed).
-
-	  This is a debugging aid to track down net_buf leaks that slowly
-	  exhaust a pool and cause the host to re-enumerate the device after
-	  it has been idle, without any processor crash. Watch the per-pool
-	  "used" count: a pool whose "used" only ever grows (and never returns
-	  toward 0 when the bus is idle) is the leaking pool.
-
-	  The same data can be dumped on demand with `tvai_dwc3 mem <device>`.
-
-config UDC_DWC3_HEALTH_LOG_INTERVAL_MS
-	int "Interval between periodic USB health logs (ms)"
-	default 5000
-	depends on UDC_DWC3_HEALTH_LOG
-	help
-	  How often the periodic health snapshot is emitted, in milliseconds.
+	  Enable debug shell commands for debugging DWC3 and USB low-level access, such as
+	  inspecting the list of ongoing transactions.
 
 endif # UDC_DWC3
