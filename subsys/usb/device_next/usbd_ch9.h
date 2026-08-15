@@ -148,5 +148,9 @@ int usbd_handle_ctrl_xfer(struct usbd_context *uds_ctx,
  */
 int usbd_init_control_pipe(struct usbd_context *uds_ctx, bool enqueue_setup);
 
+/**
+ * TODO: write the doc
+ */
+int usbd_enqueue_setup(struct usbd_context *const uds_ctx);
 
 #endif /* ZEPHYR_INCLUDE_USBD_CH9_H */

@@ -200,6 +200,10 @@ static ALWAYS_INLINE void usbd_event_handler(struct usbd_context *const uds_ctx,
 		err = event_handler_bus_reset(uds_ctx);
 		usbd_msg_pub_simple(uds_ctx, USBD_MSG_RESET, 0);
 		break;
+	case UDC_EVT_NEW_SETUP:
+		LOG_DBG("NEW_SETUP event");
+		err = usbd_enqueue_setup(uds_ctx);
+		break;
 	case UDC_EVT_ERROR:
 		LOG_ERR("UDC error event");
 		usbd_msg_pub_simple(uds_ctx, USBD_MSG_UDC_ERROR, event->status);

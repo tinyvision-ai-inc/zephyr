@@ -113,6 +113,8 @@ void udc_ep_cancel_queued(const struct device *dev, struct udc_ep_config *const 
 	for (buf = udc_buf_get(cfg); buf; buf = udc_buf_get(cfg)) {
 		udc_submit_ep_event(dev, buf, -ECONNABORTED);
 	}
+	/* Ask the stack for a new setup packet after everything was canceled */
+	udc_submit_event(dev, UDC_EVT_NEW_SETUP, 0);
 }
 
 void udc_setup_received(const struct device *dev, const void *const setup)

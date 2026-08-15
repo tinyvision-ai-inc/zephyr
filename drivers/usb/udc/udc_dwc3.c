@@ -551,7 +551,7 @@ struct udc_dwc3_ep_data {
 	/* Index of the next TRB to receive data in the TRB ring, Link TRB excluded */
 	uint32_t head;
 	uint32_t tail;
-	/* A flag to tell when the ring buffer is full */
+	/* When the TRB ring buffer is full */
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
@@ -578,6 +578,11 @@ struct udc_dwc3_data {
 #endif
 	/* Next expected control transfer */
 	atomic_t expected_xfer;
+	/* Cached TRBs to recover from corrputed TRBs */
+	struct udc_dwc3_trb trb_cache_in[2];
+	struct udc_dwc3_trb trb_cache_out[1];
+	/* Cache that is always up to date (before stack could get time to react) */
+	struct usb_setup_packet setup_packet;
 };
 
 /*
@@ -594,10 +599,8 @@ enum {
  */
  enum {
 	UDC_DWC3_CTRL_SETUP = 1,
-	UDC_DWC3_CTRL_DATA_IN,
-	UDC_DWC3_CTRL_STATUS_IN,
-	UDC_DWC3_CTRL_DATA_OUT,
-	UDC_DWC3_CTRL_STATUS_OUT,
+	UDC_DWC3_CTRL_IN,
+	UDC_DWC3_CTRL_OUT,
 };
 
 /*
@@ -649,6 +652,9 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
 #endif
+
+static void udc_dwc3_dump_trb(const struct device *dev, struct udc_dwc3_ep_data *ep_data,
+			      const struct shell *sh);
 
 /* Shut down the controller completely  */
 static int udc_dwc3_shutdown(const struct device *const dev)
@@ -975,11 +981,14 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	trb[0].addr_lo = LO32((uintptr_t)buf->data);
 	trb[0].addr_hi = HI32((uintptr_t)buf->data);
 	trb[0].status = buf->size;
 	trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+
+	memcpy(priv->trb_cache_out, &trb[0], sizeof(priv->trb_cache_out));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
@@ -989,6 +998,7 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 				 const uint32_t ctrl)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 
@@ -1008,6 +1018,8 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 		trb[0].status = buf->len;
 		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	}
+
+	memcpy(priv->trb_cache_in, &trb[0], sizeof(priv->trb_cache_in));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
@@ -1062,24 +1074,23 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 static void udc_dwc3_ctrl_next_in(const struct device *const dev,
 				  struct net_buf *const buf)
 {
-	struct udc_data *const data = dev->data;
-	const struct usb_setup_packet *const setup = (void *)data->setup;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const struct usb_setup_packet *const setup = &priv->setup_packet;
 	const struct udc_buf_info bi = *udc_get_buf_info(buf);
 
 	if (bi.data) {
 		LOG_DBG("TRB_CONTROL_IN_DATA len %d, data %p", buf->len, (void *)buf->data);
-		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_IN);
+		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status && setup->wLength == 0) {
 		buf->size = 0;
 		LOG_DBG("TRB_CONTROL_IN_STATUS_2 len %d, data %p", buf->len, (void *)buf->data);
-		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_IN);
+		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
 	} else if (bi.status) {
 		buf->size = 0;
 		LOG_DBG("TRB_CONTROL_IN_STATUS_3 len %d, data %p", buf->len, (void *)buf->data);
-		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_IN);
+		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 	} else {
 		LOG_ERR("Unknown buffer IN type");
@@ -1099,12 +1110,12 @@ static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 	} else if (bi.data) {
 		LOG_DBG("TRB_CONTROL_OUT_DATA size %d, data %p", buf->size, (void *)buf->data);
-		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_OUT);
+		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status) {
 		buf->size = 0;
 		LOG_DBG("TRB_CONTROL_OUT_STATUS_3 size %d, data %p", buf->size, (void *)buf->data);
-		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_OUT);
+		atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 	} else {
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
@@ -1147,19 +1158,61 @@ static void udc_dwc3_ctrl_next(const struct device *const dev)
 	if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_SETUP)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_out[0]);
 
-	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_IN)) {
+	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_in[0]);
-	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_IN)) {
+	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_in[0]);
 
-	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_OUT)) {
+	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_out[0]);
-	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_OUT)) {
+	} else if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_out[0]);
 
 	} else {
 		LOG_INF("No XferNotReady event yet, waiting");
 	}
+}
+
+#include "../../subsys/usb/device_next/usbd_ch9.h"
+
+static int udc_dwc3_ep_dequeue(const struct device *const dev,
+			       struct udc_ep_config *const ep_cfg);
+static int udc_dwc3_disable(const struct device *const dev);
+static int udc_dwc3_enable(const struct device *const dev);
+static int udc_dwc3_ep_enable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
+static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
+
+static int udc_dwc3_recover(const struct device *dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	LOG_WRN("CTRL IN:");
+	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
+	LOG_WRN("CTRL OUT:");
+	udc_dwc3_dump_trb(dev, &cfg->ep_data_out[0], NULL);
+
+	LOG_WRN("Recovering USB state");
+
+	udc_dwc3_disable(dev);
+
+	udc_dwc3_ep_disable(dev, &cfg->ep_data_in[0].cfg);
+	udc_dwc3_ep_enable(dev, &cfg->ep_data_in[0].cfg);
+
+	udc_dwc3_ep_disable(dev, &cfg->ep_data_out[0].cfg);
+	udc_dwc3_ep_enable(dev, &cfg->ep_data_out[0].cfg);
+
+	udc_ep_set_busy(&cfg->ep_data_in[0].cfg, false);
+	udc_ep_set_busy(&cfg->ep_data_out[0].cfg, false);
+
+	k_sleep(K_MSEC(100));
+
+	/* Ask the stack for a new setup packet */
+	udc_submit_event(dev, UDC_EVT_NEW_SETUP, 0);
+
+	udc_dwc3_enable(dev);
+
+	return 0;
 }
 
 /*
@@ -1343,20 +1396,22 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
-	const uint32_t trb_trbctl = ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uint32_t trb_trbctl = priv->trb_cache_in->ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
-	struct udc_buf_info bi;
+	int ret;
 
 	buf = udc_buf_get(&ep_data->cfg);
 	if (buf == NULL) {
 		LOG_ERR("Missing buffer submitted for ep 0x%02X", ep_data->cfg.addr);
+		ret = udc_dwc3_recover(dev);
 		return;
 	}
 
-	bi = *udc_get_buf_info(buf);
-
-	LOG_DBG("%u:%u:%u", bi.setup, bi.data, bi.status);
+	LOG_DBG("%u:%u:%u",
+		udc_get_buf_info(buf)->setup,
+		udc_get_buf_info(buf)->data,
+		udc_get_buf_info(buf)->status);
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
@@ -1372,6 +1427,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
+	memset(priv->trb_cache_in, 0x00, sizeof(priv->trb_cache_in));
 
 	udc_submit_ep_event(dev, buf, 0);
 
@@ -1393,41 +1449,39 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const uint32_t trb_trbctl = ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
-	const uint32_t trb_status = ep_data->trb_buf[0].status;
+	//const uint32_t trb_status = ep_data->trb_buf[0].status;
 	struct udc_buf_info bi;
 	struct net_buf *buf;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
-		struct usb_setup_packet *setup_packet;
-
 		buf = udc_buf_peek(&ep_data->cfg);
 		if (buf == NULL) {
 			LOG_ERR("Missing buffer for ep 0x%02X", ep_data->cfg.addr);
 			return;
 		}
 
-		setup_packet = (void *)buf->data;
-
 		/* Update the size to the setup packet size */
-		if (buf->size < sizeof(*setup_packet)) {
+		if (buf->size < sizeof(priv->setup_packet)) {
 			LOG_ERR("Invalid size for setup packet buffer: %u", buf->size);
 			udc_submit_ep_event(dev, buf, -ENOBUFS);
 			return;
 		}
 
+		memcpy(&priv->setup_packet, buf->data, sizeof(priv->setup_packet));
 		buf->len = 0;
 
 		/* Latency optimization: set the address immediately to be able to be able
 		 * to ACK/NAK the first packets from the host with the new address,
 		 * otherwise the host issue a reset.
 		 */
-		if (setup_packet->bmRequestType == USB_REQTYPE_TYPE_STANDARD &&
-		    setup_packet->bRequest == USB_SREQ_SET_ADDRESS) {
-			udc_dwc3_set_address(dev, sys_le16_to_cpu(setup_packet->wValue));
+		if (priv->setup_packet.bmRequestType == USB_REQTYPE_TYPE_STANDARD &&
+		    priv->setup_packet.bRequest == USB_SREQ_SET_ADDRESS) {
+			udc_dwc3_set_address(dev, sys_le16_to_cpu(priv->setup_packet.wValue));
 		}
 
-		LOG_HEXDUMP_DBG(setup_packet, sizeof(*setup_packet), "Submitting SETUP");
-		udc_setup_received(dev, setup_packet);
+		LOG_HEXDUMP_DBG(&priv->setup_packet, sizeof(priv->setup_packet),
+			"Submitting SETUP");
+		udc_setup_received(dev, &priv->setup_packet);
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
 		if (buf == NULL) {
@@ -1437,7 +1491,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		}
 
 		/* Update the size to what the hardware reports */
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		buf->len = priv->setup_packet.wLength;
 
 		if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 			LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA received");
@@ -1453,6 +1507,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
+	memset(priv->trb_cache_out, 0x00, sizeof(priv->trb_cache_out));
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
@@ -1471,11 +1526,11 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 		break;
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA:
 		LOG_DBG("UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA (IN)");
-		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_IN);
+		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		break;
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS:
 		LOG_DBG("UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS (IN)");
-		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_IN);
+		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		break;
 	}
 
@@ -1492,11 +1547,11 @@ static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const
 		break;
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA:
 		LOG_DBG("UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA (OUT)");
-		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_DATA_OUT);
+		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		break;
 	case UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS:
 		LOG_DBG("UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS (OUT)");
-		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_STATUS_OUT);
+		atomic_set_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		break;
 	}
 
@@ -1717,7 +1772,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
 
-	LOG_WRN("=== %s ===", udc_dwc3_get_event_name(evt, dsts));
+	LOG_INF("=== %s ===", udc_dwc3_get_event_name(evt, dsts));
 
 	switch (evt & UDC_DWC3_EVT_MASK) {
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
@@ -1761,7 +1816,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		CODE_UNREACHABLE;
 	}
 
-	LOG_WRN("=== done ===");
+	LOG_INF("=== done ===");
 }
 
 static void udc_dwc3_event_worker(struct k_work *work)
@@ -2689,7 +2744,7 @@ static void udc_dwc3_dump_events(const struct device *dev, const struct shell *s
 }
 
 static void udc_dwc3_dump_trb(const struct device *dev, struct udc_dwc3_ep_data *ep_data,
-		     const struct shell *sh)
+			      const struct shell *sh)
 {
 	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
 		struct udc_dwc3_trb trb = ep_data->trb_buf[i];
@@ -2709,11 +2764,17 @@ static void udc_dwc3_dump_trb(const struct device *dev, struct udc_dwc3_ep_data 
 		char *tail = (i == ep_data->tail) ? " <TAIL" : "";
 		char *full = (i == ep_data->head && ep_data->full) ? " <FULL" : "";
 
-		shell_print(sh, "%p ep=0x%02x addr=0x%08x%08x ctl=%u sts=%u hwo=%u lst=%u chn=%u"
-			" csp=%u isp=%u ioc=%u spr=%u pcm1=%u sof=%u bufsiz=%u%s%s%s",
-			&ep_data->trb_buf[i], ep_data->cfg.addr, trb.addr_hi, trb.addr_lo, trbctl,
-			trbsts, hwo, lst, chn, csp, isp, ioc, spr, pcm1, sidsofn, bufsiz, head,
-			tail, full);
+#define FMT	"%p ep=0x%02x addr=0x%08x%08x ctl=%u sts=%u hwo=%u lst=%u chn=%u" \
+		" csp=%u isp=%u ioc=%u spr=%u pcm1=%u sof=%u bufsiz=%u%s%s%s"
+
+#define ARGS	&ep_data->trb_buf[i], ep_data->cfg.addr, trb.addr_hi, trb.addr_lo, trbctl, trbsts, \
+		hwo, lst, chn, csp, isp, ioc, spr, pcm1, sidsofn, bufsiz, head, tail, full
+
+		if (sh == NULL) {
+			LOG_WRN(FMT, ARGS);
+		} else {
+			shell_print(sh, FMT, ARGS);
+		}
 	}
 }
 
@@ -2862,30 +2923,11 @@ static void udc_dwc3_cmd_end_ctrl_out(const struct device *dev, const struct she
 
 static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *sh)
 {
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct net_buf *buf;
 	int ret;
 
-	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-
-	udc_ep_set_busy(&cfg->ep_data_in[0].cfg, false);
-	udc_ep_set_busy(&cfg->ep_data_out[0].cfg, false);
-
-	k_sleep(K_MSEC(100));
-
-	udc_dwc3_disable(dev);
-	udc_dwc3_enable(dev);
-
-	buf = udc_ctrl_setup_alloc(dev);
-	if (buf == NULL) {
-		shell_error(sh, "Failed to allocate a buffer");
-		return;
-	}
-
-	ret = udc_ep_enqueue(dev, buf);
+	ret = udc_dwc3_recover(dev);
 	if (ret != 0) {
-		shell_error(sh, "Failed to enqueue buffer %p: %s", buf, strerror(-ret));
+		shell_error(sh, "Failed to reinit USB: %d", ret);
 	}
 }
 

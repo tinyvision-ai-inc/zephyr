@@ -150,6 +150,8 @@ enum udc_event_type {
 	UDC_EVT_SOF,
 	/** Endpoint request result event */
 	UDC_EVT_EP_REQUEST,
+	/** Ask a new setup transfer from the USB stack */
+	UDC_EVT_NEW_SETUP,
 	/**
 	 * Non-correctable error event, requires attention from higher
 	 * levels or application.
