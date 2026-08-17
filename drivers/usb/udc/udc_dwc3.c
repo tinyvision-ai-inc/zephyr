@@ -582,6 +582,9 @@ struct udc_dwc3_data {
 #endif
 	/* Next expected control transfer */
 	atomic_t expected_xfer;
+	/* Updated whenever a packet is submitted */
+	uint32_t last_xfer_type;
+	uint8_t last_xfer_dir;
 	/* Cached TRBs to recover from corrputed TRBs */
 	struct udc_dwc3_trb trb_cache_in[2];
 	struct udc_dwc3_trb trb_cache_out[1];
@@ -987,12 +990,15 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
+	priv->last_xfer_type = ctrl;
+	priv->last_xfer_dir = USB_EP_DIR_OUT;
+
 	trb[0].addr_lo = LO32((uintptr_t)buf->data);
 	trb[0].addr_hi = HI32((uintptr_t)buf->data);
 	trb[0].status = buf->size;
 	trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 
-	memcpy(priv->trb_cache_out, &trb[0], sizeof(priv->trb_cache_out));
+	memcpy(&priv->trb_cache_out[0], (void *)&trb[0], sizeof(priv->trb_cache_out[0]));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
@@ -1005,6 +1011,9 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
+
+	priv->last_xfer_type = ctrl;
+	priv->last_xfer_dir = USB_EP_DIR_IN;
 
 	if (udc_ep_buf_has_zlp(buf)) {
 		trb[0].addr_lo = LO32((uintptr_t)buf->data);
@@ -1023,7 +1032,7 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	}
 
-	memcpy(priv->trb_cache_in, &trb[0], sizeof(priv->trb_cache_in));
+	memcpy(&priv->trb_cache_in[0], (void *)&trb[0], sizeof(priv->trb_cache_in[0]));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 }
@@ -1032,6 +1041,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
 
 	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
@@ -1052,6 +1062,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	udc_ep_set_busy(&ep_data->cfg, true);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 
+	priv->last_xfer_type = ctrl;
 	return 0;
 }
 
@@ -1154,6 +1165,36 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	}
 }
 
+static void udc_dwc3_ctrl_get_next_type(const struct device *const dev,
+					uint8_t *dir, uint8_t *type)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
+		if (priv->setup_packet.wLength == 0) {
+			*dir = USB_EP_DIR_IN;
+			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2;
+		} else if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_DEVICE) {
+			*dir = USB_EP_DIR_OUT;
+			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA;
+		} else if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_HOST) {
+			*dir = USB_EP_DIR_IN;
+			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA;
+		}
+	} else if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
+		if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_DEVICE) {
+			*dir = USB_EP_DIR_IN;
+			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
+		} else {
+			*dir = USB_EP_DIR_OUT;
+			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
+		}
+	} else if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
+		*dir = USB_EP_DIR_OUT;
+		*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP;
+	}
+}
+
 static void udc_dwc3_ctrl_next(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
@@ -1191,6 +1232,8 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 static int udc_dwc3_recover(const struct device *dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
 	LOG_WRN("CTRL IN:");
 	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
 	LOG_WRN("CTRL OUT:");
@@ -1199,8 +1242,6 @@ static int udc_dwc3_recover(const struct device *dev)
 	LOG_WRN("Recovering USB state");
 
 #if 0
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
 	/* This did not work well */
 	priv->evt_next = 0;
 	udc_dwc3_disable(dev);
@@ -1210,6 +1251,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	return 0;
 #endif
 
+#if 0
 	udc_dwc3_ep_disable(dev, &cfg->ep_data_in[0].cfg);
 	udc_dwc3_ep_enable(dev, &cfg->ep_data_in[0].cfg);
 
@@ -1228,6 +1270,29 @@ static int udc_dwc3_recover(const struct device *dev)
 	 */
 
 	udc_dwc3_enable(dev);
+#endif
+
+	//uint8_t dir = 0;
+	//uint8_t type = 0;
+	//udc_dwc3_ctrl_get_next_type(dev, &dir, &type);
+
+	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+
+		LOG_INF("TRB_CONTROL_IN_<%d>", priv->last_xfer_type);
+		udc_dwc3_trb_ctrl_in(dev, udc_buf_peek(&cfg->ep_data_in[0].cfg),
+				priv->last_xfer_type);
+
+	} else if (priv->last_xfer_dir == USB_EP_DIR_OUT) {
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+
+		LOG_INF("TRB_CONTROL_OUT_<%d>", priv->last_xfer_type);
+		udc_dwc3_trb_ctrl_out(dev, udc_buf_peek(&cfg->ep_data_out[0].cfg),
+				priv->last_xfer_type);
+	} else {
+		LOG_ERR("unknown current endpoint direction");
+		return -EIO;
+	}
 
 	return 0;
 }
@@ -1413,14 +1478,13 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = priv->trb_cache_in->ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	const uint32_t trb_trbctl = priv->trb_cache_in[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 	int ret;
 
 	buf = udc_buf_get(&ep_data->cfg);
 	if (buf == NULL) {
 		LOG_ERR("Missing buffer submitted for ep 0x%02X", ep_data->cfg.addr);
-		ret = udc_dwc3_recover(dev);
 		return;
 	}
 
@@ -1443,7 +1507,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
-	memset(priv->trb_cache_in, 0x00, sizeof(priv->trb_cache_in));
+	memset(&priv->trb_cache_in[0], 0x00, sizeof(priv->trb_cache_in[0]));
 
 	udc_submit_ep_event(dev, buf, 0);
 
@@ -1464,8 +1528,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
-	//const uint32_t trb_status = ep_data->trb_buf[0].status;
+	const uint32_t trb_trbctl = priv->trb_cache_out[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	//const uint32_t trb_status = priv->trb_cache_out[0].status;
 	struct udc_buf_info bi;
 	struct net_buf *buf;
 
@@ -1523,7 +1587,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
-	memset(priv->trb_cache_out, 0x00, sizeof(priv->trb_cache_out));
+	memset(&priv->trb_cache_out[0], 0x00, sizeof(priv->trb_cache_out[0]));
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
@@ -3059,7 +3123,7 @@ static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *s
 
 	ret = udc_dwc3_recover(dev);
 	if (ret != 0) {
-		shell_error(sh, "Failed to reinit USB: %d", ret);
+		shell_error(sh, "Failed to recover USB state: %d", ret);
 	}
 }
 static int cmd_dwc3_recover(const struct shell *sh, size_t argc, char **argv)
