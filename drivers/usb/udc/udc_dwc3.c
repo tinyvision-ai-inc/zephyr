@@ -236,6 +236,10 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GCTL_CORESOFTRESET				BIT(11)
 #define UDC_DWC3_GCTL_DEBUGATTACH				BIT(8)
 #define UDC_DWC3_GCTL_RAMCLKSEL_MASK				GENMASK(7, 6)
+#define UDC_DWC3_GCTL_RAMCLKSEL_BUS_CLK				(0x00 << 6)
+#define UDC_DWC3_GCTL_RAMCLKSEL_PIPE_CLK			(0x01 << 6)
+#define UDC_DWC3_GCTL_RAMCLKSEL_PIPE_DIV2_CLK			(0x02 << 6)
+#define UDC_DWC3_GCTL_RAMCLKSEL_MAC2_CLK			(0x03 << 6)
 #define UDC_DWC3_GCTL_SCALEDOWN_MASK				GENMASK(5, 4)
 #define UDC_DWC3_GCTL_DISSCRAMBLE				BIT(3)
 #define UDC_DWC3_GCTL_DSBLCLKGTNG				BIT(0)
@@ -1179,14 +1183,14 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg);
 static int udc_dwc3_disable(const struct device *const dev);
 static int udc_dwc3_enable(const struct device *const dev);
+static int udc_dwc3_init(const struct device *const dev);
+static int udc_dwc3_shutdown(const struct device *const dev);
 static int udc_dwc3_ep_enable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
 static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
 
 static int udc_dwc3_recover(const struct device *dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
 	LOG_WRN("CTRL IN:");
 	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
 	LOG_WRN("CTRL OUT:");
@@ -1194,7 +1198,17 @@ static int udc_dwc3_recover(const struct device *dev)
 
 	LOG_WRN("Recovering USB state");
 
+#if 0
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	/* This did not work well */
+	priv->evt_next = 0;
 	udc_dwc3_disable(dev);
+	udc_dwc3_shutdown(dev);
+	udc_dwc3_init(dev);
+	udc_dwc3_enable(dev);
+	return 0;
+#endif
 
 	udc_dwc3_ep_disable(dev, &cfg->ep_data_in[0].cfg);
 	udc_dwc3_ep_enable(dev, &cfg->ep_data_in[0].cfg);
@@ -1208,7 +1222,10 @@ static int udc_dwc3_recover(const struct device *dev)
 	k_sleep(K_MSEC(100));
 
 	/* Ask the stack for a new setup packet */
-	udc_submit_event(dev, UDC_EVT_NEW_SETUP, 0);
+	//udc_submit_event(dev, UDC_EVT_NEW_SETUP, 0);
+	/* TODO: send the correct next packet in the sequence instead: needs refactoring the
+	 * driver for this.
+	 */
 
 	udc_dwc3_enable(dev);
 
@@ -1239,13 +1256,14 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	}
 
 	/* Enable AXI64 bursts for various sizes expected */
-	reg = UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR128BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR64BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR32BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR16BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR8BRSTENA;
-	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
+	//reg = UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR128BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR64BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR32BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR16BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR8BRSTENA;
+	//reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
+	reg = 0;
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
 
 	/* Letting GTXTHRCFG and GRXTHRCFG unchanged */
@@ -1268,8 +1286,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	sys_write32(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t), base + UDC_DWC3_GEVNTSIZ(0));
 	LOG_INF("Event buffer size is %u bytes", sys_read32(base + UDC_DWC3_GEVNTSIZ(0)));
 	sys_write32(0, base + UDC_DWC3_GEVNTCOUNT(0));
-
-	/* Letting GCTL unchanged */
 
 	reg = sys_read32(base + UDC_DWC3_GUCTL2);
 	reg |= UDC_DWC3_GUCTL2_RST_ACTBITLATER;
@@ -1297,7 +1313,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/* Set the number of USB3 packets the device can receive at once */
 	reg = sys_read32(base + UDC_DWC3_DCFG);
 	reg &= ~UDC_DWC3_DCFG_NUMP_MASK;
-	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 15);
+	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
 	/* Enable reception of all USB events except UDC_DWC3_DEVTEN_ULSTCNGEN */
@@ -1812,7 +1828,10 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		LOG_ERR("Event overflow");
 		break;
 	default:
-		LOG_ERR("unknown event: 0x%x", evt);
+		LOG_ERR("unknown event: 0x%x (%u out of %u)",
+			evt,
+			sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)),
+			CONFIG_UDC_DWC3_EVENTS_NUM);
 		CODE_UNREACHABLE;
 	}
 
@@ -1927,6 +1946,12 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 			break;
 		}
 
+		LOG_INF("Requeueing buffer %p %d:%d:%d",
+			buf,
+			udc_get_buf_info(buf)->setup,
+			udc_get_buf_info(buf)->data,
+			udc_get_buf_info(buf)->status);
+
 		ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
 		if (ret != 0) {
 			return ret;
@@ -1981,6 +2006,12 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 	for (int n = 0; n <= last_num; n++) {
 		buf = ep_data->net_buf[ep_data->head];
 		if (buf != NULL) {
+			LOG_INF("Popping buffer %p %d:%d:%d",
+				buf,
+				udc_get_buf_info(buf)->setup,
+				udc_get_buf_info(buf)->data,
+				udc_get_buf_info(buf)->status);
+
 			k_fifo_put(&ep_data->requeue_fifo, buf);
 		}
 
@@ -2110,10 +2141,13 @@ static int udc_dwc3_enable(const struct device *const dev)
 static int udc_dwc3_disable(const struct device *const dev)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const struct udc_dwc3_config *const cfg = dev->config;
 
 	LOG_DBG("Disabling DWC3 driver");
 
 	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+
+	cfg->irq_disable_func();
 
 	return 0;
 }
@@ -2143,6 +2177,14 @@ static int udc_dwc3_init(const struct device *const dev)
 
 	/* Teriminate the reset of the DWC3 core after it */
 	sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+
+	//reg = sys_read32(base + UDC_DWC3_GCTL);
+	//reg &= ~UDC_DWC3_GCTL_RAMCLKSEL_MASK;
+	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_BUS_CLK;
+	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_PIPE_CLK;
+	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_PIPE_DIV2_CLK;
+	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_MAC2_CLK;
+	//sys_write32(reg, base + UDC_DWC3_GCTL);
 
 	/* The USB core was reset, configure it as documented */
 	udc_dwc3_on_soft_reset(dev);
@@ -2879,58 +2921,6 @@ static void udc_dwc3_dump_all(const struct device *dev, const struct shell *sh)
 	shell_print(sh, "");
 }
 
-static void udc_dwc3_cmd_trb_ctrl_in(const struct device *dev, const struct shell *sh)
-{
-	struct net_buf *buf;
-
-	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3");
-
-	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_IN, 128);
-	if (buf == NULL) {
-		shell_error(sh, "Failed to allocate a buffer");
-	}
-
-	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
-}
-
-static void udc_dwc3_cmd_trb_ctrl_out(const struct device *dev, const struct shell *sh)
-{
-	struct net_buf *buf;
-
-	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3");
-
-	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 128);
-	if (buf == NULL) {
-		shell_error(sh, "Failed to allocate a buffer");
-	}
-
-	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
-}
-
-static void udc_dwc3_cmd_end_ctrl_in(const struct device *dev, const struct shell *sh)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-}
-
-static void udc_dwc3_cmd_end_ctrl_out(const struct device *dev, const struct shell *sh)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-}
-
-static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *sh)
-{
-	int ret;
-
-	ret = udc_dwc3_recover(dev);
-	if (ret != 0) {
-		shell_error(sh, "Failed to reinit USB: %d", ret);
-	}
-}
-
 static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
 			     void (*fn)(const struct device *, const struct shell *sh))
 {
@@ -2946,6 +2936,135 @@ static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
 
 	(*fn)(dev, sh);
 	return 0;
+}
+
+static void udc_dwc3_cmd_trb_ctrl_status_in(const struct device *dev, const struct shell *sh)
+{
+	struct net_buf *buf;
+
+	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3 IN");
+
+	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_IN, 128);
+	if (buf == NULL) {
+		shell_error(sh, "Failed to allocate a buffer");
+	}
+
+	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+}
+static int cmd_dwc3_trb_ctrl_status_in(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_status_in);
+}
+
+static void udc_dwc3_cmd_trb_ctrl_status_out(const struct device *dev, const struct shell *sh)
+{
+	struct net_buf *buf;
+
+	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3 OUT");
+
+	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 128);
+	if (buf == NULL) {
+		shell_error(sh, "Failed to allocate a buffer");
+	}
+
+	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+}
+static int cmd_dwc3_trb_ctrl_status_out(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_status_out);
+}
+
+static void udc_dwc3_cmd_trb_ctrl_data_out(const struct device *dev, const struct shell *sh)
+{
+	struct net_buf *buf;
+
+	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA OUT");
+
+	/* 512 is wMaxPacketSize0 for USB3 */
+	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 512);
+	if (buf == NULL) {
+		shell_error(sh, "Failed to allocate a buffer");
+	}
+
+	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+}
+static int cmd_dwc3_trb_ctrl_data_out(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_data_out);
+}
+
+static void udc_dwc3_cmd_trb_ctrl_data_in(const struct device *dev, const struct shell *sh)
+{
+	struct net_buf *buf;
+
+	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA IN");
+
+	/* 512 is wMaxPacketSize0 for USB3 */
+	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_IN, 512);
+	if (buf == NULL) {
+		shell_error(sh, "Failed to allocate a buffer");
+	}
+
+	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+}
+static int cmd_dwc3_trb_ctrl_data_in(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_data_in);
+}
+
+static void udc_dwc3_cmd_trb_ctrl_setup(const struct device *dev, const struct shell *sh)
+{
+	struct net_buf *buf;
+
+	shell_print(sh, "New UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP (OUT)");
+
+	/* 512 is wMaxPacketSize0 for USB3 */
+	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 512);
+	if (buf == NULL) {
+		shell_error(sh, "Failed to allocate a buffer");
+	}
+
+	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+}
+static int cmd_dwc3_trb_ctrl_setup(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_setup);
+}
+
+static void udc_dwc3_cmd_end_ctrl_in(const struct device *dev, const struct shell *sh)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], 0);
+}
+static int cmd_dwc3_end_ctrl_in(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_end_ctrl_in);
+}
+
+static void udc_dwc3_cmd_end_ctrl_out(const struct device *dev, const struct shell *sh)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+}
+static int cmd_dwc3_end_ctrl_out(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_end_ctrl_out);
+}
+
+static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *sh)
+{
+	int ret;
+
+	ret = udc_dwc3_recover(dev);
+	if (ret != 0) {
+		shell_error(sh, "Failed to reinit USB: %d", ret);
+	}
+}
+static int cmd_dwc3_recover(const struct shell *sh, size_t argc, char **argv)
+{
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_recover);
 }
 
 static void device_name_get(size_t idx, struct shell_static_entry *entry)
@@ -2994,31 +3113,6 @@ static int cmd_dwc3_all(const struct shell *sh, size_t argc, char **argv)
 	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_dump_all);
 }
 
-static int cmd_dwc3_trb_ctrl_in(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_in);
-}
-
-static int cmd_dwc3_trb_ctrl_out(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_trb_ctrl_out);
-}
-
-static int cmd_dwc3_end_ctrl_in(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_end_ctrl_in);
-}
-
-static int cmd_dwc3_end_ctrl_out(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_end_ctrl_out);
-}
-
-static int cmd_dwc3_recover(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_recover);
-}
-
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_dwc3,
 	SHELL_CMD_ARG(trb, &dsub_device_name,
 		      "Dump an endpoint's TRB buffer\nUsage: trb <device>",
@@ -3041,12 +3135,21 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_dwc3,
 	SHELL_CMD_ARG(all, &dsub_device_name,
 		      "Dump everything\nUsage: all <device>",
 		      cmd_dwc3_all, 2, 0),
-	SHELL_CMD_ARG(trb_ctrl_in, &dsub_device_name,
-		      "Send a TRB for the CTRL IN endpoint\nUsage: trb_ctrl_in <device>",
-		      cmd_dwc3_trb_ctrl_in, 2, 0),
-	SHELL_CMD_ARG(trb_ctrl_out, &dsub_device_name,
-		      "Send a TRB for the CTRL OUT endpoint\nUsage: trb_ctrl_out <device>",
-		      cmd_dwc3_trb_ctrl_out, 2, 0),
+	SHELL_CMD_ARG(trb_ctrl_setup, &dsub_device_name,
+		      "Send a SETUP TRB to the CTRL OUT endpoint\nUsage: trb_ctrl_setup <device>",
+		      cmd_dwc3_trb_ctrl_setup, 2, 0),
+	SHELL_CMD_ARG(trb_ctrl_data_in, &dsub_device_name,
+		      "Send a DATA TRB to the CTRL IN endpoint\nUsage: trb_ctrl_data_in <device>",
+		      cmd_dwc3_trb_ctrl_data_in, 2, 0),
+	SHELL_CMD_ARG(trb_ctrl_data_out, &dsub_device_name,
+		      "Send a DATA TRB to the CTRL OUT endpoint\nUsage: trb_ctrl_data_out <device>",
+		      cmd_dwc3_trb_ctrl_data_out, 2, 0),
+	SHELL_CMD_ARG(trb_ctrl_status_in, &dsub_device_name,
+		      "Send a STATUS TRB to the CTRL IN endpoint\nUsage: trb_ctrl_status_in <device>",
+		      cmd_dwc3_trb_ctrl_status_in, 2, 0),
+	SHELL_CMD_ARG(trb_ctrl_status_out, &dsub_device_name,
+		      "Send a STATUS TRB to the CTRL OUT endpoint\nUsage: trb_ctrl_status_out <device>",
+		      cmd_dwc3_trb_ctrl_status_out, 2, 0),
 	SHELL_CMD_ARG(end_ctrl_in, &dsub_device_name,
 		      "End a transfer for the CTRL IN endpoint\nUsage: end_ctrl_in <device>",
 		      cmd_dwc3_end_ctrl_in, 2, 0),
