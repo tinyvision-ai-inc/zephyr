@@ -574,6 +574,8 @@ struct udc_dwc3_data {
 	const struct device *dev;
 	/* Dispatch from IRQ events to workqueue jobs */
 	struct k_work event_work;
+	/* A work queue entry to test if the previous transaction is stuck */
+	struct k_work_delayable watchdog_dwork;
 	/* First endpoint to be configured */
 	uint8_t first_ep;
 #if CONFIG_UDC_DWC3_SHELL
@@ -1117,16 +1119,19 @@ static void udc_dwc3_ctrl_next_in(const struct device *const dev,
 		LOG_INF("TRB_CONTROL_IN_DATA len %d, data %p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else if (bi.status && setup->wLength == 0) {
 		buf->size = 0;
 		LOG_INF("TRB_CONTROL_IN_STATUS_2 len %d, data %p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else if (bi.status) {
 		buf->size = 0;
 		LOG_INF("TRB_CONTROL_IN_STATUS_3 len %d, data %p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
 		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else {
 		LOG_ERR("Unknown buffer IN type");
 		udc_submit_ep_event(dev, buf, -EINVAL);
@@ -1136,22 +1141,25 @@ static void udc_dwc3_ctrl_next_in(const struct device *const dev,
 static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 				   struct net_buf *const buf)
 {
-	//struct udc_dwc3_data *const priv = udc_get_private(dev);
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_buf_info bi = *udc_get_buf_info(buf);
 
 	if (bi.setup) {
 		LOG_INF("TRB_CONTROL_OUT_SETUP size %d, data %p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_SETUP);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else if (bi.data) {
 		LOG_INF("TRB_CONTROL_OUT_DATA size %d, data %p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else if (bi.status) {
 		buf->size = 0;
 		LOG_INF("TRB_CONTROL_OUT_STATUS_3 size %d, data %p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+		k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 	} else {
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
 		udc_submit_ep_event(dev, buf, -EINVAL);
@@ -1329,6 +1337,8 @@ static int udc_dwc3_recover(const struct device *dev)
 		break;
 	}
 
+	k_sched_lock();
+
 	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
 		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 
@@ -1343,9 +1353,10 @@ static int udc_dwc3_recover(const struct device *dev)
 		udc_dwc3_trb_ctrl_out(dev, udc_buf_peek(&cfg->ep_data_out[0].cfg),
 				priv->last_xfer_type);
 	} else {
-		LOG_ERR("unknown current endpoint direction");
-		return -EIO;
+		LOG_WRN("unknown current endpoint direction, no action taken");
 	}
+
+	k_sched_unlock();
 
 	return 0;
 }
@@ -1651,6 +1662,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 static void udc_dwc3_on_ctrl(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	k_work_cancel_delayable(&priv->watchdog_dwork);
 
 	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
 		udc_dwc3_on_ctrl_in(dev);
@@ -1967,6 +1980,16 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	LOG_INF("=== done ===");
 
 	udc_unlock_internal(dev);
+}
+
+static void udc_dwc3_watchdog_worker(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct udc_dwc3_data *const priv =
+		CONTAINER_OF(dwork, struct udc_dwc3_data, watchdog_dwork);
+	const struct device *const dev = priv->dev;
+
+	udc_dwc3_recover(dev);
 }
 
 static void udc_dwc3_event_worker(struct k_work *work)
@@ -2472,6 +2495,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
+	k_work_init_delayable(&priv->watchdog_dwork, udc_dwc3_watchdog_worker);
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
