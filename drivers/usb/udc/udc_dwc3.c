@@ -797,7 +797,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
 	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
-		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		//param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
 	}
 
 	/* This is the usb protocol endpoint number, but the data encoding
