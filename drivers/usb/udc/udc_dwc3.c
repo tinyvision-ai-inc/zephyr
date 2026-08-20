@@ -592,6 +592,8 @@ struct udc_dwc3_data {
 	/* Updated whenever a packet is submitted */
 	uint32_t last_xfer_type;
 	uint8_t last_xfer_dir;
+	/* Number of recoveries that happened for a same transfer */
+	uint8_t last_xfer_recoveries;
 	/* Cached TRBs to recover from corrputed TRBs */
 	struct udc_dwc3_trb trb_cache_in[2];
 	struct udc_dwc3_trb trb_cache_out[1];
@@ -883,26 +885,6 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 		ep_data->cfg.addr, UDC_DWC3_DEPCMD(ep_data->epn), flags, ep_data->xferrscidx);
 }
 
-/*
- * Do not extract the buffer info from the hardware (broken) but predict it from the
- * standard + context.
- */
-static size_t udc_dwc3_ctrl_xfer_size(const struct device *const dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	switch (priv->last_xfer_type) {
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP:
-		return 8;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA:
-		return priv->setup_packet.wLength;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2:
-		return 0;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3:
-		return 0;
-	}
-}
-
 static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
 				     uint32_t flags)
@@ -1025,18 +1007,21 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
-	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_OUT;
 
-	trb[0].addr_lo = LO32((uintptr_t)buf->data);
-	trb[0].addr_hi = HI32((uintptr_t)buf->data);
-	trb[0].status = buf->size;
-	trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+	priv->trb_cache_out[0].addr_lo = LO32((uintptr_t)buf->data);
+	priv->trb_cache_out[0].addr_hi = HI32((uintptr_t)buf->data);
+	priv->trb_cache_out[0].status = buf->size;
+	priv->trb_cache_out[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 
-	memcpy(&priv->trb_cache_out[0], (void *)&trb[0], sizeof(priv->trb_cache_out[0]));
+	/* Flush cached TRB to effective TRB */
+	compiler_barrier();
+	memcpy((void *)&ep_data->trb_buf[0], &priv->trb_cache_out[0],
+	       sizeof(priv->trb_cache_out[0]));
+	compiler_barrier();
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 
@@ -1052,29 +1037,32 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
-	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_IN;
 
 	if (udc_ep_buf_has_zlp(buf)) {
-		trb[0].addr_lo = LO32((uintptr_t)buf->data);
-		trb[0].addr_hi = HI32((uintptr_t)buf->data);
-		trb[0].status = buf->len;
-		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
+		priv->trb_cache_in[0].addr_lo = LO32((uintptr_t)buf->data);
+		priv->trb_cache_in[0].addr_hi = HI32((uintptr_t)buf->data);
+		priv->trb_cache_in[0].status = buf->len;
+		priv->trb_cache_in[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
 
-		trb[1].addr_lo = 0;
-		trb[1].addr_hi = 0;
-		trb[1].status = 0;
-		trb[1].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+		priv->trb_cache_in[1].addr_lo = 0;
+		priv->trb_cache_in[1].addr_hi = 0;
+		priv->trb_cache_in[1].status = 0;
+		priv->trb_cache_in[1].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	} else {
-		trb[0].addr_lo = LO32((uintptr_t)buf->data);
-		trb[0].addr_hi = HI32((uintptr_t)buf->data);
-		trb[0].status = buf->len;
-		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+		priv->trb_cache_in[0].addr_lo = LO32((uintptr_t)buf->data);
+		priv->trb_cache_in[0].addr_hi = HI32((uintptr_t)buf->data);
+		priv->trb_cache_in[0].status = buf->len;
+		priv->trb_cache_in[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	}
 
-	memcpy(&priv->trb_cache_in[0], (void *)&trb[0], sizeof(priv->trb_cache_in[0]));
+	/* Flush cached TRB to effective TRB */
+	compiler_barrier();
+	memcpy((void *)&ep_data->trb_buf[0], &priv->trb_cache_in[0],
+	       sizeof(priv->trb_cache_in[0]));
+	compiler_barrier();
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 
@@ -1258,7 +1246,6 @@ static void udc_dwc3_ctrl_get_next_type(const struct device *const dev,
 
 static void udc_dwc3_ctrl_next(const struct device *const dev)
 {
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_dwc3_config *const cfg = dev->config;
 
 	LOG_DBG("Finding the next buffer to load");
@@ -1274,6 +1261,8 @@ static void udc_dwc3_ctrl_next(const struct device *const dev)
 	}
 
 #if 0
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
 	if (atomic_test_bit(&priv->expected_xfer, UDC_DWC3_CTRL_SETUP)) {
 		udc_dwc3_ctrl_try(dev, &cfg->ep_data_out[0]);
 
@@ -1293,6 +1282,12 @@ static int udc_dwc3_recover(const struct device *dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (priv->last_xfer_recoveries > 1) {
+		LOG_WRN("Not triggering a recovery, already recovered this transfer %u times",
+			priv->last_xfer_recoveries);
+		return 0;
+	}
 
 	LOG_WRN("CTRL IN:");
 	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
@@ -1364,6 +1359,8 @@ static int udc_dwc3_recover(const struct device *dev)
 		udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(0));
 
 #endif
+	priv->last_xfer_recoveries++;
+
 	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
 	        udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 
@@ -1573,6 +1570,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	struct net_buf *buf;
 
 	k_work_cancel_delayable(&priv->watchdog_dwork);
+	priv->last_xfer_recoveries = 0;
 
 	LOG_INF("%s: TRB CTRL IN completed", dev->name);
 
@@ -1630,6 +1628,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	LOG_INF("%s TRB CTRL OUT completed", dev->name);
 
 	k_work_cancel_delayable(&priv->watchdog_dwork);
+	priv->last_xfer_recoveries = 0;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		buf = udc_buf_peek(&ep_data->cfg);
@@ -3285,9 +3284,9 @@ static void udc_dwc3_cmd_fake_xfercomplete(const struct device *const dev, const
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
-		udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(1));
+		udc_dwc3_on_ctrl_in(dev);
 	} else {
-		udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(0));
+		udc_dwc3_on_ctrl_out(dev);
 	}
 }
 static int cmd_fake_xfercomplete(const struct shell *sh, size_t argc, char **argv)
@@ -3295,22 +3294,22 @@ static int cmd_fake_xfercomplete(const struct shell *sh, size_t argc, char **arg
 	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_fake_xfercomplete);
 }
 
-static void udc_dwc3_cmd_fake_xfercomplete0(const struct device *const dev, const struct shell *sh)
+static void udc_dwc3_cmd_fake_xfercomplete_out(const struct device *const dev, const struct shell *sh)
 {
-	udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(0));
+	udc_dwc3_on_ctrl_out(dev);
 }
-static int cmd_fake_xfercomplete0(const struct shell *sh, size_t argc, char **argv)
+static int cmd_fake_xfercomplete_out(const struct shell *sh, size_t argc, char **argv)
 {
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_fake_xfercomplete0);
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_fake_xfercomplete_out);
 }
 
-static void udc_dwc3_cmd_fake_xfercomplete1(const struct device *const dev, const struct shell *sh)
+static void udc_dwc3_cmd_fake_xfercomplete_in(const struct device *const dev, const struct shell *sh)
 {
-	udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(1));
+	udc_dwc3_on_ctrl_in(dev);
 }
-static int cmd_fake_xfercomplete1(const struct shell *sh, size_t argc, char **argv)
+static int cmd_fake_xfercomplete_in(const struct shell *sh, size_t argc, char **argv)
 {
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_fake_xfercomplete1);
+	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_fake_xfercomplete_in);
 }
 
 static void udc_dwc3_cmd_dwc3_stall_ctrl_out(const struct device *const dev, const struct shell *sh)
@@ -3450,12 +3449,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_dwc3,
 	SHELL_CMD_ARG(fake_xfercomplete, &dsub_device_name,
 		      "Fake an XFERCOMMPLETE(0|1) event\nUsage: cmd_fake_xfercomplete <device>",
 		      cmd_fake_xfercomplete, 2, 0),
-	SHELL_CMD_ARG(fake_xfercomplete0, &dsub_device_name,
-		      "Fake an XFERCOMMPLETE(0) event\nUsage: cmd_fake_xfercomplete0 <device>",
-		      cmd_fake_xfercomplete0, 2, 0),
-	SHELL_CMD_ARG(fake_xfercomplete1, &dsub_device_name,
-		      "Fake an XFERCOMMPLETE(1) event\nUsage: cmd_fake_xfercomplete1 <device>",
-		      cmd_fake_xfercomplete1, 2, 0),
+	SHELL_CMD_ARG(fake_xfercomplete_out, &dsub_device_name,
+		      "Fake an XFERCOMMPLETE(0) event\nUsage: cmd_fake_xfercomplete_out <device>",
+		      cmd_fake_xfercomplete_out, 2, 0),
+	SHELL_CMD_ARG(fake_xfercomplete_in, &dsub_device_name,
+		      "Fake an XFERCOMMPLETE(1) event\nUsage: cmd_fake_xfercomplete_in <device>",
+		      cmd_fake_xfercomplete_in, 2, 0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(dwc3, &sub_dwc3, "Synopsys DWC3 controller commands", NULL);
