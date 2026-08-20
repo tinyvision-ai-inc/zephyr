@@ -41,14 +41,14 @@ config UDC_DWC3_SHELL
 
 config UDC_DWC3_RECOVERY_TIMEOUT
 	int "Time-out duration for the watchdog that restarts stalling endpoints"
-	default 100
+	default 200
 	help
 	  Whenever an endpoint does not complete its transfer within the given duration,
 	  it is restarted (using a DepEndXfer command),
 
 config UDC_DWC3_RECOVERY_MAX_PER_XFER
 	int "Maximum number of recovery attempts to perform per transfer"
-	default 2
+	default 1
 	help
 	  When the watchdog times-out, a recovery is attempted. This controls how many times try
 	  to recover from a transfer. Ultimately a single time is sufficient.

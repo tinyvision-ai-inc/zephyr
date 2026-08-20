@@ -546,7 +546,7 @@ struct udc_dwc3_ep_data {
 	int epn;
 	/* A work queue entry to process the buffers to submit on that endpoint */
 	struct k_work work;
-	/* To re-queue cancelled buffers after an endpoint is disabled */
+	/* To re-queue cancel buffers after an endpoint is disabled */
 	struct k_fifo requeue_fifo;
 	/* Point back to the device for work queues */
 	const struct device *dev;
@@ -1283,7 +1283,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-	if (priv->last_xfer_recoveries > 1) {
+	if (priv->last_xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER) {
 		LOG_WRN("Not triggering a recovery, already recovered this transfer %u times",
 			priv->last_xfer_recoveries);
 		return 0;
@@ -1297,6 +1297,8 @@ static int udc_dwc3_recover(const struct device *dev)
 	//udc_dwc3_dump_fifo_space(dev, NULL);
 
 	LOG_WRN("Recovering USB state");
+
+	udc_lock_internal(dev, K_FOREVER);
 
 #if 0
 	/* This did not work well */
@@ -1367,6 +1369,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	        LOG_INF("TRB_CONTROL_IN_%s", name);
 	        udc_dwc3_trb_ctrl_in(dev, udc_buf_peek(&cfg->ep_data_in[0].cfg),
 				priv->last_xfer_type);
+
 	} else if (priv->last_xfer_dir == USB_EP_DIR_OUT) {
 	        udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 
@@ -1375,12 +1378,13 @@ static int udc_dwc3_recover(const struct device *dev)
 				priv->last_xfer_type);
 	} else {
 	        LOG_WRN("unknown current endpoint direction, no action taken");
-	        return 0;
 	}
 
 	k_work_reschedule_for_queue(
 		udc_get_work_q(),
 		&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+
+	udc_unlock_internal(dev);
 
 	return 0;
 }
@@ -2023,6 +2027,8 @@ static void udc_dwc3_trb_ctrl_in_worker(struct k_work *work)
 	const struct device *const dev = priv->dev;
 	const struct udc_dwc3_config *const cfg = dev->config;
 
+	udc_lock_internal(dev, K_FOREVER);
+
 	if ((cfg->ep_data_in[0].trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
 		udc_dwc3_on_ctrl_in(dev);
 	} else {
@@ -2030,6 +2036,8 @@ static void udc_dwc3_trb_ctrl_in_worker(struct k_work *work)
 			udc_get_work_q(),
 			&priv->trb_ctrl_in_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
 	}
+
+	udc_unlock_internal(dev);
 }
 
 static void udc_dwc3_trb_ctrl_out_worker(struct k_work *work)
@@ -2040,6 +2048,8 @@ static void udc_dwc3_trb_ctrl_out_worker(struct k_work *work)
 	const struct device *const dev = priv->dev;
 	const struct udc_dwc3_config *const cfg = dev->config;
 
+	udc_lock_internal(dev, K_FOREVER);
+
 	if ((cfg->ep_data_out[0].trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
 		udc_dwc3_on_ctrl_out(dev);
 	} else {
@@ -2047,6 +2057,8 @@ static void udc_dwc3_trb_ctrl_out_worker(struct k_work *work)
 			udc_get_work_q(),
 			&priv->trb_ctrl_out_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
 	}
+
+	udc_unlock_internal(dev);
 }
 
 static void udc_dwc3_event_worker(struct k_work *work)
