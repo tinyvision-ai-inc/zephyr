@@ -3,6 +3,7 @@
  * SPDX-FileCopyrightText: Copyright tinyVision.ai Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 #define DT_DRV_COMPAT snps_dwc3
 
 #include <string.h>
@@ -592,8 +593,9 @@ struct udc_dwc3_data {
 	/* Updated whenever a packet is submitted */
 	uint32_t last_xfer_type;
 	uint8_t last_xfer_dir;
+	bool xfer_active;
 	/* Number of recoveries that happened for a same transfer */
-	uint8_t last_xfer_recoveries;
+	uint8_t xfer_recoveries;
 	/* Cached TRBs to recover from corrputed TRBs */
 	struct udc_dwc3_trb trb_cache_in[2];
 	struct udc_dwc3_trb trb_cache_out[1];
@@ -1187,6 +1189,7 @@ static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 static void udc_dwc3_ctrl_try(const struct device *const dev,
 			      struct udc_dwc3_ep_data *ep_data)
 {
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct net_buf *buf;
 
@@ -1203,6 +1206,12 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	}
 
 	udc_ep_set_busy(&ep_data->cfg, true);
+
+	if (!priv->xfer_active) {
+		LOG_INF("Starting a new control transfer stream, locking");
+		lattice_usb23_lock(dev, K_FOREVER);
+		priv->xfer_active = true;
+	}
 
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 		udc_dwc3_ctrl_next_in(dev, buf);
@@ -1283,21 +1292,27 @@ static int udc_dwc3_recover(const struct device *dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-	if (priv->last_xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER) {
+	if (priv->xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER) {
 		LOG_WRN("Not triggering a recovery, already recovered this transfer %u times",
-			priv->last_xfer_recoveries);
+			priv->xfer_recoveries);
+
+		LOG_WRN("Detected idle state, giving other transfer types an opportunity to lock");
+
+		priv->xfer_active = false;
+		lattice_usb23_unlock(dev);
 		return 0;
 	}
 
-	LOG_WRN("CTRL IN:");
+	LOG_INF("CTRL IN:");
 	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
-	LOG_WRN("CTRL OUT:");
+
+	LOG_INF("CTRL OUT:");
 	udc_dwc3_dump_trb(dev, &cfg->ep_data_out[0], NULL);
+
 	//LOG_WRN("FIFO SPACE:");
 	//udc_dwc3_dump_fifo_space(dev, NULL);
 
 	LOG_WRN("Recovering USB state");
-
 	udc_lock_internal(dev, K_FOREVER);
 
 #if 0
@@ -1361,23 +1376,24 @@ static int udc_dwc3_recover(const struct device *dev)
 		udc_dwc3_handle_event(dev, UDC_DWC3_DEPEVT_XFERCOMPLETE(0));
 
 #endif
-	priv->last_xfer_recoveries++;
+
+	priv->xfer_recoveries++;
 
 	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
-	        udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 
-	        LOG_INF("TRB_CONTROL_IN_%s", name);
-	        udc_dwc3_trb_ctrl_in(dev, udc_buf_peek(&cfg->ep_data_in[0].cfg),
+		LOG_INF("TRB_CONTROL_IN_%s", name);
+		udc_dwc3_trb_ctrl_in(dev, udc_buf_peek(&cfg->ep_data_in[0].cfg),
 				priv->last_xfer_type);
 
 	} else if (priv->last_xfer_dir == USB_EP_DIR_OUT) {
-	        udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 
-	        LOG_INF("TRB_CONTROL_OUT_%s", name);
-	        udc_dwc3_trb_ctrl_out(dev, udc_buf_peek(&cfg->ep_data_out[0].cfg),
+		LOG_INF("TRB_CONTROL_OUT_%s", name);
+		udc_dwc3_trb_ctrl_out(dev, udc_buf_peek(&cfg->ep_data_out[0].cfg),
 				priv->last_xfer_type);
 	} else {
-	        LOG_WRN("unknown current endpoint direction, no action taken");
+		LOG_WRN("unknown current endpoint direction, no action taken");
 	}
 
 	k_work_reschedule_for_queue(
@@ -1574,7 +1590,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	struct net_buf *buf;
 
 	k_work_cancel_delayable(&priv->watchdog_dwork);
-	priv->last_xfer_recoveries = 0;
+	priv->xfer_recoveries = 0;
 
 	LOG_INF("%s: TRB CTRL IN completed", dev->name);
 
@@ -1632,7 +1648,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	LOG_INF("%s TRB CTRL OUT completed", dev->name);
 
 	k_work_cancel_delayable(&priv->watchdog_dwork);
-	priv->last_xfer_recoveries = 0;
+	priv->xfer_recoveries = 0;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		buf = udc_buf_peek(&ep_data->cfg);
@@ -3047,7 +3063,7 @@ static void udc_dwc3_dump_trb(const struct device *dev, struct udc_dwc3_ep_data 
 		hwo, lst, chn, csp, isp, ioc, spr, pcm1, sidsofn, bufsiz, head, tail, full
 
 		if (sh == NULL) {
-			LOG_WRN(FMT, ARGS);
+			LOG_INF(FMT, ARGS);
 		} else {
 			shell_print(sh, FMT, ARGS);
 		}

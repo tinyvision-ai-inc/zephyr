@@ -1123,6 +1123,8 @@ int usbd_enqueue_setup(struct usbd_context *const uds_ctx)
 	setup = net_buf_ref(uds_ctx->setup_buf);
 	net_buf_reset(setup);
 
+	LOG_WRN("Enqueueing SETUP");
+
 	ret = usbd_ep_ctrl_enqueue(uds_ctx, setup);
 	if (ret) {
 		LOG_ERR("Failed to enqueue SETUP buffer");
@@ -1237,6 +1239,7 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 							       setup->wLength);
 				if (next_buf == NULL) {
 					err = -ENOMEM;
+					LOG_WRN("out of memory");
 					goto ctrl_xfer_stall;
 				}
 				ret = usbd_ep_ctrl_enqueue(uds_ctx, next_buf);
@@ -1248,6 +1251,7 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 				next_buf = usbd_ep_ctrl_data_in_alloc(uds_ctx, setup->wLength);
 				if (next_buf == NULL) {
 					err = -ENOMEM;
+					LOG_WRN("out of memory");
 					goto ctrl_xfer_stall;
 				}
 			}
@@ -1275,6 +1279,7 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 			 * Halt, only protocol errors are recoverable.
 			 * Free data stage and linked status stage buffer.
 			 */
+			LOG_WRN("errno");
 			goto ctrl_xfer_stall;
 		}
 
@@ -1303,9 +1308,11 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 		}
 
 		if (ret) {
+			LOG_WRN("Out of memory");
 			goto ctrl_xfer_stall;
 		}
 
+		LOG_WRN("Enqueueing setup");
 		ret = usbd_enqueue_setup(uds_ctx);
 
 		return ret;
@@ -1330,6 +1337,7 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 	}
 
 ctrl_xfer_stall:
+	LOG_WRN("Stalling the endpoint");
 	/*
 	 * Halt only the endpoint over which the host expects
 	 * data or status stage. This facilitates the work of the drivers.
