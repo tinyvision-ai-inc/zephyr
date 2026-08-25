@@ -547,12 +547,16 @@ struct udc_dwc3_ep_data {
 	int epn;
 	/* A work queue entry to process the buffers to submit on that endpoint */
 	struct k_work work;
+	/* watch for TRB completion */
+	struct k_work_delayable dwork;
 	/* To re-queue cancel buffers after an endpoint is disabled */
 	struct k_fifo requeue_fifo;
 	/* Point back to the device for work queues */
 	const struct device *dev;
 	/* Buffer of pointers to net_buf, with index matching the position in the TRB buffers */
 	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
+	/* Cached TRBs to recover from corrputed TRBs */
+	struct udc_dwc3_trb trb_cache[CONFIG_UDC_DWC3_TRB_NUM];
 	/* Buffer of TRB structures, with index matching the position in the net_buf buffers */
 	struct udc_dwc3_trb *trb_buf;
 	/* Index of the next TRB to receive data in the TRB ring, Link TRB excluded */
@@ -579,9 +583,6 @@ struct udc_dwc3_data {
 	struct k_work event_work;
 	/* test if the previous transaction is stuck */
 	struct k_work_delayable watchdog_dwork;
-	/* watch for TRB completion */
-	struct k_work_delayable trb_ctrl_in_dwork;
-	struct k_work_delayable trb_ctrl_out_dwork;
 	/* First endpoint to be configured */
 	uint8_t first_ep;
 #if CONFIG_UDC_DWC3_SHELL
@@ -596,9 +597,6 @@ struct udc_dwc3_data {
 	bool xfer_active;
 	/* Number of recoveries that happened for a same transfer */
 	uint8_t xfer_recoveries;
-	/* Cached TRBs to recover from corrputed TRBs */
-	struct udc_dwc3_trb trb_cache_in[2];
-	struct udc_dwc3_trb trb_cache_out[1];
 	/* Cache that is always up to date (before stack could get time to react) */
 	struct usb_setup_packet setup_packet;
 };
@@ -1014,22 +1012,22 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_OUT;
 
-	priv->trb_cache_out[0].addr_lo = LO32((uintptr_t)buf->data);
-	priv->trb_cache_out[0].addr_hi = HI32((uintptr_t)buf->data);
-	priv->trb_cache_out[0].status = buf->size;
-	priv->trb_cache_out[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+	ep_data->trb_cache[0].addr_lo = LO32((uintptr_t)buf->data);
+	ep_data->trb_cache[0].addr_hi = HI32((uintptr_t)buf->data);
+	ep_data->trb_cache[0].status = buf->size;
+	ep_data->trb_cache[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 
 	/* Flush cached TRB to effective TRB */
 	compiler_barrier();
-	memcpy((void *)&ep_data->trb_buf[0], &priv->trb_cache_out[0],
-	       sizeof(priv->trb_cache_out[0]));
+	memcpy((void *)&ep_data->trb_buf[0], &ep_data->trb_cache[0],
+	       sizeof(ep_data->trb_cache[0]));
 	compiler_barrier();
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 
 	k_work_reschedule_for_queue(
 		udc_get_work_q(),
-		&priv->trb_ctrl_out_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
+		&ep_data->dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
 }
 
 static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
@@ -1044,33 +1042,33 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	priv->last_xfer_dir = USB_EP_DIR_IN;
 
 	if (udc_ep_buf_has_zlp(buf)) {
-		priv->trb_cache_in[0].addr_lo = LO32((uintptr_t)buf->data);
-		priv->trb_cache_in[0].addr_hi = HI32((uintptr_t)buf->data);
-		priv->trb_cache_in[0].status = buf->len;
-		priv->trb_cache_in[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
+		ep_data->trb_cache[0].addr_lo = LO32((uintptr_t)buf->data);
+		ep_data->trb_cache[0].addr_hi = HI32((uintptr_t)buf->data);
+		ep_data->trb_cache[0].status = buf->len;
+		ep_data->trb_cache[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
 
-		priv->trb_cache_in[1].addr_lo = 0;
-		priv->trb_cache_in[1].addr_hi = 0;
-		priv->trb_cache_in[1].status = 0;
-		priv->trb_cache_in[1].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+		ep_data->trb_cache[1].addr_lo = 0;
+		ep_data->trb_cache[1].addr_hi = 0;
+		ep_data->trb_cache[1].status = 0;
+		ep_data->trb_cache[1].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	} else {
-		priv->trb_cache_in[0].addr_lo = LO32((uintptr_t)buf->data);
-		priv->trb_cache_in[0].addr_hi = HI32((uintptr_t)buf->data);
-		priv->trb_cache_in[0].status = buf->len;
-		priv->trb_cache_in[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
+		ep_data->trb_cache[0].addr_lo = LO32((uintptr_t)buf->data);
+		ep_data->trb_cache[0].addr_hi = HI32((uintptr_t)buf->data);
+		ep_data->trb_cache[0].status = buf->len;
+		ep_data->trb_cache[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 	}
 
 	/* Flush cached TRB to effective TRB */
 	compiler_barrier();
-	memcpy((void *)&ep_data->trb_buf[0], &priv->trb_cache_in[0],
-	       sizeof(priv->trb_cache_in[0]));
+	memcpy((void *)&ep_data->trb_buf[0], &ep_data->trb_cache[0],
+	       sizeof(ep_data->trb_cache[0]));
 	compiler_barrier();
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
 
 	k_work_reschedule_for_queue(
 		udc_get_work_q(),
-		&priv->trb_ctrl_in_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
+		&ep_data->dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
 }
 
 static int udc_dwc3_trb_bulk(const struct device *const dev,
@@ -1292,8 +1290,9 @@ static int udc_dwc3_recover(const struct device *dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-	if (priv->xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER) {
-		LOG_WRN("Not triggering a recovery, already recovered this transfer %u times",
+	if (priv->xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER &&
+	    priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
+		LOG_WRN("Not triggering a recovery for SETUP, already recovered this transfer %u times",
 			priv->xfer_recoveries);
 
 		LOG_WRN("Detected idle state, giving other transfer types an opportunity to lock");
@@ -1586,7 +1585,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = priv->trb_cache_in[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	const uint32_t trb_trbctl = ep_data->trb_cache[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 
 	k_work_cancel_delayable(&priv->watchdog_dwork);
@@ -1620,7 +1619,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
-	memset(&priv->trb_cache_in[0], 0x00, sizeof(priv->trb_cache_in[0]));
+	memset(&ep_data->trb_cache[0], 0x00, sizeof(ep_data->trb_cache[0]));
 
 	udc_submit_ep_event(dev, buf, 0);
 
@@ -1641,7 +1640,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = priv->trb_cache_out[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	const uint32_t trb_trbctl = ep_data->trb_cache[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct udc_buf_info bi;
 	struct net_buf *buf;
 
@@ -1706,7 +1705,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
-	memset(&priv->trb_cache_out[0], 0x00, sizeof(priv->trb_cache_out[0]));
+	memset(&ep_data->trb_cache[0], 0x00, sizeof(ep_data->trb_cache[0]));
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
@@ -1819,42 +1818,40 @@ static void udc_dwc3_on_xfer_error_nonctrl(const struct device *const dev, const
 	}
 }
 
-static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const uint32_t evt)
+static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev,
+					  struct udc_dwc3_ep_data *ep_data)
 {
-	const struct udc_dwc3_config *const cfg = dev->config;
-	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
-	struct udc_dwc3_ep_data *const ep_data = _EP_DATA_FROM_EPN(cfg, epn);
 	struct net_buf *buf;
+	struct udc_dwc3_trb trb;
 	int ret;
 
-	while (true) {
-		struct udc_dwc3_trb trb;
-
-		ret = udc_dwc3_pop_trb(dev, ep_data, &buf, &trb);
-		if (ret == -ENOBUFS || ret == -EBUSY) {
-			break;
-		}
-		if (ret != 0) {
-			LOG_ERR("Failed to pop TRB from non-control endpoint");
-			udc_submit_event(dev, UDC_EVT_ERROR, ret);
-			break;
-		}
-
-		LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p",
-			ep_data->cfg.addr, (void *)buf->data);
-
-		udc_dwc3_on_xfer_done(dev, ep_data);
-
-		udc_ep_set_busy(&ep_data->cfg, false);
-
-		ret = udc_submit_ep_event(dev, buf, 0);
-		if (ret != 0) {
-			LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
-		}
-
-		/* We just made some room for a new buffer, check if something more to enqueue */
-		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+	ret = udc_dwc3_pop_trb(dev, ep_data, &buf, &trb);
+	if (ret == -ENOBUFS || ret == -EBUSY) {
+		return;
 	}
+	if (ret != 0) {
+		LOG_ERR("Failed to pop TRB from non-control endpoint");
+		udc_submit_event(dev, UDC_EVT_ERROR, ret);
+		return;
+	}
+
+	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p",
+		ep_data->cfg.addr, (void *)buf->data);
+
+	udc_dwc3_on_xfer_done(dev, ep_data);
+
+	udc_ep_set_busy(&ep_data->cfg, false);
+
+	ret = udc_submit_ep_event(dev, buf, 0);
+	if (ret != 0) {
+		LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
+	}
+
+	/* We just made some room for a new buffer, check if something more to enqueue */
+	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+
+	/* We just scanned one TRB, scan the next too if active */
+	k_work_reschedule_for_queue(udc_get_work_q(), &ep_data->dwork, K_MSEC(100));
 }
 
 static const char *udc_dwc3_get_devt_ulstchng_name(const uint32_t dsts)
@@ -1986,7 +1983,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_xfer_error_nonctrl(dev, evt);
 		break;
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
-		udc_dwc3_on_xfer_done_nonctrl(dev, evt);
+		//udc_dwc3_on_xfer_done_nonctrl(dev, evt);
 		break;
 	case UDC_DWC3_DEPEVT_XFERNOTREADY(0):
 		udc_dwc3_on_xfer_not_ready_out(dev, evt);
@@ -2035,45 +2032,34 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	udc_dwc3_recover(dev);
 }
 
-static void udc_dwc3_trb_ctrl_in_worker(struct k_work *work)
+static void udc_dwc3_ep_watcher(struct k_work *const work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-	struct udc_dwc3_data *const priv =
-		CONTAINER_OF(dwork, struct udc_dwc3_data, trb_ctrl_in_dwork);
-	const struct device *const dev = priv->dev;
-	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_ep_data *const ep_data =
+		CONTAINER_OF(dwork, struct udc_dwc3_ep_data, dwork);
+	const struct device *const dev = ep_data->dev;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	udc_lock_internal(dev, K_FOREVER);
 
-	if ((cfg->ep_data_in[0].trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
-		udc_dwc3_on_ctrl_in(dev);
-	} else {
+	if ((ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0) {
+		/* Not ready yet */
 		k_work_reschedule_for_queue(
 			udc_get_work_q(),
-			&priv->trb_ctrl_in_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
+			&ep_data->dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
+		goto end;
 	}
 
-	udc_unlock_internal(dev);
-}
-
-static void udc_dwc3_trb_ctrl_out_worker(struct k_work *work)
-{
-	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-	struct udc_dwc3_data *const priv =
-		CONTAINER_OF(dwork, struct udc_dwc3_data, trb_ctrl_out_dwork);
-	const struct device *const dev = priv->dev;
-	const struct udc_dwc3_config *const cfg = dev->config;
-
-	udc_lock_internal(dev, K_FOREVER);
-
-	if ((cfg->ep_data_out[0].trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
-		udc_dwc3_on_ctrl_out(dev);
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
+		if (priv->last_xfer_dir == USB_EP_DIR_IN) {
+			udc_dwc3_on_ctrl_in(dev);
+		} else {
+			udc_dwc3_on_ctrl_out(dev);
+		}
 	} else {
-		k_work_reschedule_for_queue(
-			udc_get_work_q(),
-			&priv->trb_ctrl_out_dwork, K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS));
+		udc_dwc3_on_xfer_done_nonctrl(dev, ep_data);
 	}
-
+end:
 	udc_unlock_internal(dev);
 }
 
@@ -2576,13 +2562,13 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		return ret;
 	}
 
+	k_sleep(K_MSEC(2000));
+
 	DEVICE_MMIO_NAMED_MAP(dev, base, K_MEM_CACHE_NONE);
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
 	k_work_init_delayable(&priv->watchdog_dwork, udc_dwc3_watchdog_worker);
-	k_work_init_delayable(&priv->trb_ctrl_in_dwork, udc_dwc3_trb_ctrl_in_worker);
-	k_work_init_delayable(&priv->trb_ctrl_out_dwork, udc_dwc3_trb_ctrl_out_worker);
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
@@ -2614,6 +2600,10 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	/* Control IN endpoint */
 
 	ep_data = &cfg->ep_data_in[0];
+	k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+	k_work_init_delayable(&ep_data->dwork, udc_dwc3_ep_watcher);
+	k_fifo_init(&ep_data->requeue_fifo);
+
 	ep_data->dev = dev;
 	ep_data->cfg.addr = USB_CONTROL_EP_IN;
 	ep_data->cfg.caps.in = 1;
@@ -2631,6 +2621,10 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	/* Control OUT endpoint */
 
 	ep_data = &cfg->ep_data_out[0];
+	k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+	k_work_init_delayable(&ep_data->dwork, udc_dwc3_ep_watcher);
+	k_fifo_init(&ep_data->requeue_fifo);
+
 	ep_data->dev = dev;
 	ep_data->cfg.addr = USB_CONTROL_EP_OUT;
 	ep_data->cfg.caps.out = 1;
@@ -2651,6 +2645,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 		ep_data = &cfg->ep_data_in[i];
 		k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+		k_work_init_delayable(&ep_data->dwork, udc_dwc3_ep_watcher);
 		k_fifo_init(&ep_data->requeue_fifo);
 
 		ep_data->dev = dev;
@@ -2676,6 +2671,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 		ep_data = &cfg->ep_data_out[i];
 		k_work_init(&ep_data->work, udc_dwc3_ep_worker);
+		k_work_init_delayable(&ep_data->dwork, udc_dwc3_ep_watcher);
+		k_fifo_init(&ep_data->requeue_fifo);
 
 		ep_data->dev = dev;
 		ep_data->cfg.addr = USB_EP_DIR_OUT | i;
