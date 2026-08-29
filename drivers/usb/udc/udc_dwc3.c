@@ -678,6 +678,10 @@ static void udc_dwc3_dump_fifo_space(const struct device *dev, const struct shel
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt);
 static void udc_dwc3_on_ctrl_in(const struct device *const dev);
 static void udc_dwc3_on_ctrl_out(const struct device *const dev);
+static void udc_dwc3_quest_entry(const struct device *const dev,
+				 struct udc_dwc3_ep_data *const ep_data);
+static void udc_dwc3_quest_exit(const struct device *const dev,
+				 struct udc_dwc3_ep_data *const ep_data);
 
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
@@ -996,6 +1000,8 @@ static void udc_dwc3_trb_nonctrl_init(const struct device *const dev,
 	/* HWO=0 on the first TRB will prevent the transfers to start until configured */
 	memset((void *)trb, 0x00, sizeof(*trb) * CONFIG_UDC_DWC3_TRB_NUM);
 
+	ep_data->head = ep_data->tail = 0;
+
 	/* TRB LINK that loops the ring buffer back to the beginning */
 	trb[i].ctrl = UDC_DWC3_TRB_CTRL_TRBCTL_LINK_TRB | UDC_DWC3_TRB_CTRL_HWO;
 	trb[i].addr_lo = LO32((uintptr_t)ep_data->trb_buf);
@@ -1188,40 +1194,6 @@ static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 	} else {
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
 		udc_submit_ep_event(dev, buf, -EINVAL);
-	}
-}
-
-static void udc_dwc3_ctrl_try(const struct device *const dev,
-			      struct udc_dwc3_ep_data *ep_data)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct net_buf *buf;
-	int ret;
-
-	if (udc_ep_is_busy(&cfg->ep_data_in[0].cfg) ||
-	    udc_ep_is_busy(&cfg->ep_data_out[0].cfg)) {
-		LOG_INF("Control endpoints still busy, not loading next buffer");
-		return;
-	}
-
-	buf = udc_buf_peek(&ep_data->cfg);
-	if (buf == NULL) {
-		LOG_INF("No buffer for ep 0x%02X yet", ep_data->cfg.addr);
-		return;
-	}
-
-	/* User EP_IN for both IN and OUT control endpoints */
-	ret = udc_dwc3_burst_lock(dev);
-	if (ret != 0) {
-		return;
-	}
-
-	udc_ep_set_busy(&ep_data->cfg, true);
-
-	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
-		udc_dwc3_ctrl_next_in(dev, buf);
-	} else {
-		udc_dwc3_ctrl_next_out(dev, buf);
 	}
 }
 
@@ -1945,7 +1917,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 	}
 
 	/* Allow further interrupts */
-	sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	//sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
 	cfg->irq_enable_func();
 }
 
@@ -1959,7 +1931,7 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	k_work_submit_to_queue(udc_get_work_q(), &priv->event_work);
 
 	/* Disable further interrupts until all events are processed */
-	sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	//sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
 	cfg->irq_disable_func();
 }
 
@@ -2107,6 +2079,43 @@ static void udc_dwc3_ep_unpause_all(const struct device *const dev)
 	}
 }
 
+static void udc_dwc3_reset_nonctrl(const struct device *const dev,
+				   struct udc_dwc3_ep_data *ep_data)
+{
+	struct udc_dwc3_trb trb = ep_data->trb_cache[ep_data->tail];
+
+	udc_dwc3_trb_nonctrl_init(dev, ep_data);
+
+	memcpy(&ep_data->trb_cache[0], &trb, sizeof(trb));
+	memcpy(&ep_data->trb_buf[0], &trb, sizeof(trb));
+
+	LOG_WRN("Updating xfer");
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+}
+
+static void udc_dwc3_quest_entry(const struct device *const dev,
+				 struct udc_dwc3_ep_data *const ep_data)
+{
+	if (ep_data != NULL &&
+	    ep_data->quest_step == _EP_QUEST_STEP_WATCH) {
+		LOG_WRN("Resetting ep 0x%02x (source)", ep_data->cfg.addr);
+		udc_dwc3_depcmd_end_xfer(dev, ep_data, 0);
+	}
+}
+
+static void udc_dwc3_quest_exit(const struct device *const dev,
+				 struct udc_dwc3_ep_data *const ep_data)
+{
+	if (ep_data->quest_step == _EP_QUEST_STEP_WATCH) {
+		LOG_WRN("Resetting ep 0x%02x (dest)", ep_data->cfg.addr);
+		if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
+			udc_dwc3_depcmd_start_xfer(dev, ep_data);
+		} else {
+			udc_dwc3_reset_nonctrl(dev, ep_data);
+		}
+	}
+}
+
 static void udc_dwc3_ep_switch(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
@@ -2116,6 +2125,9 @@ static void udc_dwc3_ep_switch(const struct device *const dev)
 
 	if (!udc_dwc3_has_unpaused_runnable(dev)) {
 		LOG_INF("No runnable endpoints that are unpaused, sleeping");
+
+		udc_dwc3_quest_entry(dev, priv->quest_ep_data);
+
 		udc_dwc3_burst_unlock(dev);
 		/* We are cheating: we know this is a different thread,
 		 * let context switching happen.
@@ -2125,6 +2137,8 @@ static void udc_dwc3_ep_switch(const struct device *const dev)
 		k_sleep(K_MSEC(200));
 		udc_dwc3_burst_lock(dev);
 		udc_dwc3_ep_unpause_all(dev);
+
+		udc_dwc3_quest_exit (dev, priv->quest_ep_data);
 	}
 
 	ep_data = udc_dwc3_ep_next_runnable(dev, ep_data == NULL ? 0 : ep_data->cfg.addr);
@@ -2134,8 +2148,10 @@ static void udc_dwc3_ep_switch(const struct device *const dev)
 		goto end;
 	}
 
+	udc_dwc3_quest_entry(dev, priv->quest_ep_data);
+	udc_dwc3_quest_exit(dev, ep_data);
 
-	LOG_INF("Switching to ep 0x%02x", ep_data->cfg.addr);
+	LOG_WRN("Switching to ep 0x%02x", ep_data->cfg.addr);
 	priv->quest_ep_data = ep_data;;
 	priv->quest_ep_data->quest_paused = false;
 
