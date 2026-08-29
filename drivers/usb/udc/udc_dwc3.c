@@ -2192,19 +2192,19 @@ run_step:
 	switch (ep_data->quest_step) {
 
 	case _EP_QUEST_IDLE:
-		LOG_WRN("_EP_QUEST_IDLE: 0x%02x", ep_data->cfg.addr);
+		LOG_INF("_EP_QUEST_IDLE: 0x%02x", ep_data->cfg.addr);
 		schedule = K_NO_WAIT;
 		udc_dwc3_ep_switch(dev);
 		break;
 
 	case _EP_QUEST_STEP_BEG:
-		LOG_WRN("_EP_QUEST_STEP_BEG: 0x%02x", ep_data->cfg.addr);
+		LOG_INF("_EP_QUEST_STEP_BEG: 0x%02x", ep_data->cfg.addr);
 		ep_data->quest_step = _EP_QUEST_STEP_TRB;
 		ep_data->timeout = sys_timepoint_calc(K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 		goto run_step;
 
 	case _EP_QUEST_STEP_TRB:
-		LOG_WRN("_EP_QUEST_STEP_TRB: 0x%02x", ep_data->cfg.addr);
+		LOG_INF("_EP_QUEST_STEP_TRB: 0x%02x", ep_data->cfg.addr);
 		schedule = K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS);
 
 		buf = udc_buf_peek(&ep_data->cfg);
@@ -2232,7 +2232,7 @@ run_step:
 		goto run_step;
 
 	case _EP_QUEST_STEP_WATCH:
-		LOG_WRN("_EP_QUEST_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
+		LOG_INF("_EP_QUEST_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
 		schedule = K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS);
 
 		if ((ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
@@ -2250,7 +2250,7 @@ run_step:
 		break;
 
 	case _EP_QUEST_STEP_COMPLETING:
-		LOG_WRN("_EP_QUEST_STEP_COMPLETING: 0x%02x", ep_data->cfg.addr);
+		LOG_INF("_EP_QUEST_STEP_COMPLETING: 0x%02x", ep_data->cfg.addr);
 		schedule = K_NO_WAIT;
 
 		LOG_INF("Watcher: transaction complete, stopping till next transaction");
