@@ -56,13 +56,6 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define CONFIG_UDC_DWC3_TRB_NUM 4
 #endif
 
-/*
- * Padding target for a control OUT data stage whose length is not a multiple of
- * MaxPacketSize.  Sized for the largest EP0 MaxPacketSize the core supports
- * (512 at SuperSpeed), which bounds the padding at MaxPacketSize - 1.
- */
-#define UDC_DWC3_CTRL_ALIGN_BUF_SIZE				512U
-
 #ifndef CONFIG_UDC_DWC3_RECOVERY_TIMEOUT
 /* ms a control stage may stay outstanding before the watchdog ends the transfer. */
 #define CONFIG_UDC_DWC3_RECOVERY_TIMEOUT 1000
@@ -938,7 +931,6 @@ struct udc_dwc3_config {
 	 * alignment TRB at.  Never read: it exists only so the controller has
 	 * somewhere to put the bytes it insists on being able to receive.
 	 */
-	uint8_t *ctrl_align_buf;
 	/* USB device configuration */
 	int maximum_speed_idx;
 	/* Pointers to event buffer fetched by DWC3 with DMA */
@@ -1227,6 +1219,9 @@ struct udc_dwc3_data {
 	/* ctrl_setup_done as of the last fire, to tell progress from a repeat. */
 	uint32_t ctrl_setup_wd_mark;
 	uint32_t ctrl_setup_wd_reset;
+	/* OUT descriptors the caller sized to a non-multiple of MaxPacketSize. */
+	uint32_t out_unaligned;
+	uint32_t out_unaligned_ctrl;
 	/*
 	 * Closed-loop control state, DWC_usb3 3.30b sections 4.4.1 and 4.4.2.
 	 *
@@ -2245,11 +2240,80 @@ static inline void udc_dwc3_trb_commit(volatile uint32_t *const last_word)
 	compiler_barrier();
 }
 
+/*
+ * Report an OUT descriptor whose size is not a whole number of packets.
+ *
+ * Checked at the point the size is decided, BEFORE any padding is applied - the
+ * padding would otherwise make every descriptor look compliant and the counter
+ * would read zero whether or not callers are actually getting this right.  What
+ * is being measured is the size the CALLER supplied, which is the thing we cannot
+ * see from here otherwise.
+ *
+ * The two databook exceptions are not routed here: a Setup TRB must carry exactly
+ * 8 (S3.1.2.2) and a status TRB carries 0, which passes the modulo anyway.
+ */
+static void udc_dwc3_out_size_check(const struct device *const dev,
+				    const struct udc_dwc3_ep_data *const ep_data,
+				    const uint32_t in_size, const uint32_t trb_size,
+				    const char *const what, const bool is_setup)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
+
+	/*
+	 * Silent when the caller already supplied a whole number of packets, which
+	 * is the normal case: udc_ctrl_data_alloc() rounds every control OUT buffer
+	 * up to bMaxPacketSize0 before the driver ever sees it.  Printing those would
+	 * bury the one case worth seeing.
+	 *
+	 * The test is on trb_size, the size BEFORE correction.  Testing the padded
+	 * total instead would be self-defeating - padding always makes it a multiple,
+	 * so a misaligned caller would never be reported at all.
+	 */
+	if (is_setup) {
+		if (trb_size == sizeof(struct usb_setup_packet)) {
+			return;
+		}
+
+		priv->out_unaligned++;
+		priv->out_unaligned_ctrl++;
+		LOG_ERR_RATELIMIT("EP%02x Setup OUT descriptor is %u B, not the 8 B "
+				  "S3.1.2.2 requires (caller buffer %u B, seen %u)",
+				  ep_data->cfg.addr, trb_size, in_size,
+				  priv->out_unaligned);
+		return;
+	}
+
+	/* Silent when the caller already supplied whole packets - the normal case. */
+	if (mps == 0U || (in_size % mps) == 0U) {
+		return;
+	}
+
+	priv->out_unaligned++;
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0U) {
+		priv->out_unaligned_ctrl++;
+	}
+
+	LOG_ERR_RATELIMIT("EP%02x %s OUT descriptor: the stack supplied %u B, not a "
+			  "multiple of MPS %u B - rounded up to %u B (databook S4.2.3.3 "
+			  "requires whole packets for OUT) (seen %u, control %u)",
+			  ep_data->cfg.addr, what, in_size, mps, trb_size,
+			  priv->out_unaligned, priv->out_unaligned_ctrl);
+}
+
 static void udc_dwc3_push_trb(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data,
 			      struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
+	const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
+	const uint32_t out_size = !USB_EP_DIR_IS_OUT(ep_data->cfg.addr) ? buf->len
+				  : (mps != 0U ? ROUND_UP(buf->size, mps) : buf->size);
+
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
+		udc_dwc3_out_size_check(dev, ep_data, buf->size, out_size,
+					"bulk/intr/isoc", false);
+	}
 
 	/*
 	 * head, tail, full and net_buf[] are shared with udc_dwc3_pop_trb(), and
@@ -2287,44 +2351,24 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	ep_data->net_buf[ep_data->head] = buf;
 
 	/*
-	 * An OUT descriptor must be a whole number of packets - the same databook
-	 * rule the control OUT data stage is padded for in udc_dwc3_trb_ctrl_out().
-	 * Here it cannot be satisfied the same way: buf->size is the real extent of
-	 * the caller's buffer, so rounding the descriptor up would let the core DMA
-	 * past the end of it, and rounding down would leave the tail of a packet in
-	 * the RxFIFO - which is the failure this rule exists to prevent.  The fix is
-	 * a chained alignment TRB as Linux uses in dwc3_prepare_one_trb(), and that
-	 * needs this ring to spend two slots and one net_buf[] entry on a single
-	 * transfer, which it is not built to do.
-	 *
-	 * No OUT endpoint other than EP0 is enabled in this application - UVC
-	 * declares only 0x81 - so nothing reaches this branch today.  Say so loudly
-	 * if anything ever does, rather than programming a descriptor the controller
-	 * is not defined to accept and losing the endpoint to a silent wedge.
+	 * An OUT descriptor must be a whole number of packets (S4.2.3.3), so the
+	 * programmed size is rounded up to MaxPacketSize.  Normally a no-op: the
+	 * allocation behind buf->size is already whole packets - guaranteed by
+	 * udc_ctrl_data_alloc() for control, and the class driver's job for its own
+	 * OUT endpoints.  udc_dwc3_out_size_check() reports it when it is not.
 	 */
-	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr) && ep_data->cfg.mps != 0U &&
-	    (buf->size % ep_data->cfg.mps) != 0U) {
-		LOG_ERR_RATELIMIT("EP%02x OUT buffer %u is not a multiple of MPS %u: "
-				  "the descriptor violates the OUT buffer-size rule and "
-				  "this endpoint may wedge with data stranded in the RxFIFO",
-				  ep_data->cfg.addr, buf->size, ep_data->cfg.mps);
-	}
-
-	/* TRB# with one more chunk of data */
 	trb->addr_lo = LO32((uintptr_t)buf->data);
 	trb->addr_hi = HI32((uintptr_t)buf->data);
-	trb->status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
+	trb->status = out_size;
 	trb->ctrl = ctrl;
 
 	udc_dwc3_trb_commit(&trb->ctrl);
 
-	LOG_DBG("PUSH %u, buf %p, data %p, size %u",
-		ep_data->head, (void *)buf, (void *)buf->data, buf->size);
+	LOG_DBG("PUSH %u, buf %p, data %p, size %u -> %u",
+		ep_data->head, (void *)buf, (void *)buf->data, buf->size, out_size);
 
-	/* -1 for link trb */
 	ep_data->head = (ep_data->head + 1) % (CONFIG_UDC_DWC3_TRB_NUM - 1);
 
-	/* If the head touches the tail after we add something, we are full */
 	ep_data->full = (ep_data->head == ep_data->tail);
 }
 
@@ -2350,7 +2394,7 @@ static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_d
 	/* -1 for link trb */
 	ep_data->tail = (ep_data->tail + 1) % (CONFIG_UDC_DWC3_TRB_NUM - 1);
 
-	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
+	/* If we just pulled a TRB	/* If we just pulled a TRB, we know we made one hole and we are not full anymore */
 	ep_data->full = false;
 
 	/* For buffers coming from the host, update the size actually received */
@@ -2397,7 +2441,6 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	uint32_t size;
-	uint32_t pad = 0U;
 
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_OUT;
@@ -2438,7 +2481,32 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 		size = sizeof(struct usb_setup_packet);
 	} else if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 		   ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
-		size = 0U;
+		/*
+		 * MaxPacketSize, not 0.  This is the status stage of a control READ:
+		 * an OUT transfer, on which the host sends a zero-length packet.
+		 *
+		 * The databook contradicts itself here.  Figure 3-11 draws the Status
+		 * TRB with BUFSIZ 0, but S4.2.3.3 states two prose rules for OUT
+		 * endpoints - "The BUFSIZ field must be >= 1 byte" and "The total size
+		 * of a Buffer Descriptor must be a multiple of MaxPacketSize" - and
+		 * names an exception only for the Setup stage, not the Status stage.
+		 * It then adds the rule that decides it: "A received zero-length packet
+		 * still requires a MaxPacketSize buffer."  A device cannot know a ZLP is
+		 * coming until the transfer completes, so the buffer has to be there
+		 * either way.
+		 *
+		 * Following the prose costs nothing: udc_ctrl_status_alloc() already
+		 * allocates bMaxPacketSize0 for this buffer - "despite Status being
+		 * ZLP" - so the memory exists and only this driver was discarding it.
+		 * The risk is asymmetric: if the figure is right, a ZLP simply lands in
+		 * a MaxPacketSize buffer and reports a full residual, which harms
+		 * nothing; if the prose is right, BUFSIZ 0 violated both rules on every
+		 * control read.
+		 *
+		 * The IN status stage is unaffected and stays 0 - there the device
+		 * SENDS the zero-length packet, and none of these OUT rules apply.
+		 */
+		size = USB_MPS_EP_SIZE(ep_data->cfg.mps);
 	} else {
 		size = buf->size;
 	}
@@ -2471,31 +2539,41 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	 * received length from setup_packet.wLength, not from the TRB residual, so
 	 * nothing downstream sees the rounding.
 	 */
-	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA && ep_data->cfg.mps != 0U &&
-	    (size % ep_data->cfg.mps) != 0U) {
-		pad = ep_data->cfg.mps - (size % ep_data->cfg.mps);
+	/*
+	 * cfg.mps is the ENCODED Max Packet Size: bits 10:0 are the packet size and
+	 * bits 12:11 carry the additional-transactions count for high-bandwidth
+	 * periodic endpoints.  The databook rule is a multiple of MaxPacketSize, so
+	 * the modulo has to be against the packet-size field alone - using the raw
+	 * value would compute against size|(mult<<11) and produce nonsense on any
+	 * endpoint that carries mult.  Control endpoints never do, but reading the
+	 * field correctly here keeps this right if the padding is ever reused.
+	 */
+	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
+		const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
+
+		/* Whole packets for OUT - S4.2.3.3.  Normally already true. */
+		if (mps != 0U) {
+			size = ROUND_UP(size, mps);
+		}
 	}
 
 	trb[0].addr_lo = LO32((uintptr_t)buf->data);
+
 	trb[0].addr_hi = HI32((uintptr_t)buf->data);
+	/* Caller size -> programmed size, after the round-up. */
+	udc_dwc3_out_size_check(dev, ep_data, buf->size, size,
+				ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP  ? "setup" :
+				ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA   ? "ctrl-data" :
+				ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ? "status-2" :
+				ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3 ? "status-3" :
+									  "ctrl-other",
+				ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+
 	trb[0].status = size;
 
-	if (pad != 0U) {
-		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_CHN | UDC_DWC3_TRB_CTRL_HWO;
+	trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
 
-		trb[1].addr_lo = LO32((uintptr_t)cfg->ctrl_align_buf);
-		trb[1].addr_hi = HI32((uintptr_t)cfg->ctrl_align_buf);
-		trb[1].status = pad;
-		trb[1].ctrl = UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL |
-			      UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
-
-		/* Chained pair: the terminator is written last, so commit that one. */
-		udc_dwc3_trb_commit(&trb[1].ctrl);
-	} else {
-		trb[0].ctrl = ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO;
-
-		udc_dwc3_trb_commit(&trb[0].ctrl);
-	}
+	udc_dwc3_trb_commit(&trb[0].ctrl);
 
 	memcpy(&ep_data->trb_cache[0], (void *)&trb[0], sizeof(ep_data->trb_cache[0]));
 
@@ -2727,7 +2805,14 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 		udc_dwc3_ctrl_arm_watchdog(dev, false, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status) {
-		buf->size = 0;
+		/*
+		 * buf->size is deliberately NOT zeroed here any more.  The status OUT
+		 * buffer is allocated at bMaxPacketSize0 by udc_ctrl_status_alloc(),
+		 * and udc_dwc3_trb_ctrl_out() now programs MaxPacketSize for this
+		 * stage - see the reasoning there.  Zeroing it would leave the TRB
+		 * describing more space than buf->size claims, which reads as a bug
+		 * even though the underlying allocation is large enough.
+		 */
 		LOG_DBG("trb OUT_STATUS_3 sz=%d d=%p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
 		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
@@ -4621,7 +4706,7 @@ static bool udc_dwc3_ctrl_xnr_check(const struct device *const dev,
 	 */
 	if (priv->ctrl_data_done) {
 		const uint16_t wlen = sys_le16_to_cpu(setup->wLength);
-		const uint16_t mps = cfg->ep_data_out[0].cfg.mps;
+		const uint16_t mps = USB_MPS_EP_SIZE(cfg->ep_data_out[0].cfg.mps);
 
 		if (mps != 0U && (wlen % mps) == 0U) {
 			udc_dwc3_ctrl_resync(dev,
@@ -6696,7 +6781,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				"zero %u missed %u/%u desync %u ctrl %u/%u midzero %u "
 				"decline %u/%u "
 				"setuppending %u unarmed %u startfail %u defer %u trbsts %u "
-				"setupwd %u/%u reset %u "
+				"setupwd %u/%u reset %u outmisaligned %u/%u "
 				"gc_hwm %u B link %u DSTS 0x%08x",
 				priv->evt_handled, priv->evt_late,
 				priv->evt_late_polls_max, priv->evt_late_us_max,
@@ -6712,6 +6797,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				priv->ctrl_deferred_arm, priv->ctrl_trbsts_other,
 				priv->ctrl_setup_wd_fire, priv->ctrl_setup_wd_idle,
 				priv->ctrl_setup_wd_reset,
+				priv->out_unaligned, priv->out_unaligned_ctrl,
 				priv->evt_gevntcount_hwm, priv->evt_link_total,
 				/*
 				 * DSTS on the periodic line, so COREIDLE and
@@ -7663,10 +7749,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		[DT_INST_PROP(n, num_in_endpoints)][CONFIG_UDC_DWC3_TRB_NUM]	\
 		__aligned(16);							\
 										\
-	static __nocache uint8_t udc_dwc3_ctrl_align_buf_##n			\
-		[UDC_DWC3_CTRL_ALIGN_BUF_SIZE]					\
-		__aligned(16);							\
-										\
 	static __nocache struct udc_dwc3_trb udc_dwc3_dma_trb_o##n		\
 		[DT_INST_PROP(n, num_out_endpoints)][CONFIG_UDC_DWC3_TRB_NUM]	\
 		__aligned(16);							\
@@ -7687,7 +7769,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		.ep_data_out = udc_dwc3_ep_data_o##n,				\
 		.trb_buf_in = udc_dwc3_dma_trb_i##n,				\
 		.trb_buf_out = udc_dwc3_dma_trb_o##n,				\
-		.ctrl_align_buf = udc_dwc3_ctrl_align_buf_##n,			\
 		.evt_buf = udc_dwc3_dma_evt_buf_##n,				\
 		.maximum_speed_idx = DT_ENUM_IDX(DT_DRV_INST(n), maximum_speed),\
 		.irq_enable_func = udc_dwc3_irq_enable_func_##n,		\
