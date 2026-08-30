@@ -336,6 +336,23 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_EVT_DEAD_SLOT_RECOVER
 
 /*
+ * Print the eight setup bytes of every control transfer.
+ *
+ * Invaluable for tracing a fault, and the dominant cost of running one: the
+ * console is synchronous at 115200 under LOG_MODE_MINIMAL, so this line is what
+ * sets the control-transfer rate, not the host and not the controller.  A 1 h
+ * soak spent 8.9 MB and 339k lines on it and reached only 339k SETUPs.
+ *
+ * Kept ON.  Turning it off was measured and was a bad trade: it bought only 16%
+ * more control transfers per second (93.6 -> 108.9), because the real limit is
+ * the host re-execing v4l2-ctl per iteration, not the console.  What it costs is
+ * the per-transfer trace - the eight setup bytes that identify the request in
+ * flight - which is the first thing wanted when a wedge is being diagnosed.
+ * Undefine only for an endurance run where nothing needs to be diagnosed.
+ */
+#define UDC_DWC3_LOG_EVERY_SETUP
+
+/*
  * Escalate a stuck SETUP to a core soft reset when the End Transfer that
  * normally clears it has failed twice running.
  *
@@ -4342,11 +4359,15 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		 * was in flight. Everything the stages used to narrate is derivable
 		 * from it, at a tenth of the console cost.
 		 */
+#ifdef UDC_DWC3_LOG_EVERY_SETUP
 		LOG_INF("SETUP %016llx",
 			((uint64_t)sp[0] << 56) | ((uint64_t)sp[1] << 48) |
 			((uint64_t)sp[2] << 40) | ((uint64_t)sp[3] << 32) |
 			((uint64_t)sp[4] << 24) | ((uint64_t)sp[5] << 16) |
 			((uint64_t)sp[6] << 8)  |  (uint64_t)sp[7]);
+#else
+		(void)sp;
+#endif
 		udc_setup_received(dev, &priv->setup_packet);
 
 		/*
@@ -6419,8 +6440,8 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 			priv->evt_stall_run,
 			frozen ? "FROZEN" : "advancing",
 			gc_now, priv->evt_stall_gc0,
-			frozen ? "core has placed nothing since; it is waiting for an "
-				 "acknowledge" : "core still writing, this slot skipped");
+			frozen ? "core has placed nothing since; cause unknown"
+			       : "core still writing, this slot skipped");
 
 		/*
 		 * NO REGISTER DUMP HERE. This runs inside udc_dwc3_evt_wait_first(),
