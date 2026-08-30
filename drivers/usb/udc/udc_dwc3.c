@@ -2122,7 +2122,8 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 
-	LOG_INF("DepUpdateXfer done EP%02x, addr 0x%08x, data 0x%08x, xferrscidx 0x%x",
+	/* DBG: this fires once per buffer from udc_dwc3_trb_bulk(). */
+	LOG_DBG("DepUpdateXfer done EP%02x, addr 0x%08x, data 0x%08x, xferrscidx 0x%x",
 		ep_data->cfg.addr, UDC_DWC3_DEPCMD(ep_data->epn), flags, ep_data->xferrscidx);
 }
 
@@ -6074,11 +6075,16 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 /*
  * Last resort for a SETUP the controller has received and will not retire.
  *
- * End Transfer is what clears the ordinary case - uart_v6_1355 shows it
- * rescuing four stalls in a row, the pending event landing the moment the
- * command completes.  When it does not work, nothing softer does: at the final
- * wedge in that capture the event ring was acknowledged twice, releasing the
- * credits the core was supposedly waiting on, and the core did not move.
+ * SET STALL is what clears the ordinary case - uart_v6_1355 shows the
+ * DATA/STATUS watchdog rescuing four stalls in a row through
+ * udc_dwc3_recover(), which issues Set Stall on EP0-OUT and nothing else; the
+ * pending event landed immediately after each.  (recover() has never issued an
+ * End Transfer - the machinery for that is unreachable.  Earlier text here
+ * claimed otherwise and misled a reviewer.)
+ *
+ * When Set Stall does not work, nothing softer does: at the final wedge in that
+ * capture the event ring was acknowledged twice, releasing the credits the core
+ * was supposedly waiting on, and the core did not move.
  *
  * So take the core down and bring it back.  This costs the video stream, which
  * is why it was held back at first - but the stream is gone by this point
@@ -6095,7 +6101,7 @@ static void udc_dwc3_setup_stuck_reset(const struct device *const dev)
 	const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
 	int ret;
 
-	LOG_ERR("SETUP still stuck after the End Transfer: GSTS=0x%08x "
+	LOG_ERR("SETUP still stuck after the Set Stall: GSTS=0x%08x "
 		"BusErrAddrVld=%u GBUSERRADDR=0x%08x%08x, DSTS=0x%08x - "
 		"escalating to a core soft reset (%u so far)",
 		gsts, (gsts & UDC_DWC3_GSTS_BUSERRADDRVLD) ? 1U : 0U,
