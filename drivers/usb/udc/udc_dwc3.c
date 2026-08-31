@@ -8507,6 +8507,7 @@ static void udc_dwc3_cmd_trb_ctrl_status_in(const struct device *dev, const stru
 	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_IN, 128);
 	if (buf == NULL) {
 		shell_error(sh, "Failed to allocate a buffer");
+		return;
 	}
 
 	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
@@ -8525,6 +8526,7 @@ static void udc_dwc3_cmd_trb_ctrl_status_out(const struct device *dev, const str
 	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 128);
 	if (buf == NULL) {
 		shell_error(sh, "Failed to allocate a buffer");
+		return;
 	}
 
 	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
@@ -8544,6 +8546,7 @@ static void udc_dwc3_cmd_trb_ctrl_data_out(const struct device *dev, const struc
 	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 512);
 	if (buf == NULL) {
 		shell_error(sh, "Failed to allocate a buffer");
+		return;
 	}
 
 	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
@@ -8563,6 +8566,7 @@ static void udc_dwc3_cmd_trb_ctrl_data_in(const struct device *dev, const struct
 	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_IN, 512);
 	if (buf == NULL) {
 		shell_error(sh, "Failed to allocate a buffer");
+		return;
 	}
 
 	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
@@ -8582,6 +8586,7 @@ static void udc_dwc3_cmd_trb_ctrl_setup(const struct device *dev, const struct s
 	buf = udc_ep_buf_alloc(dev, USB_CONTROL_EP_OUT, 512);
 	if (buf == NULL) {
 		shell_error(sh, "Failed to allocate a buffer");
+		return;
 	}
 
 	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
