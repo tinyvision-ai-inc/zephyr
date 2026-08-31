@@ -336,8 +336,8 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_LOG_EVERY_SETUP
 
 /*
- * Escalate a stuck SETUP to a core soft reset when the End Transfer that
- * normally clears it has failed twice running.
+ * Escalate a stuck SETUP to a core soft reset when the Set Stall that normally
+ * clears it has failed twice running.
  *
  * Undefine for the diagnostic build handed to the RTL team: without it the
  * controller is left in the wedged state for them to probe, which is the whole
@@ -3647,8 +3647,8 @@ static int udc_dwc3_recover(const struct device *dev)
 	 */
 	/*
 	 * Bounded to the fast poll for the whole of this call - see
-	 * udc_dwc3_wait_cmdact_zero(). If the endpoint is still busy the End Transfer
-	 * is not issued and ctrl_recovery_pending stays clear, so the watchdog
+	 * udc_dwc3_wait_cmdact_zero(). If the endpoint is still busy the command is
+	 * not issued and ctrl_recovery_pending stays clear, so the watchdog
 	 * rescheduled below tries again with the mutex released in between.
 	 */
 	priv->depcmd_no_sleep = true;
@@ -6089,7 +6089,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 
 #ifdef UDC_DWC3_SETUP_STUCK_RESET
 		/*
-		 * Two fires with no SETUP retired between them means the End Transfer
+		 * Two fires with no SETUP retired between them means the Set Stall
 		 * issued last time did not clear it.  Comparing ctrl_setup_done rather
 		 * than counting beats is what makes this specific: any SETUP completing
 		 * in between moves the mark, and the second fire is then a fresh fault
@@ -6177,31 +6177,6 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  * changes whether we looked.
  */
 #define UDC_DWC3_EVT_ARRIVE_MAX_POLLS 64u
-/*
- * Acknowledge in blocks of this many bytes rather than one event at a time.
- *
- * SPEC, Programming Guide 3.30b, Event Buffer Overflow Event (EvntOverflow,
- * device event type 11), p.329:
- *   "In order to avoid repeated Event Buffer Overflow Events, software must
- *    free up space in the Event Buffer by acknowledging more than 1 event
- *    (writing a value greater than 4 to the GEVNTCOUNTn register)."
- *
- * Acknowledging 4 bytes at a time frees exactly one slot, which the controller
- * refills immediately, so an overflow once established can never clear. That is
- * uart_v5_9.log: the ring sat full for ~15 s, ~4000 overflow events per second
- * ("Skipped 20254 messages"), with the driver draining ~3300/s and unable to get
- * ahead. Section 1.2.56 describes the intended model as processing "one or more
- * events" and then writing the number of bytes processed.
- *
- * BOUNDED ON PURPOSE. Deferring the acknowledge to the END of a pass would hold
- * every consumed slot for the whole pass, shrinking the controller's headroom
- * exactly when events are arriving fastest - trading one overflow cause for
- * another. Flushing every 4 events instead means at most 4 slots of a 16-slot
- * ring are ever held un-acknowledged, while every flush still frees 4 at once,
- * comfortably satisfying "greater than 4". A pass carrying a single event still
- * acknowledges 4 bytes at its end, unchanged - there is no overflow to escape in
- * that case.
- */
 /*
  * Generic command used ONLY to make the controller write an event, when the slot
  * the drain is waiting on will not fill on its own.
@@ -6345,7 +6320,10 @@ static void udc_dwc3_evt_force(const struct device *const dev)
  * Wait for the FIRST word of a pass, which is the only one worth waiting for:
  * there is nothing copied yet, so returning without it would just spin.
  *
- * Returns the event, or 0 if it never arrived - in which case a generic command
+ * Returns the event, or UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE if it never arrived -
+ * NOT 0.  Zero is a legal event word here; the sentinel is what marks a slot as
+ * unwritten, so a caller testing == 0 would be wrong.  In that case a generic
+ * command
  * has been issued to force one.
  */
 static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
@@ -6751,8 +6729,15 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 	}
 
 	/*
-	 * Exactly what was copied - never the entry count. Acknowledging events we
-	 * did not receive would advance the controller past them for good.
+	 * Acknowledge exactly what was copied - never the entry count.  Crediting
+	 * events we did not receive would advance the controller past them for good.
+	 *
+	 * One write per pass, n events at a time.  The Event Buffer Overflow section
+	 * requires software to "free up space ... by acknowledging more than 1 event
+	 * (writing a value greater than 4 to the GEVNTCOUNTn register)": crediting a
+	 * single slot at a time lets the controller refill it immediately, so an
+	 * established overflow can never clear.  uart_v5_9 is that failure - the ring
+	 * full for ~15 s at ~4000 overflow events/s while the drain managed ~3300/s.
 	 */
 	if (n > 0) {
 		sys_write32(n * sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
