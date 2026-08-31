@@ -220,42 +220,25 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 /*
  * Kick the event handler if it has not COMPLETED a pass within this long while
- * the controller still says there are events outstanding.
+ * the controller still says events are outstanding.
  *
- * Measured from when the worker EXITS, never from when it enters. A pass that
- * dispatches an endpoint command can spend a long time polling inside
- * udc_dwc3_depcmd(), and an entry stamp would count that as "recently
- * scheduled" when the handler had in fact been stuck in the middle of a pass
- * for most of the interval. The exit stamp measures the gap BETWEEN passes,
- * which is the thing that matters.
+ * Measured from worker EXIT, never entry: a pass that dispatches an endpoint
+ * command can sit a long time in udc_dwc3_depcmd(), and an entry stamp would
+ * call that "recently scheduled".  Safe to read from the heartbeat because both
+ * run on the same work queue, so the stamp is never mid-pass when compared.
  *
- * Safe to read from the heartbeat because both run on the same work queue: the
- * heartbeat only gets to run when the worker is not running, so the stamp can
- * never be mid-pass when it is compared.
+ * A kick can never be wrong: it is gated on GEVNTCOUNT > 0 and resubmitting a
+ * queued work item is a no-op.
  *
- * Shorter than the tick that samples it, deliberately. It costs nothing -
- * it adds no wake-ups, it only makes the decision taken on a beat that was
- * happening anyway more willing - and a kick can never be wrong, because it
- * is gated on GEVNTCOUNT > 0 (the controller has already said there is
- * something to read) and submitting an already-queued work item is a no-op.
+ * This is NOT sized to meet the 50 ms of USB 2.0 9.2.6.4 - detection costs the
+ * threshold plus a full tick, so no free-running value can.  Meeting a request
+ * deadline is the drain's job (see the mid-pass note in udc_dwc3_evt_drain());
+ * this is the backstop for when the drain is not running at all.
  *
- * It is NOT sized to meet the 50 ms of USB 2.0 9.2.6.4, and it should not be
- * asked to. Detection here costs the threshold plus a full tick, so no
- * setting of it that leaves the tick free-running at a background rate can
- * meet that budget. Meeting a request deadline is the job of the drain
- * re-entering itself promptly - see the mid-pass note in udc_dwc3_evt_drain()
- * - and this is the backstop for the case where the drain is not running at
- * all and no interrupt will ever say so.
- *
- * It must also stay clear of the driver's OWN console cost. The stats line
- * is emitted from udc_dwc3_event_worker(), i.e. from inside a drain pass, and
- * under LOG_MODE_MINIMAL that is a synchronous write: ~250 characters at
- * 115200 is ~22 ms, and a pass that also prints several SETUP lines is worse.
- * evt_worker_exit_t0 is stamped only when the pass FINISHES, so a threshold
- * below that cost makes the driver detect its own logging as a stalled drain
- * - kicking pointlessly and inflating evt_kick into a misleading number. At
- * 20 ms it did. 100 ms clears any plausible single pass and is still 50x
- * inside the 5 s the host waits.
+ * It must exceed the driver's OWN console cost.  The stats line is emitted from
+ * inside a drain pass and LOG_MODE_MINIMAL makes that synchronous: ~250 chars at
+ * 115200 is ~22 ms.  At 20 ms the driver detected its own logging as a stalled
+ * drain.  100 ms clears any plausible pass and is still 50x inside the host's 5 s.
  */
 #define UDC_DWC3_EVT_IDLE_KICK_MS				100u
 
@@ -1778,39 +1761,25 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
 	/*
-	 * Burst Size is "number of packets per burst minus one", so the comment
-	 * that used to sit here - "a single packet per burst (encoded as '0')" -
-	 * described 0 while the code wrote 15, i.e. sixteen packets per burst, on
-	 * every endpoint including the control ones.
+	 * Burst Size is "number of packets per burst minus one".
 	 *
-	 * Control endpoints do not burst, and Table 4-1's power-on sequence
-	 * programs BrstSiz = 0 for them, so 0 is restored here unconditionally for
-	 * endpoint 0. At SuperSpeed this field drives the ACK NumP flow control on
-	 * IN bursts, so an over-stated burst size on the control IN endpoint is not
-	 * cosmetic.
+	 * Control endpoints do not burst and Table 4-1 programs BrstSiz = 0 for them, so
+	 * 0 is forced for endpoint 0.  At SuperSpeed this field drives ACK NumP flow
+	 * control on IN bursts, so an over-stated value there is not cosmetic.
 	 *
-	 * Non-control endpoints keep 15, and that is correct rather than merely
-	 * unexamined. The field description defines BrstSiz for IN transfers as a
-	 * CEILING, not a request: "If BrstSiz >= the NumP value in the initiating
-	 * TP_ACK, then the device controller attempts a burst length of NumP." NumP
-	 * comes from the host, and the host is bounded by the endpoint descriptor's
-	 * bMaxBurst. So an over-stated BrstSiz on an IN endpoint cannot produce a
-	 * burst the host did not ask for, while lowering it would cap the video
-	 * endpoint below what the host is willing to take.
+	 * Non-control endpoints keep 15, and that is correct rather than unexamined.  For
+	 * IN the field is a CEILING: "If BrstSiz >= the NumP value in the initiating
+	 * TP_ACK, then the device controller attempts a burst length of NumP" - NumP comes
+	 * from the host, bounded by the descriptor's bMaxBurst, so an over-stated BrstSiz
+	 * cannot produce a burst the host did not ask for, while lowering it would cap the
+	 * video endpoint.  bMaxBurst is not available here in any case:
+	 * udc_ep_enable_internal() takes (addr, attributes, mps, interval) and the UDC API
+	 * carries no burst field.
 	 *
-	 * bMaxBurst itself is not available here - udc_ep_enable_internal() takes
-	 * (addr, attributes, mps, interval) and the UDC API carries no burst field
-	 * at all - so it could not be programmed exactly even if that were wanted.
-	 * For IN endpoints it does not need to be.
-	 *
-	 * The one case where the value is a genuine assertion rather than a limit
-	 * is a non-control OUT endpoint: there BrstSiz is "the NumP value utilized
-	 * in the response TP_ACK", i.e. the credit this device advertises. 15 tells
-	 * the host the device desires up to sixteen packets. It is left as is: the
-	 * host is still bounded by the descriptor, 0 is explicitly worse - it makes
-	 * NumP=0, "a flow-control condition ... for each DP received and a
-	 * subsequent ERDY is transmitted" - and neither capture shows an OUT
-	 * endpoint in difficulty. Revisit only with evidence.
+	 * For a non-control OUT endpoint it IS an assertion - the credit this device
+	 * advertises.  15 is left because the host is still bounded by the descriptor and
+	 * 0 is explicitly worse (NumP=0 forces a flow-control ERDY per DP).  Revisit only
+	 * with evidence.
 	 */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 0);
@@ -2555,38 +2524,23 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	}
 
 	/*
-	 * An OUT transfer buffer must be a whole number of packets.  The databook
-	 * is unconditional about it - "the total size of a Buffer Descriptor must
-	 * be a multiple of MaxPacketSize" for OUT endpoints - and unlike the size
-	 * rules on Setup TRBs there is no interlock behind it: the core accepts the
-	 * short descriptor, and then has nowhere defined to put a packet that
-	 * overruns it.
+	 * An OUT descriptor must be a whole number of packets: "the total size of a
+	 * Buffer Descriptor must be a multiple of MaxPacketSize".  Unlike the Setup TRB
+	 * size rule there is no interlock - the core accepts a short descriptor and then
+	 * has nowhere defined to put a packet that overruns it.  Symptom when it bites:
+	 * DSTS.RXFIFOEMPTY clear (a received packet with nowhere to go), GEVNTCOUNT
+	 * frozen on an event the core will not place, endpoint dead.
 	 *
-	 * The host drives this constantly.  The class request the tester loops on
-	 * is SET_CUR with wLength 2 (bmRequestType 0x21, bRequest 0x01), so the
-	 * data stage arms a 2-byte OUT descriptor against a 512-byte EP0.  Nearly
-	 * every one of those completes; occasionally one does not, and when it does
-	 * not the capture shows DSTS.RXFIFOEMPTY clear - a received packet still
-	 * sitting in the RxFIFO with nowhere to be written - GEVNTCOUNT frozen
-	 * holding an event the core will not place, and the endpoint dead from
-	 * there.  Healthy samples in the same run all read RXFIFOEMPTY set.
+	 * So round up.  This is a PLAIN round-up of trb[0] - there is no trb[1] and no
+	 * scratch buffer.  Linux uses a chained form in __dwc3_ep0_do_control_data();
+	 * this driver does not, because chaining costs ring slots and bookkeeping for a
+	 * case the stack never produces.
 	 *
-	 * So round the descriptor up to a packet boundary, as the databook asks.
-	 *
-	 * This is a PLAIN round-up of trb[0], not the chained scratch descriptor an
-	 * earlier version of this comment described - there is no trb[1] and no
-	 * scratch buffer.  Linux uses the chained form in
-	 * __dwc3_ep0_do_control_data() ("prepare extra trb to align transfer to
-	 * MPS"); this driver deliberately does not, because the chaining cost ring
-	 * slots and bookkeeping for a case the stack never produces.
-	 *
-	 * The tradeoff, accepted knowingly: rounding up tells the controller it may
-	 * write up to the rounded size into the caller's buffer.  For control that
-	 * is safe by construction - udc_ctrl_data_alloc() already rounds every
-	 * control OUT allocation up to bMaxPacketSize0, so buf->size is a whole
-	 * number of packets and this round-up is a no-op (measured: caller 512 B on
-	 * every descriptor).  udc_dwc3_out_size_check() reports it if that ever
-	 * stops being true.
+	 * Tradeoff, accepted knowingly: rounding up permits the controller to write up to
+	 * the rounded size into the caller's buffer.  Safe by construction for control -
+	 * udc_ctrl_data_alloc() already rounds to bMaxPacketSize0, so this is a no-op
+	 * (measured: caller 512 B on every descriptor) - and udc_dwc3_out_size_check()
+	 * reports it if that ever stops being true.
 	 */
 	/*
 	 * cfg.mps is the ENCODED Max Packet Size: bits 10:0 are the packet size and
@@ -2779,7 +2733,9 @@ static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
 		udc_dwc3_ctrl_arm_watchdog(dev, true, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status && setup->wLength == 0) {
 		/*
-		 * A status stage moves no data, so the TRB must carry BUFSIZ 0.
+		 * An IN status stage SENDS the zero-length packet, so its TRB carries
+		 * BUFSIZ 0.  (The OUT status stage RECEIVES a ZLP and carries
+		 * MaxPacketSize instead - see udc_dwc3_trb_ctrl_out().)
 		 * udc_dwc3_trb_ctrl_in() takes BUFSIZ from buf->len for the IN
 		 * direction - buf->size is the OUT-side receive capacity, and is what
 		 * udc_dwc3_trb_ctrl_out() reads - so len is the field that has to be
@@ -3301,32 +3257,17 @@ static void udc_dwc3_ctrl_next(const struct device *const dev)
 	LOG_DBG("load");
 
 	/*
-	 * Offer BOTH control endpoints, rather than computing which one should be
-	 * next.
+	 * Offer BOTH control endpoints rather than computing which is next.
 	 *
-	 * The computation used to come from udc_dwc3_ctrl_get_next_type(), which
-	 * reads priv->last_xfer_type - and that is set by
-	 * udc_dwc3_trb_ctrl_in()/_out() as a side effect of arming ANY stage,
-	 * including the speculative SETUP. Once a SETUP can be armed alongside a
-	 * live transfer, last_xfer_type describes the SETUP rather than the
-	 * transfer in progress, so the routing was derived from state that no
-	 * longer meant what it was read as.
+	 * The computation came from udc_dwc3_ctrl_get_next_type(), which reads
+	 * last_xfer_type - set by trb_ctrl_in()/_out() as a side effect of arming ANY
+	 * stage, including the speculative SETUP.  Once a SETUP can be armed alongside a
+	 * live transfer, last_xfer_type describes the SETUP rather than the transfer the
+	 * host is still working through, so the inference picks the wrong endpoint.
 	 *
-	 * That is the same defect as change 46, one level up: inference from
-	 * remembered state where the queued buffer's own flags are authoritative.
-	 * It was bounded rather than harmless - the OUT endpoint got an
-	 * unconditional try below, so only IN stages could be missed, and only
-	 * when a SETUP had overwritten the type first.
-	 *
-	 * Trying both removes the inference entirely. udc_dwc3_ctrl_try() peeks its
-	 * own queue and returns immediately when there is nothing there or the
-	 * endpoint is not free, and udc_dwc3_ctrl_next_in()/_out() derive the stage
-	 * from the buffer's setup/data/status flags. Nothing has to remember what
-	 * came before.
-	 *
-	 * IN first, then OUT: when the current transfer's stage is an IN one, that
-	 * gives the intended steady state directly - the stage armed, then the next
-	 * SETUP behind it on the other endpoint.
+	 * udc_dwc3_ctrl_try() already refuses an endpoint that is busy or has nothing
+	 * queued, so offering both is both simpler and correct: whichever genuinely has
+	 * work takes it, and the other is a no-op.
 	 */
 	udc_dwc3_ctrl_try(dev, &cfg->ep_data_in[0]);
 
@@ -3861,40 +3802,20 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/*
 	 * Global Rx Threshold: disable multi-packet RX thresholding.
 	 *
-	 * Databook 1.2.4 documents an erratum on this register:
+	 * Databook 1.2.4 erratum: an "ACK TP with NumP=0 followed by ACK TP with NumP=1
+	 * without ERDY TP ... during a burst bulk OUT transfer" can leave third-party
+	 * USB 3.0 hosts waiting for an ERDY.  The documented workaround is
+	 * GRXTHRCFG.UsbRxPktCntSel=0 plus fixed DCFG.NUMP - NUMP is programmed below, so
+	 * clearing this bit is what selects that mode.
 	 *
-	 *   "There is an issue when ACK TP with NumP=0 followed by ACK TP with
-	 *    NumP=1 without ERDY TP sent by the device controller during a burst bulk
-	 *    OUT transfer. This may cause third-party USB 3.0 host controllers to keep
-	 *    waiting for the ERDY TP."
+	 * Databook 4.2.4 reaches the same condition another way: with RX thresholding on,
+	 * "do not use the 'on-demand' mode of transfer for SS OUT endpoints", or a final
+	 * ACK TP (NumP=0) deadlocks the host waiting for an ERDY that on-demand software
+	 * never sends.  This driver arms OUT TRBs only when the stack enqueues a buffer -
+	 * exactly that on-demand mode - so either this bit goes or SS OUT endpoints must
+	 * keep a TRB permanently armed.  Clearing it is much the smaller change.
 	 *
-	 * and gives the workaround:
-	 *
-	 *   "the Global Rx Threshold mode must be disabled by setting
-	 *    GRXTHRCFG.UsbRxPktCntSel=0. Instead, software can program the DCFG.NUMP
-	 *    mode (where fixed NUMP is transmitted always) instead of the RX threshold
-	 *    based nump mode to prevent the device from sending ACK TP with NumP=0."
-	 *
-	 * DCFG.NUMP is programmed further down, so the fixed-NUMP half was already in
-	 * place; clearing this bit is what actually selects that mode.
-	 *
-	 * The same condition is reachable a second way. Databook 4.2.4:
-	 *
-	 *   "When RX packet threshold feature is enabled, do not use the 'on-demand'
-	 *    mode of transfer for SS OUT endpoints. This restriction is because, if
-	 *    the last packet of the transfer ends with an ACK TP (NumP=0), then the
-	 *    USB is in flow control and the host waits for an ERDY, but the
-	 *    'on-demand' application does not setup any packet until the host polls,
-	 *    creating a dead-lock situation."
-	 *
-	 * This driver arms OUT TRBs only when the stack enqueues a buffer, which is
-	 * precisely the on-demand mode that note forbids while thresholding is on. So
-	 * either this bit goes, or SS OUT endpoints must keep a TRB permanently
-	 * armed - the control OUT SETUP TRB above all. Clearing the bit is by far the
-	 * smaller change.
-	 *
-	 * The pre-existing value is logged before anything is modified, so a capture
-	 * records what the core powered up with even when the workaround is disabled.
+	 * The power-on value is logged before anything is modified.
 	 */
 	reg = sys_read32(base + UDC_DWC3_GRXTHRCFG);
 	LOG_INF("GRXTHRCFG=0x%08x at reset (UsbRxPktCntSel=%u, UsbRxPktCnt=%u)", reg,
@@ -3943,37 +3864,21 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	memset((void *)cfg->evt_buf, 0, CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
 
 	/*
-	 * The read pointer belongs with that memset and must never be separated
-	 * from it.
+	 * The read pointer belongs with that memset and must never be separated from it.
 	 *
-	 * SPEC, Programming Guide 3.30b, "Register Access Considerations", Device
-	 * Registers, DCTL entry:
+	 * CSftRst clears all CSRs except GSTS, GSNPSID, GGPIO, GUID, GUSB2PHYCFGn,
+	 * GUSB3PIPECTLn, DCFG, DCTL, DEVTEN and DSTS.  GEVNTADR/SIZ/COUNT are absent from
+	 * that list, which is why the lines below reprogram them - and it means the
+	 * controller's write pointer restarts at slot 0, so anything the driver believed
+	 * about its read position is now wrong.
 	 *
-	 *   "CSftRst: This bit will clear the interrupts and all the CSRs except the
-	 *    following registers: GSTS, GSNPSID, GGPIO, GUID, GUSB2PHYCFGn
-	 *    registers, GUSB3PIPECTLn registers, DCFG, DCTL, DEVTEN, DSTS"
+	 * Leaving it stale does not lose an event, it HANGS the ring: the drain parks on
+	 * evt_next, which the controller will not reach again until it has written every
+	 * slot ahead of it, while GEVNTCOUNT reports events piling up at slot 0 that
+	 * nothing collects - the empty-slot stall, arrived at by way of a bug.
 	 *
-	 * GEVNTADR, GEVNTSIZ and GEVNTCOUNT are absent from that exception list, so
-	 * the CSFTRST above cleared them - which is precisely why the lines that
-	 * follow have to program the buffer address and size again. The controller's
-	 * event write pointer therefore restarts at slot 0, and anything this driver
-	 * still believed about where it had reached is now wrong by however far the
-	 * previous session got.
-	 *
-	 * Leaving it stale does not lose an event, it hangs the ring: the drain
-	 * parks on slot evt_next, which the controller will not reach again until
-	 * it has written every slot ahead of it, while GEVNTCOUNT keeps reporting
-	 * the events piling up at slot 0 that nothing is collecting. That is the
-	 * empty-slot stall this driver spends so much effort detecting, arriving
-	 * by way of a bug rather than by way of the hardware.
-	 *
-	 * udc_dwc3_init() is a UDC API entry point, not boot-only code, so this is
-	 * reachable on any re-init. It only stays hidden because priv starts
-	 * zeroed and the first pass through happens to agree. The disabled block
-	 * in udc_dwc3_recover() carries the same assignment, so the requirement
-	 * was understood - it just never made it into the live path.
-	 *
-	 * The stall bookkeeping goes with it: every field in it names a slot index
+	 * udc_dwc3_init() is a UDC API entry point, not boot-only, so this is reachable on
+	 * any re-init.  The stall bookkeeping goes with it: every field names a slot index
 	 * or an age that no longer refers to anything.
 	 */
 	priv->evt_next = 0;
@@ -4682,40 +4587,28 @@ static void udc_dwc3_ctrl_resync(const struct device *const dev,
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	/*
-	 * REPORT ONLY. This deliberately takes no recovery action, and that is a
-	 * correction of a defect, not a stub.
+	 * REPORT ONLY - deliberately no recovery action.
 	 *
-	 * The two flag-driven tests in udc_dwc3_ctrl_xnr_check() - ctrl_setup_seen
-	 * (4.4.x step 2) and ctrl_data_done (4.4.2 step 5) - cannot be trusted in
-	 * this driver, because it arms AHEAD of the host: the next SETUP is armed
-	 * speculatively and the status stage is armed before the host has finished
-	 * with the request. There is therefore a window in which setup_packet still
-	 * describes a transfer the host is legitimately still working through while
-	 * the flags already say no request is in progress. Every XferNotReady in
-	 * that window trips the check.
+	 * The flag-driven tests in udc_dwc3_ctrl_xnr_check() (ctrl_setup_seen, 4.4.x
+	 * step 2; ctrl_data_done, 4.4.2 step 5) cannot be trusted here, because this
+	 * driver arms AHEAD of the host: the next SETUP speculatively, the status stage
+	 * before the host has finished.  That leaves a window where setup_packet still
+	 * describes a transfer the host is legitimately working through while the flags
+	 * say none is in progress, and every XferNotReady in it trips the check.
 	 *
-	 * Measured, not guessed: a cold boot with the checks reporting rather than
-	 * acting logged ten trips of "SETUP has not retired" plus one "more data
-	 * than wLength" during ordinary enumeration, immediately after "Setting
-	 * address to 2". With the recovery enabled each of those issued Set Stall on
-	 * EP0 - and an End Transfer against a live control endpoint, the command
-	 * this driver documents as hanging - which destroyed enumeration and
-	 * eventually took the host controller down with it. 10e114e4 plus this fix
-	 * alone reproduced that 0/3; the same build with this function made
-	 * report-only passed 3/3.
+	 * Measured: a cold boot logged ten "SETUP has not retired" plus one "more data
+	 * than wLength" during ordinary enumeration.  With recovery enabled each issued
+	 * Set Stall on EP0 and an End Transfer against a live control endpoint, which
+	 * destroyed enumeration and took the host controller down - 0/3 boots.  Made
+	 * report-only, the same build passed 3/3.
 	 *
-	 * Acting on a signal that fires during healthy traffic is worse than not
-	 * acting at all. The counter and the line below keep the diagnostic value -
-	 * a real host deviation still shows up - without letting a false positive
-	 * tear down a working endpoint. Restoring the recovery needs a way to know
-	 * a request is genuinely current, which the arming events cannot provide.
+	 * Acting on a signal that fires during healthy traffic is worse than not acting.
+	 * Restoring recovery needs a way to know a request is genuinely current, which
+	 * the arming events cannot provide.
 	 *
-	 * Plain LOG_ERR for the first few, NOT LOG_ERR_RATELIMIT: enumeration
-	 * happens about a second after boot, inside the first
-	 * CONFIG_LOG_RATELIMIT_INTERVAL_MS (5000 ms), where the rate limiter has no
-	 * previous emission to compare against and swallows the message. That is
-	 * why this fired dozens of times during enumeration and never printed a
-	 * line, which cost a long hunt.
+	 * Plain LOG_ERR for the first few, NOT LOG_ERR_RATELIMIT: enumeration happens
+	 * inside the first CONFIG_LOG_RATELIMIT_INTERVAL_MS (5000 ms), where the limiter
+	 * has no previous emission to compare against and swallows the message entirely.
 	 */
 	priv->ctrl_desync++;
 
@@ -5472,33 +5365,20 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	/*
 	 * XferNotReady on a NON-CONTROL endpoint: ignore it.
 	 *
-	 * It means only "the host asked and no TRB was available", and the
-	 * databook says of it: "This event can happen when software issues a Start
-	 * Transfer or Update Transfer. In this case, software must ignore this
-	 * event because it has already issued the Start Transfer or Update
-	 * Transfer", and "the application must enable this event if it plans to
-	 * issue Start Transfer on demand". This driver does not arm on demand - it
-	 * arms bulk and isochronous transfers from ep_enqueue - so there is
-	 * nothing to do.
+	 * It means only "the host asked and no TRB was available".  The databook: "This
+	 * event can happen when software issues a Start Transfer or Update Transfer.  In
+	 * this case, software must ignore this event", and "the application must enable
+	 * this event if it plans to issue Start Transfer on demand".  This driver arms
+	 * bulk and isochronous from ep_enqueue, not on demand, so there is nothing to do.
 	 *
-	 * IT SHARED THE DISCONNECT BODY UNTIL NOW, and that was a real defect.
-	 * _NORMAL_EP expands the label to endpoints 2..31, so an ordinary poll of
-	 * the video or a bulk endpoint ran udc_dwc3_drop_xfer_state(), which
-	 * clears end_xfer_pending and resume_pending on EVERY endpoint plus
-	 * ctrl_recovery_pending, ctrl_recovery_ep and watchdog_ep. Those flags are
-	 * what makes udc_dwc3_ctrl_try() defer arming and what
-	 * udc_dwc3_depcmd_start_xfer() checks before issuing, so clearing them
-	 * falsely lets a Start Transfer go out while the transfer resource is
-	 * still held - CmdStatus 4'h1, "there is no transfer resource available on
-	 * the endpoint", which is the "Start Transfer failed on EP00" seen on the
-	 * rig. It also forgot any recovery in flight. All of it was invisible: the
-	 * only trace was a LOG_DBG, compiled out at INF, and labelled
-	 * "disconnect".
-	 *
-	 * Found by review, not by the logs. Present since 10e114e4, so it is not
-	 * the recent regression - but it is on a path the host exercises whenever
-	 * it polls an endpoint with nothing armed, which during streaming is not
-	 * rare.
+	 * It shared the DISCONNECT body until fixed, which was a real defect: _NORMAL_EP
+	 * covers endpoints 2..31, so an ordinary poll ran udc_dwc3_drop_xfer_state() and
+	 * cleared end_xfer_pending/resume_pending on every endpoint plus the recovery and
+	 * watchdog state.  Those flags are what defer arming and what start_xfer() checks,
+	 * so clearing them let a Start Transfer go out while the transfer resource was
+	 * still held - CmdStatus 4'h1, the "Start Transfer failed on EP00" seen on the
+	 * rig - and forgot any recovery in flight.  Invisible: the only trace was a
+	 * LOG_DBG labelled "disconnect".
 	 */
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
 	case UDC_DWC3_DEVT_ULSTCHNG:
@@ -6231,49 +6111,26 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 }
 
 /*
- * Upper bound on the wait for a posted event write to land in the event buffer.
+ * Upper bound on the wait for a posted event write to land in the buffer.
  *
- * The USB core writes the event word over AXI, which is posted: the write is
- * acknowledged to the core before the data has reached the event RAM, and
- * GEVNTCOUNT can therefore become visible to software while the slot it refers
- * to is still empty. Reading the slot unconditionally consumes whatever the
- * previous occupant left behind - a well-formed, plausible event from one
- * ring-wrap ago, which is the worst kind of failure because nothing downstream
- * can tell it apart from a real one.
+ * The core's AXI write is posted: GEVNTCOUNT can become visible while the slot
+ * it refers to is still empty.  Reading unconditionally would consume whatever
+ * the previous occupant left - a well-formed event from one ring-wrap ago,
+ * indistinguishable downstream from a real one.  Hence the sentinel every slot
+ * is re-armed with, and the buffer initialised to, at setup.
  *
- * Zero is not a representable event: an endpoint event always carries a
- * non-zero type in bits 9:6, and every device event sets bit 0. That makes it a
- * safe "not arrived yet" sentinel, which each slot is re-armed with after it is
- * consumed, and which the whole buffer is initialised to at setup.
+ * Three properties matter, all learned the hard way:
  *
- * A rig capture showed how much this matters, and how the first version of this
- * wait got it wrong. The slot was still empty on the first read for the
- * majority of events, so a short fixed spin - 64 reads - expired constantly:
- * 53558 expiries against 33319 events actually handled. Each expiry abandoned
- * the drain pass and logged an error, so the ring lost ground on roughly two
- * events in three and eventually overflowed, taking the video and control
- * streams down with it.
- *
- * Two things follow, and both are the point of the numbers below.
- *
- * The wait has to be long enough that expiry means a genuine fault rather than
- * a slow write. This core has an instruction cache but no data cache, so every
- * one of these reads goes to memory and waiting really does make progress -
- * re-reading could not help if a stale line could be held. The budget is a
- * time, not a read count, so it does not change meaning with the core clock.
- *
- * The reads are paced rather than run flat out. The loop itself is in the
- * instruction cache, so an unthrottled version issues back-to-back Wishbone
- * reads at core speed against the same event RAM the controller is writing over
- * AXI. That is contention with the write being waited for, so hammering the bus
- * can hold off the very event it is looking for. Polling once per interval
- * costs nothing against a wait measured in microseconds and leaves the bus
- * mostly idle for the writer.
- *
- * And expiry must not be logged per occurrence. At 115200 baud, tens of
- * thousands of error lines are themselves enough to starve the ring. The count
- * is kept instead and reported by "dwc3 evt", with an occasional line to say it
- * is happening at all.
+ *   - It is a TIME budget, not a read count.  A fixed 64-read spin expired on
+ *     most events (53558 expiries against 33319 events handled), abandoning the
+ *     drain each time until the ring overflowed.  A time also keeps its meaning
+ *     across core clocks.
+ *   - Reads are PACED.  Unthrottled polling issues back-to-back Wishbone reads
+ *     against the same RAM the controller is writing over AXI, holding off the
+ *     very event being waited for.
+ *   - Expiry is COUNTED, not logged per occurrence.  At 115200 baud tens of
+ *     thousands of error lines would themselves starve the ring; "dwc3 evt"
+ *     reports the total.
  */
 /*
  * Constraints the event buffer has to satisfy, checked here rather than
@@ -6457,39 +6314,20 @@ static void udc_dwc3_evt_force(const struct device *const dev)
 	}
 
 	/*
-	 * SPEC, Programming Guide 3.30b, DGCMD Table, bit 10 CMDACT "Command
-	 * Active", access R/W1S:
+	 * DGCMD bit 10 CMDACT, R/W1S: software sets it to start the generic command and
+	 * the controller clears it when done.  Set therefore means the previous command
+	 * is still executing.  The databook does not define writing over that, and this
+	 * is not the place to find out - forces are milliseconds apart and a generic
+	 * command retires in microseconds, so this should never be taken.
 	 *
-	 *   "The software sets this bit to 1 to enable the device controller to
-	 *    execute the generic command. The device controller sets this bit to 0
-	 *    after executing the command."
-	 *
-	 * So the bit set means the controller is still executing the last one. The
-	 * databook does not say what writing over that does, and this is not the
-	 * place to find out. Forces are milliseconds apart and a generic command
-	 * retires in microseconds, so this should never be taken.
-	 *
-	 * Note this deliberately does NOT save/clear/restore GUSB2PHYCFG the way
-	 * udc_dwc3_depcmd() does, for two reasons.
-	 *
-	 * The requirement does not reach this case. SPEC, Programming Guide 3.30b,
-	 * Note accompanying the 2.0-only device initialization:
-	 *
-	 *   "When DCFG.DevSpd is programmed for 2.0 only mode (such as, High-Speed
-	 *    or Full-Speed), if the application wants to issue any commands to clear
-	 *    any pending transfers during a Disconnect interrupt, then it has to
-	 *    disable gusb2phycfg[SusPHY] before issuing any commands and re-enable it
-	 *    after the commands have completed."
-	 *
-	 * Both conditions are absent here: this controller enumerates at SuperSpeed,
-	 * and this is not disconnect handling.
-	 *
-	 * And doing it anyway would cost more than it bought. It is a
-	 * read-modify-write that udc_dwc3_depcmd() performs on the usbd thread under
-	 * the UDC mutex, while this runs unlocked on the work queue - adding it here
-	 * would introduce a real race to remove a hazard this core does not have.
-	 * GUSB2PHYCFGn is also on the CSftRst exception list quoted in
-	 * udc_dwc3_on_soft_reset(), so its value is not something a reset restored.
+	 * Deliberately does NOT save/clear/restore GUSB2PHYCFG the way udc_dwc3_depcmd()
+	 * does.  The requirement it serves is scoped to DCFG.DevSpd 2.0-only mode during
+	 * Disconnect handling; this controller enumerates at SuperSpeed and this is not
+	 * disconnect.  Doing it anyway would cost more than it bought: it is a
+	 * read-modify-write that depcmd() performs on the usbd thread under the UDC mutex,
+	 * while this runs unlocked on the work queue, so it would add a real race to
+	 * remove a hazard this core does not have.  GUSB2PHYCFGn is also on the CSftRst
+	 * exception list, so a reset did not disturb it.
 	 */
 	if (sys_read32(base + UDC_DWC3_DGCMD) & UDC_DWC3_DGCMD_ACT) {
 		return;
@@ -6818,11 +6656,6 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 
 			evt = udc_dwc3_evt_wait_first(dev);
 			if (evt == UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
-				/*
-				 * Skipping counts as progress, so the pass is not
-				 * marked stalled: a credit was freed, and the worker
-				 * should come straight back to use it.
-				 */
 				/*
 				 * No decision here any more. The drain records the
 				 * run - slot, age, give-ups, gc when it opened - and
