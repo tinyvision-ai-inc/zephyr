@@ -720,9 +720,37 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GEVNTCOUNT_MASK				GENMASK(15, 0)
 #define UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY			BIT(31)
 
+/*
+ * GEVNTCOUNT, read with a full fence.
+ *
+ * A/B under test (2026-09-02). This fence was added, removed, and is back so
+ * both arms can be run to a detector verdict. The earlier comparison was not
+ * valid: the fence-present arm was stopped by hand before it reached one, and
+ * the fence-free binary wedged at setup 230 on one run and ctrl 18,144 on the
+ * next - a spread far wider than the difference being measured.
+ *
+ * The argument used to remove it covered only load-load ordering: issuing the
+ * event-buffer load ahead of this one needs speculative issue past a branch,
+ * and this core is an in-order rv32im with none. That argument is incomplete.
+ * "fence iorw,iorw" is a FULL fence, so it also drains the store buffer -
+ * which an in-order core still has - and the ring's 0xffffffff sentinel scheme
+ * depends on those sentinel stores having landed before the count is trusted.
+ *
+ * The other hazard, the controller's posted write to the ring landing after
+ * GEVNTCOUNT has already incremented, is NOT what this guards. That one is the
+ * sentinel's job. Keep the two distinct when reasoning about this function.
+ */
 static inline uint32_t udc_dwc3_gevntcount(const mm_reg_t base)
 {
-	return sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) & UDC_DWC3_GEVNTCOUNT_MASK;
+	const uint32_t count = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) &
+			       UDC_DWC3_GEVNTCOUNT_MASK;
+
+#if defined(CONFIG_RISCV)
+	__asm__ volatile ("fence iorw,iorw" ::: "memory");
+#else
+	barrier_dsync_fence_full();
+#endif
+	return count;
 }
 
 /* USB Device Active USB Endpoint Enable */
@@ -1349,6 +1377,18 @@ struct udc_dwc3_data {
 	uint32_t ctrl_recover_mark;	/* ctrl_setup_done at the last recover() */
 	uint32_t ctrl_wd_dump;		/* non-SETUP watchdog fires dumped so far */
 	uint32_t ctrl_wd_upd_mark;	/* stage count at the last control re-cache */
+	bool buscfg_logged;		/* the one-shot bus/DMA config report has run */
+	/*
+	 * Descriptors overwritten while the controller still owned them.
+	 *
+	 * Nothing enforces the invariant the control path depends on - that
+	 * udc_ep_is_busy() being false means the controller has released trb[0].
+	 * busy is driver state; HWO is the hardware's. They have been seen to
+	 * disagree (EP80 busy=0 with HWO=1 in uart_01sep_2328_epdis). If they
+	 * disagree again, trb_fill() stamps over a descriptor the controller is
+	 * actively using, and that is a race a faster bus makes far more likely.
+	 */
+	uint32_t trb_stomp;
 	uint32_t nonctrl_recache;	/* re-caches issued on non-control endpoints */
 	uint32_t ctrl_setup_wd_upd_mark;
 	uint32_t ctrl_status_done;	/* status stages retired (IN and OUT) */
@@ -1698,6 +1738,28 @@ static inline void udc_dwc3_trb_sync(volatile uint32_t *const last_word)
 #endif
 }
 
+/* Bounded: the first few are what matter, and this may fire in a tight loop. */
+#define UDC_DWC3_TRB_STOMP_LOG_FIRST				8u
+
+static struct udc_dwc3_data *udc_dwc3_stomp_priv;
+
+static inline void udc_dwc3_trb_stomp_report(volatile struct udc_dwc3_trb *const trb)
+{
+	struct udc_dwc3_data *const priv = udc_dwc3_stomp_priv;
+
+	if (priv == NULL) {
+		return;
+	}
+
+	priv->trb_stomp++;
+
+	if (priv->trb_stomp <= UDC_DWC3_TRB_STOMP_LOG_FIRST) {
+		LOG_ERR("overwriting a descriptor the controller still owns: "
+			"ctrl 0x%08x sts 0x%08x (stomp %u)",
+			trb->ctrl, trb->status, priv->trb_stomp);
+	}
+}
+
 /*
  * Fill a TRB and make it visible to the controller. The ONLY place a TRB's
  * words are written.
@@ -1716,6 +1778,17 @@ static inline void udc_dwc3_trb_fill(volatile struct udc_dwc3_trb *const trb,
 				     const uintptr_t addr, const uint32_t status,
 				     const uint32_t ctrl)
 {
+	/*
+	 * Report - do not prevent - overwriting a descriptor the controller still
+	 * owns. Refusing here would strand the endpoint, and the callers have no
+	 * recovery path for a refusal; the point is to make the violation visible,
+	 * because until now it would have been silent and is a prime suspect for a
+	 * controller left holding a descriptor it will not release.
+	 */
+	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+		udc_dwc3_trb_stomp_report(trb);
+	}
+
 	trb->addr_lo = LO32(addr);
 	trb->addr_hi = HI32(addr);
 	trb->status = status;
@@ -4114,13 +4187,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 * the outstanding-request limit; GUCTL1 carries errata workaround bits.
 	 * Neither was previously even defined here.
 	 */
-	LOG_INF("BUSCFG: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GUCTL=0x%08x "
-		"GUCTL1=0x%08x GCTL=0x%08x",
-		sys_read32(base + UDC_DWC3_GSBUSCFG0),
-		sys_read32(base + UDC_DWC3_GSBUSCFG1),
-		sys_read32(base + UDC_DWC3_GUCTL),
-		sys_read32(base + UDC_DWC3_GUCTL1),
-		sys_read32(base + UDC_DWC3_GCTL));
 
 	LOG_INF("GRXTHRCFG=0x%08x at reset (UsbRxPktCntSel=%u, UsbRxPktCnt=%u)", reg,
 		(reg & UDC_DWC3_GRXTHRCFG_USBRXPKTCNTSEL) ? 1U : 0U,
@@ -4684,11 +4750,44 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		 * from it, at a tenth of the console cost.
 		 */
 #ifdef UDC_DWC3_LOG_EVERY_SETUP
-		LOG_INF("SETUP %016llx",
-			((uint64_t)sp[0] << 56) | ((uint64_t)sp[1] << 48) |
-			((uint64_t)sp[2] << 40) | ((uint64_t)sp[3] << 32) |
-			((uint64_t)sp[4] << 24) | ((uint64_t)sp[5] << 16) |
-			((uint64_t)sp[6] << 8)  |  (uint64_t)sp[7]);
+		{
+			/*
+			 * Collapse runs of the SAME SETUP packet.
+			 *
+			 * Under v4l2 control spam one packet repeats to the exclusion of
+			 * everything else: a 6-minute capture held 18,310 SETUP lines out
+			 * of 20,015, and 17,628 of those were one identical SET_CUR. At
+			 * LOG_MODE_MINIMAL every line is a synchronous UART write, so that
+			 * is both the log budget and a real slice of the wall clock.
+			 *
+			 * A time-based rate limit would drop DISTINCT packets, which are
+			 * the ones worth having. This drops only exact repeats, so every
+			 * unique SETUP still prints. A marker every 1024 keeps a long run
+			 * visible and preserves the count if the device wedges mid-run.
+			 *
+			 * Single event worker, so these statics need no lock.
+			 */
+			static uint64_t last_sp;
+			static uint32_t rep;
+			const uint64_t this_sp =
+				((uint64_t)sp[0] << 56) | ((uint64_t)sp[1] << 48) |
+				((uint64_t)sp[2] << 40) | ((uint64_t)sp[3] << 32) |
+				((uint64_t)sp[4] << 24) | ((uint64_t)sp[5] << 16) |
+				((uint64_t)sp[6] << 8)  |  (uint64_t)sp[7];
+
+			if (this_sp == last_sp) {
+				if ((++rep % 1024U) == 0U) {
+					LOG_INF("SETUP %016llx x%u", this_sp, rep);
+				}
+			} else {
+				if (rep != 0U) {
+					LOG_INF("SETUP %016llx x%u end", last_sp, rep);
+					rep = 0U;
+				}
+				LOG_INF("SETUP %016llx", this_sp);
+				last_sp = this_sp;
+			}
+		}
 #else
 		(void)sp;
 #endif
@@ -6189,6 +6288,28 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 
 	drain_stuck = (priv->hb_drain_stuck_beats * UDC_DWC3_HEARTBEAT_MS) >=
 		      CONFIG_UDC_DWC3_RECOVERY_TIMEOUT;
+
+	/*
+	 * Report the bus/DMA configuration once, from here rather than from
+	 * udc_dwc3_init().  At init it is unreachable in practice: a power cycle
+	 * drops the FTDI along with the board, so a UART reader cannot span it, and
+	 * by the time wait-ftdi returns the boot output has already gone.  Printed
+	 * on the first heartbeat instead, any capture catches it.
+	 *
+	 * These are bitfile values the driver never writes - GSBUSCFG1's
+	 * PipeTransLimit in particular, which bounds how many AXI requests the
+	 * master may have outstanding.  They matter whenever the bitstream changes.
+	 */
+	if (!priv->buscfg_logged) {
+		priv->buscfg_logged = true;
+		LOG_INF("BUSCFG: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GUCTL=0x%08x "
+			"GUCTL1=0x%08x GCTL=0x%08x",
+			sys_read32(base + UDC_DWC3_GSBUSCFG0),
+			sys_read32(base + UDC_DWC3_GSBUSCFG1),
+			sys_read32(base + UDC_DWC3_GUCTL),
+			sys_read32(base + UDC_DWC3_GUCTL1),
+			sys_read32(base + UDC_DWC3_GCTL));
+	}
 
 
 
@@ -7691,7 +7812,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				"decline %u/%u "
 				"setuppending %u unarmed %u startfail %u defer %u trbsts %u "
 				"setupwd %u/%u reset %u updxfer %u resync %u recache %u outmisaligned %u/%u xnrdy %u "
-				"gc_hwm %u B gc0max %u B multi %u link %u out1 %u/%u out2 %u/%u DSTS 0x%08x",
+				"gc_hwm %u B gc0max %u B multi %u link %u out1 %u/%u out2 %u/%u stomp %u DSTS 0x%08x",
 				priv->evt_handled, priv->evt_late,
 				priv->evt_late_polls_max, priv->evt_late_us_max,
 				priv->evt_gaveup, priv->evt_gaveup_us_max,
@@ -7718,6 +7839,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				cfg->num_out_eps > 1 ? cfg->ep_data_out[1].n_retire : 0U,
 				cfg->num_out_eps > 2 ? cfg->ep_data_out[2].n_arm : 0U,
 				cfg->num_out_eps > 2 ? cfg->ep_data_out[2].n_retire : 0U,
+				priv->trb_stomp,
 				/*
 				 * DSTS on the periodic line, so COREIDLE and
 				 * RXFIFOEMPTY get sampled during HEALTHY STREAMING -
@@ -8538,6 +8660,9 @@ unlock:
 static int udc_dwc3_driver_preinit(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	/* Single controller instance; the stomp reporter needs a way to reach it. */
+	udc_dwc3_stomp_priv = priv;
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_data *const data = dev->data;
 	struct udc_dwc3_ep_data *ep_data;
