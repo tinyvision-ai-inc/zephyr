@@ -226,6 +226,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
  */
 #define UDC_DWC3_HEARTBEAT_MS					200u
 
+
 /*
  * Kick the event handler if it has not COMPLETED a pass within this long while
  * the controller still says events are outstanding.
@@ -563,6 +564,8 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 /* Global SoC Bus Configuration Register */
 #define UDC_DWC3_GSBUSCFG0					0xc100
+#define UDC_DWC3_GSBUSCFG1					0xc104
+#define UDC_DWC3_GUCTL1						0xc11c
 #define UDC_DWC3_GSBUSCFG0_DATRDREQINFO				GENMASK(31, 28)
 #define UDC_DWC3_GSBUSCFG0_DESRDREQINFO				GENMASK(27, 24)
 #define UDC_DWC3_GSBUSCFG0_DATWRREQINFO				GENMASK(23, 20)
@@ -1045,6 +1048,16 @@ struct udc_dwc3_ep_data {
 	 */
 	bool resume_pending;
 	/*
+	 * Arms and retires on this endpoint. The usbmon capture of
+	 * uart_02sep_0139_racefix showed EP01 bulk OUT stop accepting host writes
+	 * 465 s BEFORE control wedged, with nothing logged device-side at all -
+	 * the only trace was the SRP loop slowing down, which had been dismissed
+	 * as a flaky test. These two counters make that moment visible: when arms
+	 * keep climbing and retires stop, the endpoint has stopped completing.
+	 */
+	uint32_t n_arm;
+	uint32_t n_retire;
+	/*
 	 * Whether the postponed resume meant Init or Modify. Captured when the
 	 * resume defers, because by the time it runs the stack has already set
 	 * cfg.stat.enabled and the answer can no longer be read off it.
@@ -1335,6 +1348,8 @@ struct udc_dwc3_data {
 	uint32_t ctrl_resync;		/* control endpoints resynchronised after a stall */
 	uint32_t ctrl_recover_mark;	/* ctrl_setup_done at the last recover() */
 	uint32_t ctrl_wd_dump;		/* non-SETUP watchdog fires dumped so far */
+	uint32_t ctrl_wd_upd_mark;	/* stage count at the last control re-cache */
+	uint32_t nonctrl_recache;	/* re-caches issued on non-control endpoints */
 	uint32_t ctrl_setup_wd_upd_mark;
 	uint32_t ctrl_status_done;	/* status stages retired (IN and OUT) */
 	uint32_t ctrl_trbsts_other;
@@ -2522,6 +2537,8 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	 * udc_ctrl_data_alloc() for control, and the class driver's job for its own
 	 * OUT endpoints.  udc_dwc3_out_size_check() reports it when it is not.
 	 */
+	ep_data->n_arm++;
+
 	udc_dwc3_trb_fill(trb, (uintptr_t)buf->data, out_size, ctrl);
 
 	LOG_DBG("PUSH %u, buf %p, data %p, size %u -> %u",
@@ -4086,6 +4103,25 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 * The power-on value is logged before anything is modified.
 	 */
 	reg = sys_read32(base + UDC_DWC3_GRXTHRCFG);
+	/*
+	 * The bus/DMA configuration, read once and never before logged.
+	 *
+	 * GSBUSCFG0's burst-enable bits are all commented out in this function, so
+	 * whatever the bitfile leaves there is what the controller uses - and with
+	 * no INCR burst enabled the databook says every DMA falls back to the
+	 * largest enabled length, i.e. single beats. That is a throughput property
+	 * under stress and nobody has ever looked at the value. GSBUSCFG1 carries
+	 * the outstanding-request limit; GUCTL1 carries errata workaround bits.
+	 * Neither was previously even defined here.
+	 */
+	LOG_INF("BUSCFG: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GUCTL=0x%08x "
+		"GUCTL1=0x%08x GCTL=0x%08x",
+		sys_read32(base + UDC_DWC3_GSBUSCFG0),
+		sys_read32(base + UDC_DWC3_GSBUSCFG1),
+		sys_read32(base + UDC_DWC3_GUCTL),
+		sys_read32(base + UDC_DWC3_GUCTL1),
+		sys_read32(base + UDC_DWC3_GCTL));
+
 	LOG_INF("GRXTHRCFG=0x%08x at reset (UsbRxPktCntSel=%u, UsbRxPktCnt=%u)", reg,
 		(reg & UDC_DWC3_GRXTHRCFG_USBRXPKTCNTSEL) ? 1U : 0U,
 		(uint32_t)FIELD_GET(UDC_DWC3_GRXTHRCFG_USBRXPKTCNT_MASK, reg));
@@ -5338,6 +5374,7 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const 
 
 		/* Liveness proxy for the SETUP watchdog - see nonctrl_done. */
 		priv->nonctrl_done++;
+		ep_data->n_retire++;
 
 		udc_ep_set_busy(&ep_data->cfg, false);
 
@@ -6153,6 +6190,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	drain_stuck = (priv->hb_drain_stuck_beats * UDC_DWC3_HEARTBEAT_MS) >=
 		      CONFIG_UDC_DWC3_RECOVERY_TIMEOUT;
 
+
+
 	/*
 	 * Kick a handler that has stopped being scheduled.
 	 *
@@ -6334,8 +6373,22 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		priv->ctrl_quiet_t0 = k_cycle_get_32();
 		priv->ctrl_quiet_logged = false;
 	} else if (!priv->ctrl_quiet_logged && priv->ctrl_setup_done > 0U &&
+		   priv->ctrl_decline_pending &&
 		   k_cyc_to_ms_near32(k_cycle_get_32() - priv->ctrl_quiet_t0) >=
 						UDC_DWC3_CTRL_QUIET_MS) {
+		/*
+		 * ctrl_decline_pending is the whole point of this clause: silence on
+		 * the control endpoint is only worth reporting if something is waiting
+		 * to be armed and cannot be. Without it this fired on a HEALTHY IDLE
+		 * bus - uart_02sep_0236_nocspam produced seven of these 32-line dumps
+		 * in three minutes purely because the control-spam load had been turned
+		 * off and nothing was generating traffic.
+		 *
+		 * Same error as the non-control sweep that was removed: acting on a
+		 * signal that also occurs during normal operation. An idle endpoint and
+		 * a stalled one look identical unless something external says the host
+		 * is asking, and the decline is that something.
+		 */
 		priv->ctrl_quiet_logged = true;
 		LOG_ERR("no control traffic for %u ms after %u SETUPs: busy o/i %u/%u, "
 			"trb o/i 0x%08x/0x%08x, gc %u B, DSTS 0x%08x (rxfifoempty %u), "
@@ -6355,6 +6408,45 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 #ifdef STALL_DIAG_LOG
 		udc_dwc3_stall_diag_dump(dev, "control traffic stopped");
 #endif
+
+		/*
+		 * Non-control endpoints get a re-cache here, and ONLY here.
+		 *
+		 * They have no stall detection of their own and cannot have one on
+		 * their own terms: an OUT endpoint armed and waiting for a host with
+		 * nothing to send is byte-for-byte identical to one that is stalled.
+		 * HWO stays 1 and BUFSIZ keeps the software-prepared value in both
+		 * cases, because the controller only writes the descriptor back when it
+		 * retires it - databook 4.2.3, "when the hardware writes back the TRBs,
+		 * it updates the BUFSIZ field to represent the remaining unused
+		 * buffer". A periodic sweep would therefore fire on healthy endpoints
+		 * and its counter would carry no information.
+		 *
+		 * This branch supplies the evidence the endpoint cannot: control
+		 * traffic has stopped, so something is wrong device-wide. Re-caching
+		 * every armed OUT descriptor then costs one command each and may
+		 * unstick a bulk endpoint that would otherwise fail silently - which
+		 * until now it would have, the watchdog guarding only the control pair.
+		 *
+		 * Re-cache only: no stall, no End Transfer, no claim cleared.
+		 */
+		for (int i = 1; i < cfg->num_out_eps; i++) {
+			struct udc_dwc3_ep_data *const e = &cfg->ep_data_out[i];
+			const volatile struct udc_dwc3_trb *t = e->trb_buf;
+
+			if (t == NULL || !udc_ep_is_busy(&e->cfg) ||
+			    (t[e->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+				continue;
+			}
+
+			priv->nonctrl_recache++;
+			udc_dwc3_depcmd_update_xfer(dev, e);
+
+			LOG_ERR("  EP%02x armed through a control stall (ctrl 0x%08x "
+				"sts 0x%08x): re-cached (%u)", e->cfg.addr,
+				t[e->tail].ctrl, t[e->tail].status,
+				priv->nonctrl_recache);
+		}
 	}
 
 	/*
@@ -6597,6 +6689,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	struct udc_dwc3_data *const priv =
 		CONTAINER_OF(dwork, struct udc_dwc3_data, watchdog_dwork);
 	const struct device *const dev = priv->dev;
+	struct udc_dwc3_ep_data *wd_ep;
 
 	/*
 	 * A SETUP TRB is armed speculatively and then waits on the host, so its
@@ -6788,6 +6881,18 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 * synchronously - dumping all of them would itself change what is being
 	 * measured. The first one is the one that matters.
 	 */
+	/*
+	 * Snapshot watchdog_ep ONCE. This worker runs on the system work queue and
+	 * reads it without the UDC mutex, while udc_dwc3_on_ctrl(), ep_disable()
+	 * and drop_xfer_state() all clear it from the UDC work queue. Re-reading
+	 * the field between a NULL check and a dereference is a fault, not merely a
+	 * stale read. The endpoint objects are static (cfg->ep_data_*), so a
+	 * snapshot cannot dangle - at worst it names an endpoint whose stage has
+	 * just completed, and Update Transfer against a completed resource is
+	 * detected and ignored by the controller (databook 3.2.2.6).
+	 */
+	wd_ep = priv->watchdog_ep;
+
 	if (priv->ctrl_wd_dump < UDC_DWC3_CTRL_WD_DUMP_FIRST) {
 		const struct udc_dwc3_config *const cfg = dev->config;
 		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -6803,9 +6908,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			"EP80 busy=%u ctrl=0x%08x sts=0x%08x | "
 			"setup %u status %u decline %u | DSTS 0x%08x",
 			priv->ctrl_wd_dump,
-			priv->watchdog_ep == NULL ? "nothing" :
-				(USB_EP_DIR_IS_IN(priv->watchdog_ep->cfg.addr) ?
-					"EP80" : "EP00"),
+			wd_ep == NULL ? "nothing" :
+				(USB_EP_DIR_IS_IN(wd_ep->cfg.addr) ? "EP80" : "EP00"),
 			priv->watchdog_type,
 			udc_ep_is_busy(&cfg->ep_data_out[0].cfg) ? 1U : 0U,
 			o[0].ctrl, o[0].status,
@@ -6814,6 +6918,41 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			priv->ctrl_setup_done, priv->ctrl_status_done,
 			priv->ctrl_decline,
 			sys_read32(base + UDC_DWC3_DSTS));
+	}
+
+	/*
+	 * Try the cheap remedy on THIS stage before Set Stall, whatever stage it is.
+	 *
+	 * The same re-cache already existed but was gated inside the SETUP branch
+	 * above, so it never ran for a DATA or STATUS stage - updxfer read 0 through
+	 * every wedge in uart_02sep_0001_noreclaim, all of which fired with type
+	 * 0x50 (CONTROL_DATA). An earlier "the re-cache does not help" result was
+	 * measured on a stuck SETUP and does not carry over to this stage.
+	 *
+	 * Update Transfer only asks the controller to re-read the descriptor;
+	 * databook 3.2.2.6 says issuing it against a resource that has already
+	 * completed is detected and ignored, so it cannot do the damage that ending
+	 * a control transfer did. One attempt per episode, marked by the stage
+	 * counters so a stage retiring in between counts as a fresh episode.
+	 */
+	if (wd_ep != NULL &&
+	    (priv->ctrl_setup_done + priv->ctrl_status_done) != priv->ctrl_wd_upd_mark) {
+		priv->ctrl_wd_upd_mark = priv->ctrl_setup_done + priv->ctrl_status_done;
+		priv->ctrl_setup_wd_updxfer++;
+
+		priv->depcmd_no_sleep = true;
+		udc_dwc3_depcmd_update_xfer(dev, wd_ep);
+		priv->depcmd_no_sleep = false;
+
+		LOG_ERR("re-cached EP%02x (type 0x%02x) with Update Transfer "
+			"(attempt %u): if the stage completes now, the controller was "
+			"holding a stale descriptor",
+			wd_ep->cfg.addr, priv->watchdog_type,
+			priv->ctrl_setup_wd_updxfer);
+
+		k_work_reschedule(&priv->watchdog_dwork,
+				  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+		return;
 	}
 
 	udc_dwc3_recover(dev);
@@ -7551,8 +7690,8 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				"zero %u missed %u/%u desync %u ctrl %u/%u midzero %u "
 				"decline %u/%u "
 				"setuppending %u unarmed %u startfail %u defer %u trbsts %u "
-				"setupwd %u/%u reset %u updxfer %u resync %u outmisaligned %u/%u xnrdy %u "
-				"gc_hwm %u B gc0max %u B multi %u link %u DSTS 0x%08x",
+				"setupwd %u/%u reset %u updxfer %u resync %u recache %u outmisaligned %u/%u xnrdy %u "
+				"gc_hwm %u B gc0max %u B multi %u link %u out1 %u/%u out2 %u/%u DSTS 0x%08x",
 				priv->evt_handled, priv->evt_late,
 				priv->evt_late_polls_max, priv->evt_late_us_max,
 				priv->evt_gaveup, priv->evt_gaveup_us_max,
@@ -7569,11 +7708,16 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				priv->ctrl_setup_wd_reset,
 				priv->ctrl_setup_wd_updxfer,
 				priv->ctrl_resync,
+				priv->nonctrl_recache,
 				priv->out_unaligned, priv->out_unaligned_ctrl,
 				priv->xnrdy_nonctrl,
 				priv->evt_gevntcount_hwm,
 				priv->evt_gaveup_gc0_max, priv->evt_gaveup_multi,
 				priv->evt_link_total,
+				cfg->num_out_eps > 1 ? cfg->ep_data_out[1].n_arm : 0U,
+				cfg->num_out_eps > 1 ? cfg->ep_data_out[1].n_retire : 0U,
+				cfg->num_out_eps > 2 ? cfg->ep_data_out[2].n_arm : 0U,
+				cfg->num_out_eps > 2 ? cfg->ep_data_out[2].n_retire : 0U,
 				/*
 				 * DSTS on the periodic line, so COREIDLE and
 				 * RXFIFOEMPTY get sampled during HEALTHY STREAMING -
