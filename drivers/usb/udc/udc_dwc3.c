@@ -694,58 +694,7 @@ struct udc_dwc3_data {
 	uint8_t last_xfer_dir;
 	/* Cache that is always up to date (before stack could get time to react) */
 	struct usb_setup_packet setup_packet;
-	/*
-	 * Instrumentation for telling apart the two remaining explanations of a
-	 * stall: the write really did land later than the deadline, or the deadline
-	 * expired while this thread was not running. Nothing here changes behaviour.
-	 */
-	uint32_t evt_gevntcount_hwm;	/* worst announced-but-unread backlog, bytes */
-	uint32_t evt_zero;		/* slots the CONTROLLER wrote as 0x00000000 */
-	uint32_t evt_missed;		/* give-up runs presumed a LOST write */
-	uint32_t evt_missed_frozen;	/* of those, with GEVNTCOUNT not moving */
-	bool evt_missed_counted;	/* this run already counted as missed */
-	uint32_t evt_kick;		/* heartbeat had to restart a stopped drain */
-	/*
-	 * Interrupts taken versus worker passes entered. These two answer a
-	 * question the rest of the instrumentation cannot: when the drain is found
-	 * idle with events already in the ring, was the driver never TOLD (no
-	 * interrupt), or told and not SCHEDULED (work queue starved)?
-	 *
-	 * isr climbing while runs stalls = the submit happened and the queue did not
-	 * service it. The system work queue is cooperative here
-	 * (CONFIG_SYSTEM_WORKQUEUE_PRIORITY = -1) and the USB stack's own thread is
-	 * cooperative at a HIGHER priority (K_PRIO_COOP(8)), so a busy usbd thread
-	 * that does not yield can starve this queue outright.
-	 *
-	 * Both stalled together = no interrupt was delivered at all, even though
-	 * GEVNTCOUNT was non-zero and the event was already in memory.
-	 */
-	uint32_t evt_isr;		/* interrupt handler invocations */
-	uint32_t evt_worker_runs;	/* event worker passes entered */
-	uint32_t evt_skipped;		/* events discarded to free a full ring */
-	bool evt_worker_ran;		/* evt_worker_exit_t0 means something */
-	uint32_t evt_link_total;	/* USB/Link State Change events seen */
-	uint32_t evt_link_run;		/* consecutive events reporting the same state */
-	uint32_t evt_link_last;		/* that state, EvtInfo[3:0] */
-	/* Times the drain re-scheduled itself because an event raced the unmask. */
-	uint32_t evt_rearm;
-	/*
-	 * Where the event ring is copied to before it is acknowledged. In priv and
-	 * not on the stack because every work item here shares the system work
-	 * queue's 1 KB stack, and this array stays live across udc_dwc3_handle_event()
-	 * - the deepest call chain in the driver. Single-threaded and under the UDC
-	 * mutex, so there is no reentrancy to worry about.
-	 */
 	uint32_t evt_copy[CONFIG_UDC_DWC3_EVENTS_NUM];
-	/* Set when a drain pass stopped on an empty slot rather than finishing. */
-	bool evt_drain_midzero;		/* pass ended on a mid-pass empty slot */
-	uint32_t evt_midzero;		/* how many passes ended that way */
-	/* OUT descriptors the caller sized to a non-multiple of MaxPacketSize. */
-	uint32_t out_unaligned;
-	uint32_t out_unaligned_ctrl;
-	/* To maintain the control state machine */
-	bool ctrl_setup_seen;
-	bool ctrl_data_done;
 	/*
 	 * The two ends of a control transfer, counted independently.
 	 *
@@ -758,7 +707,6 @@ struct udc_dwc3_data {
 	 * and that no existing counter answers: ctrl_desync says a stage looked
 	 * out of order, but not whether requests are being abandoned wholesale.
 	 */
-	uint32_t ctrl_setup_done;	/* SETUP stages retired */
 	uint32_t ctrl_status_done;	/* status stages retired (IN and OUT) */
 	uint32_t ctrl_trbsts_other;
 	/*
@@ -844,14 +792,6 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data,
 			      const bool modify);
 static void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t fifo);
-
-static inline void udc_dwc3_ctrl_request_done(const struct device *const dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	priv->ctrl_setup_seen = false;
-	priv->ctrl_data_done = false;
-}
 
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
@@ -1433,11 +1373,6 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_OUT;
 
-	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
-	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
-		udc_dwc3_ctrl_request_done(dev);
-	}
-
 	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		size = sizeof(struct usb_setup_packet);
 	} else if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
@@ -1474,11 +1409,6 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_IN;
-
-	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
-	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
-		udc_dwc3_ctrl_request_done(dev);
-	}
 
 	trb[0].addr_lo = LO32((uintptr_t)buf->data);
 	trb[0].addr_hi = HI32((uintptr_t)buf->data);
@@ -2095,8 +2025,6 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL STATUS packet sent");
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA packet sent");
-		/* 4.4.2 step 5 needs to know the data stage is behind us. */
-		priv->ctrl_data_done = true;
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		LOG_ERR("Unexpected SETUP IN packet");
 	} else {
@@ -2153,13 +2081,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		memcpy(&priv->setup_packet, buf->data, sizeof(priv->setup_packet));
 
-		/*
-		 * Step 2 has happened: the SETUP retired and setup_packet describes
-		 * the request now in progress. Until this point any XferNotReady for
-		 * a data or status stage belongs to a transfer that is already over.
-		 */
-		priv->ctrl_setup_seen = true;
-		priv->ctrl_setup_done++;
 		buf->len = 0;
 
 		/* Latency optimization: set the address immediately to be able to be able
@@ -2251,8 +2172,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 			LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA received");
-			/* 4.4.2 step 5 needs to know the data stage is behind us. */
-			priv->ctrl_data_done = true;
 		} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3 ||
 			   trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2) {
 			buf->len = 0;
@@ -2272,31 +2191,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	udc_ep_set_busy(&ep_data->cfg, false);
 
 	udc_dwc3_ctrl_next(dev);
-}
-
-/*
- * Dispatch a control completion to the handler for the endpoint it came from.
- *
- * The endpoint number is taken from the event, not from priv->last_xfer_dir.
- * That shortcut was safe only while udc_dwc3_ctrl_try() guaranteed a single
- * control TRB in flight; now that a SETUP can be armed on the OUT endpoint
- * while a status stage is still outstanding on the IN one - which is what
- * breaks the abandoned-transfer deadlock - two control TRBs can be live at
- * once, and last_xfer_dir names whichever was armed most recently rather than
- * whichever just completed.
- *
- * Every other handler in this driver already derives its endpoint this way.
- */
-static void udc_dwc3_on_ctrl(const struct device *const dev, const uint32_t evt)
-{
-	const uint32_t epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
-
-	/* Physical endpoint 0 is control OUT, 1 is control IN. */
-	if ((epn & 1U) != 0U) {
-		udc_dwc3_on_ctrl_in(dev);
-	} else {
-		udc_dwc3_on_ctrl_out(dev);
-	}
 }
 
 static bool udc_dwc3_dgcmd_wait_idle(const mm_reg_t base)
@@ -2674,8 +2568,10 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 
 	switch (evt & UDC_DWC3_EVT_MASK) {
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(0):
+		udc_dwc3_on_ctrl_out(dev);
+		break;
 	case UDC_DWC3_DEPEVT_XFERCOMPLETE(1):
-		udc_dwc3_on_ctrl(dev, evt);
+		udc_dwc3_on_ctrl_in(dev);
 		break;
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERCOMPLETE):
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERINPROGRESS):
@@ -2785,8 +2681,6 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	const struct device *const dev = ptr;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_dwc3_config *const cfg = dev->config;
-
-	priv->evt_isr++;
 
 	k_work_submit_to_queue(udc_get_work_q(), &priv->event_work);
 

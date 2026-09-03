@@ -1123,8 +1123,6 @@ int usbd_enqueue_setup(struct usbd_context *const uds_ctx)
 	setup = net_buf_ref(uds_ctx->setup_buf);
 	net_buf_reset(setup);
 
-	LOG_WRN("Enqueueing SETUP");
-
 	ret = usbd_ep_ctrl_enqueue(uds_ctx, setup);
 	if (ret) {
 		LOG_ERR("Failed to enqueue SETUP buffer");
@@ -1197,7 +1195,6 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 
 	if (err) {
 		if (!bi->setup) {
-			LOG_INF("Unref %d", __LINE__);
 			net_buf_unref(buf);
 		}
 
@@ -1211,7 +1208,6 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 	}
 
 	if (bi->data && bi->ep == USB_CONTROL_EP_IN) {
-		LOG_INF("Unref %d", __LINE__);
 		net_buf_unref(buf);
 		return 0;
 	}
@@ -1266,7 +1262,6 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 		 */
 		ret = handle_setup_request(uds_ctx, next_buf);
 		if ((ret || errno) && next_buf) {
-			LOG_INF("Unref %d", __LINE__);
 			net_buf_unref(next_buf);
 		}
 
@@ -1279,14 +1274,12 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 			 * Halt, only protocol errors are recoverable.
 			 * Free data stage and linked status stage buffer.
 			 */
-			LOG_WRN("errno");
 			goto ctrl_xfer_stall;
 		}
 
 		if (setup->wLength == 0) {
 			ret = usbd_enqueue_status_in(uds_ctx);
 		} else if (reqtype_is_to_device(setup)) {
-			LOG_INF("Unref %d", __LINE__);
 			/* Data OUT buffer is no longer needed */
 			net_buf_unref(next_buf);
 
@@ -1295,7 +1288,6 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 			/* Enqueue Data IN */
 			ret = usbd_ep_ctrl_enqueue(uds_ctx, next_buf);
 			if (ret) {
-				LOG_INF("Unref %d", __LINE__);
 				net_buf_unref(next_buf);
 				goto ctrl_xfer_stall;
 			}
@@ -1312,7 +1304,6 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 			goto ctrl_xfer_stall;
 		}
 
-		LOG_WRN("Enqueueing setup");
 		ret = usbd_enqueue_setup(uds_ctx);
 
 		return ret;
