@@ -265,7 +265,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
  * never released, udc_dwc3_ctrl_try() turns every later request away with a
  * LOG_DBG that is compiled out at INF, and the SETUP lines simply stop. There
  * is no error, no warning, nothing - the log just ends, which is exactly what
- * uart_v6_1, _2 and _6 all do, and it is why three captures of a dying device
+ * three separate captures of a dying device all do, and it is why they
  * have told us nothing about why it died.
  *
  * So silence itself has to be the trigger. This will also fire once on a host
@@ -308,7 +308,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
  * gone.
  *
  * A second, deliberately. The longest delayed write ever measured inside the
- * poll budget is 1141 us - three orders of magnitude below - and uart_v6_13
+ * poll budget is 1141 us - three orders of magnitude below - and one capture
  * recorded a slot that filled legitimately after 636 give-ups, roughly 636 ms.
  * A 250 ms threshold would have discarded that event while it was still on its
  * way. Skipping costs an event permanently, so the threshold belongs well past
@@ -663,13 +663,11 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 /* USB Device Event Enable Register */
 #define UDC_DWC3_DEVTEN						0xc708
-#define UDC_DWC3_DEVTEN_INACTTIMEOUTRCVEDEN			BIT(13)
+/* Bits 10, 11 and 13 are RESERVED in this controller - do not write them. */
 #define UDC_DWC3_DEVTEN_VNDRDEVTSTRCVEDEN			BIT(12)
-#define UDC_DWC3_DEVTEN_EVNTOVERFLOWEN				BIT(11)
-#define UDC_DWC3_DEVTEN_CMDCMPLTEN				BIT(10)
 #define UDC_DWC3_DEVTEN_ERRTICERREN				BIT(9)
 #define UDC_DWC3_DEVTEN_SOFEN					BIT(7)
-#define UDC_DWC3_DEVTEN_EOPFEN					BIT(6)
+#define UDC_DWC3_DEVTEN_U3L2L1SUSPEN				BIT(6)
 #define UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN			BIT(5)
 #define UDC_DWC3_DEVTEN_WKUPEVTEN				BIT(4)
 #define UDC_DWC3_DEVTEN_ULSTCNGEN				BIT(3)
@@ -1077,7 +1075,7 @@ struct udc_dwc3_ep_data {
 	bool resume_pending;
 	/*
 	 * Arms and retires on this endpoint. The usbmon capture of
-	 * uart_02sep_0139_racefix showed EP01 bulk OUT stop accepting host writes
+	 * A capture showed EP01 bulk OUT stop accepting host writes
 	 * 465 s BEFORE control wedged, with nothing logged device-side at all -
 	 * the only trace was the SRP loop slowing down, which had been dismissed
 	 * as a flaky test. These two counters make that moment visible: when arms
@@ -1384,7 +1382,7 @@ struct udc_dwc3_data {
 	 * Nothing enforces the invariant the control path depends on - that
 	 * udc_ep_is_busy() being false means the controller has released trb[0].
 	 * busy is driver state; HWO is the hardware's. They have been seen to
-	 * disagree (EP80 busy=0 with HWO=1 in uart_01sep_2328_epdis). If they
+	 * disagree (EP80 busy=0 with HWO=1 has been seen on the rig). If they
 	 * disagree again, trb_fill() stamps over a descriptor the controller is
 	 * actively using, and that is a race a faster bus makes far more likely.
 	 */
@@ -1825,7 +1823,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * Reading it regardless is self-perpetuating rather than merely wrong. The
 	 * wait cannot succeed, so the command is never issued, so the register is
 	 * never written, so it stays undefined - and the endpoint is locked out for
-	 * the lifetime of the boot. That is what happened to ep 0x80 in uart_v4.log:
+	 * the lifetime of the boot. That is what happened to ep 0x80 on the rig:
 	 * its very first DEPCFG was refused and all 85 command attempts that
 	 * followed, on that one endpoint, were refused for the same reason. EP0-OUT
 	 * escaped only because DEPSTARTCFG is issued on DEPCMD(0) first, which makes
@@ -2021,28 +2019,31 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/*
 	 * Burst Size is "number of packets per burst minus one".
 	 *
-	 * Control endpoints do not burst and Table 4-1 programs BrstSiz = 0 for them, so
-	 * 0 is forced for endpoint 0.  At SuperSpeed this field drives ACK NumP flow
-	 * control on IN bursts, so an over-stated value there is not cosmetic.
+	 * Control endpoints do not burst and Table 4-1 programs BrstSiz = 0 for them,
+	 * so 0 is forced for endpoint 0.
 	 *
-	 * Non-control endpoints keep 15, and that is correct rather than unexamined.  For
-	 * IN the field is a CEILING: "If BrstSiz >= the NumP value in the initiating
-	 * TP_ACK, then the device controller attempts a burst length of NumP" - NumP comes
-	 * from the host, bounded by the descriptor's bMaxBurst, so an over-stated BrstSiz
-	 * cannot produce a burst the host did not ask for, while lowering it would cap the
-	 * video endpoint.  bMaxBurst is not available here in any case:
-	 * udc_ep_enable_internal() takes (addr, attributes, mps, interval) and the UDC API
-	 * carries no burst field.
+	 * Non-control endpoints use 3, a burst of 4 packets.  That matches the FIFO
+	 * depth in both directions - each TX FIFO is 4136 B and RX0 is 4136 B, so a
+	 * burst of 4 x 1024 = 4096 B fits where 16 x 1024 = 16384 B does not - and it
+	 * is the value the controller vendor specifies alongside DCFG.NUMP = 4.
 	 *
-	 * For a non-control OUT endpoint it IS an assertion - the credit this device
-	 * advertises.  15 is left because the host is still bounded by the descriptor and
-	 * 0 is explicitly worse (NumP=0 forces a flow-control ERDY per DP).  Revisit only
-	 * with evidence.
+	 * The two directions are not symmetric, and the change means something
+	 * different in each.  On a non-control OUT endpoint the field is the credit
+	 * this device advertises.  On IN it is a CEILING: "If BrstSiz >= the NumP
+	 * value in the initiating TP_ACK, then the device controller attempts a burst
+	 * length of NumP".  Lowering it from 15 therefore does cap what the IN
+	 * endpoints can attempt, the video endpoint included - deliberately, down to
+	 * what the FIFO can actually sustain.  Re-measure video throughput after any
+	 * change here; the baseline immediately before this one was 19.8 transfers/s
+	 * of 19216 B, about 0.36 MB/s.
+	 *
+	 * 0 is never right for a data endpoint: it makes the ACK TP carry NumP = 0,
+	 * which is a flow-control condition on every data packet received.
 	 */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 0);
 	} else {
-		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 15);
+		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 3);
 	}
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
@@ -2326,7 +2327,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 		 * endpoint and goes on believing a stage is armed, so the claim is
 		 * never given back and udc_dwc3_ctrl_try() declines every later
 		 * request - silently, because those declines are LOG_DBG.
-		 * uart_v6_8 caught exactly that: busy o/i 1/0 with 72 declines, a
+		 * A capture caught exactly that: busy o/i 1/0 with 72 declines, a
 		 * buffer queued and ready, and the device dead after 22 SETUPs.
 		 *
 		 * CmdStatus 4'h1 on a Start Transfer means "there is no transfer
@@ -2336,7 +2337,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 		 * transfer resource."
 		 *
 		 * NOT by End Transfer here, though 3.2.2.2 offers it: on a CONTROL
-		 * endpoint End Transfer hangs this controller. uart_v6_9 caught it
+		 * endpoint End Transfer hangs this controller. A capture caught it
 		 * doing so - DEPCMD 0x00000d08 on EP0, CMDTYP 8 with CMDACT still
 		 * set after 1000 ms, sixty times over, while DSTS showed the frame
 		 * counter still advancing in U0. The command engine was wedged, not
@@ -2353,6 +2354,40 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	}
 
 	ep_data->xferrscidx = idx;
+
+	/*
+	 * Report the transfer resource index the controller handed back, once per
+	 * endpoint rather than once per transfer, and say so if two endpoints end
+	 * up holding the same one.  Requested by the vendor to validate their
+	 * simulation of the DEPSTARTCFG sequence against ours.
+	 */
+	if (!ep_data->xferrscidx_valid) {
+		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
+		const struct udc_dwc3_ep_data *clash = NULL;
+
+		for (uint8_t i = 0; i < cfg->num_in_eps && clash == NULL; i++) {
+			if (&cfg->ep_data_in[i] != ep_data &&
+			    cfg->ep_data_in[i].xferrscidx_valid &&
+			    cfg->ep_data_in[i].xferrscidx == idx) {
+				clash = &cfg->ep_data_in[i];
+			}
+		}
+		for (uint8_t i = 0; i < cfg->num_out_eps && clash == NULL; i++) {
+			if (&cfg->ep_data_out[i] != ep_data &&
+			    cfg->ep_data_out[i].xferrscidx_valid &&
+			    cfg->ep_data_out[i].xferrscidx == idx) {
+				clash = &cfg->ep_data_out[i];
+			}
+		}
+
+		if (clash != NULL) {
+			LOG_WRN("XFERRSCIDX EP%02x = %u, SHARED with EP%02x",
+				ep_data->cfg.addr, idx, clash->cfg.addr);
+		} else {
+			LOG_INF("XFERRSCIDX EP%02x = %u", ep_data->cfg.addr, idx);
+		}
+	}
+
 	ep_data->xferrscidx_valid = true;
 
 	LOG_DBG("start EP%02x idx=0x%x",
@@ -2875,7 +2910,21 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
-	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO;
+
+	/*
+	 * CSP is Continue-on-Short-Packet, an OUT-endpoint control.  It used to be
+	 * set in both directions; the vendor has no documentation for what the
+	 * controller does with it on an IN endpoint, so it is now OUT-only.
+	 *
+	 * Safe by construction even if it changes which completion the controller
+	 * raises on IN: per Table 4-8 XferComplete on an IN endpoint needs LST=1,
+	 * which this driver never sets, and XFERCOMPLETE and XFERINPROGRESS are
+	 * routed to the same handler anyway - see udc_dwc3_on_xfer_done_nonctrl().
+	 */
+	if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		ctrl |= UDC_DWC3_TRB_CTRL_CSP;
+	}
 
 	/*
 	 * DBG for the same reason the control stages are: one line per transfer on
@@ -3338,7 +3387,7 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	if (buf == NULL) {
 		/*
 		 * DBG, not INF: in steady state "nothing queued right now" is the normal
-		 * answer, and at INF it was 36% of uart_v5_3.log - 2.4 MB, about 258 s of
+		 * answer, and at INF it was 36% of one capture - 2.4 MB, about 258 s of
 		 * console time in a 638 s run. It matters when chasing buffer starvation,
 		 * nowhere else.
 		 */
@@ -3820,7 +3869,7 @@ static int udc_dwc3_recover(const struct device *dev)
 		 * ctrl_recovery_pending is cleared by the Endpoint Command Complete
 		 * for the End Transfer we issued - and by nothing else short of a
 		 * bus reset. So its only way out is an event, on the one path where
-		 * events have already stopped arriving: uart_v6_8 shows this branch
+		 * events have already stopped arriving: a capture shows this branch
 		 * repeating to the end of the capture with GEVNTCOUNT=0 every time,
 		 * i.e. waiting for a completion that provably cannot come. A latch
 		 * whose only exit is the thing that is broken disables recovery for
@@ -3974,7 +4023,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	 * Set Stall, NOT End Transfer.
 	 *
 	 * End Transfer is the natural reflex and it is wrong here. On a control
-	 * endpoint this controller does not complete it: uart_v6_9 shows DEPCMD
+	 * endpoint this controller does not complete it: a capture shows DEPCMD
 	 * 0x00000d08 on EP0 - CMDTYP 8, CMDACT still asserted after 1000 ms -
 	 * blocking every later command with "previous command still active",
 	 * sixty consecutive recovery attempts, none issued. DSTS kept advancing
@@ -4002,9 +4051,9 @@ static int udc_dwc3_recover(const struct device *dev)
 
 	/*
 	 * Set Stall on its own is enough when the stage simply needs abandoning -
-	 * uart_v6_1355 shows four in a row rescued that way. It is not enough when
+	 * A capture shows four in a row rescued that way. It is not enough when
 	 * the endpoint stays claimed afterwards, and repeating it does not become
-	 * enough: uart_01sep_2059_fix2 issued 163 of these in eighteen minutes
+	 * enough: one run issued 163 of these in eighteen minutes
 	 * without a single SETUP retiring between them, then wedged anyway.
 	 *
 	 * So escalate on the second recovery that retires nothing. Comparing
@@ -4016,7 +4065,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	 * NO End Transfer on the control pair here, and no "reclaim".
 	 *
 	 * A reclaim was tried - End Transfer with HIPRI_FORCERM on both control
-	 * endpoints, clear the busy claim, re-arm - and uart_01sep_2328_epdis
+	 * endpoints, clear the busy claim, re-arm - and a capture
 	 * shows it CREATING the wedge it was meant to clear. EP80 reads
 	 * ctrl=0x00000000 at control watchdog #1, the reclaim runs twice, and by
 	 * watchdog #2 it reads ctrl=0x53 with HWO set and busy clear: a descriptor
@@ -4027,7 +4076,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	 * resource - seven times, permanently.
 	 *
 	 * This is the hazard udc_dwc3_depcmd_start_xfer() already documents from
-	 * uart_v6_9: End Transfer on a CONTROL endpoint hangs this controller's
+	 * Seen on the rig: End Transfer on a CONTROL endpoint hangs this controller's
 	 * command engine. Set Stall alone does not clear every stall, but it does
 	 * not manufacture this one.
 	 */
@@ -4391,17 +4440,29 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		CODE_UNREACHABLE;
 	}
 
-	/* Set the number of USB3 packets the device can receive at once */
+	/*
+	 * Number of USB3 packets the device can receive at once.
+	 *
+	 * With GRXTHRCFG.UsbRxPktCntSel = 0 - this controller's reset state - the NumP
+	 * the device advertises in its ACK TP is min(DCFG.NUMP, bMaxBurst) for each
+	 * endpoint.  bMaxBurst is 15 in the class descriptors, which are not this
+	 * driver's to change, so DCFG.NUMP is the only clamp there is: at 1 the device
+	 * advertised a burst of one packet no matter what the descriptor said.
+	 *
+	 * 4 matches the RX FIFO.  RX0 is 4136 B, so a burst of 4 x 1024 = 4096 B fits
+	 * and 16 x 1024 = 16384 B does not.  Raising this without also holding BrstSiz
+	 * down would advertise capacity the FIFO cannot absorb.
+	 */
 	reg = sys_read32(base + UDC_DWC3_DCFG);
 	reg &= ~UDC_DWC3_DCFG_NUMP_MASK;
-	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 1);
+	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 4);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
 	/*
-	 * Enable reception of all USB events except ULSTCNGEN, which is a
-	 * diagnostic-only class - see below.
+	 * Enable reception of all USB events this controller actually defines.
+	 * Bits that are not fields in DEVTEN are deliberately not written - see below.
 	 */
-	reg = UDC_DWC3_DEVTEN_INACTTIMEOUTRCVEDEN;
+	reg = 0;
 	/*
 	 * VNDRDEVTSTRCVED IS DELIBERATELY NOT ENABLED.
 	 *
@@ -4421,31 +4482,43 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 * disabled makes the zero sentinel sound by construction: with no
 	 * multi-word event in the ring, no legitimate event word can be zero.
 	 */
-	reg |= UDC_DWC3_DEVTEN_EVNTOVERFLOWEN;
-	reg |= UDC_DWC3_DEVTEN_CMDCMPLTEN;
+	/*
+	 * EvntOverflowEn, CmdCmpltEn and InactTimeoutRcvedEn are NOT fields in
+	 * this controller's DEVTEN and used to be set here.  Per the vendor the
+	 * register is: 0 DisconnEvtEn, 1 USBRstEvtEn, 2 ConnectDoneEvtEn,
+	 * 3 ULStCngEn, 4 WkUpEvtEn, 5 HibernationReqEvtEn, 6 U3L2L1SuspEn,
+	 * 7 SofEvtEn, 8 L1SuspEn, 9 ErrticErrEvtEn, 10 and 11 RESERVED,
+	 * 12 VndrDevTstRcvdEn, 14 L1WkUpEvtEn, 16 EccErrEn.  Bits 10, 11 and 13
+	 * therefore landed on reserved bits and are no longer written.
+	 */
 	reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
 	reg |= UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN;
 	reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
 	/*
-	 * Link state change events are OFF by default, and this is a diagnostic
-	 * switch rather than a functional one.
+	 * Link state change events are ENABLED.  With USB Reset and Connection Done
+	 * they are the controller vendor's recommended minimum DEVTEN set.
 	 *
-	 * Stock does not enable them. They were turned on here to see link
-	 * transitions, and nothing in the dispatch acts on them - the value only
-	 * ever reached a log line. uart_v6_3 shows the cost of that: 1450 of them
-	 * in the last 45 seconds of the run, every one reporting U0 while DSTS read
-	 * back U0, SuperSpeed, DEVCTRLHLT=0 and a SOFFN advancing at 93-96%% of
-	 * nominal throughout. The link never changed state. Each of those events
-	 * still took a slot in a 16-entry ring that was already failing to drain,
-	 * and a full ring makes the controller withhold link credits and stop the
-	 * bus - so a purely cosmetic event class was feeding the failure.
+	 * They were masked here once, on the reasoning that a purely cosmetic event
+	 * class was filling a 16-entry ring that was already failing to drain.  Both
+	 * halves of that were wrong, and the capture behind it says so:
 	 *
-	 * Enable it deliberately when link behaviour is the thing under
-	 * investigation, and expect the event rate to be part of what you measure.
+	 *   - The ring was never under pressure.  During the storm that prompted the
+	 *     masking - 2,554 link events in about 20 s, ~128/s - the measured event
+	 *     buffer high-water mark was 12 bytes of 64, three slots of sixteen.
+	 *   - The events were not cosmetic.  That same run showed link events with
+	 *     ZERO endpoint events, which is what identified a SuperSpeed recovery
+	 *     loop and explained the host's -110 timeouts and its dead controller.
+	 *     Without this class a link retrain and a dead device look identical from
+	 *     the log, and telling those apart has been needed at least once.
+	 *
+	 * The real cost was console, not ring space: two unbounded lines per event
+	 * under LOG_MODE_MINIMAL is a synchronous UART write inside the event worker.
+	 * That is handled at the point of use - udc_dwc3_log_link_event() prints on a
+	 * state CHANGE and then only every UDC_DWC3_EVT_LINK_LOG_EVERY repeats, and
+	 * the running total is on the stats line as "link".  The state it reports
+	 * comes from the event word, not from a re-read of DSTS.
 	 */
-#ifdef CONFIG_UDC_DWC3_LINK_STATE_EVENTS
 	reg |= UDC_DWC3_DEVTEN_ULSTCNGEN;
-#endif
 	reg |= UDC_DWC3_DEVTEN_CONNECTDONEEN;
 	reg |= UDC_DWC3_DEVTEN_USBRSTEN;
 	reg |= UDC_DWC3_DEVTEN_DISCONNEVTEN;
@@ -4943,7 +5016,7 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, const uint32_t evt)
 	 * live stage at once, and a completion on one must not disarm the
 	 * watchdog that is still guarding the other.
 	 *
-	 * This was the terminal wedge in uart_01sep_0336_xnrdy_s01: the IN
+	 * This was the terminal wedge in one capture: the IN
 	 * status completion cancelled the OUT SETUP watchdog, and the following
 	 * udc_dwc3_ctrl_next() found EP0-OUT already busy with the speculative
 	 * SETUP and declined without re-arming it. The host's next SETUP was
@@ -5727,7 +5800,7 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
  * The dispatch does nothing with these beyond logging them, so under a link that
  * is retraining the driver's entire contribution was two blocking console lines
  * per transition - 2554 events, ~5100 lines and about 7.7 s of console in
- * uart_v5_3.log, on a path the controller drives at whatever rate it likes.
+ * one capture, on a path the controller drives at whatever rate it likes.
  *
  * Every genuine transition is still reported, because a state that differs from
  * the last one always prints. What is suppressed is repetition: the same state
@@ -5798,7 +5871,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	 *
 	 * Overflow is the worse of the two, because it is raised only when the
 	 * driver is ALREADY behind: every line spent reporting it is time not
-	 * spent draining, which produces the next overflow. uart_v5_7.log has
+	 * spent draining, which produces the next overflow. One capture has
 	 * 1,960 such lines - 40 kB, about 3.5 s of blocking console - against 6
 	 * lines for the 1,546 link events that actually caused it.
 	 */
@@ -6023,7 +6096,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
  *
  * The control watchdog cannot do this job: udc_dwc3_on_ctrl() cancels it on every
  * control event, so once a transfer completes there is no deadline armed anywhere.
- * In uart_v5_3.log the link died moments after a completion and nothing noticed
+ * In one capture the link died moments after a completion and nothing noticed
  * for the twenty seconds until the host gave up - zero warnings in 638 seconds.
  *
  * Deliberately takes NO lock. A dispatch wedged while holding the UDC mutex is
@@ -6376,14 +6449,14 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	 * time it is offered a stage while the speculative SETUP legitimately
 	 * holds the endpoint - and ctrl_arm_t0 only advances on a GRANT. So any
 	 * pause in control traffic longer than the timeout looks identical to a
-	 * stuck claim. uart_v6_11 caught it doing exactly that: the detector
+	 * stuck claim. A capture caught it doing exactly that: the detector
 	 * fired the moment the host started the video stream and paused control
 	 * traffic - "claimed 1100 ms ... (865 declines)" - and every silence
 	 * report in that capture shows trb o/i 0x00000023, i.e. HWO set with
 	 * TRBCTL 2, a correctly armed Control-Setup with a buffer queued behind
 	 * it. Each false firing then issued Set Stall on EP0-OUT and broke the
 	 * host's next request; 42 recoveries in that run against 1 in the whole
-	 * of the 20-minute uart_v6_6.
+	 * of a 20-minute run.
 	 *
 	 * The genuine condition this is for - a claim held with NO descriptor
 	 * armed to receive the host's next SETUP - is unaffected, and that is
@@ -6392,7 +6465,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	/*
 	 * ...OR the drain has stopped, which is the case the clause above misses.
 	 *
-	 * uart_01sep_2037_fix1 wedged with a Control-Setup correctly armed
+	 * One run wedged with a Control-Setup correctly armed
 	 * (trb o/i 0x00000023) and 83172 declines behind it, so the armed-SETUP
 	 * exclusion held recovery off for the entire wedge - resync 0, and the
 	 * SETUP watchdog was suppressed too because RXFIFOEMPTY was set. Nothing
@@ -6425,7 +6498,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		/*
 		 * udc_dwc3_recover() issues Set Stall on EP0-OUT.  It does NOT issue an
 		 * End Transfer - an earlier version of this comment claimed it did, and
-		 * that was wrong.  Worth being precise about, because uart_v6_1355 shows
+		 * that was wrong.  Worth being precise about, because a capture shows
 		 * this call rescuing four stalled event writes in a row (the pending
 		 * XFERCOMPLETE landed immediately after each "Recovering USB state"), so
 		 * Set Stall - not End Transfer - is the action with evidence behind it.
@@ -6501,7 +6574,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * ctrl_decline_pending is the whole point of this clause: silence on
 		 * the control endpoint is only worth reporting if something is waiting
 		 * to be armed and cannot be. Without it this fired on a HEALTHY IDLE
-		 * bus - uart_02sep_0236_nocspam produced seven of these 32-line dumps
+		 * bus - one run produced seven of these 32-line dumps
 		 * in three minutes purely because the control-spam load had been turned
 		 * off and nothing was generating traffic.
 		 *
@@ -6726,12 +6799,12 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 /*
  * Last resort for a SETUP the controller has received and will not retire.
  *
- * SET STALL is what clears the ordinary case - uart_v6_1355 shows the
+ * SET STALL is what clears the ordinary case - a capture shows the
  * DATA/STATUS watchdog rescuing four stalls in a row through
  * udc_dwc3_recover(), which issues Set Stall on EP0-OUT and nothing else; the
  * pending event landed immediately after each.  (recover() has never issued an
  * End Transfer - the machinery for that is unreachable.  Earlier text here
- * claimed otherwise and misled a reviewer.)
+ * claimed otherwise and was misleading.)
  *
  * When Set Stall does not work, nothing softer does: at the final wedge in that
  * capture the event ring was acknowledged twice, releasing the credits the core
@@ -6817,7 +6890,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 * age says nothing: the bus can sit idle for minutes with the endpoint
 	 * perfectly healthy.  DSTS.RXFIFOEMPTY is what separates the two cases.
 	 *
-	 * uart_v6_1355 shows the split cleanly.  Six event-write stalls: the four
+	 * A capture shows the split cleanly.  Six event-write stalls: the four
 	 * that recovered all read RXFIFOEMPTY set - nothing was stuck, only the
 	 * event write was late - and each was rescued by the DATA/STATUS watchdog
 	 * firing udc_dwc3_recover(), which issues SET STALL on EP0-OUT.  The
@@ -6826,7 +6899,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 * Set Stall, not End Transfer.  recover() has never issued an End Transfer
 	 * - the machinery for that (ctrl_recovery_pending) is unreachable, as noted
 	 * where it is defined.  An earlier version of this comment said otherwise
-	 * and led a reviewer to conclude the driver had a broken End-Transfer
+	 * and can suggest the driver has a broken End-Transfer
 	 * recovery; it does not, because that was never the mechanism that worked.
 	 *
 	 * The two at the final wedge read RXFIFOEMPTY clear, with EP0-OUT holding a
@@ -7046,7 +7119,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 *
 	 * The same re-cache already existed but was gated inside the SETUP branch
 	 * above, so it never ran for a DATA or STATUS stage - updxfer read 0 through
-	 * every wedge in uart_02sep_0001_noreclaim, all of which fired with type
+	 * every wedge in one run, all of which fired with type
 	 * 0x50 (CONTROL_DATA). An earlier "the re-cache does not help" result was
 	 * measured on a stuck SETUP and does not carry over to this stage.
 	 *
@@ -7149,7 +7222,7 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  * A wall-clock deadline was the wrong instrument. This runs on a work queue
  * thread that can be descheduled mid-wait, so the deadline expired while nobody
  * was looking and the driver blamed a write that had never been given the chance
- * to be late: uart_v5_3.log caught it at 38 polls across 3384 us against a 250 us
+ * to be late: a capture caught it at 38 polls across 3384 us against a 250 us
  * deadline, 99% of the window unobserved.
  *
  * A poll count cannot be fooled that way. 64 looks is 64 real observations of the
@@ -7202,7 +7275,7 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  *
  * Replaces a count-based gate that did not do what it looked like it did. It
  * counted consecutive give-ups on the SAME slot, and reset whenever the stall
- * moved - so in uart_v6_3 every stall report carried run=1, the gate was true
+ * moved - so in one capture every stall report carried run=1, the gate was true
  * every time, and the force fired on all ~192 give-ups a second instead of the
  * intended one in eight. Wall-clock bounds it absolutely at two a second no
  * matter how the stall moves between slots, which matters because every forced
@@ -7216,7 +7289,7 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  *
  * A stalled pass used to resubmit nothing at all, on the reasoning that the
  * interrupt is level-sensitive on GEVNTCOUNT and would re-enter the worker by
- * itself. uart_v6_3 shows that failing: two heartbeat reports caught the head
+ * itself. A capture shows that failing: two heartbeat reports caught the head
  * slot HOLDING a valid event, with the give-up run at one give-up and 1.7-2.0
  * seconds old, GEVNTCOUNT at 64 B - a completely full ring - and evt_rearm
  * frozen at 283 for the whole run. The event had arrived and nothing looked at
@@ -7381,7 +7454,7 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 	 * acknowledge can release it. GEVNTCOUNT advancing means the core is still
 	 * writing and this one slot was skipped - a different fault entirely.
 	 *
-	 * uart_v6_14 was the frozen kind: raw=0x00000010 on all sixteen samples
+	 * One capture was the frozen kind: raw=0x00000010 on all sixteen samples
 	 * across 25 s and 16,113 give-ups, with ~53 forced commands landing
 	 * nothing.
 	 */
@@ -7639,7 +7712,7 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 * land. Only the first word is worth waiting for.
 			 *
 			 * This must NOT mark the pass stalled, and marking it was a
-			 * defect - the one uart_v6_6 was built on. The tail reads
+			 * defect - the one that theory was built on. The tail reads
 			 * evt_drain_gaveup as "do not come back", and lifts that
 			 * refusal only for a pass that opened a stall RUN. This path
 			 * opens no run (runs are opened in udc_dwc3_evt_wait_first(),
@@ -7651,7 +7724,7 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 * the ring sat with GEVNTCOUNT > 0 until the heartbeat kicked
 			 * it UDC_DWC3_EVT_IDLE_KICK_MS later.
 			 *
-			 * That is what uart_v6_6 shows. All five "drain IDLE 200 ms
+			 * That is what a capture shows. All five "drain IDLE 200 ms
 			 * with no give-up run" reports carry a valid event in the head
 			 * slot, and each is followed by the kick counter stepping by
 			 * one - 0->1, 1->2, 2->3, 3->4, 4->5, five for five, with no
@@ -7692,7 +7765,7 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 * question turns on, so it is taken only from runs that printed
 			 * nothing while it was being timed. A logged or forced run has
 			 * milliseconds of synchronous console inside the interval and
-			 * measures the UART, not the controller: uart_v6_3 reported
+			 * measures the UART, not the controller: a capture reported
 			 * 7.6-11.3 us-scaled figures that matched its own log lines to
 			 * within a few per cent, on the 1-in-1021 stalls that were the
 			 * only ones it measured at all.
@@ -7775,7 +7848,7 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 	 * requires software to "free up space ... by acknowledging more than 1 event
 	 * (writing a value greater than 4 to the GEVNTCOUNTn register)": crediting a
 	 * single slot at a time lets the controller refill it immediately, so an
-	 * established overflow can never clear.  uart_v5_9 is that failure - the ring
+	 * established overflow can never clear.  A capture is that failure - the ring
 	 * full for ~15 s at ~4000 overflow events/s while the drain managed ~3300/s.
 	 */
 	if (n > 0) {
@@ -7873,7 +7946,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 	 * UDC_DWC3_EVT_GAVEUP_RETRY_MS - which is the correction. It used to return
 	 * without resubmitting, on the assumption that the level-sensitive
 	 * interrupt re-enabled just above would bring the worker back by itself.
-	 * uart_v6_3 disproves that: the heartbeat twice found the head slot holding
+	 * A capture disproves that: the heartbeat twice found the head slot holding
 	 * a valid event, the give-up run one give-up old and nearly two seconds
 	 * stale, the ring completely full, and evt_rearm frozen for the entire run.
 	 * Nothing had looked. Waiting a whole second for the heartbeat while the
@@ -8223,7 +8296,7 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 	 * This does issue End Transfer on a control endpoint when reached via
 	 * udc_dwc3_shutdown(), which looks like it contradicts the "End Transfer on
 	 * a live control endpoint hangs" rule the recovery paths are built around.
-	 * It is not a contradiction, and it was reviewed and left alone deliberately:
+	 * It is not a contradiction, and it is left alone deliberately:
 	 *
 	 * udc_dwc3_on_set_config_or_interface() issues exactly this command on
 	 * EP0-IN on every SetConfiguration - it is what forces the TX FIFO
