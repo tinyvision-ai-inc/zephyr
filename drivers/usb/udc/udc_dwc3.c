@@ -350,6 +350,17 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_EVT_LOOKAHEAD_MIN_MS				50u
 
 /*
+ * How long a non-control endpoint may hold a descriptor the controller owns,
+ * with nothing retiring, before it is called wedged. Two seconds is orders of
+ * magnitude past any healthy bulk completion and still inside the window before
+ * the host gives up on the device.
+ */
+#define UDC_DWC3_EP_WEDGE_MS					2000u
+
+/* Episodes reported per boot. The value is the evidence, not the volume. */
+#define UDC_DWC3_EP_WEDGE_REPORT_MAX				8u
+
+/*
  * Whether the heartbeat may ACT on a dead slot, or only report it.
  *
  * Undefine for the build handed to the RTL team: the driver then detects and
@@ -1107,6 +1118,12 @@ struct udc_dwc3_ep_data {
 	 * with HWO set and BUFSIZ zero.
 	 */
 	uint32_t armed_len[CONFIG_UDC_DWC3_TRB_NUM];
+	/* Wedge detection: when the outstanding descriptor was first seen, and the
+	 * retire count at that moment. Reset whenever anything retires.
+	 */
+	uint32_t wedge_t0;
+	uint32_t wedge_last_retire;
+	bool wedge_reported;
 	/*
 	 * Whether the postponed resume meant Init or Modify. Captured when the
 	 * resume defers, because by the time it runs the stack has already set
@@ -1162,6 +1179,9 @@ struct udc_dwc3_data {
 	uint32_t evt_sweep_rescued;	/* completions the heartbeat sweep returned */
 	uint32_t evt_sweep_runs;	/* sweeps that found something to drain */
 	uint32_t evt_lookahead_short;	/* stalls ended early by the look-ahead proof */
+	uint32_t ep_wedge_reports;	/* episodes reported this boot (capped) */
+	uint32_t ep_wedge_total;	/* episodes seen this boot */
+	bool ctrl_stall_captured;	/* a CTRLSTALL capture is waiting for its pair */
 	uint32_t evt_gaveup_slot;	/* slot the current give-up run is stuck on */
 	uint32_t evt_gaveup_run;		/* consecutive give-ups on that same slot */
 	uint32_t evt_gaveup_t0;		/* cycle stamp when the run started */
@@ -6293,6 +6313,8 @@ static void udc_dwc3_heartbeat_expiry(struct k_timer *const timer)
  * side workaround would hide the fault rather than locate it, and these
  * registers are the only ones that can tell the candidate causes apart.
  */
+static void udc_dwc3_epstate_dump(const struct device *const dev, const char *const tag);
+
 static void udc_dwc3_stall_diag_dump(const struct device *const dev,
 				     const char *const why)
 {
@@ -6470,6 +6492,20 @@ static void udc_dwc3_stall_diag_dump(const struct device *const dev,
 	/* For correlating with an ILA or bus trace. */
 	LOG_INF("  AT: DSTS=0x%08x cycles=%u",
 		sys_read32(base + UDC_DWC3_DSTS), k_cycle_get_32());
+
+	/*
+	 * Last, because it is the only part of this that issues commands, and
+	 * everything passive above must be recorded before the core is touched.
+	 *
+	 * This is the capture that matters for the control-endpoint failure: the
+	 * driver already reported one DEPGETSTATE on EP0-OUT, but a single value
+	 * from a single endpoint says nothing without something to compare it
+	 * against. Taking all five here, and again from
+	 * udc_dwc3_ctrl_stall_cleared() when traffic resumes, gives the same
+	 * endpoints wedged and working within seconds of each other.
+	 */
+	priv->ctrl_stall_captured = true;
+	udc_dwc3_epstate_dump(dev, "CTRLSTALL");
 }
 #endif /* STALL_DIAG_LOG */
 
@@ -6511,6 +6547,177 @@ static bool udc_dwc3_evt_lookahead_lost(const struct device *const dev, const ui
 static bool udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
 					const uint32_t gc, const bool frozen,
 					const uint32_t gaveup_ms);
+
+/*
+ * Capture DEPGETSTATE for every endpoint this driver drives.
+ *
+ * Databook 3.2.2.3: the 32 bits returned in DEPCMDPAR2 are "the current data
+ * sequence number, flow control state, and control transfer state (for control
+ * endpoints)". No field layout is published - the command is documented only for
+ * hibernation - so a single value says nothing. What is worth capturing is the
+ * DIFFERENCE between the same endpoint wedged and that endpoint working, which is
+ * why this is called both when a wedge is declared and again when it clears.
+ * When the bitfield decoding arrives, that pair says which bits were wrong.
+ *
+ * Error paths ONLY. A periodic version of this perturbed the timing enough to
+ * suppress the fault it was meant to observe.
+ *
+ * EP85 is deliberately absent: the UVC Manager issues its own commands on that
+ * endpoint's DEPCMD and a write from here could corrupt it.
+ */
+/*
+ * The healthy half of the control-endpoint pair. Called when control traffic
+ * moves again after a stall was captured, so the two dumps bracket the failure on
+ * the same endpoints, seconds apart.
+ */
+static void udc_dwc3_ctrl_stall_cleared(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (!priv->ctrl_stall_captured) {
+		return;
+	}
+
+	priv->ctrl_stall_captured = false;
+	LOG_ERR("control traffic resumed after a stall capture");
+	udc_dwc3_epstate_dump(dev, "CTRLCLEARED");
+}
+
+static void udc_dwc3_epstate_dump(const struct device *const dev, const char *const tag)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	static const uint8_t epns[] = { 0U, 1U, 2U, 5U, 9U };
+	static const char *const names[] = { "EP00", "EP80", "EP01", "EP82", "EP84" };
+	const bool saved_no_sleep = priv->depcmd_no_sleep;
+
+	priv->depcmd_no_sleep = true;
+
+	for (uint32_t i = 0U; i < ARRAY_SIZE(epns); i++) {
+		const uint32_t epn = epns[i];
+		const bool dir_in = (epn & 1U) != 0U;
+		const uint32_t log_ep = epn >> 1;
+		struct udc_dwc3_ep_data *ep_data;
+		uint32_t par2;
+
+		if (dir_in ? (cfg->num_in_eps <= log_ep) : (cfg->num_out_eps <= log_ep)) {
+			continue;
+		}
+		ep_data = dir_in ? &cfg->ep_data_in[log_ep] : &cfg->ep_data_out[log_ep];
+
+		/*
+		 * Twice. The first DEPGETSTATE on an endpoint can return a stale
+		 * PAR2 - that is what produced a bogus 0x00000004 in the first
+		 * capture of every earlier run.
+		 */
+		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE);
+		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE);
+		par2 = sys_read32(base + UDC_DWC3_DEPCMDPAR2(epn));
+
+		if (ep_data->trb_buf == NULL) {
+			LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x "
+				"(not configured)", tag, names[i], epn, par2,
+				sys_read32(base + UDC_DWC3_DEPCMD(epn)));
+			continue;
+		}
+
+		LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x | busy=%u "
+			"head=%u tail=%u n_retire=%u arm=%u trb ctrl=0x%08x sts=0x%08x "
+			"rscidx=0x%x", tag, names[i], epn, par2,
+			sys_read32(base + UDC_DWC3_DEPCMD(epn)),
+			udc_ep_is_busy(&ep_data->cfg) ? 1U : 0U,
+			ep_data->head, ep_data->tail, ep_data->n_retire,
+			ep_data->armed_len[ep_data->tail],
+			ep_data->trb_buf[ep_data->tail].ctrl,
+			ep_data->trb_buf[ep_data->tail].status,
+			ep_data->xferrscidx);
+	}
+
+	priv->depcmd_no_sleep = saved_no_sleep;
+}
+
+/*
+ * Declare a non-control endpoint wedged when it has held a descriptor the
+ * controller owns for UDC_DWC3_EP_WEDGE_MS with nothing retiring, and capture the
+ * controller's own view of it at that moment.
+ *
+ * This is the W1 signature: HWO still set, BUFSIZ still the programmed length,
+ * the endpoint command layer reporting OK. Until now nothing in the driver
+ * noticed it - the sweep only handles the opposite case, a descriptor the
+ * controller HAS released whose completion never arrived.
+ *
+ * A descriptor armed with zero length is excluded: that is the CDC-ACM
+ * echo-mitigation ZLP, which legitimately waits HWO=1 until the host issues an
+ * IN token that may never come.
+ */
+static void udc_dwc3_detect_wedged_eps(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uint32_t now = k_cycle_get_32();
+
+	/*
+	 * IN endpoints only.
+	 *
+	 * An idle OUT endpoint legitimately parks with HWO set, waiting for the
+	 * host to send something that may never come - that is success, not a
+	 * wedge, and treating it as one made this fire during enumeration.
+	 */
+	for (uint32_t i = 1U; i < cfg->num_in_eps; i++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[i];
+		bool outstanding;
+
+		if (ep_data->trb_buf == NULL) {
+			continue;
+		}
+
+		outstanding = udc_ep_is_busy(&ep_data->cfg) &&
+			      ep_data->armed_len[ep_data->tail] != 0U &&
+			      (ep_data->trb_buf[ep_data->tail].ctrl &
+			       UDC_DWC3_TRB_CTRL_HWO) != 0U;
+
+		if (!outstanding || ep_data->n_retire != ep_data->wedge_last_retire) {
+			if (ep_data->wedge_reported) {
+				LOG_ERR("EP%02x cleared after %u ms",
+					ep_data->cfg.addr,
+					k_cyc_to_ms_near32(now - ep_data->wedge_t0));
+				udc_dwc3_epstate_dump(dev, "CLEARED");
+				ep_data->wedge_reported = false;
+			}
+			ep_data->wedge_last_retire = ep_data->n_retire;
+			ep_data->wedge_t0 = now;
+			continue;
+		}
+
+		/*
+		 * n_retire == 0 means this endpoint has never completed anything,
+		 * which is the state during and just after enumeration. Issuing
+		 * DEPGETSTATE across five endpoints while the host is doing
+		 * SET_ADDRESS breaks the enumeration outright - measured, 443 USB
+		 * resets against 2 for the same build without this check. A real
+		 * mid-stream wedge always has traffic behind it.
+		 */
+		if (ep_data->n_retire == 0U || ep_data->wedge_reported ||
+		    priv->ep_wedge_reports >= UDC_DWC3_EP_WEDGE_REPORT_MAX ||
+		    k_cyc_to_ms_near32(now - ep_data->wedge_t0) < UDC_DWC3_EP_WEDGE_MS) {
+			continue;
+		}
+
+		ep_data->wedge_reported = true;
+		priv->ep_wedge_reports++;
+		priv->ep_wedge_total++;
+
+		LOG_ERR("EP%02x WEDGED: descriptor owned by the controller for %u ms, "
+			"nothing retired (n_retire=%u, armed %u bytes, ctrl 0x%08x "
+			"sts 0x%08x) - episode %u",
+			ep_data->cfg.addr, k_cyc_to_ms_near32(now - ep_data->wedge_t0),
+			ep_data->n_retire, ep_data->armed_len[ep_data->tail],
+			ep_data->trb_buf[ep_data->tail].ctrl,
+			ep_data->trb_buf[ep_data->tail].status, priv->ep_wedge_total);
+		udc_dwc3_epstate_dump(dev, "WEDGED");
+	}
+}
 
 static void udc_dwc3_sweep_completed(const struct device *const dev)
 {
@@ -6583,6 +6790,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	const uint32_t gc = udc_dwc3_gevntcount(base);
 
 	udc_dwc3_sweep_completed(dev);
+	udc_dwc3_detect_wedged_eps(dev);
 	/*
 	 * How long the drain has been parked on the same empty slot, or 0 when it
 	 * is not parked at all. Only meaningful while a run is active: without one
@@ -6808,6 +7016,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	 */
 	if (priv->ctrl_setup_done != priv->hb_last_setup_done) {
 		priv->hb_last_setup_done = priv->ctrl_setup_done;
+		/* Control traffic moved: if a stall was captured, take its pair. */
+		udc_dwc3_ctrl_stall_cleared(dev);
 		priv->ctrl_quiet_t0 = k_cycle_get_32();
 		priv->ctrl_quiet_logged = false;
 	} else if (!priv->ctrl_quiet_logged && priv->ctrl_setup_done > 0U &&
