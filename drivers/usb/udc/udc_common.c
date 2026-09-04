@@ -165,6 +165,8 @@ void udc_setup_received(const struct device *dev, const void *const setup)
 			net_buf_add_mem(buf, setup, 8);
 		}
 
+		LOG_WRN("%s submitting event", __func__);
+
 		udc_submit_ep_event(dev, buf, 0);
 	}
 
