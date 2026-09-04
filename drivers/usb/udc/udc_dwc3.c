@@ -546,9 +546,6 @@ struct udc_dwc3_ep_data {
 	struct udc_ep_config cfg;
 	/* Endpoint number (physical address): the logical address is on ep_cfg */
 	int epn;
-	/* watch for TRB completion */
-	uint8_t quest_step;
-	uint8_t quest_paused;
 	/* To re-queue cancel buffers after an endpoint is disabled */
 	struct k_fifo requeue_fifo;
 	/* Point back to the device for work queues */
@@ -566,8 +563,10 @@ struct udc_dwc3_ep_data {
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
-	/* Time-out for endpoint being active */
-	k_timepoint_t timeout;
+	/* Work on one particular endpoint */
+	struct k_work_delayable runner_dwork;
+	/* watch for TRB completion */
+	uint8_t runner_step;
 };
 
 /*
@@ -594,12 +593,6 @@ struct udc_dwc3_data {
 	/* Updated whenever a packet is submitted */
 	uint32_t last_xfer_type;
 	uint8_t last_xfer_dir;
-	/* Work on one particular endpoint */
-	struct k_work_delayable quest_dwork;
-	/* Currently running endpoint */
-	struct udc_dwc3_ep_data *quest_ep_data;
-	/* Number of recoveries that happened for a same transfer */
-	uint8_t xfer_recoveries;
 	/* Cache that is always up to date (before stack could get time to react) */
 	struct usb_setup_packet setup_packet;
 };
@@ -678,10 +671,6 @@ static void udc_dwc3_dump_fifo_space(const struct device *dev, const struct shel
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt);
 static void udc_dwc3_on_ctrl_in(const struct device *const dev);
 static void udc_dwc3_on_ctrl_out(const struct device *const dev);
-static void udc_dwc3_quest_entry(const struct device *const dev,
-				 struct udc_dwc3_ep_data *const ep_data);
-static void udc_dwc3_quest_exit(const struct device *const dev,
-				 struct udc_dwc3_ep_data *const ep_data);
 
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
@@ -1100,30 +1089,6 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	return 0;
 }
 
-static int udc_dwc3_burst_lock(const struct device *const dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	int ret;
-
-	if (priv->quest_ep_data == NULL) {
-		ret = lattice_usb23_lock(dev, K_FOREVER);
-		if (ret < 0) {
-			LOG_WRN("Failed to acquire lock");
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
-static void udc_dwc3_burst_unlock(const struct device *const dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	priv->quest_ep_data = NULL;
-	lattice_usb23_unlock(dev);
-}
-
 /*
  * Control buffers (outdated)
  *
@@ -1195,108 +1160,6 @@ static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
 		udc_submit_ep_event(dev, buf, -EINVAL);
 	}
-}
-
-static void udc_dwc3_ctrl_get_next_type(const struct device *const dev,
-					uint8_t *dir, uint8_t *type)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
-		if (priv->setup_packet.wLength == 0) {
-			*dir = USB_EP_DIR_IN;
-			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2;
-
-		} else if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_DEVICE) {
-			*dir = USB_EP_DIR_OUT;
-			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA;
-
-		} else if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_HOST) {
-			*dir = USB_EP_DIR_IN;
-			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA;
-		}
-	} else if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
-		if (priv->setup_packet.RequestType.direction == USB_REQTYPE_DIR_TO_DEVICE) {
-			*dir = USB_EP_DIR_IN;
-			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
-		} else {
-			*dir = USB_EP_DIR_OUT;
-			*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3;
-		}
-	} else if (priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3
-		|| priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2) {
-		*dir = USB_EP_DIR_OUT;
-		*type = UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP;
-	}
-}
-
-static int udc_dwc3_recover(const struct device *dev)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const char *name;
-
-	if (priv->xfer_recoveries >= CONFIG_UDC_DWC3_RECOVERY_MAX_PER_XFER &&
-	    priv->last_xfer_type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
-		LOG_WRN("Not triggering a recovery for SETUP, already recovered this transfer %u times",
-			priv->xfer_recoveries);
-
-		LOG_WRN("Detected idle state, giving other transfer types an opportunity to lock");
-
-		udc_dwc3_burst_unlock(dev);
-		return 0;
-	}
-
-	LOG_INF("CTRL IN:");
-	udc_dwc3_dump_trb(dev, &cfg->ep_data_in[0], NULL);
-
-	LOG_INF("CTRL OUT:");
-	udc_dwc3_dump_trb(dev, &cfg->ep_data_out[0], NULL);
-
-	//LOG_WRN("FIFO SPACE:");
-	//udc_dwc3_dump_fifo_space(dev, NULL);
-
-	LOG_WRN("Recovering USB state");
-	udc_lock_internal(dev, K_FOREVER);
-
-	switch (priv->last_xfer_type) {
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP:
-		name = "SETUP";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA:
-		name = "DATA";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2:
-		name = "STATUS_2";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3:
-		name = "STATUS_3";
-		break;
-	default:
-		name = "<?>";
-		break;
-	}
-
-	priv->xfer_recoveries++;
-
-	if (priv->last_xfer_dir == USB_EP_DIR_IN) {
-		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-
-		LOG_INF("TRB_CONTROL_IN_%s (%d)", name, priv->last_xfer_type);
-		udc_dwc3_trb_ctrl_in(dev, udc_buf_peek(&cfg->ep_data_in[0].cfg),
-				priv->last_xfer_type);
-
-	} else if (priv->last_xfer_dir == USB_EP_DIR_OUT) {
-		udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-
-		LOG_INF("TRB_CONTROL_OUT_%s (%d)", name, priv->last_xfer_type);
-		udc_dwc3_trb_ctrl_out(dev, udc_buf_peek(&cfg->ep_data_out[0].cfg),
-				priv->last_xfer_type);
-	} else {
-		LOG_WRN("unknown current endpoint direction, no action taken");
-	}
-
-	return 0;
 }
 
 /*
@@ -1484,7 +1347,6 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	struct net_buf *buf;
 
 	//k_work_cancel_delayable(&priv->watchdog_dwork);
-	//priv->xfer_recoveries = 0;
 
 	LOG_INF("%s: TRB CTRL IN completed", dev->name);
 
@@ -1534,7 +1396,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	LOG_INF("%s TRB CTRL OUT completed", dev->name);
 
 	//k_work_cancel_delayable(&priv->watchdog_dwork);
-	//priv->xfer_recoveries = 0;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		buf = udc_buf_peek(&ep_data->cfg);
@@ -1926,7 +1787,7 @@ static void udc_dwc3_irq_handler(void *const ptr)
 	const struct device *const dev = ptr;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const struct udc_dwc3_config *const cfg = dev->config;
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	//const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	k_work_submit_to_queue(udc_get_work_q(), &priv->event_work);
 
@@ -1936,301 +1797,67 @@ static void udc_dwc3_irq_handler(void *const ptr)
 }
 
 /*
- * Quests
+ * Runners
  *
  * Threads take too much memory, multiple chained workqueues cannot be controlled in a central point
  * and have a group behavior, and cannot be cancelled reliably, or have a "status" command.
  */
 
 enum {
-	_EP_QUEST_IDLE,
-	_EP_QUEST_STEP_BEG,
-	_EP_QUEST_STEP_TRB,
-	_EP_QUEST_STEP_WATCH,
-	_EP_QUEST_STEP_COMPLETING,
-	_EP_QUEST_STEP_END,
+	_EP_RUNNER_IDLE,
+	_EP_RUNNER_STEP_BEG,
+	_EP_RUNNER_STEP_TRB,
+	_EP_RUNNER_STEP_WATCH,
+	_EP_RUNNER_STEP_COMPLETING,
+	_EP_RUNNER_STEP_END,
 };
 
-static void udc_dwc3_ep_switch(const struct device *const dev);
-
-static void udc_dwc3_ep_pause(const struct device *dev,
-				      struct udc_dwc3_ep_data *const ep_data)
+static void udc_dwc3_ep_trigger(const struct device *dev, struct udc_dwc3_ep_data *ep_data)
 {
-	udc_lock_internal(dev, K_FOREVER);
-
-	ep_data->quest_paused = true;
-	udc_dwc3_ep_switch(dev);
-
-	udc_unlock_internal(dev);
+	k_work_reschedule_for_queue(udc_get_work_q(), &ep_data->runner_dwork, K_NO_WAIT);
 }
 
-static void udc_dwc3_ep_trigger(const struct device *dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	udc_dwc3_ep_switch(dev);
-	k_work_reschedule_for_queue(udc_get_work_q(), &priv->quest_dwork, K_MSEC(1));
-}
-
-static void udc_dwc3_ep_activate(const struct device *dev, struct udc_dwc3_ep_data *ep_data)
-{
-	if (ep_data->quest_step == _EP_QUEST_IDLE) {
-		ep_data->quest_step = _EP_QUEST_STEP_BEG;
-	}
-}
-
-static bool udc_dwc3_ep_is_runnable(const struct device *const dev,
-				         struct udc_dwc3_ep_data *ep_data)
-{
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
-		uint8_t dir = 0;
-		uint8_t type = 0;
-
-		udc_dwc3_ctrl_get_next_type(dev, &dir, &type);
-		if (dir != USB_EP_GET_DIR(ep_data->cfg.addr) &&
-		    ep_data->quest_step <= _EP_QUEST_STEP_BEG) {
-			/* Do not allow new control transacton for the wrong direction,
-			 * but still allow ongoing one to complete (i.e. if preempted).
-			 */
-			return false;
-		}
-	}
-
-	return (ep_data->quest_step >= _EP_QUEST_STEP_BEG &&
-		ep_data->quest_step < _EP_QUEST_STEP_END);
-}
-
-static void udc_dwc3_ep_dump(const struct device *const dev)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct udc_dwc3_ep_data *ep_data;
-
-	for (int i = 0; i < cfg->num_out_eps; i++) {
-		ep_data = &cfg->ep_data_out[i];
-		LOG_DBG("- ep 0x0%x, step %d, runnable %d",
-			i, ep_data->quest_step, udc_dwc3_ep_is_runnable(dev, ep_data));
-	}
-	for (int i = 0; i < cfg->num_in_eps; i++) {
-		ep_data = &cfg->ep_data_in[i];
-		LOG_DBG("- ep 0x8%x, step %d, runnable %d",
-			i, ep_data->quest_step, udc_dwc3_ep_is_runnable(dev, ep_data));
-	}
-}
-
-static struct udc_dwc3_ep_data *udc_dwc3_ep_next_runnable(const struct device *const dev,
-							  uint8_t cur_ep)
-{
-	const struct udc_dwc3_config *const cfg = dev->config;
-	struct udc_dwc3_ep_data *ep_data;
-
-	LOG_DBG("Checking endpoints following 0x%02x", cur_ep);
-
-	for (int ep = cur_ep + 1, n = 0; n < cfg->num_in_eps + cfg->num_out_eps; n++, ep++) {
-		/* wrap */
-		if (ep == (USB_EP_DIR_IN | cfg->num_in_eps)) {
-			ep = USB_EP_DIR_OUT;
-		}
-		if (ep == (USB_EP_DIR_OUT | cfg->num_out_eps)) {
-			ep = USB_EP_DIR_IN;
-		}
-
-		/* check */
-		ep_data = USB_EP_DIR_IS_IN(ep)
-			? &cfg->ep_data_in[USB_EP_GET_IDX(ep)]
-			: &cfg->ep_data_out[USB_EP_GET_IDX(ep)];
-
-		if (udc_dwc3_ep_is_runnable(dev, ep_data)) {
-			return ep_data;
-		}
-	}
-
-	return NULL;
-}
-
-static bool udc_dwc3_has_unpaused_runnable(const struct device *const dev)
-{
-	const struct udc_dwc3_config *cfg = dev->config;
-	struct udc_dwc3_ep_data *ep_data;
-
-	for (int i = 0; i < cfg->num_in_eps; i++) {
-		ep_data = &cfg->ep_data_in[i];
-		if (udc_dwc3_ep_is_runnable(dev, ep_data) && !ep_data->quest_paused) {
-			return true;
-		}
-	}
-	for (int i = 0; i < cfg->num_out_eps; i++) {
-		ep_data = &cfg->ep_data_out[i];
-		if (udc_dwc3_ep_is_runnable(dev, ep_data) && !ep_data->quest_paused) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void udc_dwc3_ep_unpause_all(const struct device *const dev)
-{
-	const struct udc_dwc3_config *cfg = dev->config;
-
-	for (int i = 0; i < cfg->num_in_eps; i++) {
-		cfg->ep_data_in[i].quest_paused = false;
-	}
-	for (int i = 0; i < cfg->num_out_eps; i++) {
-		cfg->ep_data_out[i].quest_paused = false;
-	}
-}
-
-static void udc_dwc3_reset_nonctrl(const struct device *const dev,
-				   struct udc_dwc3_ep_data *ep_data)
-{
-	struct udc_dwc3_trb trb = ep_data->trb_cache[ep_data->tail];
-
-	udc_dwc3_trb_nonctrl_init(dev, ep_data);
-
-	memcpy(&ep_data->trb_cache[0], &trb, sizeof(trb));
-	memcpy(&ep_data->trb_buf[0], &trb, sizeof(trb));
-
-	LOG_WRN("Updating xfer");
-	udc_dwc3_depcmd_update_xfer(dev, ep_data);
-}
-
-static void udc_dwc3_quest_entry(const struct device *const dev,
-				 struct udc_dwc3_ep_data *const ep_data)
-{
-	if (ep_data != NULL &&
-	    ep_data->quest_step == _EP_QUEST_STEP_WATCH) {
-		LOG_WRN("Resetting ep 0x%02x (source)", ep_data->cfg.addr);
-		udc_dwc3_depcmd_end_xfer(dev, ep_data, 0);
-	}
-}
-
-static void udc_dwc3_quest_exit(const struct device *const dev,
-				 struct udc_dwc3_ep_data *const ep_data)
-{
-	if (ep_data->quest_step == _EP_QUEST_STEP_WATCH) {
-		LOG_WRN("Resetting ep 0x%02x (dest)", ep_data->cfg.addr);
-		if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
-			udc_dwc3_depcmd_start_xfer(dev, ep_data);
-		} else {
-			udc_dwc3_reset_nonctrl(dev, ep_data);
-		}
-	}
-}
-
-static void udc_dwc3_ep_switch(const struct device *const dev)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	struct udc_dwc3_ep_data *ep_data = priv->quest_ep_data;
-
-	udc_lock_internal(dev, K_FOREVER);
-
-	if (!udc_dwc3_has_unpaused_runnable(dev)) {
-		LOG_INF("No runnable endpoints that are unpaused, sleeping");
-
-		udc_dwc3_quest_entry(dev, priv->quest_ep_data);
-
-		udc_dwc3_burst_unlock(dev);
-		/* We are cheating: we know this is a different thread,
-		 * let context switching happen.
-		 * Does not work without CONFIG_UDC_WORKQUEUE=y
-		 * This is when the video stream is expected to play.
-		 */
-		k_sleep(K_MSEC(200));
-		udc_dwc3_burst_lock(dev);
-		udc_dwc3_ep_unpause_all(dev);
-
-		udc_dwc3_quest_exit (dev, priv->quest_ep_data);
-	}
-
-	ep_data = udc_dwc3_ep_next_runnable(dev, ep_data == NULL ? 0 : ep_data->cfg.addr);
-	if (ep_data == NULL) {
-		LOG_INF("No runnable endpoint, unlocking");
-		udc_dwc3_burst_unlock(dev);
-		goto end;
-	}
-
-	udc_dwc3_quest_entry(dev, priv->quest_ep_data);
-	udc_dwc3_quest_exit(dev, ep_data);
-
-	LOG_WRN("Switching to ep 0x%02x", ep_data->cfg.addr);
-	priv->quest_ep_data = ep_data;;
-	priv->quest_ep_data->quest_paused = false;
-
-	udc_dwc3_ep_dump(dev);
-end:
-	udc_unlock_internal(dev);
-}
-
-static void udc_dwc3_ep_quest(struct k_work *const work)
+static void udc_dwc3_ep_runner(struct k_work *const work)
 {
 	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-	struct udc_dwc3_data *const priv = CONTAINER_OF(dwork, struct udc_dwc3_data, quest_dwork);
-	const struct device *const dev = priv->dev;
-	struct udc_dwc3_ep_data *ep_data;
+	struct udc_dwc3_ep_data *const ep_data =
+		CONTAINER_OF(dwork, struct udc_dwc3_ep_data, runner_dwork);
+	const struct device *const dev = ep_data->dev;
 	struct net_buf *buf;
 	k_timeout_t schedule = K_FOREVER;
 	int ret;
 
 	udc_lock_internal(dev, K_FOREVER);
 
-	ret = udc_dwc3_burst_lock(dev);
-	if (ret != 0) {
-		LOG_WRN("Lock owned by other context");
-		goto abort;
-	}
-
-	if (priv->quest_ep_data == NULL) {
-		LOG_INF("No endpoint scheduled yet, picking one");
-		udc_dwc3_ep_switch(dev);
-	}
-
-	ep_data = priv->quest_ep_data;
-
-	if (ep_data == NULL) {
-		LOG_WRN("No endpoint scheduled yet, nothing to schedule, exiting");
-		goto abort;
-	}
-
-	if (ep_data->cfg.stat.halted) {
-		LOG_WRN("Endpoint is halted, not running");
-		udc_dwc3_ep_switch(dev);
-		goto next;
-	}
-
 run_step:
-	if (ep_data->quest_paused) {
-		LOG_WRN("EP is paused");
-	}
-
 	LOG_INF("Watcher: running ep 0x%02x, tail %u, step %u, trb.ctrl 0x%08x",
-		ep_data->cfg.addr, ep_data->tail, ep_data->quest_step,
+		ep_data->cfg.addr, ep_data->tail, ep_data->runner_step,
 		ep_data->trb_buf[ep_data->tail].ctrl);
 
-	switch (ep_data->quest_step) {
+	switch (ep_data->runner_step) {
 
-	case _EP_QUEST_IDLE:
-		LOG_WRN("_EP_QUEST_IDLE: 0x%02x", ep_data->cfg.addr);
+	case _EP_RUNNER_IDLE:
+		LOG_WRN("_EP_RUNNER_IDLE: 0x%02x", ep_data->cfg.addr);
 		schedule = K_NO_WAIT;
-		udc_dwc3_ep_switch(dev);
 		break;
 
-	case _EP_QUEST_STEP_BEG:
-		LOG_WRN("_EP_QUEST_STEP_BEG: 0x%02x", ep_data->cfg.addr);
-		ep_data->quest_step = _EP_QUEST_STEP_TRB;
-		ep_data->timeout = sys_timepoint_calc(K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+	case _EP_RUNNER_STEP_BEG:
+		LOG_WRN("_EP_RUNNER_STEP_BEG: 0x%02x", ep_data->cfg.addr);
+		ep_data->runner_step = _EP_RUNNER_STEP_TRB;
 		goto run_step;
 
-	case _EP_QUEST_STEP_TRB:
-		LOG_WRN("_EP_QUEST_STEP_TRB: 0x%02x", ep_data->cfg.addr);
+	case _EP_RUNNER_STEP_TRB:
+		LOG_WRN("_EP_RUNNER_STEP_TRB: 0x%02x", ep_data->cfg.addr);
 		schedule = K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS);
 
 		buf = udc_buf_peek(&ep_data->cfg);
 		if (buf == NULL) {
-			ep_data->quest_step = _EP_QUEST_IDLE;
+			ep_data->runner_step = _EP_RUNNER_IDLE;
 			LOG_DBG("abort: no data");
 			break;
 		}
 
-		ep_data->quest_step = _EP_QUEST_STEP_WATCH;
+		ep_data->runner_step = _EP_RUNNER_STEP_WATCH;
 
 		if (ep_data->cfg.addr == USB_CONTROL_EP_IN) {
 			udc_dwc3_ctrl_next_in(dev, buf);
@@ -2247,37 +1874,29 @@ run_step:
 		}
 		goto run_step;
 
-	case _EP_QUEST_STEP_WATCH:
-		LOG_WRN("_EP_QUEST_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
+	case _EP_RUNNER_STEP_WATCH:
+		LOG_WRN("_EP_RUNNER_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
 		schedule = K_MSEC(CONFIG_UDC_DWC3_CTRL_POLL_MS);
 
 		if ((ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
-			ep_data->quest_step = _EP_QUEST_STEP_COMPLETING;
+			ep_data->runner_step = _EP_RUNNER_STEP_COMPLETING;
 			goto run_step;
-		}
-
-		if (sys_timepoint_expired(ep_data->timeout)) {
-			LOG_INF("Watcher: timeout reached for ep 0x%02x, end of burst",
-				ep_data->cfg.addr);
-			udc_dwc3_ep_pause(dev, ep_data);
-			break;
 		}
 
 		break;
 
-	case _EP_QUEST_STEP_COMPLETING:
-		LOG_WRN("_EP_QUEST_STEP_COMPLETING: 0x%02x", ep_data->cfg.addr);
+	case _EP_RUNNER_STEP_COMPLETING:
+		LOG_WRN("_EP_RUNNER_STEP_COMPLETING: 0x%02x", ep_data->cfg.addr);
 		schedule = K_NO_WAIT;
 
 		LOG_INF("Watcher: transaction complete, stopping till next transaction");
 
-		ep_data->quest_step = _EP_QUEST_STEP_BEG;
+		ep_data->runner_step = _EP_RUNNER_STEP_BEG;
 
 		if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 			if (udc_buf_peek(&ep_data->cfg) == NULL) {
-				ep_data->quest_step = _EP_QUEST_IDLE;
+				ep_data->runner_step = _EP_RUNNER_IDLE;
 			}
-			udc_dwc3_ep_switch(dev);
 		}
 
 		if (ep_data->cfg.addr == USB_EP_DIR_IN) {
@@ -2291,15 +1910,11 @@ run_step:
 		break;
 
 	default:
-		LOG_ERR("Unknown quest step %d", ep_data->quest_step);
+		LOG_ERR("Unknown runner step %d", ep_data->runner_step);
 	}
 
-next:
-	LOG_INF("Rescheduling again");
-	k_work_reschedule_for_queue(udc_get_work_q(), &priv->quest_dwork, schedule);
+	k_work_reschedule_for_queue(udc_get_work_q(), &ep_data->runner_dwork, schedule);
 
-abort:
-	LOG_DBG("Done");
 	udc_unlock_internal(dev);
 }
 
@@ -2324,8 +1939,7 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 	}
 
 	udc_buf_put(ep_cfg, buf);
-	udc_dwc3_ep_activate(dev, ep_data);
-	udc_dwc3_ep_trigger(dev);
+	udc_dwc3_ep_trigger(dev, ep_data);
 
 	return 0;
 }
@@ -2378,11 +1992,6 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 		if (ret != 0) {
 			return ret;
 		}
-	}
-
-	/* We might have blocked transfers earlier */
-	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		//k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 	}
 
 	return 0;
@@ -2494,7 +2103,7 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	ep_data->cfg.stat.halted = false;
 
 	/* Resume halted previously transfers */
-	//k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+	//k_work_submit_to_queue(udc_get_work_q(), &ep_data->runner_dwork);
 
 	return 0;
 }
@@ -2732,7 +2341,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
-	k_work_init_delayable(&priv->quest_dwork, udc_dwc3_ep_quest);
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
@@ -2780,6 +2388,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		return ret;
 	}
 
+	k_work_init_delayable(&ep_data->runner_dwork, udc_dwc3_ep_runner);
+
 	/* Control OUT endpoint */
 
 	ep_data = &cfg->ep_data_out[0];
@@ -2798,6 +2408,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		LOG_ERR("Failed to register endpoint");
 		return ret;
 	}
+
+	k_work_init_delayable(&ep_data->runner_dwork, udc_dwc3_ep_runner);
 
 	/* Normal IN endpoints */
 	for (int i = 1; i < cfg->num_in_eps; i++) {
@@ -2821,6 +2433,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 			LOG_ERR("Failed to register endpoint");
 			return ret;
 		}
+
+		k_work_init_delayable(&ep_data->runner_dwork, udc_dwc3_ep_runner);
 	}
 
 	/* Normal OUT endpoints */
@@ -2845,6 +2459,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 			LOG_ERR("Failed to register endpoint");
 			return ret;
 		}
+
+		k_work_init_delayable(&ep_data->runner_dwork, udc_dwc3_ep_runner);
 	}
 
 	return 0;
@@ -3515,20 +3131,6 @@ static int cmd_dwc3_stall_ctrl_in(const struct shell *sh, size_t argc, char **ar
 	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_dwc3_stall_ctrl_in);
 }
 
-static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *sh)
-{
-	int ret;
-
-	ret = udc_dwc3_recover(dev);
-	if (ret != 0) {
-		shell_error(sh, "Failed to recover USB state: %d", ret);
-	}
-}
-static int cmd_dwc3_recover(const struct shell *sh, size_t argc, char **argv)
-{
-	return dump_cmd2_handler(sh, argc, argv, udc_dwc3_cmd_recover);
-}
-
 static void device_name_get(size_t idx, struct shell_static_entry *entry)
 {
 	const struct device *dev = shell_device_lookup(idx, NULL);
@@ -3624,9 +3226,6 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_dwc3,
 	SHELL_CMD_ARG(stall_ctrl_out, &dsub_device_name,
 		      "Stall the CTRL OUT endpoint\nUsage: stall_ctrl_out <device>",
 		      cmd_dwc3_stall_ctrl_out, 2, 0),
-	SHELL_CMD_ARG(recover, &dsub_device_name,
-		      "Try to recover from a transfer that is stuck\nUsage: recover <device>",
-		      cmd_dwc3_recover, 2, 0),
 	SHELL_CMD_ARG(fake_xfercomplete, &dsub_device_name,
 		      "Fake an XFERCOMMPLETE(0|1) event\nUsage: fake_xfercomplete <device>",
 		      cmd_fake_xfercomplete, 2, 0),
