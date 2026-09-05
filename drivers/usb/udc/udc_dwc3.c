@@ -576,8 +576,6 @@ struct udc_dwc3_data {
 	const struct device *dev;
 	/* Dispatch from IRQ events to workqueue jobs */
 	struct k_work event_work;
-	/* test if the previous transaction is stuck */
-	struct k_work_delayable watchdog_dwork;
 	/* watch for TRB completion */
 	struct k_work_delayable trb_ctrl_in_dwork;
 	struct k_work_delayable trb_ctrl_out_dwork;
@@ -1148,10 +1146,6 @@ static void udc_dwc3_ctrl_next_in(const struct device *const dev,
 		udc_submit_ep_event(dev, buf, -EINVAL);
 		return;
 	}
-
-	k_work_reschedule_for_queue(
-		udc_get_work_q(),
-		&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 }
 
 static void udc_dwc3_ctrl_next_out(const struct device *const dev,
@@ -1178,10 +1172,6 @@ static void udc_dwc3_ctrl_next_out(const struct device *const dev,
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
 		udc_submit_ep_event(dev, buf, -EINVAL);
 	}
-
-	k_work_reschedule_for_queue(
-		udc_get_work_q(),
-		&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
 }
 
 static void udc_dwc3_ctrl_try(const struct device *const dev,
@@ -1380,10 +1370,6 @@ static int udc_dwc3_recover(const struct device *dev)
 	        LOG_WRN("unknown current endpoint direction, no action taken");
 	}
 
-	k_work_reschedule_for_queue(
-		udc_get_work_q(),
-		&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
-
 	udc_unlock_internal(dev);
 
 	return 0;
@@ -1573,7 +1559,6 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	const uint32_t trb_trbctl = priv->trb_cache_in[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 
-	k_work_cancel_delayable(&priv->watchdog_dwork);
 	priv->last_xfer_recoveries = 0;
 
 	LOG_INF("%s: TRB CTRL IN completed", dev->name);
@@ -1631,7 +1616,6 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 	LOG_INF("%s TRB CTRL OUT completed", dev->name);
 
-	k_work_cancel_delayable(&priv->watchdog_dwork);
 	priv->last_xfer_recoveries = 0;
 
 	if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
@@ -2007,16 +1991,6 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	LOG_INF("=== done ===");
 
 	udc_unlock_internal(dev);
-}
-
-static void udc_dwc3_watchdog_worker(struct k_work *work)
-{
-	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-	struct udc_dwc3_data *const priv =
-		CONTAINER_OF(dwork, struct udc_dwc3_data, watchdog_dwork);
-	const struct device *const dev = priv->dev;
-
-	udc_dwc3_recover(dev);
 }
 
 static void udc_dwc3_trb_ctrl_in_worker(struct k_work *work)
@@ -2564,7 +2538,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
-	k_work_init_delayable(&priv->watchdog_dwork, udc_dwc3_watchdog_worker);
 	k_work_init_delayable(&priv->trb_ctrl_in_dwork, udc_dwc3_trb_ctrl_in_worker);
 	k_work_init_delayable(&priv->trb_ctrl_out_dwork, udc_dwc3_trb_ctrl_out_worker);
 
