@@ -706,6 +706,37 @@ static void udc_dwc3_unlock(const struct device *const dev)
 	udc_unlock_internal(dev);
 }
 
+struct {
+	uint64_t cycles;
+	char *tag;
+} trace[1024];
+size_t trace_cycle;
+
+void trace_tag(char *tag)
+{
+	if (trace_cycle >= ARRAY_SIZE(trace)) {
+		return;
+	}
+
+	trace[trace_cycle].cycles = k_cycle_get_64();
+	trace[trace_cycle].tag = tag;
+	trace_cycle++;
+}
+
+void trace_dump(void)
+{
+	printk("trace:\n");
+
+	for (int i = 0; i < ARRAY_SIZE(trace); i++) {
+		uint64_t duration_us =
+			(trace[i].cycles - trace[i - (i > 0)].cycles)
+			* USEC_PER_SEC
+			/ CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC;
+		printk("%4d, %8llu cycles, %8lld us, %s\n",
+			i, trace[i].cycles, duration_us, trace[i].tag);
+	}
+}
+
 /*
  * Commands
  *
@@ -726,7 +757,7 @@ static int udc_dwc3_dgcmd(const struct device *const dev, uint32_t cmd, uint32_t
 	cmd |= UDC_DWC3_DGCMD_IOC;
 	sys_write32(cmd, base + UDC_DWC3_DGCMD);
 
-	ret = k_sem_take(&priv->cmd_ioc_sem, K_MSEC(500));
+	ret = k_sem_take(&priv->cmd_ioc_sem, K_MSEC(100));
 	if (ret != 0) {
 		LOG_ERR("command expired");
 		return -EIO;
@@ -757,7 +788,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 				const uint32_t addr, const uint32_t cmd)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	k_timepoint_t end = sys_timepoint_calc(K_USEC(500000));
+	k_timepoint_t end = sys_timepoint_calc(K_MSEC(100));
 	uint32_t reg;
 
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
@@ -833,9 +864,9 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 
 	/* Per-endpoint events */
 	//param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
-	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	//param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
-		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		//param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
 	}
 
 	/* This is the usb protocol endpoint number, but the data encoding
@@ -1296,7 +1327,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/* Set the number of USB3 packets the device can receive at once */
 	reg = sys_read32(base + UDC_DWC3_DCFG);
 	reg &= ~UDC_DWC3_DCFG_NUMP_MASK;
-	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 0);
+	reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DCFG);
 
 	/* Enable reception of all USB events except UDC_DWC3_DEVTEN_ULSTCNGEN */
@@ -1483,7 +1514,7 @@ static struct udc_buf_info udc_dwc3_on_ctrl_out(const struct device *const dev)
 			udc_dwc3_set_address(dev, sys_le16_to_cpu(priv->setup_packet.wValue));
 		}
 
-		LOG_HEXDUMP_WRN(&priv->setup_packet, sizeof(priv->setup_packet),
+		LOG_HEXDUMP_INF(&priv->setup_packet, sizeof(priv->setup_packet),
 			"Submitting SETUP");
 
 		udc_setup_received(dev, &priv->setup_packet);
@@ -1867,19 +1898,21 @@ run_step:
 	switch (ep_data->runner_step) {
 
 	case _EP_RUNNER_IDLE:
-		LOG_WRN("_EP_RUNNER_IDLE: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_IDLE");
+		LOG_INF("_EP_RUNNER_IDLE: 0x%02x", ep_data->cfg.addr);
 		goto unlock;
 
 	case _EP_RUNNER_STEP_BEG:
-		LOG_WRN("_EP_RUNNER_STEP_BEG: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_STEP_BEG");
+		LOG_INF("_EP_RUNNER_STEP_BEG: 0x%02x", ep_data->cfg.addr);
 
 		buf = udc_buf_peek(&ep_data->cfg);
 		if (buf == NULL) {
 			ep_data->runner_step = _EP_RUNNER_STEP_BEG;
 
-			LOG_WRN("no buffer for ep 0x%02x", ep_data->cfg.addr);
+			LOG_INF("no buffer for ep 0x%02x", ep_data->cfg.addr);
 
-			schedule = K_USEC(500);
+			schedule = K_MSEC(1);
 			break;
 		}
 
@@ -1894,29 +1927,31 @@ run_step:
 			if (ret != 0) {
 				LOG_WRN("abort: No more room for buffer");
 
-				schedule = K_USEC(500);
+				schedule = K_MSEC(1);
 				break;
 			}
 
 			udc_buf_get(&ep_data->cfg);
 		}
 
-		schedule = K_USEC(500);
+		schedule = K_MSEC(1);
 		break;
 
 	case _EP_RUNNER_STEP_WATCH:
-		LOG_WRN_RATELIMIT("_EP_RUNNER_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_STEP_WATCH");
+		LOG_INF_RATELIMIT("_EP_RUNNER_STEP_WATCH: 0x%02x", ep_data->cfg.addr);
 
 		if ((ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0) {
 			ep_data->runner_step = _EP_RUNNER_STEP_COMPLETE;
 			goto run_step;
 		}
 
-		schedule = K_USEC(500);
+		schedule = K_MSEC(1);
 		break;
 
 	case _EP_RUNNER_STEP_COMPLETE:
-		LOG_WRN("_EP_RUNNER_STEP_COMPLETE: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_STEP_COMPLETE");
+		LOG_INF("_EP_RUNNER_STEP_COMPLETE: 0x%02x", ep_data->cfg.addr);
 
 		LOG_INF("Transaction complete, stopping till next transaction");
 
@@ -1932,7 +1967,9 @@ run_step:
 		goto run_step;
 
 	case _EP_RUNNER_STEP_NEXT:
-		LOG_WRN("_EP_RUNNER_STEP_NEXT: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_STEP_NEXT");
+		LOG_INF("_EP_RUNNER_STEP_NEXT: 0x%02x", ep_data->cfg.addr);
+		trace_tag("_EP_RUNNER_STEP_NEXT (postlog)");
 
 #define _EP_TRIGGER(stage, cfg_ep_data) \
 		buf = udc_buf_peek(&cfg_ep_data.cfg); \
@@ -1946,11 +1983,11 @@ run_step:
 #define _EP_TRIGGER_IN(stage) _EP_TRIGGER(stage, cfg->ep_data_in[0])
 #define _EP_TRIGGER_OUT(stage) _EP_TRIGGER(stage, cfg->ep_data_out[0])
 
-		schedule = K_MSEC(1);
+		schedule = K_USEC(500);
 
 		buf = udc_buf_peek(&cfg->ep_data_in[0].cfg);
 		if (buf != NULL) {
-			LOG_WRN("Next IN is %u:%u:%u",
+			LOG_INF("Next IN is %u:%u:%u",
 				udc_get_buf_info(buf)->setup,
 				udc_get_buf_info(buf)->data,
 				udc_get_buf_info(buf)->status);
@@ -1958,7 +1995,7 @@ run_step:
 
 		buf = udc_buf_peek(&cfg->ep_data_out[0].cfg);
 		if (buf != NULL) {
-			LOG_WRN("Next OUT is %u:%u:%u",
+			LOG_INF("Next OUT is %u:%u:%u",
 				udc_get_buf_info(buf)->setup,
 				udc_get_buf_info(buf)->data,
 				udc_get_buf_info(buf)->status);
@@ -2007,9 +2044,11 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	const struct udc_buf_info bi = *udc_get_buf_info(buf);
 
-	LOG_WRN("Enqueueing buf %p, data %p, size %u, len %u, ep 0x%02x %u:%u:%u",
+	LOG_INF("Enqueueing buf %p, data %p, size %u, len %u, ep 0x%02x %u:%u:%u",
 		(void *)buf, (void *)buf->data, buf->size, buf->len, ep_cfg->addr,
 		bi.setup, bi.data, bi.status);
+
+	trace_tag(__func__);
 
 	if (ep_data->cfg.addr == USB_CONTROL_EP_OUT) {
 		memset(buf->data, 0x00, buf->size);
@@ -2148,7 +2187,7 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
-	LOG_WRN("Ep 0x%02x STALL", ep_cfg->addr);
+	LOG_INF("Ep 0x%02x STALL", ep_cfg->addr);
 
 	switch (ep_data->cfg.addr) {
 	case USB_CONTROL_EP_IN:
@@ -2298,13 +2337,13 @@ static int udc_dwc3_init(const struct device *const dev)
 	/* Teriminate the reset of the DWC3 core after it */
 	sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
 
-	//reg = sys_read32(base + UDC_DWC3_GCTL);
-	//reg &= ~UDC_DWC3_GCTL_RAMCLKSEL_MASK;
-	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_BUS_CLK;
+	reg = sys_read32(base + UDC_DWC3_GCTL);
+	reg &= ~UDC_DWC3_GCTL_RAMCLKSEL_MASK;
+	reg |= UDC_DWC3_GCTL_RAMCLKSEL_BUS_CLK;
 	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_PIPE_CLK;
 	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_PIPE_DIV2_CLK;
 	//reg |= UDC_DWC3_GCTL_RAMCLKSEL_MAC2_CLK;
-	//sys_write32(reg, base + UDC_DWC3_GCTL);
+	sys_write32(reg, base + UDC_DWC3_GCTL);
 
 	/* The USB core was reset, configure it as documented */
 	udc_dwc3_on_soft_reset(dev);
@@ -3251,15 +3290,19 @@ static void udc_dwc3_cmd_stall_ctrl_in(const struct device *const dev, const str
 }
 CMD2_HANDLER(udc_dwc3_cmd_stall_ctrl_in, cmd_stall_ctrl_in);
 
-static void udc_dwc3_cmd_(const struct device *const dev, const struct shell *sh)
+static void udc_dwc3_cmd_evt_handler(const struct device *const dev, const struct shell *sh)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	k_work_submit_to_queue(udc_get_work_q(), &priv->event_work);
 }
-CMD2_HANDLER(udc_dwc3_cmd_stall_ctrl_in, cmd_stall_ctrl_in);
+CMD2_HANDLER(udc_dwc3_cmd_evt_handler, cmd_evt_handler);
 
-cmd_evt_handler
+static void udc_dwc3_cmd_trace(const struct device *const dev, const struct shell *sh)
+{
+	trace_dump();
+}
+CMD2_HANDLER(udc_dwc3_cmd_trace, cmd_trace);
 
 static void device_name_get(size_t idx, struct shell_static_entry *entry)
 {
@@ -3342,6 +3385,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_dwc3,
 	SHELL_CMD_ARG(evt_handler, &dsub_device_name,
 		      "Manually call the event handler\nUsage: evt_handler <device>",
 		      cmd_evt_handler, 2, 0),
+	SHELL_CMD_ARG(trace, &dsub_device_name,
+		      "Tracing results\nUsage: trace <device>",
+		      cmd_trace, 2, 0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(dwc3, &sub_dwc3, "Synopsys DWC3 controller commands", NULL);
