@@ -1,3 +1,4 @@
+void trace_tag(char const *);
 /*
  * Copyright (c) 2021-2022 Nordic Semiconductor ASA
  *
@@ -125,6 +126,8 @@ void udc_setup_received(const struct device *dev, const void *const setup)
 	struct net_buf *buf;
 
 	udc_lock_internal(dev, K_FOREVER);
+
+	trace_tag(__func__);
 
 	/* Cancel obsolete data/status stage requests */
 	for (buf = udc_buf_get(cfg_in); buf; buf = udc_buf_get(cfg_in)) {

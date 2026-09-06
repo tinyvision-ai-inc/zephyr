@@ -1,3 +1,4 @@
+void trace_tag(const char *);
 /*
  * Copyright (c) 2022 Nordic Semiconductor ASA
  *
@@ -967,20 +968,27 @@ static int std_request_to_host(struct usbd_context *const uds_ctx,
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	int ret;
 
+	trace_tag(__func__);
+
 	switch (setup->bRequest) {
 	case USB_SREQ_GET_STATUS:
+		LOG_INF("USB_SREQ_GET_STATUS:");
 		ret = sreq_get_status(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_DESCRIPTOR:
+		LOG_INF("USB_SREQ_GET_DESCRIPTOR:");
 		ret = sreq_get_descriptor(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_CONFIGURATION:
+		LOG_INF("USB_SREQ_GET_CONFIGURATION:");
 		ret = sreq_get_configuration(uds_ctx, buf);
 		break;
 	case USB_SREQ_GET_INTERFACE:
+		LOG_INF("USB_SREQ_GET_INTERFACE:");
 		ret = sreq_get_interface(uds_ctx, buf);
 		break;
 	default:
+		LOG_WRN("Unsupported bRequest to host %u", setup->bRequest);
 		errno = -ENOTSUP;
 		ret = 0;
 		break;
@@ -994,6 +1002,8 @@ static int vendor_device_request(struct usbd_context *const uds_ctx,
 {
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	struct usbd_vreq_node *vreq_nd;
+
+	trace_tag(__func__);
 
 	if (!IS_ENABLED(CONFIG_USBD_VREQ_SUPPORT)) {
 		errno = -ENOTSUP;
@@ -1029,6 +1039,8 @@ static int nonstd_request(struct usbd_context *const uds_ctx,
 	struct usbd_class_node *c_nd = NULL;
 	int ret = 0;
 
+	trace_tag(__func__);
+
 	switch (setup->RequestType.recipient) {
 	case USB_REQTYPE_RECIPIENT_ENDPOINT:
 		c_nd = usbd_class_get_by_ep(uds_ctx, setup->wIndex);
@@ -1061,6 +1073,8 @@ static int handle_setup_request(struct usbd_context *const uds_ctx,
 {
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	int ret;
+
+	trace_tag(__func__);
 
 	errno = 0;
 
@@ -1100,6 +1114,8 @@ static int ctrl_xfer_get_setup(struct usbd_context *const uds_ctx,
 			       struct net_buf *const buf)
 {
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
+
+	trace_tag(__func__);
 
 	if (buf->len != sizeof(struct usb_setup_packet)) {
 		return -EINVAL;
@@ -1144,6 +1160,8 @@ static int usbd_enqueue_status_in(struct usbd_context *const uds_ctx)
 		return -ENOMEM;
 	}
 
+	trace_tag(__func__);
+
 	ret = usbd_ep_ctrl_enqueue(uds_ctx, status_in);
 	if (ret) {
 		LOG_ERR("Failed to enqueue Status IN buffer");
@@ -1185,6 +1203,8 @@ int usbd_handle_ctrl_xfer(struct usbd_context *const uds_ctx,
 	struct usb_setup_packet *setup = usbd_get_setup_pkt(uds_ctx);
 	struct udc_buf_info *bi;
 	int ret = 0;
+
+	trace_tag(__func__);
 
 	bi = udc_get_buf_info(buf);
 	if (USB_EP_GET_IDX(bi->ep)) {

@@ -1,3 +1,4 @@
+void trace_tag(const char *);
 /*
  * Copyright (c) 2022 Nordic Semiconductor ASA
  *
@@ -36,18 +37,31 @@ static int usbd_event_carrier(const struct device *dev,
 {
 	struct usbd_context *const uds_ctx = (void *)udc_get_event_ctx(dev);
 	k_spinlock_key_t key;
+	int ret;
+
+	trace_tag(__func__);
 
 	if (event->type == UDC_EVT_EP_REQUEST) {
 		/*
 		 * Always add completed transfer requests to the list, so they
 		 * do not get lost.
 		 */
+		trace_tag("usbd_event_carrier locking");
 		key = k_spin_lock(&uds_ctx->ep_event_lock);
+		trace_tag("usbd_event_carrier locked");
 		sys_slist_append(&uds_ctx->ep_events, &event->buf->node);
 		k_spin_unlock(&uds_ctx->ep_event_lock, key);
 	}
 
-	return k_msgq_put(&usbd_msgq, event, K_NO_WAIT);
+	trace_tag("usbd_event_carrier putting event");
+
+	ret = k_msgq_put(&usbd_msgq, event, K_NO_WAIT);
+	if (ret != 0) {
+		LOG_ERR("Failed to submit event to queue");
+		return ret;
+	}
+
+	return 0;
 }
 
 static void event_handler_ep_request(struct usbd_context *const uds_ctx)
@@ -62,6 +76,8 @@ static void event_handler_ep_request(struct usbd_context *const uds_ctx)
 		key = k_spin_lock(&uds_ctx->ep_event_lock);
 		node = sys_slist_get(&uds_ctx->ep_events);
 		k_spin_unlock(&uds_ctx->ep_event_lock, key);
+
+		trace_tag(__func__);
 
 		buf = SYS_SLIST_CONTAINER(node, buf, node);
 		if (buf == NULL) {
@@ -164,6 +180,8 @@ static ALWAYS_INLINE void usbd_event_handler(struct usbd_context *const uds_ctx,
 {
 	int err = 0;
 
+	trace_tag(__func__);
+
 	/* Always check if there is a completed transfer request. */
 	event_handler_ep_request(uds_ctx);
 	if (event->type == UDC_EVT_EP_REQUEST) {
@@ -227,7 +245,11 @@ static void usbd_thread(void *p1, void *p2, void *p3)
 	struct udc_event event;
 
 	while (true) {
+		trace_tag("usbd_thread waiting event");
+
 		k_msgq_get(&usbd_msgq, &event, K_FOREVER);
+
+		trace_tag("usbd_thread got event");
 
 		uds_ctx = (void *)udc_get_event_ctx(event.dev);
 		__ASSERT(uds_ctx != NULL && usbd_is_initialized(uds_ctx),

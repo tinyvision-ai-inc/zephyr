@@ -1,3 +1,4 @@
+void trace_tag(const char *);
 /*
  * Copyright (c) 2022 Nordic Semiconductor ASA
  *
@@ -648,6 +649,8 @@ static __maybe_unused int cdc_acm_send_notification(const struct device *dev,
 		return -ENOMEM;
 	}
 
+	trace_tag(__func__);
+
 	net_buf_add_mem(buf, &notification, sizeof(struct cdc_acm_notification));
 	ret = usbd_ep_enqueue(c_data, buf);
 	if (ret) {
@@ -706,6 +709,8 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 
 	data->zlp_needed = len != 0 && len % cdc_acm_get_bulk_mps(c_data) == 0;
 
+	trace_tag(__func__);
+
 	ret = usbd_ep_enqueue(c_data, buf);
 	if (ret) {
 		LOG_ERR("Failed to enqueue");
@@ -758,6 +763,8 @@ static void cdc_acm_rx_fifo_handler(struct k_work *work)
 
 	/* Shrink the buffer size if operating on a full speed bus */
 	buf->size = MIN(cdc_acm_get_bulk_mps(c_data), buf->size);
+
+	trace_tag(__func__);
 
 	ret = usbd_ep_enqueue(c_data, buf);
 	if (ret) {
