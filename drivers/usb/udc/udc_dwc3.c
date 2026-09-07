@@ -117,6 +117,25 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 /* Incomplete coverage of all fields, but suited for what this driver supports */
 #define UDC_DWC3_EVT_MASK					GENMASK(11, 0)
 #define UDC_DWC3_DEPEVT_EPN_MASK				GENMASK(5, 1)
+/*
+ * Fields the controller returns in an Endpoint Command Complete event.
+ * Programming Guide 3.30b, Table 3-7 "Device Endpoint-n Events: DEPEVT":
+ *
+ *   [27:24] Command Type. The command type that completed. "Valid only in a
+ *           DEPEVT event. Undefined when read from the DEPCMD.EventParam field."
+ *   [22:16] Transfer Resource Index (XferRscIdx), for a Command Complete raised
+ *           by Start Transfer. "This index must be used in all Update Transfer
+ *           and End Transfer commands."
+ *   [15:12] Command status, same encoding as DEPCMD.
+ *
+ * Taking the index from the event rather than from DEPCMD is what makes this
+ * work on an endpoint whose DEPCMD this driver does not own: the value is
+ * captured by the controller when the command completed, so a later write to
+ * that register by anything else cannot disturb it.
+ */
+#define UDC_DWC3_DEPEVT_CMDTYP_MASK				GENMASK(27, 24)
+#define UDC_DWC3_DEPEVT_XFERRSCIDX_MASK				GENMASK(22, 16)
+#define UDC_DWC3_DEPEVT_CMDSTATUS_MASK				GENMASK(15, 12)
 #define UDC_DWC3_DEPEVT_XFERCOMPLETE(epn)			(((epn) << 1) | (0x01 << 6))
 #define UDC_DWC3_DEPEVT_XFERINPROGRESS(epn)			(((epn) << 1) | (0x02 << 6))
 #define UDC_DWC3_DEPEVT_XFERNOTREADY(epn)			(((epn) << 1) | (0x03 << 6))
@@ -485,7 +504,13 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
  * command cannot be mistaken for a transfer resource index. The field is seven
  * bits wide, so no real index can collide with this value.
  */
-#define UDC_DWC3_XFERRSCIDX_INVALID				0xffU
+/*
+ * XferRscIdx is a 7-bit field (DEPCMD/DEPEVT [22:16]), so every value the
+ * controller can assign fits in 0x00-0x7f. A 32-bit all-ones can therefore
+ * never be mistaken for one, which is what lets ep_data->xferrscidx carry its
+ * own "not established" state instead of a separate flag beside it.
+ */
+#define UDC_DWC3_XFERRSCIDX_INVALID				0xffffffffU
 /* DEPCFG Command and Parameters */
 /* Command type occupies bits 3:0 - DEPCFG(1) through DEPSTARTCFG(9). */
 #define UDC_DWC3_DEPCMD_CMDTYP_MASK				GENMASK(3, 0)
@@ -590,6 +615,15 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 /* Global SoC Bus Configuration Register */
 #define UDC_DWC3_GSBUSCFG0					0xc100
 #define UDC_DWC3_GSBUSCFG1					0xc104
+/*
+ * AXI Pipelined Transfers Burst Request Limit. Encoded as N-1, so 0x0 is one
+ * outstanding request and 0xf is sixteen: "when the AXI master reaches this
+ * limit, it does not make any more requests on the AXI ARADDR and AWADDR buses
+ * until the associated data phases complete".
+ */
+#define UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK			GENMASK(11, 8)
+/* Break DMA transfers at the 1k page boundary instead of 4k. */
+#define UDC_DWC3_GSBUSCFG1_EN1KPAGE				BIT(12)
 #define UDC_DWC3_GUCTL1						0xc11c
 #define UDC_DWC3_GSBUSCFG0_DATRDREQINFO				GENMASK(31, 28)
 #define UDC_DWC3_GSBUSCFG0_DESRDREQINFO				GENMASK(27, 24)
@@ -1075,7 +1109,13 @@ struct udc_dwc3_ep_data {
 	 * endpoint, cleared by DEPSTARTCFG, which reassigns transfer resources and
 	 * so invalidates every index handed out before it.
 	 */
-	bool xferrscidx_valid;
+	/*
+	 * UDC_DWC3_XFERRSCIDX_INVALID until an index has been recorded, which is
+	 * also how the two collection paths know there is something to collect:
+	 * the Command Complete event, and the pre-poll of the next command on this
+	 * endpoint. Set back to INVALID whenever a Start Transfer is posted, and
+	 * whenever the controller drops the resources behind it.
+	 */
 	/*
 	 * Set when this endpoint's armed transfer has been invalidated but its
 	 * completion event is still queued behind us. The event must be discarded
@@ -1751,19 +1791,20 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
  * Make a descriptor visible to the controller before the command that fetches it.
  *
  * Call with the word written LAST for that descriptor, immediately before Start
- * Transfer or Update Transfer. Two things happen and both are needed:
+ * Transfer or Update Transfer.
  *
- *   read-back - a load cannot be answered until the write ahead of it to the
- *               same location has landed, so this pushes the posted write out.
- *               It must be the last word: the earlier fields were written
- *               before it, so draining it drains them too.
+ *   fence     - stops the command-register write from overtaking the descriptor
+ *               writes. It has to be "iorw,iorw": r/w order MEMORY only, and the
+ *               command register is device I/O, so "fence rw,rw" leaves exactly
+ *               the reordering this exists to prevent.
  *
- *   fence     - stops the command-register write from overtaking. It has to be
- *               "iorw,iorw": r/w order MEMORY only, and the command register is
- *               device I/O, so "fence rw,rw" leaves exactly the reordering this
- *               exists to prevent.
+ * The fence is what remains and it is still required. Wishbone ordering holds
+ * the writes in program order on the bus, but nothing stops the COMPILER from
+ * moving the command-register store ahead of the descriptor stores, and that
+ * would let the controller fetch a descriptor this driver has not finished
+ * writing.
  *
- * Without this the controller can fetch a descriptor before the arming write is
+ * Without it the controller can fetch a descriptor before the arming write is
  * visible to it, cache HWO=0 for a TRB software has already armed, and then sit
  * on a received packet with nowhere to put it - while the CPU, reading its own
  * writes, sees the descriptor correctly armed.
@@ -1771,19 +1812,25 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
 static inline void udc_dwc3_trb_sync(volatile uint32_t *const last_word)
 {
 	/*
-	 * The read is NOT dead code and the compiler may not remove it: the
-	 * pointer is volatile, and an access through a volatile lvalue has to be
-	 * performed exactly as written. The (void) cast only silences the
-	 * unused-variable warning - it contributes nothing to keeping the load.
+	 * The read-back that used to be here is deliberately gone. Uncomment the
+	 * two lines to put it back.
 	 *
-	 * What would silently break this is dropping volatile from trb_buf or
-	 * from this parameter. Then the load becomes removable, it disappears at
-	 * -Os, and the ordering is gone with no warning anywhere. Verified
-	 * present in trb_ctrl_out, trb_ctrl_in and trb_bulk at -Os.
+	 * It read the ownership word to push the arming write out ahead of the
+	 * doorbell. The RTL team have since confirmed Wishbone writes on this path
+	 * are NOT posted - the ACK comes back only once the write has committed -
+	 * so the descriptor was already in LRAM by the time the store returned and
+	 * the load could not push out anything. What it did cost was one LRAM read
+	 * per descriptor, immediately before the doorbell, on the same memory the
+	 * controller was about to fetch from.
+	 *
+	 * If it is restored: the load must stay a volatile access, and last_word
+	 * must remain the word written LAST, or it drains nothing. Dropping
+	 * volatile from trb_buf or from this parameter makes it removable and it
+	 * disappears at -Os with no warning anywhere.
 	 */
-	uint32_t readback = *last_word;
-
-	(void)readback;
+	/* uint32_t readback = *last_word; */
+	/* (void)readback; */
+	ARG_UNUSED(last_word);
 
 #if defined(CONFIG_RISCV)
 	__asm__ volatile ("fence iorw,iorw" ::: "memory");
@@ -1859,8 +1906,16 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	const uint32_t epn = udc_dwc3_depcmd_epn(addr);
 	const bool first_on_ep = (epn >= 32u) ||
 				 ((priv->depcmd_issued & BIT(epn)) == 0);
-	const bool needs_result =
-		(cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) == UDC_DWC3_DEPCMD_DEPSTRTXFER;
+	/*
+	 * Nothing is waited on for its result any more. Start Transfer used to be,
+	 * which cost up to UDC_DWC3_CMD_FAST_POLLS reads of the shared CSR port for
+	 * every armed transfer - once per buffer on the bulk path.
+	 *
+	 * Its transfer resource index now arrives in the Command Complete event
+	 * that UDC_DWC3_DEPCMD_CMDIOC asks for, and udc_dwc3_collect_xferrscidx()
+	 * below is the backstop for when that event has not been drained yet.
+	 */
+	const bool needs_result = false;
 	uint32_t phycfg_saved;
 	uint32_t reg = 0;
 
@@ -1953,6 +2008,44 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * fence here cannot be missed by a path added later, and costs one
 	 * instruction on a path that already does an MMIO write.
 	 */
+	/*
+	 * The transfer resource index of this endpoint lives and dies with the two
+	 * commands that bracket a transfer, so both are handled here rather than at
+	 * the call sites. Programming Guide 3.2.2.2: "Start Transfer causes the use
+	 * of the transfer resource. End Transfer or an XferComplete event releases
+	 * the transfer resource."
+	 *
+	 * Start Transfer  - a new resource is being assigned and its index is not
+	 *                   known yet. INVALID is also what tells the two collection
+	 *                   paths there is something to collect.
+	 * End Transfer    - the resource is released. Left at its old value the
+	 *                   index would address a resource this endpoint no longer
+	 *                   holds.
+	 *
+	 * BEFORE the write, never after. The Command Complete event for a Start
+	 * Transfer can only be raised once the command is in flight, so clearing
+	 * afterwards would race the collection it is supposed to enable and could
+	 * throw away an index that had already arrived. Everything that could refuse
+	 * this command has already returned by this point, so clearing here cannot
+	 * discard the index of a transfer that is still running.
+	 *
+	 * Not covered: an XferComplete carrying LST, which the databook names as the
+	 * other release point. Every LST path in this driver re-arms with a Start
+	 * Transfer, which invalidates here anyway, so nothing has been seen to use a
+	 * stale index in that window.
+	 */
+	{
+		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
+		const uint32_t cmdtyp = cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK;
+
+		if (_EPN_IS_VALID(cfg, epn) &&
+		    (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER ||
+		     cmdtyp == UDC_DWC3_DEPCMD_DEPENDXFER)) {
+			_EP_DATA_FROM_EPN(cfg, epn)->xferrscidx =
+				UDC_DWC3_XFERRSCIDX_INVALID;
+		}
+	}
+
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 
 	/*
@@ -2290,6 +2383,112 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     uint32_t flags);
 
 /*
+ * Record a transfer resource index the controller handed back.
+ *
+ * Reached from both collection paths: the Command Complete event, and the
+ * pre-poll backstop below. Idempotent, so it does not matter which arrives
+ * first or whether both do.
+ *
+ * Reports the index once per endpoint rather than once per transfer, and says
+ * so if two endpoints end up holding the same one. Requested by the vendor to
+ * validate their simulation of the DEPSTARTCFG sequence against ours.
+ */
+static void udc_dwc3_store_xferrscidx(const struct device *const dev,
+				      struct udc_dwc3_ep_data *const ep_data,
+				      const uint32_t idx)
+{
+	if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
+		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
+		const struct udc_dwc3_ep_data *clash = NULL;
+
+		for (uint8_t i = 0; i < cfg->num_in_eps && clash == NULL; i++) {
+			if (&cfg->ep_data_in[i] != ep_data &&
+			    cfg->ep_data_in[i].xferrscidx == idx) {
+				clash = &cfg->ep_data_in[i];
+			}
+		}
+		for (uint8_t i = 0; i < cfg->num_out_eps && clash == NULL; i++) {
+			if (&cfg->ep_data_out[i] != ep_data &&
+			    cfg->ep_data_out[i].xferrscidx == idx) {
+				clash = &cfg->ep_data_out[i];
+			}
+		}
+
+		if (clash != NULL) {
+			LOG_WRN("XFERRSCIDX EP%02x = %u, SHARED with EP%02x",
+				ep_data->cfg.addr, idx, clash->cfg.addr);
+		} else {
+			LOG_INF("XFERRSCIDX EP%02x = %u", ep_data->cfg.addr, idx);
+		}
+	}
+
+	ep_data->xferrscidx = idx;
+}
+
+/*
+ * Backstop for a Start Transfer whose Command Complete event has not been
+ * drained yet. Called before anything that needs the index.
+ *
+ * The index is normally recorded by udc_dwc3_on_ep_cmd_cmplt() from the event
+ * word. This path exists for the case where the next command on the endpoint
+ * arrives before the event has been processed, and reads the index back from
+ * DEPCMD instead.
+ *
+ * DEPCMD is only trusted when its CMDTYP field still reads as the Start
+ * Transfer this driver issued. That check is what makes this safe on an
+ * endpoint whose DEPCMD is also written by something else: a foreign Update
+ * Transfer leaves its own CMDTYP behind, so the mismatch is visible here and
+ * the stale index is left alone. priv->depcmd_last could not do that - it
+ * records what this driver last wrote, not what is in the register.
+ */
+static void udc_dwc3_collect_xferrscidx(const struct device *const dev,
+					struct udc_dwc3_ep_data *const ep_data)
+{
+	const uint32_t addr = UDC_DWC3_DEPCMD(ep_data->epn);
+	uint32_t reg = 0;
+
+	if (ep_data->xferrscidx != UDC_DWC3_XFERRSCIDX_INVALID) {
+		return;
+	}
+
+	if (!udc_dwc3_wait_cmdact_zero(dev, addr, &reg)) {
+		LOG_WRN("EP%02x Start Transfer still active, transfer resource index "
+			"not collected, keeping 0x%x%s", ep_data->cfg.addr,
+			ep_data->xferrscidx,
+			ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
+				? " (never established)" : "");
+		return;
+	}
+
+	if ((reg & UDC_DWC3_DEPCMD_CMDTYP_MASK) != UDC_DWC3_DEPCMD_DEPSTRTXFER) {
+		LOG_WRN("EP%02x DEPCMD no longer holds the Start Transfer (0x%08x), "
+			"leaving the transfer resource index to the Command Complete "
+			"event", ep_data->cfg.addr, reg);
+		return;
+	}
+
+	/*
+	 * Keep the previous index when the command failed. The controller only
+	 * assigns a resource on success, so taking the field after a failure would
+	 * replace a working index with one addressing some other endpoint's
+	 * resource - or none - for every Update and End Transfer after it.
+	 */
+	if ((reg & UDC_DWC3_DEPCMD_STATUS_MASK) != UDC_DWC3_DEPCMD_STATUS_OK) {
+		LOG_ERR("EP%02x Start Transfer reported 0x%08x, keeping transfer "
+			"resource index 0x%x%s", ep_data->cfg.addr, reg,
+			ep_data->xferrscidx,
+			ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
+				? " (never established)" : "");
+		return;
+	}
+
+	udc_dwc3_store_xferrscidx(dev, ep_data,
+				  FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg));
+	LOG_DBG("EP%02x transfer resource index taken from DEPCMD",
+		ep_data->cfg.addr);
+}
+
+/*
  * Returns true when the transfer is running.
  *
  * It used to return void, so a failed Start Transfer was logged and counted but
@@ -2304,6 +2503,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t idx;
+	uint32_t cmd;
 	uint32_t reg;
 
 	/*
@@ -2373,7 +2573,30 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
-	idx = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSTRTXFER);
+	/*
+	 * CMDIOC asks the controller for a Command Complete event carrying the
+	 * transfer resource index, which is what replaces waiting for it here.
+	 * The databook lists the index as returned "in the DEPCMDn register and in
+	 * the Command Complete event"; the event is used because it is captured at
+	 * completion and cannot be disturbed by a later write to DEPCMD.
+	 */
+	cmd = UDC_DWC3_DEPCMD_DEPSTRTXFER;
+
+	/*
+	 * Only while the controller is running - "the field must not be set while
+	 * DCTL.RunStop is 0", see UDC_DWC3_DEPCMD_CMDIOC. Start Transfer is issued
+	 * before RunStop is set during bring-up, and asking for a completion event
+	 * there is a protocol violation that takes the device down before it
+	 * enumerates.
+	 *
+	 * With no event the index is still collected: udc_dwc3_collect_xferrscidx()
+	 * reads it back from DEPCMD before the next command that needs it.
+	 */
+	if ((sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0) {
+		cmd |= UDC_DWC3_DEPCMD_CMDIOC;
+	}
+
+	idx = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), cmd);
 
 	/*
 	 * Keep the previous index when the command failed. The controller only
@@ -2386,10 +2609,19 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 		struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 		priv->ctrl_start_fail++;
-		LOG_ERR("Start Transfer failed on EP%02x, keeping transfer resource "
-			"index 0x%x%s (%u so far)", ep_data->cfg.addr,
+
+		/*
+		 * The command was never issued, so no resource was assigned. Whatever
+		 * this endpoint held is either already INVALID - End Transfer and an
+		 * LST XferComplete both clear it - or belongs to a transfer that is
+		 * still running, in which case it stays correct. Nothing to do here
+		 * but say so.
+		 */
+		LOG_ERR("Start Transfer not issued on EP%02x, transfer resource index "
+			"is 0x%x%s (%u so far)", ep_data->cfg.addr,
 			ep_data->xferrscidx,
-			ep_data->xferrscidx_valid ? "" : " (never established)",
+			ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
+				? " (none established)" : " (still running)",
 			priv->ctrl_start_fail);
 
 		/*
@@ -2424,45 +2656,13 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 		return false;
 	}
 
-	ep_data->xferrscidx = idx;
-
 	/*
-	 * Report the transfer resource index the controller handed back, once per
-	 * endpoint rather than once per transfer, and say so if two endpoints end
-	 * up holding the same one.  Requested by the vendor to validate their
-	 * simulation of the DEPSTARTCFG sequence against ours.
+	 * udc_dwc3_depcmd() has already invalidated the index. It arrives with the
+	 * Command Complete event, or is read back by udc_dwc3_collect_xferrscidx()
+	 * if something needs it before that event has been drained.
 	 */
-	if (!ep_data->xferrscidx_valid) {
-		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
-		const struct udc_dwc3_ep_data *clash = NULL;
-
-		for (uint8_t i = 0; i < cfg->num_in_eps && clash == NULL; i++) {
-			if (&cfg->ep_data_in[i] != ep_data &&
-			    cfg->ep_data_in[i].xferrscidx_valid &&
-			    cfg->ep_data_in[i].xferrscidx == idx) {
-				clash = &cfg->ep_data_in[i];
-			}
-		}
-		for (uint8_t i = 0; i < cfg->num_out_eps && clash == NULL; i++) {
-			if (&cfg->ep_data_out[i] != ep_data &&
-			    cfg->ep_data_out[i].xferrscidx_valid &&
-			    cfg->ep_data_out[i].xferrscidx == idx) {
-				clash = &cfg->ep_data_out[i];
-			}
-		}
-
-		if (clash != NULL) {
-			LOG_WRN("XFERRSCIDX EP%02x = %u, SHARED with EP%02x",
-				ep_data->cfg.addr, idx, clash->cfg.addr);
-		} else {
-			LOG_INF("XFERRSCIDX EP%02x = %u", ep_data->cfg.addr, idx);
-		}
-	}
-
-	ep_data->xferrscidx_valid = true;
-
-	LOG_DBG("start EP%02x idx=0x%x",
-		ep_data->cfg.addr, ep_data->xferrscidx);
+	LOG_DBG("start EP%02x issued, transfer resource index pending",
+		ep_data->cfg.addr);
 
 	return true;
 }
@@ -2472,6 +2672,9 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 {
 	uint32_t flags = 0;
 
+	/* Take the index from DEPCMD if its Command Complete has not been drained. */
+	udc_dwc3_collect_xferrscidx(dev, ep_data);
+
 	/*
 	 * Warn, but still issue the command. A non-control endpoint receives exactly
 	 * one Start Transfer, from udc_dwc3_trb_nonctrl_init(), and every buffer
@@ -2480,7 +2683,7 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 	 * transfer. The command will fail on its own if the resource is genuinely
 	 * not there, and that failure is logged by udc_dwc3_depcmd().
 	 */
-	if (!ep_data->xferrscidx_valid) {
+	if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
 		LOG_WRN("Update Transfer on EP%02x with no established transfer "
 			"resource index, proceeding with 0x%x",
 			ep_data->cfg.addr, ep_data->xferrscidx);
@@ -2509,9 +2712,12 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
 				     uint32_t flags)
 {
+	/* Take the index from DEPCMD if its Command Complete has not been drained. */
+	udc_dwc3_collect_xferrscidx(dev, ep_data);
+
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	if (!ep_data->xferrscidx_valid) {
+	if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
 		LOG_WRN("End Transfer on EP%02x with no established transfer "
 			"resource index, proceeding with 0x%x",
 			ep_data->cfg.addr, ep_data->xferrscidx);
@@ -2580,10 +2786,10 @@ static void udc_dwc3_depcmd_start_config(const struct device *const dev,
 	 * again.
 	 */
 	for (uint8_t i = 0; i < cfg->num_in_eps; i++) {
-		cfg->ep_data_in[i].xferrscidx_valid = false;
+		cfg->ep_data_in[i].xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
 	}
 	for (uint8_t i = 0; i < cfg->num_out_eps; i++) {
-		cfg->ep_data_out[i].xferrscidx_valid = false;
+		cfg->ep_data_out[i].xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
 	}
 
 	LOG_DBG("DepStartConfig done ep=%s", is_control ? "control" : "non-control");
@@ -4302,16 +4508,85 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 */
 	DEV_DATA(dev)->depcmd_issued = 0;
 
-	/* Enable AXI64 bursts for various sizes expected */
-	//reg = UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR128BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR64BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR32BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR16BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR8BRSTENA;
-	//reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
-	reg = 0;
-	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
+	/*
+	 * Same reasoning for the transfer resource indices. A Start Transfer issued
+	 * before the reset can no longer report, and DEPCMD reads undefined until
+	 * this driver writes it again, so nothing may be collected from either
+	 * source afterwards.
+	 */
+	for (uint8_t i = 0; i < DEV_CFG(dev)->num_in_eps; i++) {
+		DEV_CFG(dev)->ep_data_in[i].xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
+	}
+	for (uint8_t i = 0; i < DEV_CFG(dev)->num_out_eps; i++) {
+		DEV_CFG(dev)->ep_data_out[i].xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
+	}
+
+	/*
+	 * SoC bus configuration: adopt the vendor reference values.
+	 *
+	 * This is register hygiene, NOT a fix for anything. It is applied because
+	 * the combination the bitfile powers up with is one the databook does not
+	 * define, and because two independent vendor trees in this workspace ship
+	 * the same pair of values for the same controller:
+	 *
+	 *   modules/tee/tf-a/trusted-firmware-a/drivers/st/usb_dwc3/usb_dwc3.c:2089
+	 *   modules/hal/stm32/stm32cube/stm32mp2xx/drivers/src/stm32mp2xx_ll_usb_drd.c:702
+	 *       GSBUSCFG0 = 0xe, GSBUSCFG1 = 0xf00   ("From Linux Driver")
+	 *
+	 * What was here before did nothing. sys_set_bits() is a read-modify-write
+	 * that ORs, so a mask of zero writes the register back unchanged - and OR
+	 * could never have cleared INCRBRSTENA anyway. The rig has therefore always
+	 * run on GSBUSCFG0=0x00000001, GSBUSCFG1=0x00000300, whatever the bitfile
+	 * left there. sys_write32 is used below for the same reason: bit 0 has to be
+	 * cleared, and the whole register has to be pinned rather than inherited.
+	 *
+	 * GSBUSCFG0 = 0xe - INCR16|INCR8|INCR4, INCRBRSTENA clear.
+	 *   Selects INCRX mode, where aligned transfers use only the enumerated
+	 *   power-of-2 lengths 1, 2, 4, 8, 16. The databook recommends exactly this
+	 *   for aligned applications, and our descriptors are 16-byte aligned. A TRB
+	 *   is two beats on the 64-bit bus, which INCR4 covers.
+	 *
+	 *   The value it replaces, 0x1, is INCR undefined-length mode bounded by
+	 *   "the largest-enabled burst length of INCR32/64/128/256" - none of which
+	 *   is enabled. That bound is undefined, which is the reason to change it.
+	 *
+	 *   HONEST CAVEAT: the DIRECTION of this change is not established. The
+	 *   comment further down this function reads the same undefined case as
+	 *   already producing single beats, in which case this LENGTHENS bursts
+	 *   rather than shortening them. Both readings are defensible from the
+	 *   databook text. Do not interpret a soak result either way until ARLEN /
+	 *   AWLEN have actually been observed on the bus.
+	 *
+	 * GSBUSCFG1 = 0xf00 - PipeTransLimit 0xf, so sixteen outstanding requests
+	 *   rather than the four the bitfile leaves. Carried because the reference
+	 *   sets both together and changing burst shape while leaving transaction
+	 *   concurrency at a non-reference value is half a change. Its effect here
+	 *   may well be nil: whatever consumes this AXI master appears to serialise
+	 *   transactions anyway, in which case the extra requests simply wait on the
+	 *   address channel. EN1KPAGE stays clear - transfers break at 4k as before.
+	 *
+	 * Both power-on values are read and logged BEFORE being overwritten. The
+	 * periodic BUSCFG line in udc_dwc3_heartbeat_worker() runs long after this
+	 * and therefore reports what was written here, not what the bitfile had -
+	 * so without this log the original values would no longer be observable at
+	 * all. They are worth keeping: they are the only evidence of what the
+	 * bitfile configures, and a change in them means the bitfile changed.
+	 */
+	LOG_INF("BUSCFG at reset: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
+		sys_read32(base + UDC_DWC3_GSBUSCFG0),
+		sys_read32(base + UDC_DWC3_GSBUSCFG1));
+
+	sys_write32(UDC_DWC3_GSBUSCFG0_INCR16BRSTENA |
+		    UDC_DWC3_GSBUSCFG0_INCR8BRSTENA |
+		    UDC_DWC3_GSBUSCFG0_INCR4BRSTENA,
+		    base + UDC_DWC3_GSBUSCFG0);
+
+	sys_write32(FIELD_PREP(UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK, 0xfU),
+		    base + UDC_DWC3_GSBUSCFG1);
+
+	LOG_INF("BUSCFG programmed: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
+		sys_read32(base + UDC_DWC3_GSBUSCFG0),
+		sys_read32(base + UDC_DWC3_GSBUSCFG1));
 
 	/*
 	 * Global Rx Threshold: disable multi-packet RX thresholding.
@@ -5867,6 +6142,35 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 	}
 
 	ep_data = _EP_DATA_FROM_EPN(cfg, epn);
+
+	/*
+	 * A Start Transfer completion carries the transfer resource index this
+	 * driver needs for every later Update and End Transfer on this endpoint.
+	 * Take it and stop - none of the End Transfer handling below applies.
+	 *
+	 * The command type comes from the event rather than from any record kept
+	 * here, so a completion for a command this driver did not issue cannot be
+	 * mistaken for one it did.
+	 */
+	if (FIELD_GET(UDC_DWC3_DEPEVT_CMDTYP_MASK, evt) ==
+	    FIELD_GET(UDC_DWC3_DEPCMD_CMDTYP_MASK, UDC_DWC3_DEPCMD_DEPSTRTXFER)) {
+		if ((evt & UDC_DWC3_DEPEVT_CMDSTATUS_MASK) != UDC_DWC3_DEPCMD_STATUS_OK) {
+			LOG_ERR("EP%02x Start Transfer reported status 0x%x in its "
+				"Command Complete, keeping transfer resource index "
+				"0x%x%s", ep_data->cfg.addr,
+				(unsigned int)FIELD_GET(UDC_DWC3_DEPEVT_CMDSTATUS_MASK, evt),
+				ep_data->xferrscidx,
+				ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
+				? " (never established)" : "");
+			return;
+		}
+
+		udc_dwc3_store_xferrscidx(dev, ep_data,
+					  FIELD_GET(UDC_DWC3_DEPEVT_XFERRSCIDX_MASK, evt));
+		LOG_DBG("EP%02x transfer resource index taken from the event",
+			ep_data->cfg.addr);
+		return;
+	}
 
 	if (!ep_data->end_xfer_pending) {
 		LOG_WRN("EpCmdCmplt on EP%02x with no End Transfer outstanding",
@@ -8746,6 +9050,13 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 	LOG_DBG("Disabling EP%02x", ep_cfg->addr);
 
 	/*
+	 * Any Start Transfer still outstanding on this endpoint belongs to a
+	 * transfer that is being torn down. Leaving the flag set would let the next
+	 * enable collect an index for a transfer that no longer exists.
+	 */
+	ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
+
+	/*
 	 * Drop any reference the control machinery holds to this endpoint before
 	 * tearing it down. The watchdog and the pending-recovery record both keep a
 	 * pointer here, and udc_dwc3_shutdown() disables the control endpoints, so
@@ -9300,6 +9611,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 	ep_data->cfg.caps.control = 1;
 	ep_data->cfg.caps.mps = mps;
 	ep_data->trb_buf = cfg->trb_buf_out[0];
+	/* Static storage starts at 0, which is a legal index. */
+	ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
 	ep_data->epn = 0;
 
 	/*
@@ -9334,6 +9647,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		ep_data->cfg.caps.iso = true;
 		ep_data->cfg.caps.mps = mps;
 		ep_data->trb_buf = cfg->trb_buf_in[i];
+		/* Static storage starts at 0, which is a legal index. */
+		ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
 		ep_data->epn = (i << 1) | 1;
 
 		ret = udc_register_ep(dev, &ep_data->cfg);
@@ -9362,6 +9677,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 		ep_data->cfg.caps.iso = true;
 		ep_data->cfg.caps.mps = mps;
 		ep_data->trb_buf = cfg->trb_buf_out[i];
+		/* Static storage starts at 0, which is a legal index. */
+		ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
 		ep_data->epn = (i << 1) | 0;
 
 		ret = udc_register_ep(dev, &ep_data->cfg);
