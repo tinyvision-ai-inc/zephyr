@@ -1467,8 +1467,12 @@ struct udc_dwc3_data {
 	 * duplicated event for a request already at its status stage is reported
 	 * and dropped, which is what the previous code did for every case.
 	 *
-	 * Deliberately NOT cleared when the status stage completes, only when the
-	 * next SETUP retires (or a stall ends the request). The suppression window
+	 * Deliberately NOT cleared when the status stage completes. It is cleared
+	 * when the next SETUP retires, when a stall ends the request, and on the
+	 * reset paths through udc_dwc3_drop_xfer_state() - a USB or soft reset,
+	 * disconnect or disable leaves no status stage outstanding, so carrying the
+	 * suppression across one would swallow the new session's first genuine
+	 * step-2 event. The suppression window
 	 * therefore covers status-completion-to-next-SETUP as well, which is where
 	 * the duplicates actually land. The cost is that a GENUINE step-2 event in
 	 * that same window - the host starting a stage for a transfer that really
@@ -1572,6 +1576,17 @@ struct udc_dwc3_data {
 	 */
 	uint32_t depcmd_last[32];
 	uint32_t depcmd_reported;
+	/*
+	 * One bit per physical endpoint, set once a failed Start Transfer has been
+	 * announced on that endpoint and cleared only when the next Start Transfer
+	 * is posted. A failed Start Transfer is visible from two places: the
+	 * one-command-late pre-poll in udc_dwc3_depcmd(), and the Command Complete
+	 * handler in udc_dwc3_on_ep_cmd_cmplt(). Both used to print it, so the same
+	 * failure was announced twice. This bit makes whichever path observes it
+	 * second skip its line, without being cleared by unrelated commands the way
+	 * depcmd_reported is.
+	 */
+	uint32_t start_fail_reported;
 };
 
 /*
@@ -2073,20 +2088,40 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 			 */
 			if ((reg & UDC_DWC3_DEPCMD_STATUS_MASK) !=
 			    UDC_DWC3_DEPCMD_STATUS_OK) {
+				bool already_reported = false;
+
 				/*
-				 * Mark it reported here as well. This branch and the
-				 * one-command-late CMDERR check below both look at the
-				 * same register, so without this a failure caught here
-				 * is announced twice before udc_dwc3_on_ep_cmd_cmplt()
-				 * announces it a third time.
+				 * One line per failed Start Transfer, wherever it is
+				 * first seen.
+				 *
+				 * The same failure is observable twice: here, in the
+				 * pre-poll of the next command on this endpoint, and
+				 * again in udc_dwc3_on_ep_cmd_cmplt() when the Command
+				 * Complete is drained. Which comes first depends on
+				 * when the event queue runs, so neither can be made the
+				 * sole reporter.
+				 *
+				 * start_fail_reported is per-TRANSFER and survives until
+				 * the next Start Transfer is posted, so whichever site
+				 * observes the failure second stays quiet.
+				 * depcmd_reported is per-COMMAND and separately
+				 * suppresses the generic one-command-late CMDERR line
+				 * below, which would otherwise describe this same
+				 * register read a second time.
 				 */
 				if (epn < 32u) {
+					already_reported =
+						(priv->start_fail_reported & BIT(epn)) != 0;
+					priv->start_fail_reported |= BIT(epn);
 					priv->depcmd_reported |= BIT(epn);
 				}
 
-				LOG_ERR("EP%02x Start Transfer reported 0x%08x, keeping "
-					"transfer resource index 0x%x",
-					done_ep->cfg.addr, reg, done_ep->xferrscidx);
+				if (!already_reported) {
+					LOG_ERR("EP%02x Start Transfer reported 0x%08x, "
+						"keeping transfer resource index 0x%x",
+						done_ep->cfg.addr, reg,
+						done_ep->xferrscidx);
+				}
 			} else if (done_ep->xferrscidx ==
 				   UDC_DWC3_XFERRSCIDX_INVALID) {
 				udc_dwc3_store_xferrscidx(dev, done_ep,
@@ -2218,6 +2253,19 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 		priv->depcmd_issued |= BIT(epn);
 		priv->depcmd_last[epn] = cmd;
 		priv->depcmd_reported &= ~BIT(epn);
+
+		/*
+		 * A new Start Transfer begins a new transfer, so any failure
+		 * reported for the previous one must not suppress the next one's
+		 * failure. Clear the per-transfer report bit only for the command
+		 * that starts a transfer; unrelated commands must leave it so the
+		 * one-command-late pre-poll and the Command Complete handler agree
+		 * about the same failed Start Transfer.
+		 */
+		if ((cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) ==
+		    UDC_DWC3_DEPCMD_DEPSTRTXFER) {
+			priv->start_fail_reported &= ~BIT(epn);
+		}
 	}
 
 	/*
@@ -2715,14 +2763,6 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 	uint32_t flags = 0;
 
 	/*
-	 * Warn, but still issue the command. A non-control endpoint receives exactly
-	 * one Start Transfer, from udc_dwc3_trb_nonctrl_init(), and every buffer
-	 * after that depends on Update Transfer - so refusing here because that one
-	 * command failed would take the whole data path down rather than one
-	 * transfer. The command will fail on its own if the resource is genuinely
-	 * not there, and that failure is logged by udc_dwc3_depcmd().
-	 */
-	/*
 	 * REFUSE, do not proceed. This used to warn and issue the command anyway,
 	 * on the reasoning that a non-control endpoint gets exactly one Start
 	 * Transfer and refusing here would take the whole data path down rather
@@ -2736,8 +2776,9 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 	 * path is down either way, but this way it is silent and it may disturb a
 	 * resource this endpoint does not own.
 	 *
-	 * The buffer stays queued, so the recovery in udc_dwc3_on_ep_cmd_cmplt()
-	 * has something to re-arm once a valid index exists.
+	 * The buffers stay in the ring, and udc_dwc3_on_ep_cmd_cmplt() flushes them
+	 * with a single Update Transfer once the Command Complete supplies the
+	 * index - so refusing here strands nothing.
 	 */
 	if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
 		LOG_ERR("Update Transfer on EP%02x refused: no transfer resource "
@@ -3089,7 +3130,7 @@ static int udc_dwc3_trb_nonctrl_init(const struct device *const dev,
 	return 0;
 }
 
-static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf *const buf,
+static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf *const buf,
 				  const uint32_t ctrl)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -3124,7 +3165,7 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 				  trb[0].ctrl, trb[0].status, ctrl,
 				  priv->ctrl_arm_refused, priv->trb_stomp);
 		udc_ep_set_busy(&ep_data->cfg, false);
-		return;
+		return false;
 	}
 
 	priv->last_xfer_type = ctrl;
@@ -3240,9 +3281,11 @@ static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	memcpy(&ep_data->trb_cache[0], (void *)&trb[0], sizeof(ep_data->trb_cache[0]));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
+
+	return true;
 }
 
-static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
+static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 				 struct net_buf *const buf,
 				 const uint32_t ctrl)
 {
@@ -3280,7 +3323,7 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 				  trb[0].ctrl, trb[0].status, ctrl,
 				  priv->ctrl_arm_refused, priv->trb_stomp);
 		udc_ep_set_busy(&ep_data->cfg, false);
-		return;
+		return false;
 	}
 
 	priv->last_xfer_type = ctrl;
@@ -3317,6 +3360,8 @@ static void udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	memcpy(&ep_data->trb_cache[0], (void *)&trb[0], sizeof(ep_data->trb_cache[0]));
 
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
+
+	return true;
 }
 
 static int udc_dwc3_trb_bulk(const struct device *const dev,
@@ -3436,7 +3481,10 @@ static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
 	if (bi.data) {
 		LOG_DBG("trb IN_DATA ln=%d d=%p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
-		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+		if (!udc_dwc3_trb_ctrl_in(dev, buf,
+					  UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA)) {
+			return false;
+		}
 		udc_dwc3_ctrl_arm_watchdog(dev, true, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status && setup->wLength == 0) {
 		/*
@@ -3456,7 +3504,10 @@ static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
 		buf->len = 0;
 		LOG_DBG("trb IN_STATUS_2 ln=%d d=%p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
-		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
+		if (!udc_dwc3_trb_ctrl_in(dev, buf,
+					  UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2)) {
+			return false;
+		}
 		udc_dwc3_ctrl_arm_watchdog(dev, true, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
 	} else if (bi.status) {
 		/* Same as the two-stage case above: buf->len is what reaches the TRB. */
@@ -3464,7 +3515,10 @@ static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
 		buf->len = 0;
 		LOG_DBG("trb IN_STATUS_3 ln=%d d=%p", buf->len, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_IN);
-		udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+		if (!udc_dwc3_trb_ctrl_in(dev, buf,
+					  UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3)) {
+			return false;
+		}
 		udc_dwc3_ctrl_arm_watchdog(dev, true, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 	} else {
 		LOG_ERR("Unknown buffer IN type");
@@ -3488,7 +3542,10 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
 	if (bi.setup) {
 		LOG_DBG("trb OUT_SETUP sz=%d d=%p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_SETUP);
-		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+		if (!udc_dwc3_trb_ctrl_out(dev, buf,
+					   UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP)) {
+			return false;
+		}
 
 		udc_dwc3_ctrl_arm_watchdog(dev, false,
 					   UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
@@ -3519,7 +3576,10 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
 	} else if (bi.data) {
 		LOG_DBG("trb OUT_DATA sz=%d d=%p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
-		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+		if (!udc_dwc3_trb_ctrl_out(dev, buf,
+					   UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA)) {
+			return false;
+		}
 		udc_dwc3_ctrl_arm_watchdog(dev, false, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 	} else if (bi.status) {
 		/*
@@ -3532,7 +3592,10 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
 		 */
 		LOG_DBG("trb OUT_STATUS_3 sz=%d d=%p", buf->size, (void *)buf->data);
 		//atomic_clear_bit(&priv->expected_xfer, UDC_DWC3_CTRL_OUT);
-		udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+		if (!udc_dwc3_trb_ctrl_out(dev, buf,
+					   UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3)) {
+			return false;
+		}
 		udc_dwc3_ctrl_arm_watchdog(dev, false, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 	} else {
 		LOG_ERR("Unknown buffer OUT, size %d, data %p", buf->size, (void *)buf->data);
@@ -3948,10 +4011,13 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	udc_ep_set_busy(&ep_data->cfg, true);
 
 	/*
-	 * Give the claim back if nothing was armed. The reject paths in
-	 * udc_dwc3_ctrl_next_in()/_out() report an unusable buffer and return; with
-	 * the claim left standing, this endpoint - and through the pair check, the
-	 * other one too - would stay blocked until the watchdog intervened.
+	 * Give the claim back if nothing was armed. Two kinds of refusal reach here:
+	 * an unusable buffer type, and a TRB the controller still owns - arming over
+	 * HWO is a databook violation and the Start Transfer after it is refused for
+	 * want of a resource. Either way nothing was armed, so the watchdog must not
+	 * have been started for it and this arm must not be counted; with the claim
+	 * left standing, this endpoint - and through the pair check, the other one
+	 * too - would stay blocked until the watchdog intervened.
 	 */
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 		armed = udc_dwc3_ctrl_next_in(dev, buf);
@@ -4099,6 +4165,7 @@ static void udc_dwc3_ctrl_rearm(const struct device *const dev,
 	const uint32_t type = priv->watchdog_type;
 	struct net_buf *buf;
 	const char *name;
+	bool armed;
 
 	switch (type) {
 	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP:
@@ -4145,10 +4212,20 @@ static void udc_dwc3_ctrl_rearm(const struct device *const dev,
 
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 		LOG_INF("trb IN_%s", name);
-		udc_dwc3_trb_ctrl_in(dev, buf, type);
+		armed = udc_dwc3_trb_ctrl_in(dev, buf, type);
 	} else {
 		LOG_INF("trb OUT_%s", name);
-		udc_dwc3_trb_ctrl_out(dev, buf, type);
+		armed = udc_dwc3_trb_ctrl_out(dev, buf, type);
+	}
+
+	/*
+	 * The arming helpers refuse when the descriptor is still owned by the
+	 * controller (HWO set). In that case they already release the claim, so
+	 * there is no stage to re-arm and no transfer to watch; arming the watchdog
+	 * here would put a deadline on a wait that never became live.
+	 */
+	if (!armed) {
+		return;
 	}
 
 	/*
@@ -4347,13 +4424,6 @@ static int udc_dwc3_recover(const struct device *dev)
 				priv->ctrl_recovery_ep->end_xfer_pending = false;
 			}
 			priv->ctrl_recovery_pending = false;
-	/*
-	 * No status stage is outstanding after a reset, so the late-event
-	 * suppression must not survive it - it would swallow the first genuine
-	 * step-2 XferNotReady of the new session as a duplicate.
-	 */
-	priv->ctrl_status_armed = false;
-	priv->ctrl_status_xnr = false;
 			priv->ctrl_recovery_ep = NULL;
 		} else {
 			LOG_WRN("recovery End Transfer on the control endpoint has "
@@ -4581,6 +4651,20 @@ static void udc_dwc3_drop_xfer_state(const struct device *const dev,
 
 	priv->ctrl_recovery_pending = false;
 	priv->ctrl_recovery_ep = NULL;
+
+	/*
+	 * The control request state is per-transfer. USB reset, disconnect,
+	 * controller disable and soft reset all end the current request, so the
+	 * flags describing it must not survive into the next session. In
+	 * particular a stale ctrl_status_armed would swallow the first genuine
+	 * step-2 XferNotReady of the new session as a duplicate, and a stale
+	 * ctrl_setup_seen would classify a pre-SETUP event against the previous
+	 * request's setup_packet.
+	 */
+	priv->ctrl_status_armed = false;
+	priv->ctrl_status_xnr = false;
+	priv->ctrl_setup_seen = false;
+	priv->ctrl_data_done = false;
 
 	/*
 	 * Cancel, not just forget. Since udc_dwc3_on_ctrl() only cancels a
@@ -5149,11 +5233,19 @@ static void udc_dwc3_on_set_config_or_interface(const struct device *const dev)
 
 	for (int i = 1; i < cfg->num_in_eps; i++) {
 		if (udc_ep_is_busy(&cfg->ep_data_in[i].cfg)) {
+			/*
+			 * The endpoint is being ended so the transfer resource can be
+			 * reassigned below. Its next enable starts a fresh session, so
+			 * a retry budget accumulated on the dead transfer must not
+			 * carry into it.
+			 */
+			cfg->ep_data_in[i].start_retry = 0;
 			udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[i], 0);
 		}
 	}
 	for (int i = 1; i < cfg->num_out_eps; i++) {
 		if (udc_ep_is_busy(&cfg->ep_data_out[i].cfg)) {
+			cfg->ep_data_out[i].start_retry = 0;
 			udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_out[i], 0);
 		}
 	}
@@ -6372,6 +6464,55 @@ static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t ds
 }
 
 /*
+ * Park every armed buffer on an endpoint back on its requeue FIFO and reset the
+ * TRB ring to the empty state.
+ *
+ * This is the buffer half of a driver-level teardown. It deliberately does not
+ * touch cfg.stat.enabled (owned by udc_common.c), does not issue commands, and
+ * does not clear DALEPENA; callers decide those. It is used both by
+ * udc_dwc3_ep_disable() and by the retry-exhaustion path in
+ * udc_dwc3_on_ep_cmd_cmplt(), which reaches an equivalently dead endpoint
+ * without going through the stack's disable callback.
+ *
+ * Oldest first. The ring holds the oldest queued buffer at tail, and
+ * requeue_fifo is a FIFO, so walking tail forward preserves submission order.
+ * The previous walk went backwards from head - newest first - which combined
+ * with FIFO semantics handed the buffers back REVERSED whenever two or more
+ * were outstanding. (Backwards would have been right for a LIFO, which is what
+ * the old comment assumed.)
+ */
+static void udc_dwc3_ep_ring_release(struct udc_dwc3_ep_data *const ep_data)
+{
+	/* TRB_NUM - 1 is deliberate: the last TRB is the LINK descriptor
+	 * (see udc_dwc3_trb_nonctrl_init), which stays armed to keep the ring
+	 * intact; only the payload slots are drained and cleared.
+	 */
+	const int slots = CONFIG_UDC_DWC3_TRB_NUM - 1;
+	struct net_buf *buf;
+
+	for (int n = 0; n < slots; n++) {
+		const int idx = (ep_data->tail + n) % slots;
+
+		buf = ep_data->net_buf[idx];
+		if (buf != NULL) {
+			LOG_DBG("Popping buffer %p %d:%d:%d",
+				buf,
+				udc_get_buf_info(buf)->setup,
+				udc_get_buf_info(buf)->data,
+				udc_get_buf_info(buf)->status);
+
+			k_fifo_put(&ep_data->requeue_fifo, buf);
+		}
+	}
+
+	/* Reset the buffers */
+	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
+	memset(ep_data->net_buf, 0, sizeof(*ep_data->net_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
+	ep_data->head = ep_data->tail = 0;
+	ep_data->full = false;
+}
+
+/*
  * Endpoint Command Complete.
  *
  * Only End Transfer asks for this event (see UDC_DWC3_DEPCMD_CMDIOC), and it is
@@ -6416,6 +6557,8 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 	if (FIELD_GET(UDC_DWC3_DEPEVT_CMDTYP_MASK, evt) ==
 	    FIELD_GET(UDC_DWC3_DEPCMD_CMDTYP_MASK, UDC_DWC3_DEPCMD_DEPSTRTXFER)) {
 		if ((evt & UDC_DWC3_DEPEVT_CMDSTATUS_MASK) != UDC_DWC3_DEPCMD_STATUS_OK) {
+			bool already_reported = false;
+
 			priv->ctrl_start_fail++;
 
 			/*
@@ -6425,19 +6568,32 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 			 * path that Start Transfer no longer takes. Without this the
 			 * bit is never set and that line repeats on every following
 			 * command for the endpoint.
+			 *
+			 * start_fail_reported is the Start Transfer-specific half of
+			 * that: depcmd()'s pre-poll observes the same failed command
+			 * when the next endpoint command is issued, before the event
+			 * is drained or after it, and the two observations used to
+			 * print the same failure twice. Whichever path gets here
+			 * second now finds the bit set and stays quiet.
 			 */
 			if (epn < 32) {
+				already_reported =
+					(priv->start_fail_reported & BIT(epn)) != 0;
+				priv->start_fail_reported |= BIT(epn);
 				priv->depcmd_reported |= BIT(epn);
 			}
 
-			LOG_ERR("EP%02x Start Transfer reported status 0x%x in its "
-				"Command Complete, keeping transfer resource index "
-				"0x%x%s (%u so far)", ep_data->cfg.addr,
-				(unsigned int)FIELD_GET(UDC_DWC3_DEPEVT_CMDSTATUS_MASK, evt),
-				ep_data->xferrscidx,
-				ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
-				? " (never established)" : "",
-				priv->ctrl_start_fail);
+			if (!already_reported) {
+				LOG_ERR("EP%02x Start Transfer reported status 0x%x in "
+					"its Command Complete, keeping transfer resource "
+					"index 0x%x%s (%u so far)", ep_data->cfg.addr,
+					(unsigned int)FIELD_GET(UDC_DWC3_DEPEVT_CMDSTATUS_MASK,
+								evt),
+					ep_data->xferrscidx,
+					ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID
+					? " (never established)" : "",
+					priv->ctrl_start_fail);
+			}
 
 			/*
 			 * RELEASE THE CLAIM. This is the whole point of handling the
@@ -6527,19 +6683,55 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 
 			/*
 			 * Out of retries, or the re-init could not even issue. Take the
-			 * endpoint out of DALEPENA rather than leave it enabled with no
-			 * resource: that is the state udc_dwc3_ep_resume() would never
-			 * have reached back when Start Transfer failures were caught
-			 * inline, and it is what makes the next ep_enable() re-init from
-			 * a known position instead of inheriting this one.
+			 * endpoint down the same way udc_dwc3_ep_disable() does, short of
+			 * issuing an End Transfer against a resource that does not exist:
+			 * clear DALEPENA, park every armed buffer back on the requeue FIFO
+			 * so a later enable can re-arm it, and reset the ring and the retry
+			 * budget. This is the asynchronous failure of an enable that already
+			 * returned success, so the stack still records the endpoint as
+			 * enabled; that field is owned by udc_common.c and is left alone,
+			 * while the driver state below is made consistent with an endpoint
+			 * that has no transfer resource and nothing armed.
 			 */
 			sys_clear_bits(DEVICE_MMIO_NAMED_GET(dev, base) +
 					       UDC_DWC3_DALEPENA,
 				       UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
 
-			LOG_ERR("EP%02x disabled: Start Transfer failed %u times and no "
-				"transfer resource was ever assigned",
+			LOG_ERR("EP%02x transfer disabled: Start Transfer failed %u times "
+				"and no transfer resource was ever assigned; parking queued "
+				"buffers for re-enable",
 				ep_data->cfg.addr, ep_data->start_retry);
+
+			udc_dwc3_ep_ring_release(ep_data);
+			ep_data->start_retry = 0;
+
+			/*
+			 * Bring the rest of the endpoint state in line with the driver
+			 * state below. Neither flag can be set on this path - the resume
+			 * that issued the failed Start Transfer had to clear
+			 * resume_pending before it ran, and it only ran because
+			 * end_xfer_pending was already clear - but a teardown that leaves
+			 * them standing would look correct until a stale completion ran
+			 * against it.
+			 */
+			ep_data->end_xfer_pending = false;
+			ep_data->resume_pending = false;
+			udc_ep_set_busy(&ep_data->cfg, false);
+
+			/*
+			 * The stack still records this endpoint as enabled, because the
+			 * enable that posted the Start Transfer returned success before
+			 * the command could fail. cfg.stat.enabled is owned by
+			 * udc_common.c and is not written from here.
+			 *
+			 * Raise the error so the failure is not confined to this driver's
+			 * log. Note what that does and does not buy: UDC_EVT_ERROR reaches
+			 * the application only through a registered msg_cb, and the FLIR
+			 * app registers none - so on this build nothing re-enables the
+			 * endpoint. This makes the failure loud and consistent, not
+			 * recovered.
+			 */
+			udc_submit_event(dev, UDC_EVT_ERROR, -EIO);
 
 			return;
 		}
@@ -6551,6 +6743,24 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 					  FIELD_GET(UDC_DWC3_DEPEVT_XFERRSCIDX_MASK, evt));
 		LOG_DBG("EP%02x transfer resource index taken from the event",
 			ep_data->cfg.addr);
+
+		/*
+		 * The requeue loop in udc_dwc3_ep_resume() runs while the UDC mutex
+		 * is held, so its Update Transfer commands are all refused for want
+		 * of this index before this Command Complete has been drained. Those
+		 * buffers are already in the ring, though: head advanced past them
+		 * and nothing will fetch them until an Update Transfer runs. Flush
+		 * them now that the index exists, so a non-control endpoint resumed
+		 * with queued work does not sit with an armed ring the controller
+		 * will never process.
+		 */
+		if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 &&
+		    (ep_data->head != ep_data->tail || ep_data->full)) {
+			if (!udc_dwc3_depcmd_update_xfer(dev, ep_data)) {
+				LOG_ERR("EP%02x start complete but Update Transfer refused "
+					"with armed ring", ep_data->cfg.addr);
+			}
+		}
 		return;
 	}
 
@@ -9473,8 +9683,6 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	const int slots = CONFIG_UDC_DWC3_TRB_NUM - 1;
-	struct net_buf *buf;
 
 	LOG_DBG("Disabling EP%02x", ep_cfg->addr);
 
@@ -9546,33 +9754,10 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 	udc_ep_set_busy(ep_cfg, false);
 
 	/*
-	 * Oldest first.  The ring holds the oldest queued buffer at tail, and
-	 * requeue_fifo is a FIFO, so walking tail forward preserves submission
-	 * order.  The previous walk went backwards from head - newest first - which
-	 * combined with FIFO semantics handed the buffers back REVERSED whenever two
-	 * or more were outstanding.  (Backwards would have been right for a LIFO,
-	 * which is what the old comment assumed.)
+	 * Oldest first, back onto the requeue FIFO, and reset the ring. The
+	 * submission-order rationale for that walk lives with the helper.
 	 */
-	for (int n = 0; n < slots; n++) {
-		const int idx = (ep_data->tail + n) % slots;
-
-		buf = ep_data->net_buf[idx];
-		if (buf != NULL) {
-			LOG_DBG("Popping buffer %p %d:%d:%d",
-				buf,
-				udc_get_buf_info(buf)->setup,
-				udc_get_buf_info(buf)->data,
-				udc_get_buf_info(buf)->status);
-
-			k_fifo_put(&ep_data->requeue_fifo, buf);
-		}
-	}
-
-	/* Reset the buffers */
-	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
-	memset(ep_data->net_buf, 0, sizeof(*ep_data->net_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
-	ep_data->head = ep_data->tail = 0;
-	ep_data->full = false;
+	udc_dwc3_ep_ring_release(ep_data);
 
 	return 0;
 }
@@ -10712,7 +10897,7 @@ static void udc_dwc3_cmd_trb_ctrl_status_in(const struct device *dev, const stru
 		return;
 	}
 
-	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+	(void)udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 }
 static int cmd_dwc3_trb_ctrl_status_in(const struct shell *sh, size_t argc, char **argv)
 {
@@ -10731,7 +10916,7 @@ static void udc_dwc3_cmd_trb_ctrl_status_out(const struct device *dev, const str
 		return;
 	}
 
-	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
+	(void)udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3);
 }
 static int cmd_dwc3_trb_ctrl_status_out(const struct shell *sh, size_t argc, char **argv)
 {
@@ -10751,7 +10936,7 @@ static void udc_dwc3_cmd_trb_ctrl_data_out(const struct device *dev, const struc
 		return;
 	}
 
-	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+	(void)udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 static int cmd_dwc3_trb_ctrl_data_out(const struct shell *sh, size_t argc, char **argv)
 {
@@ -10771,7 +10956,7 @@ static void udc_dwc3_cmd_trb_ctrl_data_in(const struct device *dev, const struct
 		return;
 	}
 
-	udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
+	(void)udc_dwc3_trb_ctrl_in(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
 }
 static int cmd_dwc3_trb_ctrl_data_in(const struct shell *sh, size_t argc, char **argv)
 {
@@ -10791,7 +10976,7 @@ static void udc_dwc3_cmd_trb_ctrl_setup(const struct device *dev, const struct s
 		return;
 	}
 
-	udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
+	(void)udc_dwc3_trb_ctrl_out(dev, buf, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP);
 }
 static int cmd_dwc3_trb_ctrl_setup(const struct shell *sh, size_t argc, char **argv)
 {
