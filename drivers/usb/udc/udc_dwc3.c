@@ -1418,7 +1418,32 @@ struct udc_dwc3_data {
 	 */
 	bool ctrl_setup_seen;		/* SETUP retired, so setup_packet is current */
 	bool ctrl_data_done;		/* the data stage of that request has retired */
+	/*
+	 * An XferNotReady(Status) has arrived for the request in progress, so the
+	 * status stage may be armed. Both programming models make this a
+	 * precondition, not an optimisation:
+	 *
+	 *   4.4.1 step 3  "Wait for an XferNotReady event for the Status stage
+	 *                  which will occur on EP1."
+	 *   4.4.2 step 4  "After the XferComplete event is received, software waits
+	 *                  for an XferNotReady event."
+	 *
+	 * Arming ahead of it is what made ctrl_setup_seen and ctrl_data_done
+	 * untrustworthy: with the status stage already posted, an XferNotReady the
+	 * host sends about the DATA stage arrives to find the driver's flags
+	 * describing a request it has already moved past, and every step-2 and
+	 * step-5b test then fires during healthy traffic. That is why
+	 * udc_dwc3_ctrl_resync() had to be made report-only. Waiting here is what
+	 * makes those flags mean what the models assume they mean.
+	 *
+	 * The DATA stage is deliberately NOT gated: 4.4.2 step 3 arms it straight
+	 * after the SETUP completes, and step 3b says to ignore the XferNotReady
+	 * that follows.
+	 */
+	bool ctrl_status_xnr;		/* XferNotReady(Status) seen for this request */
+	uint32_t ctrl_status_defer;	/* status arms held back waiting for it */
 	uint32_t ctrl_desync;		/* spec error cases caught and recovered */
+	uint32_t ctrl_stall_issued;	/* Set Stalls issued for steps 2 and 5b */
 	/*
 	 * The two ends of a control transfer, counted independently.
 	 *
@@ -1607,6 +1632,7 @@ static inline void udc_dwc3_ctrl_request_done(const struct device *const dev)
 
 	priv->ctrl_setup_seen = false;
 	priv->ctrl_data_done = false;
+	priv->ctrl_status_xnr = false;
 }
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
@@ -3761,6 +3787,42 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 	}
 
 	/*
+	 * 4.4.1 step 3 / 4.4.2 step 4: the status stage waits for its
+	 * XferNotReady. The host decides when the data stage is over, and until it
+	 * says so this device has no business posting a status TRB - doing it
+	 * anyway is what let the driver run ahead of the host and made every
+	 * step-2/step-5b test fire during ordinary enumeration.
+	 *
+	 * Only the status stage waits. A SETUP starts a new transfer and must be
+	 * armable at any time; the data stage is armed immediately per step 3.
+	 *
+	 * The buffer stays queued - only a peek has happened and no claim is taken
+	 * - and udc_dwc3_on_xfer_not_ready_in()/_out() call udc_dwc3_ctrl_next()
+	 * on every XferNotReady, which comes back through here with the flag set.
+	 *
+	 * A deadline goes on the wait for the same reason the End Transfer
+	 * deferral above has one: if the event never arrives, nothing else would
+	 * ever revisit this endpoint. It is the same watchdog and the same
+	 * ownership rule - claim it only when no live stage is already being
+	 * watched, so an armed stage's deadline is never pushed out by this.
+	 */
+	if (udc_get_buf_info(buf)->status && !priv->ctrl_status_xnr) {
+		priv->ctrl_status_defer++;
+
+		if (priv->watchdog_ep == NULL) {
+			priv->watchdog_ep = ep_data;
+			priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
+		}
+
+		k_work_schedule(&priv->watchdog_dwork,
+				K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+
+		LOG_DBG("EP%02X: status stage held until XferNotReady(Status)",
+			ep_data->cfg.addr);
+		return;
+	}
+
+	/*
 	 * A SETUP is checked against ITS OWN endpoint only; every other stage has
 	 * to wait for the pair.
 	 *
@@ -5170,6 +5232,15 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		 * a data or status stage belongs to a transfer that is already over.
 		 */
 		priv->ctrl_setup_seen = true;
+		/*
+		 * A new request starts here, so any XferNotReady(Status) recorded for
+		 * the previous one must not authorise this one's status stage. Without
+		 * this, a request abandoned after its status was asked for would leave
+		 * the flag set and the very next transfer would arm its status stage
+		 * early - reintroducing exactly the run-ahead this flag exists to stop,
+		 * intermittently and only after an abandoned transfer.
+		 */
+		priv->ctrl_status_xnr = false;
 		priv->ctrl_setup_done++;
 		buf->len = 0;
 
@@ -5587,6 +5658,62 @@ static void udc_dwc3_ctrl_resync(const struct device *const dev,
 }
 
 /*
+ * The two cases where both programming models REQUIRE Set Stall, acted on.
+ *
+ *   4.4.1/4.4.2 step 2   "If a XferNotReady (Data/Status) event is received
+ *                         before the XferComplete event for the Setup stage,
+ *                         issue Set Stall."
+ *   4.4.2 step 5b        "This host is trying to move more data than specified
+ *                         in the wLength field ... software issues Set Stall on
+ *                         EP0 and goes back to Step 1."
+ *
+ * This was tried once before and cold boot did not survive it: eleven step-2
+ * reports and one step-5b fired during ordinary enumeration, each issuing Set
+ * Stall and an End Transfer against a live control endpoint, and the board
+ * failed 3/3 boots. The reason was not the stall - it was that the tests were
+ * being asked a question they could not answer, because the driver armed the
+ * status stage before the host had asked for it and the flags they read
+ * therefore described a request the host had already left behind.
+ *
+ * ctrl_status_xnr is what removed that. With the status stage held until
+ * XferNotReady(Status), ctrl_setup_seen and ctrl_data_done describe the request
+ * the host is actually working on, which is the precondition these two tests
+ * always assumed. Acting on them is only sound with that in place: this
+ * function must not be reintroduced without it.
+ *
+ * Only Set Stall. No End Transfer - the earlier attempt paired the two, and
+ * ending a live control endpoint is what took enumeration down. The models ask
+ * for End Transfer at one place only, step 3a (wrong-direction data), which is
+ * left reporting for now.
+ *
+ * The stall is issued on the physical control OUT endpoint. EP0 is the
+ * databook's name for the control endpoint pair here, and the controller
+ * applies the stall to both directions.
+ */
+static void udc_dwc3_ctrl_stall(const struct device *const dev,
+				const char *const why)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	priv->ctrl_stall_issued++;
+
+	if (priv->ctrl_stall_issued <= UDC_DWC3_CTRL_DESYNC_LOG_FIRST) {
+		LOG_WRN("control Set Stall #%u (spec-mandated): %s",
+			priv->ctrl_stall_issued, why);
+	}
+
+	udc_dwc3_depcmd_set_stall(dev, &cfg->ep_data_out[0]);
+
+	/*
+	 * "and goes back to Step 1" - the request is over, so the flags describing
+	 * it must not outlive it. The controller clears the stall itself on the
+	 * next SETUP, which the stack keeps armed.
+	 */
+	udc_dwc3_ctrl_request_done(dev);
+}
+
+/*
  * Check a control XferNotReady against the stage the programming model says is
  * current, and recover if the host is somewhere else.
  *
@@ -5617,9 +5744,9 @@ static bool udc_dwc3_ctrl_xnr_check(const struct device *const dev,
 	 * completed."
 	 */
 	if (!priv->ctrl_setup_seen) {
-		udc_dwc3_ctrl_resync(dev,
+		udc_dwc3_ctrl_stall(dev,
 			"XferNotReady for a stage of a request whose SETUP has not "
-			"retired");
+			"retired (step 2)");
 		return false;
 	}
 
@@ -5700,9 +5827,9 @@ static bool udc_dwc3_ctrl_xnr_check(const struct device *const dev,
 				"zero-length OUT packet, which needs a receive buffer "
 				"the stack has already reclaimed");
 		} else {
-			udc_dwc3_ctrl_resync(dev,
+			udc_dwc3_ctrl_stall(dev,
 				"host is moving more data than the wLength it "
-				"declared");
+				"declared (step 5b)");
 		}
 		return false;
 	}
@@ -5712,6 +5839,8 @@ static bool udc_dwc3_ctrl_xnr_check(const struct device *const dev,
 
 static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const uint32_t evt)
 {
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
 	/*
 	 * ALWAYS ARM THE NEXT STAGE. Detection must never suppress it.
 	 *
@@ -5741,6 +5870,18 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 		 */
 		LOG_ERR_RATELIMIT("Invalid event (SETUP IN not possible)");
 	} else {
+		/*
+		 * Record the status request BEFORE the check. The check can decline
+		 * the event as a spec error case, but the host has still asked for
+		 * the status stage, and 4.4.1 step 4 / 4.4.2 step 7 arm it on that
+		 * asking. Gating the record on the check would deadlock exactly the
+		 * transfers the check is suspicious of.
+		 */
+		if ((evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK) ==
+		    UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS) {
+			priv->ctrl_status_xnr = true;
+		}
+
 		(void)udc_dwc3_ctrl_xnr_check(dev, evt, true);
 	}
 
@@ -5749,6 +5890,8 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 
 static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const uint32_t evt)
 {
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
 	/*
 	 * ALWAYS ARM THE NEXT STAGE. Detection must never suppress it.
 	 *
@@ -5773,6 +5916,18 @@ static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const
 		LOG_ERR_RATELIMIT(
 			"Invalid event (SETUP OUT not expected to have an event)");
 	} else {
+		/*
+		 * Record the status request BEFORE the check. The check can decline
+		 * the event as a spec error case, but the host has still asked for
+		 * the status stage, and 4.4.1 step 4 / 4.4.2 step 7 arm it on that
+		 * asking. Gating the record on the check would deadlock exactly the
+		 * transfers the check is suspicious of.
+		 */
+		if ((evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK) ==
+		    UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS) {
+			priv->ctrl_status_xnr = true;
+		}
+
 		(void)udc_dwc3_ctrl_xnr_check(dev, evt, false);
 	}
 
@@ -8681,6 +8836,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				"decline %u/%u "
 				"setuppending %u unarmed %u startfail %u defer %u trbsts %u "
 				"setupwd %u/%u reset %u updxfer %u resync %u recache %u outmisaligned %u/%u xnrdy %u "
+				"statuswait %u stall %u "
 				"gc_hwm %u B gc0max %u B multi %u link %u out1 %u/%u out2 %u/%u stomp %u DSTS 0x%08x",
 				priv->evt_handled, priv->evt_late,
 				priv->evt_late_polls_max, priv->evt_late_us_max,
@@ -8701,6 +8857,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				priv->nonctrl_recache,
 				priv->out_unaligned, priv->out_unaligned_ctrl,
 				priv->xnrdy_nonctrl,
+				priv->ctrl_status_defer, priv->ctrl_stall_issued,
 				priv->evt_gevntcount_hwm,
 				priv->evt_gaveup_gc0_max, priv->evt_gaveup_multi,
 				priv->evt_link_total,
