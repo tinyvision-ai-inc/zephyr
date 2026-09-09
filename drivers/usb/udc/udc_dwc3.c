@@ -1360,7 +1360,6 @@ struct udc_dwc3_data {
 	bool ctrl_quiet_logged;		/* this quiet period already reported */
 	uint32_t ctrl_unarmed;		/* EP0-OUT found with no armed TRB */
 	uint32_t ctrl_start_fail;	/* Start Transfer commands rejected */
-	uint32_t ctrl_recovery_t0;	/* cycle stamp of the pending recovery */
 	bool ctrl_unarmed_seen;		/* seen on the previous beat too */
 	bool evt_gaveup_logged;		/* this run was reported, so report its recovery */
 	/*
@@ -1374,7 +1373,6 @@ struct udc_dwc3_data {
 	 * the second half of the recovery, and the watchdog is the fallback if
 	 * it never arrives.
 	 */
-	bool ctrl_recovery_pending;
 	/*
 	 * The endpoint recovery ended, remembered so the re-arm cannot follow
 	 * last_xfer_dir somewhere else. Between issuing the End Transfer and its
@@ -1382,7 +1380,6 @@ struct udc_dwc3_data {
 	 * completion and move last_xfer_dir, and udc_dwc3_ep_disable() may complete
 	 * an End Transfer on the other control endpoint.
 	 */
-	struct udc_dwc3_ep_data *ctrl_recovery_ep;
 	/*
 	 * The control endpoint and stage the watchdog is guarding.
 	 *
@@ -1686,10 +1683,6 @@ static void udc_dwc3_ctrl_state_set(const struct device *const dev,
 	priv->ctrl_state = next;
 }
 
-static inline void udc_dwc3_ctrl_request_done(const struct device *const dev)
-{
-	udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
-}
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
 #endif
@@ -3203,7 +3196,6 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 
 	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
-		udc_dwc3_ctrl_request_done(dev);
 		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
@@ -3341,7 +3333,7 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	 * the XferComplete that databook 3.2.2.2 names. The only difference is that
 	 * the descriptor the controller owns is left intact.
 	 *
-	 * Checked before ctrl_request_done() below, so a request is never completed
+	 * Checked before the status arm below, so a request is never completed
 	 * for a stage that was not armed.
 	 */
 	if ((trb[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
@@ -3361,7 +3353,6 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 
 	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
-		udc_dwc3_ctrl_request_done(dev);
 		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
@@ -3822,6 +3813,17 @@ static void udc_dwc3_ctrl_abandon(const struct device *const dev,
 	udc_ep_set_busy(&peer->cfg, false);
 
 	/*
+	 * The abandoned transfer is gone, so its stage goes with it. Without this
+	 * the next request is judged against the old one's state until the
+	 * replacement SETUP retires and overwrites it - normally one event later
+	 * and harmless, but if that completion is the one that goes missing, the
+	 * machine spends the whole wedge reading a stage belonging to a request
+	 * the host walked away from. Not reset_to_step1(): this path keeps its own
+	 * TRB handling and re-arms the OUT endpoint directly, below.
+	 */
+	udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
+
+	/*
 	 * Release both control endpoints. Only one of them owned a TRB, but the
 	 * claim is taken as a pair for data and status stages, so both are cleared
 	 * before the replacement SETUP tries to claim its own.
@@ -4112,88 +4114,6 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
  *
  * Runs with the UDC mutex held, from udc_dwc3_handle_event().
  */
-static void udc_dwc3_ctrl_rearm(const struct device *const dev,
-				struct udc_dwc3_ep_data *const ep_data)
-{
-	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	/*
-	 * The stage the watchdog was guarding, not the one armed most recently.
-	 * With a SETUP armable while a status stage is outstanding, last_xfer_type
-	 * can already describe the SETUP by the time recovery runs.
-	 */
-	const uint32_t type = priv->watchdog_type;
-	struct net_buf *buf;
-	const char *name;
-	bool armed;
-
-	switch (type) {
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP:
-		name = "SETUP";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA:
-		name = "DATA";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2:
-		name = "STATUS_2";
-		break;
-	case UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3:
-		name = "STATUS_3";
-		break;
-	default:
-		name = "<?>";
-		break;
-	}
-
-	/*
-	 * The queue can be empty by now. udc_dwc3_on_ctrl() removes the buffer as
-	 * soon as a transfer completes, and "dwc3 recover" can be typed at any
-	 * moment. Both arming helpers dereference the buffer immediately, so the
-	 * peek is checked rather than passed on.
-	 *
-	 * With nothing queued there is nothing to re-arm and nothing to wait for:
-	 * the End Transfer has already cleared the endpoint, and udc_dwc3_ctrl_try()
-	 * arms it when the stack queues a buffer. The watchdog is deliberately not
-	 * rescheduled on that path - it would only End an idle endpoint again.
-	 */
-	buf = udc_buf_peek(&ep_data->cfg);
-	if (buf == NULL) {
-		LOG_WRN("nothing queued on EP%02x, ended the transfer without "
-			"re-arming", ep_data->cfg.addr);
-		/*
-		 * Release the claim too. recover() left it standing because a stage was
-		 * about to be re-armed; with nothing to arm, leaving it set would keep
-		 * the endpoint marked busy with no TRB behind it, and the pair check
-		 * would then block the other one as well.
-		 */
-		udc_ep_set_busy(&ep_data->cfg, false);
-		return;
-	}
-
-	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
-		LOG_INF("trb IN_%s", name);
-		armed = udc_dwc3_trb_ctrl_in(dev, buf, type);
-	} else {
-		LOG_INF("trb OUT_%s", name);
-		armed = udc_dwc3_trb_ctrl_out(dev, buf, type);
-	}
-
-	/*
-	 * The arming helpers refuse when the descriptor is still owned by the
-	 * controller (HWO set). In that case they already release the claim, so
-	 * there is no stage to re-arm and no transfer to watch; arming the watchdog
-	 * here would put a deadline on a wait that never became live.
-	 */
-	if (!armed) {
-		return;
-	}
-
-	/*
-	 * Same rule as the arming path, including for SETUP: the expiry is gated
-	 * on RXFIFOEMPTY in udc_dwc3_watchdog_worker(), so re-arming it here can no
-	 * longer produce the self-sustaining recovery loop that removing it fixed.
-	 */
-	udc_dwc3_ctrl_arm_watchdog(dev, USB_EP_DIR_IS_IN(ep_data->cfg.addr), type);
-}
 
 /*
  * Dump the controller's own view of itself.
@@ -4284,83 +4204,6 @@ static int udc_dwc3_recover(const struct device *dev)
 	 */
 	udc_lock_internal(dev, K_FOREVER);
 
-	/*
-	 * A recovery is already outstanding - the End Transfer issued last time has
-	 * not reported completion. Issuing another command on that endpoint now
-	 * would have to wait for the first one to finish, and that wait would be
-	 * held across this mutex, which is precisely what the event handler needs
-	 * in order to deliver the completion being waited for. Doing so would
-	 * rebuild the deadlock this function was restructured to avoid.
-	 *
-	 * So report it and leave the endpoint alone. The watchdog keeps checking,
-	 * and udc_dwc3_ctrl_rearm() finishes the recovery if the event does turn
-	 * up. An End Transfer that never completes is the controller-side fault
-	 * this driver is chasing, and this line is what makes it visible.
-	 */
-	/*
-	 * UNREACHABLE AS IT STANDS.  ctrl_recovery_pending is only ever assigned
-	 * false (here, in udc_dwc3_on_ep_cmd_cmplt(), in ctrl_request_done() and at
-	 * enable); nothing sets it true, so this block and the re-arm it pairs with
-	 * in udc_dwc3_on_ep_cmd_cmplt() never run, and udc_dwc3_ctrl_rearm() is
-	 * reached only from there.
-	 *
-	 * Left in place deliberately rather than deleted: it is inert at runtime, so
-	 * removing it cannot fix anything, while ripping it out would cascade into
-	 * ctrl_rearm() and the end_xfer_pending bookkeeping during an investigation.
-	 * Do not read it as a working End-Transfer recovery - there isn't one.
-	 */
-	if (priv->ctrl_recovery_pending) {
-		const uint32_t age =
-			k_cyc_to_ms_near32(k_cycle_get_32() - priv->ctrl_recovery_t0);
-
-		/*
-		 * Give the latch an exit.
-		 *
-		 * ctrl_recovery_pending is cleared by the Endpoint Command Complete
-		 * for the End Transfer we issued - and by nothing else short of a
-		 * bus reset. So its only way out is an event, on the one path where
-		 * events have already stopped arriving: a capture shows this branch
-		 * repeating to the end of the capture with GEVNTCOUNT=0 every time,
-		 * i.e. waiting for a completion that provably cannot come. A latch
-		 * whose only exit is the thing that is broken disables recovery for
-		 * the rest of the run, which is worse than any recovery it was
-		 * guarding against.
-		 *
-		 * Held for twice the recovery timeout, so an End Transfer that is
-		 * merely slow still gets its own completion and the ordinary path is
-		 * untouched. Past that the promise is abandoned and the next attempt
-		 * is allowed through.
-		 */
-		if (age >= 2U * CONFIG_UDC_DWC3_RECOVERY_TIMEOUT) {
-			LOG_ERR("recovery End Transfer on EP%02x never reported "
-				"completion after %u ms (GEVNTCOUNT=%u): abandoning "
-				"the wait, recovery is re-enabled",
-				priv->ctrl_recovery_ep != NULL ?
-					priv->ctrl_recovery_ep->cfg.addr : 0U,
-				age,
-				sys_read32(DEVICE_MMIO_NAMED_GET(dev, base) +
-					   UDC_DWC3_GEVNTCOUNT(0)));
-
-			if (priv->ctrl_recovery_ep != NULL) {
-				priv->ctrl_recovery_ep->end_xfer_pending = false;
-			}
-			priv->ctrl_recovery_pending = false;
-			priv->ctrl_recovery_ep = NULL;
-		} else {
-			LOG_WRN("recovery End Transfer on the control endpoint has "
-				"not completed yet (%u ms), not issuing another "
-				"command, GEVNTCOUNT=%u bytes", age,
-				sys_read32(DEVICE_MMIO_NAMED_GET(dev, base) +
-					   UDC_DWC3_GEVNTCOUNT(0)));
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
-			udc_unlock_internal(dev);
-
-			return 0;
-		}
-
-		/* Timed out above: fall through and retry the recovery. */
-	}
 
 	/*
 	 * A control endpoint still marked as concluding an End Transfer, with no
@@ -4403,9 +4246,9 @@ static int udc_dwc3_recover(const struct device *dev)
 	}
 
 	/*
-	 * End the stuck transfer and stop here. The re-arm happens in
-	 * udc_dwc3_ctrl_rearm(), driven by this End Transfer's own completion
-	 * event.
+	 * End the stuck transfer and stop here. The re-arm was to have been driven
+	 * by this End Transfer's own completion event; that path never existed at
+	 * runtime and has been removed.
 	 *
 	 * Issuing the Start inline would mean waiting for the End to finish first,
 	 * since a command cannot be issued while the previous one on the endpoint
@@ -4464,8 +4307,8 @@ static int udc_dwc3_recover(const struct device *dev)
 	/*
 	 * Bounded to the fast poll for the whole of this call - see
 	 * udc_dwc3_wait_cmdact_zero(). If the endpoint is still busy the command is
-	 * not issued and ctrl_recovery_pending stays clear, so the watchdog
-	 * rescheduled below tries again with the mutex released in between.
+	 * not issued, so the watchdog rescheduled below tries again with the mutex
+	 * released in between.
 	 */
 	priv->depcmd_no_sleep = true;
 
@@ -4619,9 +4462,17 @@ static void udc_dwc3_ctrl_reset_to_step1(const struct device *const dev,
 	priv->watchdog_ep = NULL;
 	priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
 
-	/* The End Transfer recovery slot. */
-	priv->ctrl_recovery_pending = false;
-	priv->ctrl_recovery_ep = NULL;
+	/*
+	 * The watchdog's epoch marks. These are compared against the cumulative
+	 * ctrl_setup_done / ctrl_status_done to allow one attempt per episode.
+	 * Carried across a reset they describe an episode that no longer exists,
+	 * so the next one either burns its single attempt immediately or has it
+	 * suppressed. Re-stamp them to the counters as they stand now.
+	 */
+	priv->ctrl_wd_upd_mark = priv->ctrl_setup_done + priv->ctrl_status_done;
+	priv->ctrl_setup_wd_upd_mark = priv->ctrl_wd_upd_mark;
+	priv->ctrl_setup_wd_snap_setup = priv->ctrl_setup_done;
+	priv->ctrl_setup_wd_snap_nonctrl = priv->nonctrl_done;
 
 	if (!all_endpoints) {
 		return;
@@ -5541,9 +5392,9 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			 *
 			 * udc_dwc3_ctrl_next_out() only ever arms STATUS_3 - a two-stage
 			 * transfer's status is IN - so STATUS_2 should never complete on
-			 * this endpoint.  But udc_dwc3_ctrl_rearm() re-arms whatever
-			 * watchdog_type held, verbatim, and its switch has a STATUS_2 arm,
-			 * so the combination is constructible.  It used to land in the
+			 * this endpoint.  The removed deferred re-arm would have re-armed
+			 * whatever watchdog_type held, verbatim, including a STATUS_2 arm,
+			 * so the combination was constructible.  It used to land in the
 			 * error branch below, which logs and then falls through having
 			 * neither zeroed the length nor counted the stage - a status stage
 			 * silently reported as a data one.
@@ -6438,7 +6289,6 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
 	struct udc_dwc3_ep_data *ep_data;
-	bool rearmed = false;
 
 	if (!_EPN_IS_VALID(cfg, epn)) {
 		LOG_ERR_RATELIMIT("event 0x%08x names physical endpoint %d, which "
@@ -6683,12 +6533,6 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 	 * endpoint, finish the recovery now. The flag keeps this apart from the
 	 * End Transfers issued by udc_dwc3_ep_disable(), which must not re-arm.
 	 */
-	if (priv->ctrl_recovery_pending && ep_data == priv->ctrl_recovery_ep) {
-		priv->ctrl_recovery_pending = false;
-		priv->ctrl_recovery_ep = NULL;
-		udc_dwc3_ctrl_rearm(dev, ep_data);
-		rearmed = true;
-	}
 
 	/*
 	 * Second half of a non-control resume that udc_dwc3_ep_resume() postponed
@@ -6725,7 +6569,7 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 		 * The resume path needs no equivalent: it ends with the same submit.
 		 */
 		k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
-	} else if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0 && !rearmed) {
+	} else if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 		/*
 		 * Control counterpart of the same wake-up. udc_dwc3_ctrl_try() declines
 		 * to arm while end_xfer_pending is set, and the buffer that was refused
@@ -7756,47 +7600,16 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * XFERCOMPLETE landed immediately after each "Recovering USB state"), so
 		 * Set Stall - not End Transfer - is the action with evidence behind it.
 		 */
+		/*
+		 * recover() owns the stall. It issues Set Stall on EP0-OUT in the
+		 * common case, and deliberately does NOT when it finds no control
+		 * stage outstanding - which is exactly the state a soft reset leaves
+		 * behind. A second stall here fired in that case anyway, during
+		 * active re-enumeration, and the host answered it with a port reset.
+		 * One recovery action per episode, decided by the function that can
+		 * tell which case it is in.
+		 */
 		(void)udc_dwc3_recover(dev);
-
-		/*
-		 * Then STALL EP0-OUT, which is what actually unblocks the HOST.
-		 *
-		 * Recovering our own side is only half of it. The host is still
-		 * waiting on a transfer we have just thrown away, and with nothing
-		 * said it waits out its full timeout - USB_CTRL_SET_TIMEOUT, 5 s on
-		 * Linux - before it retries. A STALL makes the controller answer the
-		 * next IN or OUT of that dead transfer immediately, so the host fails
-		 * fast with -EPIPE and reissues instead of sitting out the timeout.
-		 * This is the resynchronisation the databook prescribes for every
-		 * 4.4.1/4.4.2 error case: Set Stall on EP0, then back to Step 1.
-		 *
-		 * And it is safe to issue even if this recovery turns out to be
-		 * unnecessary, which is what makes it usable on a timeout. Databook
-		 * 3.2.2 on Set/Clear Stall: "For control endpoints, the application
-		 * issues only the Set Stall command, and only on the OUT direction of
-		 * the control endpoint. The controller automatically clears the STALL
-		 * when it receives a SETUP token for the endpoint. The application
-		 * must not issue the Clear Stall command on a control endpoint.\"
-		 * So the stall is self-clearing in HARDWARE on the host's very next
-		 * SETUP - it cannot latch, and it cannot leave the endpoint halted
-		 * the way a spurious stall on a bulk endpoint would. That is why this
-		 * is a safe thing to do on a suspicion, and a Clear Stall must never
-		 * be paired with it here.
-		 *
-		 * Issued after the re-arm on purpose: the replacement SETUP is then
-		 * already waiting when the hardware clears the stall.
-		 */
-		/*
-		 * Under the lock. udc_dwc3_recover() takes and drops it internally,
-		 * which left this command outside any lock at all - and a DEPCMD
-		 * issued bare races the usbd thread, which reaches
-		 * udc_dwc3_depcmd_start_xfer() through ep_enqueue on the same
-		 * endpoint command registers.
-		 */
-		udc_lock_internal(dev, K_FOREVER);
-		udc_dwc3_depcmd_set_stall(dev, &cfg->ep_data_out[0]);
-
-		udc_unlock_internal(dev);
 	}
 
 	/*
@@ -7855,7 +7668,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		LOG_ERR("no control traffic for %u ms after %u SETUPs: busy o/i %u/%u, "
 			"trb o/i 0x%08x/0x%08x, gc %u B, DSTS 0x%08x (rxfifoempty %u), "
 			"decline %u, "
-			"setuppend %u, ep0out queued %u",
+			"setuppend %u, ep0out queued %u, state %u<-%u seq %u",
 			UDC_DWC3_CTRL_QUIET_MS, priv->ctrl_setup_done,
 			udc_ep_is_busy(&cfg->ep_data_out[0].cfg) ? 1U : 0U,
 			udc_ep_is_busy(&cfg->ep_data_in[0].cfg) ? 1U : 0U,
@@ -7865,7 +7678,9 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 			(sys_read32(base + UDC_DWC3_DSTS) &
 			 UDC_DWC3_DSTS_RXFIFOEMPTY) ? 1U : 0U,
 			priv->ctrl_decline, priv->ctrl_setup_pending,
-			udc_buf_peek(&cfg->ep_data_out[0].cfg) != NULL ? 1U : 0U);
+			udc_buf_peek(&cfg->ep_data_out[0].cfg) != NULL ? 1U : 0U,
+			(unsigned int)priv->ctrl_state, priv->ctrl_state_prev,
+			priv->ctrl_state_seq);
 
 #ifdef STALL_DIAG_LOG
 		udc_dwc3_stall_diag_dump(dev, "control traffic stopped");
@@ -8190,8 +8005,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 * pending XFERCOMPLETE landed immediately after each one.
 	 *
 	 * Set Stall, not End Transfer.  recover() has never issued an End Transfer
-	 * - the machinery for that (ctrl_recovery_pending) is unreachable, as noted
-	 * where it is defined.  An earlier version of this comment said otherwise
+	 * - the machinery for that was unreachable and has been removed.
+	 * An earlier version of this comment said otherwise
 	 * and can suggest the driver has a broken End-Transfer
 	 * recovery; it does not, because that was never the mechanism that worked.
 	 *
@@ -8426,7 +8241,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 		LOG_ERR("control watchdog #%u: guarding %s, type 0x%02x | "
 			"EP00 busy=%u ctrl=0x%08x sts=0x%08x | "
 			"EP80 busy=%u ctrl=0x%08x sts=0x%08x | "
-			"setup %u status %u decline %u | DSTS 0x%08x",
+			"setup %u status %u decline %u | state %u<-%u seq %u | DSTS 0x%08x",
 			priv->ctrl_wd_dump,
 			wd_ep == NULL ? "nothing" :
 				(USB_EP_DIR_IS_IN(wd_ep->cfg.addr) ? "EP80" : "EP00"),
@@ -8437,6 +8252,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			i[0].ctrl, i[0].status,
 			priv->ctrl_setup_done, priv->ctrl_status_done,
 			priv->ctrl_decline,
+			(unsigned int)priv->ctrl_state, priv->ctrl_state_prev,
+			priv->ctrl_state_seq,
 			sys_read32(base + UDC_DWC3_DSTS));
 	}
 
@@ -8455,7 +8272,18 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 	 * a control transfer did. One attempt per episode, marked by the stage
 	 * counters so a stage retiring in between counts as a fresh episode.
 	 */
-	if (wd_ep != NULL &&
+	/*
+	 * Only for a stage that was actually armed. udc_dwc3_ctrl_try() also
+	 * schedules this watchdog for DEFERRALS - a status wait, or a wait for an
+	 * End Transfer - with watchdog_type NONE and nothing armed on the
+	 * endpoint. Reaching Update Transfer in that state gets the command
+	 * refused for want of a transfer resource index, and prints "Update
+	 * Transfer refused: no transfer resource index established" at ERROR for
+	 * what is a normal, expected wait. That reads exactly like the controller
+	 * fault this driver is chasing, in a log where telling the two apart is
+	 * the whole job.
+	 */
+	if (wd_ep != NULL && priv->watchdog_type != UDC_DWC3_WATCHDOG_TYPE_NONE &&
 	    (priv->ctrl_setup_done + priv->ctrl_status_done) != priv->ctrl_wd_upd_mark) {
 		priv->ctrl_wd_upd_mark = priv->ctrl_setup_done + priv->ctrl_status_done;
 		priv->ctrl_setup_wd_updxfer++;
@@ -9500,11 +9328,10 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 	 * Waiting here is not an option: the completion is delivered by
 	 * udc_dwc3_handle_event() on the same work queue that runs this code, and
 	 * it needs the UDC mutex this path already holds. So the resume is
-	 * postponed instead and udc_dwc3_on_ep_cmd_cmplt() performs it, exactly as
-	 * udc_dwc3_ctrl_rearm() does for the control endpoints.
+	 * postponed instead and udc_dwc3_on_ep_cmd_cmplt() performs it.
 	 *
 	 * Only non-control endpoints: this function issues no Start Transfer for
-	 * endpoint 0, and control recovery already has its own deferred re-arm.
+	 * endpoint 0.
 	 *
 	 * Postponing cannot strand the endpoint. end_xfer_pending is set only when
 	 * CmdIOC was requested - which requires DCTL.RunStop - and is cleared again
@@ -9617,10 +9444,6 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 		k_work_cancel_delayable(&priv->watchdog_dwork);
 		priv->watchdog_ep = NULL;
 		priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
-	}
-	if (priv->ctrl_recovery_ep == ep_data) {
-		priv->ctrl_recovery_ep = NULL;
-		priv->ctrl_recovery_pending = false;
 	}
 
 	/*
