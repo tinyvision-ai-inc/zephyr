@@ -1455,9 +1455,18 @@ struct udc_dwc3_data {
 		UDC_DWC3_CTRL_STATUS_READY,
 		UDC_DWC3_CTRL_STATUS_ARMED,
 	} ctrl_state;
+	/*
+	 * The last transition, kept so a wedge dump can say how the machine got
+	 * to the state it is stuck in. Costs 8 bytes and no log string; the
+	 * driver's text is relocated into RAM on this board, so a LOG_DBG here
+	 * would be paid for ten times over in the scarcest memory on the part.
+	 */
+	uint8_t  ctrl_state_prev;	/* state we came from */
+	uint16_t ctrl_state_seq;	/* transitions since boot, wraps */
 	uint32_t ctrl_status_defer;	/* status arms held back waiting for it */
 	uint32_t ctrl_desync;		/* spec error cases caught and recovered */
 	uint32_t ctrl_stall_issued;	/* Set Stalls issued for steps 2 and 5b */
+	uint32_t ep_halts;		/* halts set on non-control endpoints */
 	/*
 	 * The two ends of a control transfer, counted independently.
 	 *
@@ -1651,11 +1660,35 @@ static void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t
  * status stage is a point this driver chooses, so the ordering is not in
  * question.
  */
-static inline void udc_dwc3_ctrl_request_done(const struct device *const dev)
+/*
+ * THE ONLY PLACE ctrl_state IS ASSIGNED.
+ *
+ * Deliberately not inline, and deliberately without a log call. This board
+ * relocates the driver's text into RAM - .ram_text_reloc is 33 KB of the 64 KB
+ * part and this file is nearly all of it - so an inlined body is paid for at
+ * every one of the ten call sites in the memory that is 99% full, while a
+ * function is paid for once. The call overhead is a handful of cycles on a path
+ * that already issues MMIO writes.
+ *
+ * Assignment only: no entry actions. The actions that surround a transition
+ * here are its CAUSE, not its effect - the arming helpers set STATUS_ARMED
+ * before Start Transfer, and udc_dwc3_ctrl_next() runs after XferNotReady at
+ * the same level - so moving them in would invert the flow and make the
+ * machine re-entrant on a 1 KB work-queue stack.
+ */
+static void udc_dwc3_ctrl_state_set(const struct device *const dev,
+				    const enum udc_dwc3_ctrl_state next)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-	priv->ctrl_state = UDC_DWC3_CTRL_IDLE;
+	priv->ctrl_state_prev = (uint8_t)priv->ctrl_state;
+	priv->ctrl_state_seq++;
+	priv->ctrl_state = next;
+}
+
+static inline void udc_dwc3_ctrl_request_done(const struct device *const dev)
+{
+	udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
 }
 #ifdef CONFIG_UDC_DWC3_SHELL
 static void udc_dwc3_init_fifo_space(const struct device *dev);
@@ -3171,7 +3204,7 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
 		udc_dwc3_ctrl_request_done(dev);
-		priv->ctrl_state = UDC_DWC3_CTRL_STATUS_ARMED;
+		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
 	/*
@@ -3329,7 +3362,7 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
 	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
 		udc_dwc3_ctrl_request_done(dev);
-		priv->ctrl_state = UDC_DWC3_CTRL_STATUS_ARMED;
+		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
 	if (udc_ep_buf_has_zlp(buf)) {
@@ -4529,54 +4562,89 @@ static int udc_dwc3_recover(const struct device *dev)
  * in every one of them: USB reset, disconnect, controller disable, and soft
  * reset. The control-side recovery record is dropped for the same reason.
  */
-static void udc_dwc3_drop_xfer_state(const struct device *const dev,
-				     const char *const reason)
+/*
+ * THE ONE PLACE THAT PUTS THE CONTROL PAIR BACK ON STEP 1.
+ *
+ * Written because the state that describes "a control transfer is in flight" is
+ * spread over five places, and every teardown path used to reset its own subset
+ * from memory. That is not a hypothetical: a soft reset cleared ctrl_state and
+ * the watchdog but left ctrl_decline_pending set, so one recovery timeout later
+ * the heartbeat read "the host is still asking" against a claim nothing held,
+ * issued Set Stall on EP0-OUT in the middle of re-enumeration, and the host
+ * answered with a port reset. Anything added to the machine from here on has
+ * exactly one place it must be torn down.
+ *
+ * The transition itself is recorded by udc_dwc3_ctrl_state_set(): prev state
+ * plus a sequence number identify it uniquely, so no reason string is carried.
+ *
+ * all_endpoints tears down every endpoint's pending flags as well - correct for
+ * a bus reset, disconnect or controller disable, wrong for a control-only
+ * resynchronisation that must not disturb the data endpoints.
+ *
+ * This deliberately does NOT re-arm. Callers that want the speculative SETUP
+ * back call udc_dwc3_ctrl_next() themselves, because the right moment differs:
+ * a stall re-arms immediately, a disable must not re-arm at all.
+ */
+static void udc_dwc3_ctrl_reset_to_step1(const struct device *const dev,
+					 const bool all_endpoints)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uint32_t now = k_cycle_get_32();
 
-	LOG_DBG("dropping outstanding End Transfer state (%s)", reason);
-
-	priv->ctrl_recovery_pending = false;
-	priv->ctrl_recovery_ep = NULL;
+	udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
 
 	/*
-	 * The control state is per-transfer. USB reset, disconnect, controller
-	 * disable and soft reset all end the current request, so the state must
-	 * not survive into the next session: a stale STATUS_ARMED would swallow
-	 * the new session's first genuine step-2 XferNotReady as a duplicate, and
-	 * any state past IDLE would judge a pre-SETUP event against the previous
-	 * request's setup_packet.
+	 * The claims. Releasing these is not cosmetic: udc_dwc3_ctrl_try()
+	 * refuses to arm a SETUP while EP0-OUT reads busy, so a claim carried
+	 * across a reset means no SETUP can ever be armed again and the device
+	 * cannot enumerate however many times the host resets the port.
 	 */
-	priv->ctrl_state = UDC_DWC3_CTRL_IDLE;
+	udc_ep_set_busy(&cfg->ep_data_out[0].cfg, false);
+	udc_ep_set_busy(&cfg->ep_data_in[0].cfg, false);
 
 	/*
-	 * Cancel, not just forget. Since udc_dwc3_on_ctrl() only cancels a
-	 * watchdog whose endpoint matches the one that completed, a deadline left
-	 * pending here with its owner cleared is one nothing can ever match - it
-	 * fires later against an unrelated stage.
+	 * The heartbeat's stuck-claim detector. ctrl_decline_pending is a level,
+	 * cleared only on a grant, so it outlives the transfer it describes
+	 * unless it is cleared here. The three stamps go with it: leaving an old
+	 * stamp makes the next check measure an age that spans the reset.
 	 */
+	priv->ctrl_decline_pending = false;
+	priv->ctrl_decline_t = now;
+	priv->ctrl_arm_t0 = now;
+	priv->ctrl_quiet_t0 = now;
+
+	/* The per-stage watchdog, and the slot it would have acted on. */
 	k_work_cancel_delayable(&priv->watchdog_dwork);
 	priv->watchdog_ep = NULL;
 	priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
 
+	/* The End Transfer recovery slot. */
+	priv->ctrl_recovery_pending = false;
+	priv->ctrl_recovery_ep = NULL;
+
+	if (!all_endpoints) {
+		return;
+	}
+
 	for (int i = 0; i < cfg->num_in_eps; i++) {
 		cfg->ep_data_in[i].end_xfer_pending = false;
 		cfg->ep_data_in[i].resume_pending = false;
-		/*
-		 * The retry budget belongs to one session. A soft reset, USB reset or
-		 * disconnect already clears depcmd_issued and the resource indices, so
-		 * carrying an exhausted budget across would disable an endpoint on its
-		 * first failure after the reset with no retry at all.
-		 */
 		cfg->ep_data_in[i].start_retry = 0;
 	}
-
 	for (int i = 0; i < cfg->num_out_eps; i++) {
 		cfg->ep_data_out[i].end_xfer_pending = false;
 		cfg->ep_data_out[i].resume_pending = false;
 		cfg->ep_data_out[i].start_retry = 0;
 	}
+}
+
+static void udc_dwc3_drop_xfer_state(const struct device *const dev,
+				     const char *const reason)
+{
+	LOG_DBG("dropping outstanding End Transfer state (%s)", reason);
+
+	udc_dwc3_ctrl_reset_to_step1(dev, true);
 }
 
 static void udc_dwc3_on_soft_reset(const struct device *const dev)
@@ -5202,7 +5270,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA packet sent");
 		/* 4.4.2 step 5 needs to know the data stage is behind us. */
-		priv->ctrl_state = UDC_DWC3_CTRL_DATA_DONE;
+		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_DATA_DONE);
 	} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
 		LOG_ERR("Unexpected SETUP IN packet");
 	} else {
@@ -5303,7 +5371,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		 * A new request starts here. One assignment: whatever the previous
 		 * transfer left behind cannot survive it.
 		 */
-		priv->ctrl_state = UDC_DWC3_CTRL_SETUP_DONE;
+		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_SETUP_DONE);
 		priv->ctrl_setup_done++;
 		buf->len = 0;
 
@@ -5465,7 +5533,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
 			LOG_HEXDUMP_DBG(buf->data, buf->len, "CTRL DATA received");
 			/* 4.4.2 step 5 needs to know the data stage is behind us. */
-			priv->ctrl_state = UDC_DWC3_CTRL_DATA_DONE;
+			udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_DATA_DONE);
 		} else if (trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3 ||
 			   trb_trbctl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2) {
 			/*
@@ -5756,10 +5824,15 @@ static void udc_dwc3_ctrl_stall(const struct device *const dev, const char *cons
 
 	udc_dwc3_depcmd_set_stall(dev, &cfg->ep_data_out[0]);
 
-	/* Back to Step 1. */
-	priv->ctrl_state = UDC_DWC3_CTRL_IDLE;
-	udc_ep_set_busy(&cfg->ep_data_out[0].cfg, false);
-	udc_ep_set_busy(&cfg->ep_data_in[0].cfg, false);
+	/*
+	 * Back to Step 1, through the one primitive that knows the whole set.
+	 * Control-only scope: a control resynchronisation must not clear the data
+	 * endpoints' pending flags. Routing through it also cancels the stage
+	 * watchdog, which this path used to leave armed - it would then fire a
+	 * second later against a transfer that no longer existed and Set Stall
+	 * EP0-OUT again.
+	 */
+	udc_dwc3_ctrl_reset_to_step1(dev, false);
 	udc_dwc3_ctrl_next(dev);
 }
 
@@ -5953,7 +6026,7 @@ static void udc_dwc3_on_xfer_not_ready_in(const struct device *const dev, const 
 			 */
 			if (priv->ctrl_state == UDC_DWC3_CTRL_SETUP_DONE ||
 			    priv->ctrl_state == UDC_DWC3_CTRL_DATA_DONE) {
-				priv->ctrl_state = UDC_DWC3_CTRL_STATUS_READY;
+				udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_READY);
 			}
 		}
 
@@ -6007,7 +6080,7 @@ static void udc_dwc3_on_xfer_not_ready_out(const struct device *const dev, const
 			 */
 			if (priv->ctrl_state == UDC_DWC3_CTRL_SETUP_DONE ||
 			    priv->ctrl_state == UDC_DWC3_CTRL_DATA_DONE) {
-				priv->ctrl_state = UDC_DWC3_CTRL_STATUS_READY;
+				udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_READY);
 			}
 		}
 
@@ -9150,7 +9223,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				"decline %u/%u "
 				"setuppending %u unarmed %u startfail %u defer %u trbsts %u "
 				"setupwd %u/%u reset %u updxfer %u resync %u recache %u outmisaligned %u/%u xnrdy %u "
-				"statuswait %u stall %u "
+				"statuswait %u stall %u ephalt %u "
 				"gc_hwm %u B gc0max %u B multi %u link %u out1 %u/%u out2 %u/%u stomp %u DSTS 0x%08x",
 				priv->evt_handled, priv->evt_late,
 				priv->evt_late_polls_max, priv->evt_late_us_max,
@@ -9171,7 +9244,7 @@ static void udc_dwc3_event_worker(struct k_work *work)
 				priv->nonctrl_recache,
 				priv->out_unaligned, priv->out_unaligned_ctrl,
 				priv->xnrdy_nonctrl,
-				priv->ctrl_status_defer, priv->ctrl_stall_issued,
+				priv->ctrl_status_defer, priv->ctrl_stall_issued, priv->ep_halts,
 				priv->evt_gevntcount_hwm,
 				priv->evt_gaveup_gc0_max, priv->evt_gaveup_multi,
 				priv->evt_link_total,
@@ -9601,6 +9674,18 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
+	/*
+	 * Say WHO halted the endpoint. A halt on a data endpoint is the visible
+	 * start of a failure that ends somewhere else entirely - a capture had
+	 * EP85 halted, the host clearing it 280 s later, and control stopping dead
+	 * immediately after - and without this line there is no way to tell a halt
+	 * this driver was asked for from one the controller raised on its own.
+	 *
+	 * INF, not DBG: it is rare on a healthy run (zero on a clean enumeration)
+	 * and it is the first event in that chain.
+	 */
+	LOG_INF("Set halt on EP%02x (requested by the stack)", ep_cfg->addr);
+
 	switch (ep_data->cfg.addr) {
 	case USB_CONTROL_EP_IN:
 		/* The datasheet says to only set stall the OUT direction */
@@ -9612,6 +9697,7 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 	default:
 		udc_dwc3_depcmd_set_stall(dev, ep_data);
 		ep_data->cfg.stat.halted = true;
+		priv->ep_halts++;
 	}
 
 	/* So that the next type is SETUP */
