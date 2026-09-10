@@ -4603,6 +4603,24 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 *   for aligned applications, and our descriptors are 16-byte aligned. A TRB
 	 *   is two beats on the 64-bit bus, which INCR4 covers.
 	 *
+	 *   DELIBERATELY NOT WIDENED TO INCR32-256. The Lattice RTL comparison asks
+	 *   for "INCR4-256, clear bit0"; bit 0 is already clear, so only the widening
+	 *   was left, and it was applied and then reverted. Two reasons, both about
+	 *   the PipeTransLimit change below rather than about this register:
+	 *
+	 *     - With PipeTransLimit 0 there is one AXI transaction in flight at a
+	 *       time, and the bridge runs one FSM for both directions, so whatever
+	 *       is in flight blocks descriptor fetch, payload AND event writes for
+	 *       its whole duration. INCR256 on the 64-bit bus is 2048 B against
+	 *       INCR16's 128 B, so it multiplies that blocking window by sixteen -
+	 *       the same window the PipeTransLimit change exists to shorten.
+	 *     - Nothing measures it. The comparison's own "do not" list rejects
+	 *       retuning REQINFO in this register for exactly that reason.
+	 *
+	 *   If it is ever revisited, 0x1e (up to INCR32, 256 B) is the next step,
+	 *   and it must not share a soak with a PipeTransLimit change - a result
+	 *   could not be attributed to either.
+	 *
 	 *   The value it replaces, 0x1, is INCR undefined-length mode bounded by
 	 *   "the largest-enabled burst length of INCR32/64/128/256" - none of which
 	 *   is enabled. That bound is undefined, which is the reason to change it.
@@ -4614,13 +4632,54 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 *   databook text. Do not interpret a soak result either way until ARLEN /
 	 *   AWLEN have actually been observed on the bus.
 	 *
-	 * GSBUSCFG1 = 0xf00 - PipeTransLimit 0xf, so sixteen outstanding requests
-	 *   rather than the four the bitfile leaves. Carried because the reference
-	 *   sets both together and changing burst shape while leaving transaction
-	 *   concurrency at a non-reference value is half a change. Its effect here
-	 *   may well be nil: whatever consumes this AXI master appears to serialise
-	 *   transactions anyway, in which case the extra requests simply wait on the
-	 *   address channel. EN1KPAGE stays clear - transfers break at 4k as before.
+	 * GSBUSCFG1 - NOT WRITTEN. PipeTransLimit is left at its power-on value,
+	 *   which this silicon reports as 3 (GSBUSCFG1=0x00000300 at reset, logged
+	 *   every boot by the line below). The bitfile owns the value.
+	 *
+	 *   Neither of the two values this driver has written was ever justified by a
+	 *   measurement. 0xf came from a reference design, with the file's own note
+	 *   admitting "its effect here may well be nil" - which the experiment below
+	 *   disproves outright. 0 came from the Lattice RTL comparison and is worse
+	 *   still. With both endpoints discredited and nothing measured in between,
+	 *   writing any value is a guess; POR at least is the value the bitfile was
+	 *   built around.
+	 *
+	 *   This is not "leave it alone and hope". The reset value is read and logged
+	 *   before anything else touches the register, so a bitfile that changes it
+	 *   is visible in the first BUSCFG line of every boot. Inheriting silently
+	 *   would be the unsafe form of this; inheriting and logging is not.
+	 *
+	 *   If it is revisited, change it in ONE step from POR and soak against the
+	 *   0xf baseline below - not two variables at once, and not another endpoint.
+	 *
+	 *   0 WAS TRIED AND IS MEASURABLY WORSE. The Lattice RTL comparison states
+	 *   the AXI slave on this part takes a single outstanding transaction and
+	 *   asks for PipeTransLimit 0. That was built, flashed and soaked on
+	 *   2026-09-10 against the immediately preceding run - same bitfile, same
+	 *   firmware but for this field, same loads (1280x2048 GREY video plus the
+	 *   SRP CDC loop, no EP0 spam), same script. At 481 s:
+	 *
+	 *              PipeTransLimit=0xf      PipeTransLimit=0
+	 *     errors            7                   243
+	 *     recoveries        7                   150
+	 *     SRP ok           23                     5
+	 *     SRP aborts        0                    45
+	 *
+	 *   SRP stopped succeeding entirely at 120 s and never recovered; the
+	 *   dominant error became "control endpoint claimed N ms with the host still
+	 *   asking ... drain stuck, events unconsumed".
+	 *
+	 *   The likely reason is that with one transaction in flight, descriptor
+	 *   fetch, payload and event writes all serialise behind whatever the video
+	 *   path is moving - 2.6 MB per frame - so control and CDC starve. Note this
+	 *   is evidence AGAINST the single-outstanding premise: if the slave really
+	 *   accepted only one, setting 0 should have changed nothing.
+	 *
+	 *   The 0xf column above is therefore the baseline any future value must be
+	 *   compared against, and POR 3 - now in effect - is the untested middle
+	 *   ground between it and 0.
+	 *
+	 *   EN1KPAGE stays clear - transfers break at 4k as before.
 	 *
 	 * Both power-on values are read and logged BEFORE being overwritten. The
 	 * periodic BUSCFG line in udc_dwc3_heartbeat_worker() runs long after this
@@ -4638,8 +4697,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		    UDC_DWC3_GSBUSCFG0_INCR4BRSTENA,
 		    base + UDC_DWC3_GSBUSCFG0);
 
-	sys_write32(FIELD_PREP(UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK, 0xfU),
-		    base + UDC_DWC3_GSBUSCFG1);
+	/*
+	 * GSBUSCFG1 IS DELIBERATELY NOT WRITTEN - see the PipeTransLimit note above.
+	 * Uncomment only with a measurement to justify the value chosen.
+	 */
+	/* sys_write32(FIELD_PREP(UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK, 0xfU), */
+	/*	       base + UDC_DWC3_GSBUSCFG1); */
 
 	LOG_INF("BUSCFG programmed: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
 		sys_read32(base + UDC_DWC3_GSBUSCFG0),
@@ -4667,13 +4730,14 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	/*
 	 * The bus/DMA configuration, read once and never before logged.
 	 *
-	 * GSBUSCFG0's burst-enable bits are all commented out in this function, so
-	 * whatever the bitfile leaves there is what the controller uses - and with
-	 * no INCR burst enabled the databook says every DMA falls back to the
-	 * largest enabled length, i.e. single beats. That is a throughput property
-	 * under stress and nobody has ever looked at the value. GSBUSCFG1 carries
-	 * the outstanding-request limit; GUCTL1 carries errata workaround bits.
-	 * Neither was previously even defined here.
+	 * GSBUSCFG0's burst-enable bits ARE written earlier in this function, so the
+	 * value read back here is the one programmed above and not what the bitfile
+	 * left. This paragraph used to say the opposite, from when the writes were
+	 * commented out; the reading it recorded is kept because it is still the
+	 * argument for writing them at all - with no INCR burst enabled the databook
+	 * says every DMA falls back to the largest enabled length, i.e. single beats.
+	 * GSBUSCFG1 carries the outstanding-request limit; GUCTL1 carries errata
+	 * workaround bits.
 	 */
 
 	LOG_INF("GRXTHRCFG=0x%08x at reset (UsbRxPktCntSel=%u, UsbRxPktCnt=%u)", reg,
