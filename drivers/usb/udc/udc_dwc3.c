@@ -859,9 +859,25 @@ static inline uint32_t udc_dwc3_gevntcount(const mm_reg_t base)
 #define UDC_DWC3_ANALYZERTRACE					0xe008
 
 /* USB Global Debug Queue/FIFO Space Available register */
+/*
+ * How many physical endpoints this driver keeps its own per-endpoint copies for.
+ *
+ * NOT the architectural limit - the controller allows 32 - but the number this
+ * build actually configures. epn is 2*logical + direction, so six IN endpoints
+ * reach epn 11, which is what DALEPENA=0xabf shows on this part. depcmd_last[]
+ * is a software copy of commands WE issued on endpoints WE configured, so it
+ * only ever needs to span those. Sizing it 32 cost 128 bytes of a 64 KB part
+ * that is 98% full, for sixteen entries that can never be written.
+ *
+ * Every bound check on epn uses this, so the array and the guards cannot drift
+ * apart. An epn beyond it is dropped, not recorded - never indexed.
+ */
+#define UDC_DWC3_MAX_EPN					16U
+
 #define UDC_DWC3_GDBGFIFOSPACE					0xc160
 #define UDC_DWC3_GDBGFIFOSPACE_AVAILABLE_MASK			GENMASK(31, 16)
 #define UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_MASK			GENMASK(8, 5)
+#define UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXFIFO			(0x0 << 5)
 #define UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXQ			(0x0 << 5)
 #define UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXQ			(0x1 << 5)
 #define UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXREQQ			(0x2 << 5)
@@ -1553,7 +1569,7 @@ struct udc_dwc3_data {
 	 * the command type but not the parameters we passed, and the one-command-late
 	 * report would otherwise print the same failure a second time.
 	 */
-	uint32_t depcmd_last[32];
+	uint32_t depcmd_last[UDC_DWC3_MAX_EPN];
 	uint32_t depcmd_reported;
 	/*
 	 * One bit per physical endpoint, set once a failed Start Transfer has been
@@ -1987,7 +2003,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const uint32_t epn = udc_dwc3_depcmd_epn(addr);
-	const bool first_on_ep = (epn >= 32u) ||
+	const bool first_on_ep = (epn >= UDC_DWC3_MAX_EPN) ||
 				 ((priv->depcmd_issued & BIT(epn)) == 0);
 	/*
 	 * Nothing is waited on for its result any more. Start Transfer used to be,
@@ -2085,7 +2101,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 */
 	if (!first_on_ep &&
 	    (reg & UDC_DWC3_DEPCMD_STATUS_MASK) == UDC_DWC3_DEPCMD_STATUS_CMDERR &&
-	    (epn >= 32u || (priv->depcmd_reported & BIT(epn)) == 0)) {
+	    (epn >= UDC_DWC3_MAX_EPN || (priv->depcmd_reported & BIT(epn)) == 0)) {
 		/*
 		 * The cast is load-bearing: GENMASK() expands to unsigned long, so
 		 * the masked value widens the whole ternary to unsigned long and %x
@@ -2094,8 +2110,8 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 		 */
 		LOG_ERR("previous endpoint command on addr 0x%x reported an error "
 			"(0x%08x): command 0x%08x, type 0x%x", addr, reg,
-			epn < 32u ? priv->depcmd_last[epn] : 0u,
-			epn < 32u ? (unsigned int)(priv->depcmd_last[epn] &
+			epn < UDC_DWC3_MAX_EPN ? priv->depcmd_last[epn] : 0u,
+			epn < UDC_DWC3_MAX_EPN ? (unsigned int)(priv->depcmd_last[epn] &
 						   UDC_DWC3_DEPCMD_CMDTYP_MASK) : 0u);
 	}
 
@@ -2192,7 +2208,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * From here the register has been written, so its read value is defined and
 	 * the pre-poll above may use it on the next command for this endpoint.
 	 */
-	if (epn < 32u) {
+	if (epn < UDC_DWC3_MAX_EPN) {
 		priv->depcmd_issued |= BIT(epn);
 		priv->depcmd_last[epn] = cmd;
 		priv->depcmd_reported &= ~BIT(epn);
@@ -2763,7 +2779,7 @@ static void udc_dwc3_peek_xferrscidx(const struct device *const dev,
 	}
 
 	/* Undefined until this endpoint has been commanded at least once. */
-	if (ep_data->epn >= 32u || (priv->depcmd_issued & BIT(ep_data->epn)) == 0) {
+	if (ep_data->epn >= UDC_DWC3_MAX_EPN || (priv->depcmd_issued & BIT(ep_data->epn)) == 0) {
 		return;
 	}
 
@@ -6331,7 +6347,7 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev, const uint3
 			 * print the same failure twice. Whichever path gets here
 			 * second now finds the bit set and stays quiet.
 			 */
-			if (epn < 32) {
+			if (epn < UDC_DWC3_MAX_EPN) {
 				already_reported =
 					(priv->start_fail_reported & BIT(epn)) != 0;
 				priv->start_fail_reported |= BIT(epn);
@@ -6950,6 +6966,40 @@ static void udc_dwc3_heartbeat_expiry(struct k_timer *const timer)
 
 #ifdef STALL_DIAG_LOG
 /*
+ * Space left in ONE endpoint's TxFIFO.
+ *
+ * The dumps have always written QUEUENUM 0 into GDBGFIFOSPACE, so every
+ * "TXQ space=" line ever captured reports TxFIFO_0 - never the endpoint that
+ * wedged. EP82 owns TX2, EP85 owns TX5, and neither has ever been read.
+ *
+ * The FIFO number is not stored anywhere because it does not need to be:
+ * udc_dwc3_depcmd_ep_config() programs DEPCFG FIFONum as (addr & 0x7f), so it
+ * is the logical endpoint number. OUT endpoints have no TxFIFO; they return 0.
+ *
+ * This is the reading that separates "the controller never fetched the
+ * descriptor" from "it fetched it, moved the data, and did not transmit" - the
+ * two cases that need opposite recoveries.
+ */
+static uint32_t udc_dwc3_txfifo_space(const struct device *const dev,
+				      const struct udc_dwc3_ep_data *const e)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t sel;
+
+	if (!USB_EP_DIR_IS_IN(e->cfg.addr)) {
+		return 0U;
+	}
+
+	sel = UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXFIFO |
+	      FIELD_PREP(UDC_DWC3_GDBGFIFOSPACE_QUEUENUM_MASK,
+			 (uint32_t)(e->cfg.addr & 0x7fU));
+	sys_write32(sel, base + UDC_DWC3_GDBGFIFOSPACE);
+
+	return FIELD_GET(UDC_DWC3_GDBGFIFOSPACE_AVAILABLE_MASK,
+			 sys_read32(base + UDC_DWC3_GDBGFIFOSPACE));
+}
+
+/*
  * One hardware state dump, for the RTL side, on either shape of failure.
  *
  * Reached only after a fault has already been established - a lost event write,
@@ -7107,7 +7157,7 @@ static void udc_dwc3_stall_diag_dump(const struct device *const dev,
 
 			LOG_INF("  EP%02x: busy=%u hwo=%u trbctl=%u ctrl=0x%08x "
 				"sts=0x%08x head=%u tail=%u full=%u endxfer=%u "
-				"depcmd=0x%08x rxfree=%u",
+				"depcmd=0x%08x last=0x%08x txfifo=%u rxfree=%u",
 				e->cfg.addr,
 				udc_ep_is_busy(&e->cfg) ? 1U : 0U,
 				(c & UDC_DWC3_TRB_CTRL_HWO) ? 1U : 0U,
@@ -7116,6 +7166,9 @@ static void udc_dwc3_stall_diag_dump(const struct device *const dev,
 				e->head, e->tail, e->full ? 1U : 0U,
 				e->end_xfer_pending ? 1U : 0U,
 				sys_read32(base + UDC_DWC3_DEPCMD(e->epn)),
+				e->epn < UDC_DWC3_MAX_EPN ?
+					priv->depcmd_last[e->epn] : 0U,
+				udc_dwc3_txfifo_space(dev, e),
 				rxfree);
 		}
 	}
@@ -7267,10 +7320,20 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
 			continue;
 		}
 
-		LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x | busy=%u "
+		/*
+		 * depcmd= is the DEPGETSTATE this function just issued twice, not the
+		 * command that preceded the fault - reading the register here reports
+		 * our own footprint. last= is depcmd_last[], the command the driver
+		 * actually posted, which is the one worth having. Both are printed so
+		 * the old field keeps meaning what it always did.
+		 */
+		LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x last=0x%08x "
+			"txfifo=%u | busy=%u "
 			"head=%u tail=%u n_retire=%u arm=%u trb ctrl=0x%08x sts=0x%08x "
 			"rscidx=0x%x", tag, names[i], epn, par2,
 			sys_read32(base + UDC_DWC3_DEPCMD(epn)),
+			epn < UDC_DWC3_MAX_EPN ? priv->depcmd_last[epn] : 0U,
+			udc_dwc3_txfifo_space(dev, ep_data),
 			udc_ep_is_busy(&ep_data->cfg) ? 1U : 0U,
 			ep_data->head, ep_data->tail, ep_data->n_retire,
 			ep_data->armed_len[ep_data->tail],
