@@ -1415,10 +1415,14 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg &= ~UDC_DWC3_GSBUSCFG0_INCRBRSTENA;
 	sys_write32(reg, base + UDC_DWC3_GSBUSCFG0);
 
-	/* PipeTransLimit=0: one outstanding AXI request (do not leave POR). */
-	reg = sys_read32(base + UDC_DWC3_GSBUSCFG1);
-	reg &= ~UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK;
-	sys_write32(reg, base + UDC_DWC3_GSBUSCFG1);
+	/*
+	 * Leave GSBUSCFG1 / PipeTransLimit at POR (bitfile). Forcing 0
+	 * (single outstanding AXI) badly regresses concurrent UVC+CDC on
+	 * this SoC (HC soak: SRP dies under PipeTransLimit=0). POR here
+	 * is typically 0x300 (limit=3).
+	 */
+	LOG_INF("GSBUSCFG1 POR=0x%08x (PipeTransLimit left alone)",
+		sys_read32(base + UDC_DWC3_GSBUSCFG1));
 
 	/*
 	 * Program GTXTHRCFG TX threshold (omitted in the 4.4 port). Buffer
