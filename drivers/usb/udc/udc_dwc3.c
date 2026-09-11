@@ -46,11 +46,17 @@ static atomic_t udc_dwc3_trb_bulk_last_ep;
 static atomic_t udc_dwc3_trb_bulk_last_slot;
 static atomic_t udc_dwc3_trb_bulk_last_mismatch;
 static atomic_t udc_dwc3_event_buffer_read_enable = ATOMIC_INIT(1);
+static atomic_t udc_dwc3_event_dispatch_enable = ATOMIC_INIT(1);
 static atomic_t udc_dwc3_event_buffer_read_delay_us;
 
 void udc_dwc3_event_buffer_read_set(bool enable)
 {
 	atomic_set(&udc_dwc3_event_buffer_read_enable, enable ? 1 : 0);
+}
+
+void udc_dwc3_event_dispatch_set(bool enable)
+{
+	atomic_set(&udc_dwc3_event_dispatch_enable, enable ? 1 : 0);
 }
 
 void udc_dwc3_event_buffer_read_delay_set(uint32_t delay_us)
@@ -1928,7 +1934,9 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
 		atomic_inc(&udc_dwc3_evt_count);
-		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+		if (atomic_get(&udc_dwc3_event_dispatch_enable)) {
+			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+		}
 
 		/* Event contents are hardware-owned; acknowledge through GEVNTCOUNT. */
 		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
