@@ -778,6 +778,28 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY			BIT(31)
 
 /*
+ * DWC_usb3 Programming Guide 3.30b, section 1.3.13 DEV_IMOD[0], Table 1-90
+ * (p.253): bits 15:0 DEVICE_IMODI (Interrupt Moderation Interval), bits 31:16
+ * DEVICE_IMODC (down counter).
+ *
+ * Read and logged at boot, never written. It decides whether the
+ * EVNT_HANDLER_BUSY acknowledgement matters: "Interrupt Moderation is enabled
+ * only when the IMOD Interval is programmed to a non-zero value", and the
+ * interrupt is asserted only when "the IMOD (down) counter is 0,
+ * EVNT_HANDLER_BUSY is 0, and there are pending events". With IMODI zero the
+ * busy bit cannot gate anything; with it non-zero, failing to clear the bit
+ * stops every later interrupt. This driver never programs the register, so the
+ * value comes from the bitstream - which is why the same firmware can behave
+ * differently on different images, and why it has to be logged rather than
+ * assumed.
+ */
+#define UDC_DWC3_DEV_IMOD(n)					(0xca00 + 4 * (n))
+#define UDC_DWC3_DEV_IMOD_DEVICE_IMODI_MASK			GENMASK(15, 0)
+#define UDC_DWC3_DEV_IMOD_DEVICE_IMODC_MASK			GENMASK(31, 16)
+/* 250 ns per unit (Table 1-90), so 1 ms = 4000. */
+#define UDC_DWC3_DEV_IMOD_INTERVAL_1MS				4000U
+
+/*
  * GEVNTCOUNT, read with a full fence.
  *
  * A/B under test (2026-09-02). This fence was added, removed, and is back so
@@ -873,6 +895,17 @@ static inline uint32_t udc_dwc3_gevntcount(const mm_reg_t base)
  * apart. An epn beyond it is dropped, not recorded - never indexed.
  */
 #define UDC_DWC3_MAX_EPN					16U
+
+/*
+ * Endpoint excluded from the per-arm TRB trace below.
+ *
+ * EP85 is the video stream and is driven by the uvcmanager block in RTL, not by
+ * descriptors this driver pushes - and at ~1200 completions/s a line per arm
+ * would drown the log and change the timing it is meant to measure. Every other
+ * non-control endpoint is low rate: the CDC pair carries the SRP loop at a few
+ * transfers a second, which is exactly the traffic worth tracing.
+ */
+#define UDC_DWC3_TRBLOG_SKIP_EP					0x85U
 
 #define UDC_DWC3_GDBGFIFOSPACE					0xc160
 #define UDC_DWC3_GDBGFIFOSPACE_AVAILABLE_MASK			GENMASK(31, 16)
@@ -1521,7 +1554,7 @@ struct udc_dwc3_data {
 	 */
 	uint32_t ctrl_setup_wd_updxfer;
 	uint32_t ctrl_resync;		/* control endpoints resynchronised after a stall */
-	uint32_t ctrl_recover_mark;	/* ctrl_setup_done at the last recover() */
+	uint32_t ctrl_recover_mark;	/* stage total at the last non-SETUP Set Stall */
 	uint32_t ctrl_wd_dump;		/* non-SETUP watchdog fires dumped so far */
 	uint32_t ctrl_wd_upd_mark;	/* stage count at the last control re-cache */
 	bool buscfg_logged;		/* the one-shot bus/DMA config report has run */
@@ -3082,6 +3115,26 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	LOG_DBG("PUSH %u, buf %p, data %p, size %u -> %u",
 		ep_data->head, (void *)buf, (void *)buf->data, buf->size, out_size);
 
+	/*
+	 * Per-arm trace for the non-control endpoints, at INFO.
+	 *
+	 * Without this there is no record of WHEN a bulk TRB was armed. Bulk
+	 * endpoints use a persistent ring: Start Transfer runs once at enumeration
+	 * and every later buffer goes out on Update Transfer, neither of which was
+	 * logged. So a capture showed a completion arriving 8 s late with no way to
+	 * tell whether the descriptor had been armed 8 s earlier or 8 ms earlier -
+	 * the difference between the device sitting on data the host was asking for,
+	 * and the device simply not having produced it yet. Measured 2026-09-10:
+	 * EP82 returned a correct 24-byte SRP reply 8.09 s after the command, with
+	 * IN URBs queued the whole time, and the logs could not date the arm.
+	 *
+	 * Pair it with the XferComplete for the same slot to get arm -> retire.
+	 */
+	if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
+		LOG_INF("EP%02x: ARM s%u len=%u n=%u", ep_data->cfg.addr,
+			ep_data->head, out_size, ep_data->n_arm);
+	}
+
 	ep_data->head = (ep_data->head + 1) % (CONFIG_UDC_DWC3_TRB_NUM - 1);
 
 	ep_data->full = (ep_data->head == ep_data->tail);
@@ -3105,6 +3158,13 @@ static int udc_dwc3_pop_trb(const struct device *const dev, struct udc_dwc3_ep_d
 
 	LOG_DBG("POP %u EP%02x, buf %p, data %p",
 		ep_data->tail, ep_data->cfg.addr, (void *)*buf, (void *)(*buf)->data);
+
+	/* Retire side of the arm trace above - the two together give arm -> retire
+	 * for a slot, which is the interval the 8 s stall lives in. */
+	if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
+		LOG_INF("EP%02x: RET s%u sts=%x n=%u", ep_data->cfg.addr,
+			ep_data->tail, trb->status, ep_data->n_retire);
+	}
 
 	/* -1 for link trb */
 	ep_data->tail = (ep_data->tail + 1) % (CONFIG_UDC_DWC3_TRB_NUM - 1);
@@ -3210,8 +3270,16 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_OUT;
 
-	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
-	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
+	if ((ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
+	     ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) &&
+	    priv->ctrl_state == UDC_DWC3_CTRL_STATUS_READY) {
+		/*
+		 * STATUS_ARMED is only ever entered from STATUS_READY. Arming a
+		 * status TRB from any other state is an out-of-flow arm (the shell
+		 * diagnostics below are the one way it can happen), and recording
+		 * it would insert an IDLE -> STATUS_ARMED transition the machine
+		 * does not define into the wedge trace.
+		 */
 		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
@@ -3367,8 +3435,14 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 	priv->last_xfer_type = ctrl;
 	priv->last_xfer_dir = USB_EP_DIR_IN;
 
-	if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
-	    ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
+	if ((ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
+	     ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) &&
+	    priv->ctrl_state == UDC_DWC3_CTRL_STATUS_READY) {
+		/*
+		 * Same guard as the OUT direction: STATUS_ARMED is only entered
+		 * from STATUS_READY, so an out-of-flow status arm must not insert
+		 * a transition the machine does not define into the wedge trace.
+		 */
 		udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_ARMED);
 	}
 
@@ -4490,6 +4564,14 @@ static void udc_dwc3_ctrl_reset_to_step1(const struct device *const dev,
 	priv->ctrl_setup_wd_snap_setup = priv->ctrl_setup_done;
 	priv->ctrl_setup_wd_snap_nonctrl = priv->nonctrl_done;
 
+	/*
+	 * Sentinel for the DATA/STATUS recovery escalation: nothing has issued a
+	 * Set Stall for the episode that is about to begin, so the watchdog must
+	 * not escalate on its first recovery even if the stage total happens to
+	 * read zero (as it does after a power-on reset).
+	 */
+	priv->ctrl_recover_mark = UINT32_MAX;
+
 	if (!all_endpoints) {
 		return;
 	}
@@ -4698,11 +4780,19 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		    base + UDC_DWC3_GSBUSCFG0);
 
 	/*
-	 * GSBUSCFG1 IS DELIBERATELY NOT WRITTEN - see the PipeTransLimit note above.
-	 * Uncomment only with a measurement to justify the value chosen.
+	 * GSBUSCFG1 NOT WRITTEN - PipeTransLimit left at power-on (3 on this part).
+	 *
+	 * 0xf was restored on 2026-09-10 because rig-03 measured it lasting 1984 s
+	 * against POR's 241 s. It did NOT reproduce on the devkit: 301 s against
+	 * POR's 361 s, and worse on every counter (WRITE LOST 10 vs 3, Recovering
+	 * 5 vs 3, srpabort 4 vs 1). Best on one rig, worst on the other.
+	 *
+	 * Run-to-run spread within ONE configuration on the devkit has been
+	 * 206 / 301 / 361 / 663 / 905 s, which is larger than any difference
+	 * between register values. So none of the single-run comparisons separate
+	 * them, and POR - the value the bitfile was built around - is what this
+	 * inherits until something measures it properly.
 	 */
-	/* sys_write32(FIELD_PREP(UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK, 0xfU), */
-	/*	       base + UDC_DWC3_GSBUSCFG1); */
 
 	LOG_INF("BUSCFG programmed: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
 		sys_read32(base + UDC_DWC3_GSBUSCFG0),
@@ -4900,6 +4990,42 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	sys_write32(LO32((uintptr_t)cfg->evt_buf), base + UDC_DWC3_GEVNTADR_LO(0));
 	sys_write32(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t), base + UDC_DWC3_GEVNTSIZ(0));
 	LOG_INF("Event buffer size is %u bytes", sys_read32(base + UDC_DWC3_GEVNTSIZ(0)));
+
+	{
+		const uint32_t imod = sys_read32(base + UDC_DWC3_DEV_IMOD(0));
+		const uint32_t imodi = FIELD_GET(UDC_DWC3_DEV_IMOD_DEVICE_IMODI_MASK, imod);
+
+		LOG_INF("DEV_IMOD=0x%08x IMODI=%u IMODC=%u at reset - moderation %s",
+			imod, imodi,
+			(uint32_t)FIELD_GET(UDC_DWC3_DEV_IMOD_DEVICE_IMODC_MASK, imod),
+			imodi != 0U ? "ENABLED" : "off");
+
+		/*
+		 * Program the moderation interval.
+		 *
+		 * Table 1-90: "This field holds the minimum inter-interrupt interval
+		 * between events. The interval is specified in terms of 250ns
+		 * increments. A value of 0 disables the interrupt throttling logic
+		 * and interrupts are generated immediately if event count becomes
+		 * non-zero." So 1 ms = 4000.
+		 *
+		 * Reset leaves it 0, measured on silicon: "DEV_IMOD=0x00000000
+		 * IMODI=0 IMODC=0". Every event therefore raises an interrupt of its
+		 * own today.
+		 *
+		 * Enabling moderation also makes EVNT_HANDLER_BUSY load-bearing - the
+		 * interrupt needs "IMOD counter 0, EVNT_HANDLER_BUSY 0, and pending
+		 * events" - so the bit-31 write in the credit return is a
+		 * prerequisite for this, not an independent change.
+		 */
+		sys_write32(FIELD_PREP(UDC_DWC3_DEV_IMOD_DEVICE_IMODI_MASK,
+				       UDC_DWC3_DEV_IMOD_INTERVAL_1MS),
+			    base + UDC_DWC3_DEV_IMOD(0));
+		LOG_INF("DEV_IMOD programmed to 0x%08x (IMODI=%u = %u us)",
+			sys_read32(base + UDC_DWC3_DEV_IMOD(0)),
+			UDC_DWC3_DEV_IMOD_INTERVAL_1MS,
+			UDC_DWC3_DEV_IMOD_INTERVAL_1MS / 4U);
+	}
 
 	/*
 	 * Report the address and whether it actually satisfies the size-alignment
@@ -7081,7 +7207,10 @@ static void udc_dwc3_stall_diag_dump(const struct device *const dev,
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	LOG_ERR("=== STALL DIAG (%s) ===", why);
+	/* Dump header, not a fault: severity belongs to the line that triggered
+	 * this. It is reached from the benign control-idle path as well as from
+	 * real wedges, and an E: here made the benign case read as a failure. */
+	LOG_INF("=== STALL DIAG (%s) ===", why);
 	const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
 
 	/*
@@ -7378,7 +7507,7 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
 		par2 = sys_read32(base + UDC_DWC3_DEPCMDPAR2(epn));
 
 		if (ep_data->trb_buf == NULL) {
-			LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x "
+			LOG_INF("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x "
 				"(not configured)", tag, names[i], epn, par2,
 				sys_read32(base + UDC_DWC3_DEPCMD(epn)));
 			continue;
@@ -7391,7 +7520,7 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
 		 * actually posted, which is the one worth having. Both are printed so
 		 * the old field keeps meaning what it always did.
 		 */
-		LOG_ERR("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x last=0x%08x "
+		LOG_INF("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x last=0x%08x "
 			"txfifo=%u | busy=%u "
 			"head=%u tail=%u n_retire=%u arm=%u trb ctrl=0x%08x sts=0x%08x "
 			"rscidx=0x%x", tag, names[i], epn, par2,
@@ -7407,6 +7536,95 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
 	}
 
 	priv->depcmd_no_sleep = saved_no_sleep;
+}
+
+/*
+ * Everything the EP wedge needs and the per-endpoint dump does not carry.
+ *
+ * The EP82 wedge of 2026-09-11 is why this exists. That capture had the
+ * endpoint's own state in full - EPSTATE, TRB, TxFIFO, DEPCMD - and none of the
+ * state that says what the CONTROLLER was doing: no GEVNTCOUNT, so the event
+ * ring's occupancy at the wedge was unknown; no GSTS, so a bus error could not
+ * be excluded from the log alone; no GDBGBMU or queue spaces, so a stalled DMA
+ * or a filled internal queue was invisible; no DSTS, so the link state was
+ * unknown.
+ *
+ * The event-path counters are printed here for a separate reason. They are
+ * otherwise emitted only once per UDC_DWC3_EVT_STATS_EVERY handled events, so
+ * in that run the newest figures available were 254 SECONDS older than the
+ * wedge - late and gaveup were quoted as zero when they had simply not been
+ * sampled since. A fault report must carry its own counters, not the last
+ * periodic line to happen to precede it.
+ *
+ * Read-only throughout, except the GDBGFIFOSPACE select that
+ * udc_dwc3_core_state_dump() already performs.
+ */
+static void udc_dwc3_wedge_core_dump(const struct device *const dev,
+				     const struct udc_dwc3_ep_data *const ep_data)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
+	const uint32_t dsts = sys_read32(base + UDC_DWC3_DSTS);
+
+	LOG_INF("  WBUS: GSTS=0x%08x BusErrAddrVld=%u GBUSERRADDR=0x%08x%08x",
+		gsts, (gsts & UDC_DWC3_GSTS_BUSERRADDRVLD) ? 1U : 0U,
+		sys_read32(base + UDC_DWC3_GBUSERRADDR_HI),
+		sys_read32(base + UDC_DWC3_GBUSERRADDR_LO));
+
+	/*
+	 * GEVNTCOUNT is the one number that separates "the controller posted a
+	 * completion this driver has not drained" from "the controller posted
+	 * nothing". Without it the two are indistinguishable in the log.
+	 */
+	LOG_INF("  WRING: GEVNTADR=0x%08x%08x SIZ=0x%08x CNT=0x%08x "
+		"| driver buf=%p next slot %u",
+		sys_read32(base + UDC_DWC3_GEVNTADR_HI(0)),
+		sys_read32(base + UDC_DWC3_GEVNTADR_LO(0)),
+		sys_read32(base + UDC_DWC3_GEVNTSIZ(0)),
+		sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)),
+		(void *)cfg->evt_buf, priv->evt_next);
+
+	LOG_INF("  WEVT: handled %u late %u (worst %u polls/%u us) gaveup %u "
+		"(worst empty %u us) isr %u runs %u rearm %u kick %u skip %u "
+		"zero %u missed %u/%u midzero %u gc_hwm %u B gc0max %u B multi %u",
+		priv->evt_handled, priv->evt_late,
+		priv->evt_late_polls_max, priv->evt_late_us_max,
+		priv->evt_gaveup, priv->evt_gaveup_us_max,
+		priv->evt_isr, priv->evt_worker_runs, priv->evt_rearm,
+		priv->evt_kick, priv->evt_skipped,
+		priv->evt_zero, priv->evt_missed, priv->evt_missed_frozen,
+		priv->evt_midzero, priv->evt_gevntcount_hwm, priv->evt_gaveup_gc0_max,
+		priv->evt_gaveup_multi);
+
+	LOG_INF("  WDEV: DSTS=0x%08x (%s) DCTL=0x%08x DCFG=0x%08x DALEPENA=0x%08x",
+		dsts, udc_dwc3_get_devt_ulstchng_name(dsts),
+		sys_read32(base + UDC_DWC3_DCTL),
+		sys_read32(base + UDC_DWC3_DCFG),
+		sys_read32(base + UDC_DWC3_DALEPENA));
+
+	/*
+	 * The whole ring, not just the tail. A controller that skipped one
+	 * descriptor and moved on looks identical at the tail to one that stopped
+	 * dead; the slots ahead of it are what tell them apart.
+	 */
+	if (ep_data->trb_buf != NULL) {
+		for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
+			LOG_INF("  WTRB: EP%02x s%u addr=0x%08x%08x sts=0x%08x "
+				"ctrl=0x%08x armed=%u%s",
+				ep_data->cfg.addr, i,
+				ep_data->trb_buf[i].addr_hi,
+				ep_data->trb_buf[i].addr_lo,
+				ep_data->trb_buf[i].status,
+				ep_data->trb_buf[i].ctrl,
+				ep_data->armed_len[i],
+				i == ep_data->tail ? " <-TAIL" :
+					(i == ep_data->head ? " <-HEAD" : ""));
+		}
+	}
+
+	udc_dwc3_core_state_dump(dev);
 }
 
 /*
@@ -7488,6 +7706,7 @@ static void udc_dwc3_detect_wedged_eps(const struct device *const dev)
 			ep_data->trb_buf[ep_data->tail].ctrl,
 			ep_data->trb_buf[ep_data->tail].status, priv->ep_wedge_total);
 		udc_dwc3_epstate_dump(dev, "WEDGED");
+		udc_dwc3_wedge_core_dump(dev, ep_data);
 	}
 }
 
@@ -7792,7 +8011,21 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * is asking, and the decline is that something.
 		 */
 		priv->ctrl_quiet_logged = true;
-		LOG_ERR("no control traffic for %u ms after %u SETUPs: busy o/i %u/%u, "
+		/*
+		 * INFO, not ERROR. This fires on control-endpoint IDLENESS, and the
+		 * device cannot tell an idle host from a device that has stopped
+		 * receiving - rxfifoempty=1 and gc=0 look identical in both cases.
+		 * Measured 2026-09-10 on the devkit: it fired once at 45 SETUPs during
+		 * enumeration, control traffic resumed by itself, and the run went on
+		 * to serve another 20,000 lines without a single watchdog. Logging
+		 * that as an error made a healthy host pause look like a device fault,
+		 * and it was read as one.
+		 *
+		 * Telling the two apart needs the wire, not this counter: usbmon shows
+		 * whether the host transmitted during the silence. Until that
+		 * correlation exists, this is an observation, not a fault.
+		 */
+		LOG_INF("no control traffic for %u ms after %u SETUPs: busy o/i %u/%u, "
 			"trb o/i 0x%08x/0x%08x, gc %u B, DSTS 0x%08x (rxfifoempty %u), "
 			"decline %u, "
 			"setuppend %u, ep0out queued %u, state %u<-%u seq %u",
@@ -8442,6 +8675,43 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 		return;
 	}
 
+	/*
+	 * Escalate a stuck DATA or STATUS stage once Set Stall has had a whole
+	 * episode to work and retired nothing.
+	 *
+	 * recover() issues Set Stall on EP0-OUT and relies on the host's next
+	 * SETUP to retire the stuck descriptor with SetupPending. That is enough
+	 * while the host keeps retrying; it is not enough when the host has given
+	 * up - the capture at the wedge3 episode shows eight watchdog fires all
+	 * with type 0x50 (CONTROL_DATA) and state frozen, while the host side had
+	 * already timed out every request and stopped sending SETUPs. Repeated Set
+	 * Stalls then retire nothing and the device stays dead.
+	 *
+	 * The stage total (SETUPs + status stages retired) is the progress mark,
+	 * for the same reason the SETUP path compares ctrl_setup_done: any stage
+	 * retiring in between makes this a fresh fault rather than a repeat. The
+	 * mark is stamped before the first Set Stall, so the soft reset runs only
+	 * after one Set Stall has demonstrably failed - matching the SETUP path's
+	 * Update Transfer -> soft reset order and giving the cheap recovery its
+	 * chance before the core is taken down.
+	 *
+	 * Deferrals (watchdog_type NONE) are excluded: nothing is armed there and
+	 * recover() has its own end_xfer_pending release for them.
+	 */
+	if (priv->watchdog_type != UDC_DWC3_WATCHDOG_TYPE_NONE &&
+	    priv->watchdog_type != UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
+		const uint32_t stage_total =
+			priv->ctrl_setup_done + priv->ctrl_status_done;
+
+		if (priv->ctrl_recover_mark == stage_total) {
+			priv->ctrl_setup_wd_reset++;
+			udc_dwc3_setup_stuck_reset(dev);
+			return;
+		}
+
+		priv->ctrl_recover_mark = stage_total;
+	}
+
 	udc_dwc3_recover(dev);
 }
 
@@ -8950,7 +9220,10 @@ static bool udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
 			UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE;
 	}
 	priv->evt_next = (priv->evt_next + skip) % CONFIG_UDC_DWC3_EVENTS_NUM;
-	sys_write32(skip * sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+	/* Bit 31 with the count - see the acknowledgement note in evt_drain(). */
+	sys_write32((skip * sizeof(uint32_t)) |
+		    UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY,
+		    base + UDC_DWC3_GEVNTCOUNT(0));
 
 	priv->evt_gaveup_run = 0;
 	priv->evt_gaveup_logged = false;
@@ -9144,8 +9417,33 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 	 * established overflow can never clear.  A capture is that failure - the ring
 	 * full for ~15 s at ~4000 overflow events/s while the drain managed ~3300/s.
 	 */
+	/*
+	 * EVNT_HANDLER_BUSY (bit 31) is written WITH the count, not left clear.
+	 *
+	 * Table 1-68: "Software clears this bit (with 1'b1) when it has finished
+	 * processing the events (along with updating the EVNTCOUNT)". The hardware
+	 * SETS it every time the interrupt is asserted, and the DEV_IMOD section
+	 * gives the condition it gates: "Interrupt is asserted whenever the IMOD
+	 * (down) counter is 0, EVNT_HANDLER_BUSY is 0, and there are pending
+	 * events". Acknowledging the count alone leaves the bit set, so that
+	 * condition can never be met again and later events are written and counted
+	 * but raise no interrupt.
+	 *
+	 * That is what the logs called a lost write. Measured 2026-09-10: seven
+	 * "WRITE LOST" episodes, GEVNTCOUNT frozen at the same value across a whole
+	 * 1000 ms give-up run - and NOTHING actually lost. EP82 157 wire completions
+	 * against 157 retires, EP01 149 against 149, zero sweep rescues, zero
+	 * unknown events. The count was real and stale, the slot was empty because
+	 * the interrupt for it never came.
+	 *
+	 * Only bites when interrupt moderation is on, which is a per-bitstream
+	 * design parameter this driver never programs - hence the same firmware
+	 * behaving differently across images.
+	 */
 	if (n > 0) {
-		sys_write32(n * sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+		sys_write32((n * sizeof(uint32_t)) |
+			    UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY,
+			    base + UDC_DWC3_GEVNTCOUNT(0));
 	}
 
 	return n;
