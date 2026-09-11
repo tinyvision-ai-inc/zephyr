@@ -632,6 +632,8 @@ struct udc_dwc3_data {
 	DEVICE_MMIO_NAMED_RAM(base);
 	/* Index within trb where to queue new TRBs */
 	uint32_t evt_next;
+	/* DEPSTARTCFG parameter 2 has been issued for non-control endpoints */
+	bool non_control_config_started;
 	/* Back-reference to parent */
 	const struct device *dev;
 	/* Drains the DWC3 event buffer in thread context (mutexes are illegal in ISRs) */
@@ -1038,17 +1040,19 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
-					 struct udc_dwc3_ep_data *const ep_data)
+					 const uint32_t xfer_rsc_idx)
 {
-	const bool is_control = USB_EP_GET_IDX(ep_data->cfg.addr) > 0;
-	uint32_t flags = 0;
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const struct udc_dwc3_ep_data *const ep0_out = &cfg->ep_data_out[0];
+	uint32_t flags;
 
-	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
+	flags = FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, xfer_rsc_idx);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
-	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	/* DEPSTARTCFG is always issued through physical endpoint 0 OUT. */
+	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep0_out->epn), flags);
 
-	LOG_DBG("DepStartConfig done ep=0x%02x", ep_data->cfg.addr);
+	LOG_DBG("DepStartConfig done xfer_rsc_idx=%u", xfer_rsc_idx);
 }
 
 /*
@@ -1306,6 +1310,7 @@ static void udc_dwc3_ep0_check_trb(const struct device *const dev, const uint32_
 static void udc_dwc3_on_soft_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
@@ -1427,16 +1432,21 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	udc_dwc3_dump_link_cfg(dev, "after-enable");
 #endif
 
-	/* Configure endpoint 0x00 and 0x80 only for now */
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_in[0]);
-	udc_dwc3_depcmd_start_config(dev, &cfg->ep_data_out[0]);
+	/*
+	 * Start the control-endpoint configuration. A second DEPSTARTCFG with
+	 * parameter 2 is issued before the first non-control DEPCFG.
+	 */
+	priv->non_control_config_started = false;
+	udc_dwc3_depcmd_start_config(dev, 0);
 }
 
 static void udc_dwc3_on_usb_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
 	atomic_inc(&udc_dwc3_usbrst_count);
+	priv->non_control_config_started = false;
 	LOG_DBG("Going through DWC3 reset logic");
 
 	/* Reset all ongoing transfers on non-control IN endpoints */
@@ -2251,11 +2261,17 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 			      struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	LOG_DBG("%s 0x%02x", __func__, ep_data->cfg.addr);
 
 	memset(ep_data->trb_buf, 0, sizeof(*ep_data->trb_buf) * CONFIG_UDC_DWC3_TRB_NUM);
+	if ((USB_EP_GET_IDX(ep_data->cfg.addr) > 0) &&
+	    !priv->non_control_config_started) {
+		udc_dwc3_depcmd_start_config(dev, 2);
+		priv->non_control_config_started = true;
+	}
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
 	udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
 
