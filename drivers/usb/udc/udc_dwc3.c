@@ -411,6 +411,33 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_TRB_NUM >= 2,
  * gaveup, never stall. "Stall" elsewhere in this file means the USB endpoint
  * STALL handshake (Set Stall / Clear Stall) and is unrelated to any of this.
  */
+/*
+ * How long the heartbeat must see GEVNTCOUNT > 0 with nothing handled before it
+ * calls the drain stuck.
+ *
+ * This used to be CONFIG_UDC_DWC3_RECOVERY_TIMEOUT, which is 50 ms in
+ * priv-flir's prj.conf. Against a 200 ms heartbeat that made ONE missed beat
+ * enough, so the control-claim recovery fired roughly every other beat - 23
+ * times in 180 s on 2026-09-11 - and each firing reset the give-up run that
+ * udc_dwc3_evt_skip_dead_slot() needs. The skip needs 1000 ms of continuous
+ * run; recovery was resetting it at ~400 ms, so the one repair that clears a
+ * dead slot could never mature. Twenty to one in favour of the wrong actor.
+ *
+ * Three beats. Long enough that a single slow pass is not a stall, short
+ * enough to stay well inside the 1000 ms the skip needs.
+ */
+#define UDC_DWC3_HB_DRAIN_STUCK_MS				(3u * UDC_DWC3_HEARTBEAT_MS)
+
+/*
+ * Cumulative give-ups on ONE slot that prove it dead regardless of wall clock.
+ *
+ * The 1000 ms route below requires an UNINTERRUPTED run, which anything that
+ * resets evt_gaveup_run can starve. 103 give-ups on a single slot is already
+ * conclusive - the drain looked 103 times and the write never arrived - so this
+ * gives the skip a second, reset-resistant path to the same conclusion.
+ */
+#define UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS				64u
+
 #define UDC_DWC3_EVT_DEAD_SLOT_MS				1000u
 
 /*
@@ -1659,6 +1686,26 @@ struct udc_dwc3_data {
 	 * where no command issued earlier can still be running.
 	 */
 	uint32_t depcmd_issued;
+	/*
+	 * Command accounting. depcmd_issued above is a per-endpoint BITMAP of
+	 * "has this endpoint ever been commanded"; these are counts.
+	 *
+	 * They answer a question nothing answered before 2026-09-11: does the
+	 * command this driver posts actually reach the controller and succeed?
+	 * Update Transfer carries CmdIOC=0 and was never polled, so its CmdStatus
+	 * was never read, and udc_dwc3_depcmd_update_xfer() discarded the return
+	 * of udc_dwc3_depcmd() - reporting success even when the command had not
+	 * been issued at all. A TRB then sits HWO=1 with the controller never told
+	 * to re-cache it, which is exactly the EP82 wedge signature.
+	 */
+	uint32_t depcmd_n_issued;	/* register writes that happened        */
+	uint32_t depcmd_n_strtxfer;	/* of those, Start Transfer             */
+	uint32_t depcmd_n_updxfer;	/* of those, Update Transfer            */
+	uint32_t depcmd_n_ok;		/* completion seen, CmdStatus OK        */
+	uint32_t depcmd_n_err;		/* completion seen, CmdStatus != OK     */
+	uint32_t depcmd_n_timeout;	/* fast poll expired, status unknown    */
+	uint32_t depcmd_last_err;	/* DEPCMD value of the last failure     */
+	uint32_t depcmd_last_err_cmd;	/* the command word that failed         */
 	/* Last command word posted per physical endpoint, and a bit per endpoint
 	 * saying its failure has already been reported at issue time. DEPCMD keeps
 	 * the command type but not the parameters we passed, and the one-command-late
@@ -1865,6 +1912,11 @@ static void udc_dwc3_unlock(const struct device *const dev)
 #define UDC_DWC3_CSFTRST_MAX_POLLS 10000u
 #define UDC_DWC3_CMD_FAST_POLLS 32u
 #define UDC_DWC3_CMD_FAST_POLL_US 1u
+/*
+ * Bare reads before the loop starts yielding. Most endpoint commands retire in
+ * under a microsecond; a reschedule for those costs more than it saves.
+ */
+#define UDC_DWC3_CMD_SPIN_POLLS 4u
 #define UDC_DWC3_CMD_SLOW_POLL_US 1000u
 /*
  * Ceiling on the SLEEPING half of the command wait - and therefore on how long
@@ -1917,13 +1969,42 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
 	k_timepoint_t end = sys_timepoint_calc(K_MSEC(UDC_DWC3_CMD_TIMEOUT_MS));
 	uint32_t reg = 0;
 
+	/*
+	 * YIELD, do not burn the CPU.
+	 *
+	 * This used to k_busy_wait() between reads, which made sense when the
+	 * event ring was drained by a work item that this thread might itself be
+	 * blocking - spinning was the lesser evil. It is the wrong trade now: the
+	 * drain has its own thread and udc_dwc3_evt_drain() takes no mutex, so
+	 * every microsecond spent spinning here is a microsecond the ring could
+	 * have been drained in.
+	 *
+	 * UDC_DWC3_CMD_SPIN_POLLS bare reads first, because the overwhelming
+	 * majority of endpoint commands complete in well under a microsecond and a
+	 * reschedule would cost more than the wait. Only if the command is
+	 * genuinely slow does this start yielding.
+	 *
+	 * k_yield() and not k_sleep(): the tick is 1 ms
+	 * (CONFIG_SYS_CLOCK_TICKS_PER_SEC=1000) and the whole fast budget is 32 us,
+	 * so sleeping would overshoot the budget by 30x on the first call. Yield
+	 * hands the CPU to anything runnable and comes straight back if nothing is.
+	 *
+	 * Safe from every caller: udc_dwc3_depcmd() is never reached from an ISR -
+	 * udc_dwc3_irq_handler() only gives a semaphore - so there is no context
+	 * here in which yielding is illegal. The UDC mutex may be held; that is
+	 * fine, a mutex is not a spinlock, and holding it across a yield blocks
+	 * only threads that want the same mutex, which the drain does not.
+	 */
 	for (uint32_t i = 0; i < UDC_DWC3_CMD_FAST_POLLS; i++) {
 		reg = sys_read32(base + addr);
 		if ((reg & UDC_DWC3_DEPCMD_CMDACT) == 0) {
 			*reg_out = reg;
 			return true;
 		}
-		k_busy_wait(UDC_DWC3_CMD_FAST_POLL_US);
+
+		if (i >= UDC_DWC3_CMD_SPIN_POLLS) {
+			k_yield();
+		}
 	}
 
 	/*
@@ -2160,51 +2241,43 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * escaped only because DEPSTARTCFG is issued on DEPCMD(0) first, which makes
 	 * that register defined before anything reads it.
 	 */
+	/*
+	 * PRE-POLL DISABLED 2026-09-11. Every command is POST-polled below, so by
+	 * the time the next one is issued on this endpoint CmdAct is already clear
+	 * and there is nothing to wait for. Waiting before AND after paid for the
+	 * same interlock twice.
+	 *
+	 * The post-poll is stricter, not weaker: it enforces the same databook
+	 * rule - one command at a time per endpoint, gated on CmdAct - at the
+	 * moment the command completes rather than one command late. It also
+	 * retires the "one-command-late" harvest this block performed: the
+	 * transfer resource index and CmdStatus now come from the post-poll of the
+	 * command that produced them, not from a register read taken during the
+	 * NEXT command, by which time a wedge means there is no next command and
+	 * the status is never read at all.
+	 *
+	 * This path never fired: "previous command still active" is zero in every
+	 * captured run, on both rigs.
+	 *
+	 * The post-poll can still time out; depcmd_n_timeout counts it and the
+	 * status is unknown. That is the case this block used to catch, now
+	 * visible as a counter instead of a silent refusal.
+	 *
+	 * Kept under #if 0 rather than deleted - restoring it is one edit if the
+	 * post-poll turns out to be the wrong trade.
+	 */
+#if 0
 	if (!first_on_ep && !udc_dwc3_wait_cmdact_zero(dev, addr, &reg)) {
-		/*
-		 * GEVNTCOUNT is reported alongside, because it distinguishes the two
-		 * reasons a command can fail to finish. A large count means events
-		 * were waiting to be consumed while the controller was trying to
-		 * complete this command, which is the deadlock the databook warns
-		 * about. A count of zero means the command is stuck for some other
-		 * reason and the event path is not implicated.
-		 */
 		LOG_ERR("previous command still active on addr 0x%x (0x%08x) after %u ms, "
 			"not issuing command 0x%x, GEVNTCOUNT=%u bytes, DSTS=0x%08x (%s)",
 			addr, reg, UDC_DWC3_CMD_TIMEOUT_MS, cmd,
 			udc_dwc3_gevntcount(base),
 			sys_read32(base + UDC_DWC3_DSTS),
 			udc_dwc3_get_devt_ulstchng_name(sys_read32(base + UDC_DWC3_DSTS)));
+		priv->depcmd_n_notissued++;
 		return UDC_DWC3_XFERRSCIDX_INVALID;
 	}
 
-	/*
-	 * Harvest the transfer resource index HERE, in the poll that already
-	 * happened, and nowhere else.
-	 *
-	 * The pre-poll above has just observed CmdAct clear, so DEPCMD still
-	 * describes the command that COMPLETED - and when that command was a Start
-	 * Transfer, the controller has written the index it assigned into
-	 * XferRscIdx. This is the last instant it can be read: the write further
-	 * down replaces the register contents.
-	 *
-	 * Taking it only from the Command Complete event is not enough. The event
-	 * is drained by a work queue, so any command issued on this endpoint before
-	 * that drain runs would go out with a stale index or with INVALID - which
-	 * FIELD_PREP turns into 0x7f, a real resource belonging to nobody.
-	 *
-	 * There must never be a second poll for this. A dedicated collection helper
-	 * polled CmdAct again immediately before every Update and End Transfer,
-	 * which meant two polls of the same register per command; folding it in
-	 * here leaves exactly one.
-	 *
-	 * Only when the index is not already known: the event may well have been
-	 * drained first, and it carries the same value. Only for a Start Transfer,
-	 * because no other command assigns a resource. And CMDTYP is read from the
-	 * REGISTER rather than from depcmd_last[], so an endpoint whose DEPCMD is
-	 * also written by something outside this driver - EP85, written by the UVC
-	 * Manager - cannot have a foreign command's bits adopted as an index.
-	 */
 	if (!first_on_ep) {
 		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
 
@@ -2213,43 +2286,17 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 		}
 	}
 
-	/*
-	 * The status field still describes the command that just finished, which is
-	 * the only opportunity to notice that one failed now that most commands are
-	 * not waited on individually. Reported one command late, which beats not at
-	 * all.
-	 *
-	 * Skipped on the first command of an endpoint, where reg was never read and
-	 * the register it would have been read from is undefined anyway.
-	 */
 	if (!first_on_ep &&
 	    (reg & UDC_DWC3_DEPCMD_STATUS_MASK) == UDC_DWC3_DEPCMD_STATUS_CMDERR &&
 	    (epn >= UDC_DWC3_MAX_EPN || (priv->depcmd_reported & BIT(epn)) == 0)) {
-		/*
-		 * The cast is load-bearing: GENMASK() expands to unsigned long, so
-		 * the masked value widens the whole ternary to unsigned long and %x
-		 * is then the wrong conversion. Narrowing here rather than switching
-		 * to %lx keeps the field printed as the 4-bit command type it is.
-		 */
 		LOG_ERR("previous endpoint command on addr 0x%x reported an error "
 			"(0x%08x): command 0x%08x, type 0x%x", addr, reg,
 			epn < UDC_DWC3_MAX_EPN ? priv->depcmd_last[epn] : 0u,
 			epn < UDC_DWC3_MAX_EPN ? (unsigned int)(priv->depcmd_last[epn] &
 						   UDC_DWC3_DEPCMD_CMDTYP_MASK) : 0u);
 	}
+#endif
 
-	/*
-	 * At USB 2.0 speeds the USB2 PHY must not be suspended and L1 sleep must not
-	 * be enabled while an endpoint command executes: "if GUSB2PHYCFG[6] or
-	 * GUSB2PHYCFG[8] is set to '1', it must be set to '0' prior to issuing this
-	 * command". The databook repeats this on every endpoint command. Leaving
-	 * them set makes commands take far longer or fail outright.
-	 *
-	 * Save and restore rather than clear once at init, because these bits belong
-	 * to power management and may be turned on from outside this driver. When
-	 * both are already clear - which they appear to be on this core - this costs
-	 * one register read and no writes.
-	 */
 	reg = sys_read32(base + UDC_DWC3_GUSB2PHYCFG);
 	if ((reg & (UDC_DWC3_GUSB2PHYCFG_SUSPHY |
 		    UDC_DWC3_GUSB2PHYCFG_ENBLSLPM)) != 0) {
@@ -2380,9 +2427,30 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * before: the next command's pre-poll collects the index. Degrading to the
 	 * old behaviour is the right failure mode.
 	 */
-	if ((cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) == UDC_DWC3_DEPCMD_DEPSTRTXFER &&
-	    epn < UDC_DWC3_MAX_EPN) {
+	/*
+	 * POST-POLL EVERY COMMAND.
+	 *
+	 * Only Start Transfer used to be waited for. Update Transfer carries
+	 * CmdIOC=0, so it raises no Command Complete event, and nothing polled it -
+	 * its CmdStatus was never read by anything, ever. A command that the
+	 * controller rejected looked identical to one it accepted, and the TRB it
+	 * was supposed to re-cache stayed HWO=1 with nobody told: the EP82 wedge
+	 * signature. Same for Set/Clear Stall, DEPCFG and DEPXFERCFG.
+	 *
+	 * Affordable now, and it was not before. The wait holds the UDC mutex, and
+	 * until the drain got its own thread that mutex was what the event worker
+	 * needed to make progress - waiting here stalled the ring. udc_dwc3_evt_drain()
+	 * takes no mutex and runs on its own thread, so this delays dispatch only,
+	 * and the loop yields rather than spins.
+	 *
+	 * Bounded and non-sleeping: depcmd_no_sleep forces the fast phase, so the
+	 * worst case is UDC_DWC3_CMD_FAST_POLLS iterations. A timeout is counted,
+	 * not converted into a refusal - the command HAS been written, so refusing
+	 * anything afterwards would misreport what the controller was told.
+	 */
+	if (epn < UDC_DWC3_MAX_EPN) {
 		const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
+		const uint32_t cmdtyp = cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK;
 		const bool saved_no_sleep = priv->depcmd_no_sleep;
 		uint32_t done = 0;
 		bool finished;
@@ -2391,31 +2459,54 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 		finished = udc_dwc3_wait_cmdact_zero(dev, addr, &done);
 		priv->depcmd_no_sleep = saved_no_sleep;
 
-		if (finished && _EPN_IS_VALID(cfg, epn)) {
-			struct udc_dwc3_ep_data *const ep_data =
-				_EP_DATA_FROM_EPN(cfg, epn);
+		if (!finished) {
+			priv->depcmd_n_timeout++;
+			LOG_WRN_RATELIMIT("command 0x%x on addr 0x%x still active after "
+					  "the fast poll (0x%08x); status unknown (%u so "
+					  "far)", cmd, addr, done,
+					  priv->depcmd_n_timeout);
+			return 0;
+		}
+
+		/*
+		 * Start Transfer is the only command that assigns a transfer
+		 * resource, and adopt applies its own three checks before trusting
+		 * the value.
+		 */
+		if (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER && _EPN_IS_VALID(cfg, epn)) {
+			udc_dwc3_adopt_xferrscidx(dev, _EP_DATA_FROM_EPN(cfg, epn),
+						  done);
+		}
+
+		if ((done & UDC_DWC3_DEPCMD_STATUS_MASK) !=
+		    UDC_DWC3_DEPCMD_STATUS_OK) {
+			priv->depcmd_n_err++;
+			priv->depcmd_last_err = done;
+			priv->depcmd_last_err_cmd = cmd;
 
 			/*
-			 * Adopt first: it applies the same three checks the pre-poll
-			 * harvest does - CmdAct clear, CMDTYP still Start Transfer,
-			 * status OK - so a failed command cannot install an index.
+			 * ERROR, unconditionally. This is the line that says a
+			 * command the driver believed it had issued was refused by
+			 * the controller - the thing nothing could see before.
 			 */
-			udc_dwc3_adopt_xferrscidx(dev, ep_data, done);
+			LOG_ERR("EP%02x command type 0x%x REJECTED: DEPCMD=0x%08x "
+				"status=0x%x (%u errors so far)",
+				_EPN_IS_VALID(cfg, epn)
+					? _EP_DATA_FROM_EPN(cfg, epn)->cfg.addr : 0xffU,
+				(unsigned int)(cmdtyp >> 0),
+				done,
+				(unsigned int)((done & UDC_DWC3_DEPCMD_STATUS_MASK) >> 12),
+				priv->depcmd_n_err);
 
-			if ((done & UDC_DWC3_DEPCMD_STATUS_MASK) !=
-			    UDC_DWC3_DEPCMD_STATUS_OK) {
-				/*
-				 * Report once. udc_dwc3_on_ep_cmd_cmplt() sets the same
-				 * bits when it sees an unsolicited completion - the RTL
-				 * UVC Manager may still ask for one on EP85 - so whichever
-				 * path observes this failure second stays quiet.
-				 */
+			priv->depcmd_reported |= BIT(epn);
+			if (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER) {
 				priv->start_fail_reported |= BIT(epn);
-				priv->depcmd_reported |= BIT(epn);
-
-				return UDC_DWC3_XFERRSCIDX_INVALID;
 			}
+
+			return UDC_DWC3_XFERRSCIDX_INVALID;
 		}
+
+		priv->depcmd_n_ok++;
 	}
 
 	return 0;
@@ -2979,17 +3070,26 @@ static void udc_dwc3_adopt_xferrscidx(const struct device *const dev,
 /*
  * Take the transfer resource index from DEPCMD if it is already there.
  *
- * A single read, never a poll. udc_dwc3_depcmd() harvests the index in the
- * pre-poll it already performs, but that runs INSIDE the command it is about to
- * issue - and Update/End Transfer need the index BEFORE that, to build the
- * command word. Without this they refuse a transfer whose Command Complete has
- * simply not been drained yet: measured on EP85, where End Transfer at
- * SET_INTERFACE was refused and the index arrived microseconds later, leaving
- * the old resource unreleased.
+ * A single read, never a poll. udc_dwc3_depcmd() adopts the index in the
+ * POST-poll it performs after every command, which is the authoritative source:
+ * it reads the register of the Start Transfer that produced the index, at the
+ * moment that command completes. But that happens inside udc_dwc3_depcmd(), and
+ * Update/End Transfer need the index BEFORE calling it, to build the command
+ * word. Hence this read.
+ *
+ * (Until 2026-09-11 the adoption lived in a PRE-poll instead - it ran during
+ * the NEXT command on the endpoint, so at a wedge, where there is no next
+ * command, the index and status were never confirmed at all. That block is now
+ * under #if 0 in udc_dwc3_depcmd().)
+ *
+ * Without this read, Update/End Transfer refuse a transfer whose index has not
+ * been established yet: measured on EP85, where End Transfer at SET_INTERFACE
+ * was refused and the index arrived microseconds later, leaving the old
+ * resource unreleased.
  *
  * Trusted only when the command has finished (CmdAct clear), was a Start
- * Transfer, and succeeded - the same three conditions the pre-poll harvest
- * applies. CMDTYP comes from the register rather than from depcmd_last[], so an
+ * Transfer, and succeeded - the same three conditions udc_dwc3_adopt_xferrscidx()
+ * applies wherever it is called from. CMDTYP comes from the register rather than from depcmd_last[], so an
  * endpoint whose DEPCMD is also written from outside this driver - EP85, by the
  * UVC Manager - cannot have a foreign command's bits adopted as an index.
  */
@@ -8020,7 +8120,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	priv->hb_last_handled = priv->evt_handled;
 
 	drain_stuck = (priv->hb_drain_stuck_beats * UDC_DWC3_HEARTBEAT_MS) >=
-		      CONFIG_UDC_DWC3_RECOVERY_TIMEOUT;
+		      UDC_DWC3_HB_DRAIN_STUCK_MS;
 
 	/*
 	 * Report the bus/DMA configuration once, from here rather than from
@@ -8148,7 +8248,15 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 			drain_stuck ? "drain stuck, events unconsumed"
 				    : "no SETUP armed");
 
-		/* Re-arm the detector, or it re-enters on every following beat. */
+		/*
+		 * Re-arm the detector, or it re-enters on every following beat.
+		 *
+		 * evt_gaveup_run and evt_gaveup_t0 are DELIBERATELY left alone. They
+		 * belong to the drain and are the proof udc_dwc3_evt_skip_dead_slot()
+		 * needs; the slot is still dead after this returns, so discarding that
+		 * evidence is what stopped the skip ever maturing - 460 ms was the
+		 * longest run rig-03 reached against a 1000 ms threshold.
+		 */
 		priv->hb_drain_stuck_beats = 0U;
 
 		/* Stamp first, so a failed recovery cannot re-enter every beat. */
@@ -8172,7 +8280,31 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * One recovery action per episode, decided by the function that can
 		 * tell which case it is in.
 		 */
-		(void)udc_dwc3_recover(dev);
+		/*
+		 * ACT ON THE FAULT DIAGNOSED, not on the endpoint that reported it.
+		 *
+		 * This gate admits two unrelated causes - "no SETUP armed" and "drain
+		 * stuck" - and used to answer both with udc_dwc3_recover(), whose whole
+		 * action is Set Stall on EP0-OUT. Right for the first; it does NOTHING
+		 * for the second, because a dead event-ring slot is not repaired by
+		 * stalling the control endpoint.
+		 *
+		 * rig-03, 2026-09-11: all 11 firings named "drain stuck, events
+		 * unconsumed", all 11 stalled EP0-OUT, the slot stayed dead, declines
+		 * resumed, the next beat re-entered. 23 recoveries in 180 s, then the
+		 * device stopped answering SET_ADDRESS and never re-enumerated.
+		 *
+		 * The drain thread owns evt_next and evt_buf, so this path must not
+		 * skip slots itself. Waking it is the only safe action from here, and
+		 * is now sufficient: the drain's gate has a cumulative give-up route
+		 * that no longer depends on a wall-clock run this handler used to reset.
+		 */
+		if (drain_stuck) {
+			priv->evt_kick++;
+			k_sem_give(&priv->evt_sem);
+		} else {
+			(void)udc_dwc3_recover(dev);
+		}
 	}
 
 	/*
@@ -8435,9 +8567,22 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 				gaveup_ms >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS &&
 				udc_dwc3_evt_lookahead_lost(dev, gc);
 
+			/*
+			 * A third route, immune to anything that resets the
+			 * wall-clock run: enough give-ups on this one slot.
+			 * 2026-09-11 saw 103 on a single slot while the clock
+			 * never passed 460 ms, because the control-claim
+			 * recovery kept restarting it. The drain looked 103
+			 * times and the write never came; that is the same
+			 * conclusion the timeout reaches, by counting instead
+			 * of timing.
+			 */
+			const bool lost_by_count =
+				priv->evt_gaveup_run >= UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS;
+
 			if (gc >= sizeof(uint32_t) &&
 			    (gaveup_ms >= UDC_DWC3_EVT_DEAD_SLOT_MS ||
-			     lost_by_lookahead) &&
+			     lost_by_lookahead || lost_by_count) &&
 			    cfg->evt_buf[priv->evt_next] ==
 					UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
 				const bool frozen = (gc == priv->evt_gaveup_gc0);
