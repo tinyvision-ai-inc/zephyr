@@ -53,6 +53,9 @@ static atomic_t udc_dwc3_event_buffer_read_delay_us;
 /* Bit N set → skip DEPEVT for physical EP N (VIDIN=phy7, RAWOUT=phy2, …). */
 static atomic_t udc_dwc3_event_dispatch_skip_epn_mask;
 static atomic_t udc_dwc3_trb_status_read_enable = ATOMIC_INIT(1);
+/* When clear, push TRBs but skip DepUpdateXfer (doorbell) on bulk. */
+static atomic_t udc_dwc3_depupd_enable = ATOMIC_INIT(1);
+static atomic_t udc_dwc3_depupd_skip_count;
 
 void udc_dwc3_event_buffer_read_set(bool enable)
 {
@@ -82,6 +85,21 @@ void udc_dwc3_trb_status_read_set(bool enable)
 bool udc_dwc3_trb_status_read_get(void)
 {
 	return atomic_get(&udc_dwc3_trb_status_read_enable) != 0;
+}
+
+void udc_dwc3_depupd_set(bool enable)
+{
+	atomic_set(&udc_dwc3_depupd_enable, enable ? 1 : 0);
+}
+
+bool udc_dwc3_depupd_get(void)
+{
+	return atomic_get(&udc_dwc3_depupd_enable) != 0;
+}
+
+uint32_t udc_dwc3_depupd_skip_get(void)
+{
+	return (uint32_t)atomic_get(&udc_dwc3_depupd_skip_count);
 }
 
 void udc_dwc3_event_dispatch_stats(uint32_t *enabled, uint32_t *handled, uint32_t *skipped)
@@ -1219,7 +1237,11 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	if (ret != 0) {
 		return ret;
 	}
-	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	if (atomic_get(&udc_dwc3_depupd_enable)) {
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	} else {
+		atomic_inc(&udc_dwc3_depupd_skip_count);
+	}
 
 	return 0;
 }
