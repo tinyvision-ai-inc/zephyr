@@ -16,11 +16,12 @@ if UDC_DWC3
 
 config UDC_DWC3_EVENTS_NUM
 	int "Number of events in the event ring buffer"
-	default 16
+	default 256
+	range 16 2048
 	help
-	  It is typically not needed to increase the number of events, but
-	  if it were to happen due to some rare condition, increasing this
-	  number could be useful.
+	  Event ring slots (4 bytes each). GEVNTSIZ is this value times 4.
+	  Size to the GEVNTCOUNT watermark under load; 16 slots overflow when
+	  many XferComplete events arrive before the workqueue drains.
 
 config UDC_DWC3_TRB_NUM
 	int "Number of buffers for each non-control endpoint"

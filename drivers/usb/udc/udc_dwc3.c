@@ -39,6 +39,68 @@ static atomic_t udc_dwc3_ep0_stage_mismatch;
 static atomic_t udc_dwc3_ep0_setuppending;
 static atomic_t udc_dwc3_ep0_trb_err;
 
+static atomic_t udc_dwc3_trb_bulk_fill;
+static atomic_t udc_dwc3_trb_bulk_owned;
+static atomic_t udc_dwc3_trb_bulk_readback_mismatch;
+static atomic_t udc_dwc3_trb_bulk_last_ep;
+static atomic_t udc_dwc3_trb_bulk_last_slot;
+static atomic_t udc_dwc3_trb_bulk_last_mismatch;
+static atomic_t udc_dwc3_event_buffer_read_enable = ATOMIC_INIT(1);
+static atomic_t udc_dwc3_event_buffer_read_delay_us;
+
+void udc_dwc3_event_buffer_read_set(bool enable)
+{
+	atomic_set(&udc_dwc3_event_buffer_read_enable, enable ? 1 : 0);
+}
+
+void udc_dwc3_event_buffer_read_delay_set(uint32_t delay_us)
+{
+	atomic_set(&udc_dwc3_event_buffer_read_delay_us, (atomic_val_t)delay_us);
+}
+
+void udc_dwc3_ep0_stats(uint32_t *setup, uint32_t *fixed, uint32_t *mismatch,
+			uint32_t *setuppend, uint32_t *trberr)
+{
+	if (setup != NULL) {
+		*setup = (uint32_t)atomic_get(&udc_dwc3_ctrl_setup_count);
+	}
+	if (fixed != NULL) {
+		*fixed = (uint32_t)atomic_get(&udc_dwc3_ep0_stage_fixed);
+	}
+	if (mismatch != NULL) {
+		*mismatch = (uint32_t)atomic_get(&udc_dwc3_ep0_stage_mismatch);
+	}
+	if (setuppend != NULL) {
+		*setuppend = (uint32_t)atomic_get(&udc_dwc3_ep0_setuppending);
+	}
+	if (trberr != NULL) {
+		*trberr = (uint32_t)atomic_get(&udc_dwc3_ep0_trb_err);
+	}
+}
+
+void udc_dwc3_trb_bulk_stats(uint32_t *fill, uint32_t *owned, uint32_t *mismatch,
+			     uint32_t *last_ep, uint32_t *last_slot, uint32_t *last_mask)
+{
+	if (fill != NULL) {
+		*fill = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_fill);
+	}
+	if (owned != NULL) {
+		*owned = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_owned);
+	}
+	if (mismatch != NULL) {
+		*mismatch = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_readback_mismatch);
+	}
+	if (last_ep != NULL) {
+		*last_ep = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_last_ep);
+	}
+	if (last_slot != NULL) {
+		*last_slot = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_last_slot);
+	}
+	if (last_mask != NULL) {
+		*last_mask = (uint32_t)atomic_get(&udc_dwc3_trb_bulk_last_mismatch);
+	}
+}
+
 static struct usb_setup_packet udc_dwc3_dbg_setup;
 static bool udc_dwc3_dbg_setup_valid;
 
@@ -248,6 +310,9 @@ static atomic_t udc_dwc3_remwk_count;
 #define UDC_DWC3_GSBUSCFG0_INCR4BRSTENA				BIT(1)
 #define UDC_DWC3_GSBUSCFG0_INCRBRSTENA				BIT(0)
 
+#define UDC_DWC3_GSBUSCFG1					0xc104
+#define UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK			GENMASK(11, 8)
+
 /* Global Tx Threshold Control Register */
 #define UDC_DWC3_GTXTHRCFG					0xc108
 #define UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL			BIT(29)
@@ -262,6 +327,7 @@ static atomic_t udc_dwc3_remwk_count;
 #define UDC_DWC3_GCTL_U2RSTECN					BIT(16)
 #define UDC_DWC3_GCTL_FRMSCLDWN_MASK				GENMASK(15, 14)
 #define UDC_DWC3_GCTL_PRTCAPDIR_MASK				GENMASK(13, 12)
+#define UDC_DWC3_GCTL_PRTCAPDIR_DEVICE				2U
 #define UDC_DWC3_GCTL_CORESOFTRESET				BIT(11)
 #define UDC_DWC3_GCTL_DEBUGATTACH				BIT(8)
 #define UDC_DWC3_GCTL_RAMCLKSEL_MASK				GENMASK(7, 6)
@@ -672,25 +738,70 @@ void udc_dwc3_ring_inc(uint32_t *const nump, const uint32_t size)
 	*nump = (num >= size) ? 0 : num;
 }
 
-static void udc_dwc3_push_trb(const struct device *const dev,
-			      struct udc_dwc3_ep_data *const ep_data,
-			      struct net_buf *const buf, const uint32_t ctrl)
+static int udc_dwc3_push_trb(const struct device *const dev,
+			     struct udc_dwc3_ep_data *const ep_data,
+			     struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
+	const uint32_t addr_lo = LO32((uintptr_t)buf->data);
+	const uint32_t addr_hi = HI32((uintptr_t)buf->data);
+	const uint32_t status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
+	const uint32_t ctrl_pre_hwo = ctrl & ~UDC_DWC3_TRB_CTRL_HWO;
+	uint32_t mismatch = 0;
+
+	ARG_UNUSED(dev);
 
 	/* If the next TRB in the chain is still owned by the hardware, need
 	 * to retry later when more resources become available.
 	 */
 	__ASSERT_NO_MSG(!ep_data->full);
+	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+		atomic_inc(&udc_dwc3_trb_bulk_owned);
+		atomic_set(&udc_dwc3_trb_bulk_last_ep, ep_data->epn);
+		atomic_set(&udc_dwc3_trb_bulk_last_slot, ep_data->head);
+		LOG_ERR("bulk TRB still HWO-owned ep=%u slot=%u ctrl=0x%08x",
+			ep_data->epn, ep_data->head, trb->ctrl);
+		return -EBUSY;
+	}
 
 	/* Associate an active buffer and a TRB together */
 	ep_data->net_buf[ep_data->head] = buf;
 
-	/* TRB# with one more chunk of data */
-	trb->addr_lo = LO32((uintptr_t)buf->data);
-	trb->addr_hi = HI32((uintptr_t)buf->data);
-	trb->status = USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? buf->len : buf->size;
+	/*
+	 * Verify descriptor fields before handing ownership to the controller.
+	 * Never read back after HWO: that word is then hardware-owned.
+	 */
+	trb->addr_lo = addr_lo;
+	trb->addr_hi = addr_hi;
+	trb->status = status;
+	trb->ctrl = ctrl_pre_hwo;
+	mismatch |= (trb->addr_lo != addr_lo) ? BIT(0) : 0U;
+	mismatch |= (trb->addr_hi != addr_hi) ? BIT(1) : 0U;
+	mismatch |= (trb->status != status) ? BIT(2) : 0U;
+	mismatch |= (trb->ctrl != ctrl_pre_hwo) ? BIT(3) : 0U;
+	if (mismatch != 0U) {
+		atomic_inc(&udc_dwc3_trb_bulk_readback_mismatch);
+		atomic_set(&udc_dwc3_trb_bulk_last_ep, ep_data->epn);
+		atomic_set(&udc_dwc3_trb_bulk_last_slot, ep_data->head);
+		atomic_set(&udc_dwc3_trb_bulk_last_mismatch, mismatch);
+		LOG_ERR("bulk TRB pre-HWO readback mismatch ep=%u slot=%u mask=0x%x",
+			ep_data->epn, ep_data->head, mismatch);
+		ep_data->net_buf[ep_data->head] = NULL;
+		return -EIO;
+	}
+
+#if defined(CONFIG_RISCV)
+	__asm__ volatile ("fence iorw,iorw" ::: "memory");
+#else
+	barrier_dsync_fence_full();
+#endif
 	trb->ctrl = ctrl;
+#if defined(CONFIG_RISCV)
+	__asm__ volatile ("fence iorw,iorw" ::: "memory");
+#else
+	barrier_dsync_fence_full();
+#endif
+	atomic_inc(&udc_dwc3_trb_bulk_fill);
 
 	LOG_DBG("PUSH %u buf %p, data %p, size %u",
 		ep_data->head, (void *)buf, (void *)buf->data, buf->size);
@@ -700,6 +811,7 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 
 	/* If the head touches the tail after we add something, we are full */
 	ep_data->full = (ep_data->head == ep_data->tail);
+	return 0;
 }
 
 static struct net_buf *udc_dwc3_pop_trb(const struct device *const dev,
@@ -795,7 +907,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Max Packet Size according to the USB descriptor configuration */
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
-	/* Burst Size of a single packet per burst (encoded as '0'): no burst */
+	/* BurstSize 15: HIP field is burst length, matches bMaxBurst=15 */
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 15);
 
 	/* Set the FIFO number, must be 0 for all OUT EPs */
@@ -907,7 +1019,22 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
-	ep_data->head = ep_data->tail = 0;
+	/*
+	 * EndXfer used to only reset head/tail, orphaning TRB-resident
+	 * net_bufs. udc_ep_cancel_queued() only drains the UDC software
+	 * fifo — reclaim TRB slots so the class gets -ECONNABORTED.
+	 */
+	while (ep_data->full || (ep_data->head != ep_data->tail)) {
+		struct net_buf *buf = udc_dwc3_pop_trb(dev, ep_data);
+
+		if (buf != NULL) {
+			udc_submit_ep_event(dev, buf, -ECONNABORTED);
+		}
+	}
+
+	ep_data->head = 0;
+	ep_data->tail = 0;
+	ep_data->full = false;
 }
 
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
@@ -1001,6 +1128,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct net_buf *const buf)
 {
 	uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	int ret;
 
 	LOG_INF("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
@@ -1028,7 +1156,10 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		}
 	}
 
-	udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
+	ret = udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
+	if (ret != 0) {
+		return ret;
+	}
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 
 	return 0;
@@ -1187,15 +1318,25 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		continue;
 	}
 
-	/* Enable AXI64 bursts for various sizes expected */
-	reg = UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
+	/*
+	 * INCR4–256, INCRBRSTENA off. Slave is one AXI burst (INCR + AxLEN).
+	 * Do not leave POR bit0; OR-only can keep undefined-length INCR.
+	 */
+	reg = sys_read32(base + UDC_DWC3_GSBUSCFG0);
+	reg |= UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR128BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR64BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR32BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR16BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR8BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
-	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
+	reg &= ~UDC_DWC3_GSBUSCFG0_INCRBRSTENA;
+	sys_write32(reg, base + UDC_DWC3_GSBUSCFG0);
+
+	/* PipeTransLimit=0: one outstanding AXI request (do not leave POR). */
+	reg = sys_read32(base + UDC_DWC3_GSBUSCFG1);
+	reg &= ~UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK;
+	sys_write32(reg, base + UDC_DWC3_GSBUSCFG1);
 
 	/*
 	 * Program GTXTHRCFG TX threshold (omitted in the 4.4 port). Buffer
@@ -1228,7 +1369,19 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	LOG_INF("Event buffer size is %u bytes", sys_read32(base + UDC_DWC3_GEVNTSIZ(0)));
 	sys_write32(0, base + UDC_DWC3_GEVNTCOUNT(0));
 
-	/* Letting GCTL unchanged */
+	reg = sys_read32(base + UDC_DWC3_GCTL);
+	if (FIELD_GET(UDC_DWC3_GCTL_PRTCAPDIR_MASK, reg) !=
+	    UDC_DWC3_GCTL_PRTCAPDIR_DEVICE) {
+		reg &= ~UDC_DWC3_GCTL_PRTCAPDIR_MASK;
+		reg |= FIELD_PREP(UDC_DWC3_GCTL_PRTCAPDIR_MASK,
+				  UDC_DWC3_GCTL_PRTCAPDIR_DEVICE);
+		sys_write32(reg, base + UDC_DWC3_GCTL);
+	}
+
+	LOG_INF("GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GCTL=0x%08x",
+		sys_read32(base + UDC_DWC3_GSBUSCFG0),
+		sys_read32(base + UDC_DWC3_GSBUSCFG1),
+		sys_read32(base + UDC_DWC3_GCTL));
 
 	/* Set the USB device configuration, including max supported speed */
 	sys_write32(UDC_DWC3_DCFG_PERFRINT_90, base + UDC_DWC3_DCFG);
@@ -1617,7 +1770,6 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
 	struct udc_dwc3_ep_data *const ep_data =
 		(epn & 1) ? &cfg->ep_data_in[epn >> 1] : &cfg->ep_data_out[epn >> 1];
-	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->tail];
 	struct net_buf *buf;
 	int ret;
 
@@ -1632,11 +1784,16 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	atomic_inc(&udc_dwc3_norm_done_count);
 
 	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
-	udc_dwc3_on_xfer_done(dev, ep_data);
 
 	/* For buffers coming from the host, update the size actually received */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
+		/*
+		 * Diagnostic A/B: fixed-size RAW OUT packets fill the whole buffer.
+		 * Avoid reading the hardware TRB writeback while UVC is active.
+		 */
+		buf->len = buf->size;
+	} else {
+		udc_dwc3_on_xfer_done(dev, ep_data);
 	}
 
 	ret = udc_submit_ep_event(dev, buf, 0);
@@ -1745,12 +1902,25 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
 	while (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0) {
+		if (!atomic_get(&udc_dwc3_event_buffer_read_enable)) {
+			sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+			udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
+			continue;
+		}
+
+		const uint32_t delay_us =
+			(uint32_t)atomic_get(&udc_dwc3_event_buffer_read_delay_us);
+
+		if (delay_us != 0U) {
+			k_busy_wait(delay_us);
+		}
+
 		const uint32_t evt = cfg->evt_buf[priv->evt_next];
 
 		atomic_inc(&udc_dwc3_evt_count);
 		udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
 
-		/* Move to next event entry for both hardware and software */
+		/* Event contents are hardware-owned; acknowledge through GEVNTCOUNT. */
 		sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
 		udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
 	}
