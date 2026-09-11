@@ -1962,7 +1962,8 @@ static inline uint32_t udc_dwc3_depcmd_epn(const uint32_t addr)
 }
 
 static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
-				      const uint32_t addr, uint32_t *const reg_out)
+				      const uint32_t addr, uint32_t *const reg_out,
+				      const bool spin_only)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -2002,7 +2003,7 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
 			return true;
 		}
 
-		if (i >= UDC_DWC3_CMD_SPIN_POLLS) {
+		if (i >= UDC_DWC3_CMD_SPIN_POLLS && !spin_only) {
 			k_yield();
 		}
 	}
@@ -2267,7 +2268,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	 * post-poll turns out to be the wrong trade.
 	 */
 #if 0
-	if (!first_on_ep && !udc_dwc3_wait_cmdact_zero(dev, addr, &reg)) {
+	if (!first_on_ep && !udc_dwc3_wait_cmdact_zero(dev, addr, &reg, false)) {
 		LOG_ERR("previous command still active on addr 0x%x (0x%08x) after %u ms, "
 			"not issuing command 0x%x, GEVNTCOUNT=%u bytes, DSTS=0x%08x (%s)",
 			addr, reg, UDC_DWC3_CMD_TIMEOUT_MS, cmd,
@@ -2455,8 +2456,29 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 		uint32_t done = 0;
 		bool finished;
 
+		/*
+		 * LATENCY-CRITICAL: the control pair, and only when the command
+		 * ARMS A TRANSFER.
+		 *
+		 * epn 0 and 1 are EP0-OUT and EP0-IN. Start Transfer and Update
+		 * Transfer on those are what re-arm a control stage, and the host
+		 * gives 125-136 us before its next SETUP - so those must never
+		 * hand the CPU away mid-sequence.
+		 *
+		 * Every other command on the same endpoints - Set Stall, Clear
+		 * Stall, DEPCFG, DEPXFERCFG, End Transfer, DEPGETSTATE - sits
+		 * outside that re-arm path: they run at configuration, teardown or
+		 * fault time, where nothing is waiting 125 us for them. They yield
+		 * like any data-endpoint command.
+		 */
+		const bool latency_critical =
+			(epn <= 1U) &&
+			(cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER ||
+			 cmdtyp == UDC_DWC3_DEPCMD_DEPUPDXFER);
+
 		priv->depcmd_no_sleep = true;
-		finished = udc_dwc3_wait_cmdact_zero(dev, addr, &done);
+		finished = udc_dwc3_wait_cmdact_zero(dev, addr, &done,
+						     latency_critical);
 		priv->depcmd_no_sleep = saved_no_sleep;
 
 		if (!finished) {
@@ -10454,7 +10476,7 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 
 		wait_priv->depcmd_no_sleep = true;
 		if (!udc_dwc3_wait_cmdact_zero(dev, UDC_DWC3_DEPCMD(ep_data->epn),
-					       &done)) {
+					       &done, false)) {
 			LOG_WRN("EP%02x End Transfer still active (0x%08x) when the ring "
 				"was released; buffers may still be referenced",
 				ep_cfg->addr, done);
