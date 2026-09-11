@@ -50,6 +50,9 @@ static atomic_t udc_dwc3_event_dispatch_enable = ATOMIC_INIT(1);
 static atomic_t udc_dwc3_event_dispatch_count;
 static atomic_t udc_dwc3_event_dispatch_skip_count;
 static atomic_t udc_dwc3_event_buffer_read_delay_us;
+/* Bit N set → skip DEPEVT for physical EP N (VIDIN=phy7, RAWOUT=phy2, …). */
+static atomic_t udc_dwc3_event_dispatch_skip_epn_mask;
+static atomic_t udc_dwc3_trb_status_read_enable = ATOMIC_INIT(1);
 
 void udc_dwc3_event_buffer_read_set(bool enable)
 {
@@ -59,6 +62,26 @@ void udc_dwc3_event_buffer_read_set(bool enable)
 void udc_dwc3_event_dispatch_set(bool enable)
 {
 	atomic_set(&udc_dwc3_event_dispatch_enable, enable ? 1 : 0);
+}
+
+void udc_dwc3_event_dispatch_skip_epn_set(uint32_t mask)
+{
+	atomic_set(&udc_dwc3_event_dispatch_skip_epn_mask, (atomic_val_t)mask);
+}
+
+uint32_t udc_dwc3_event_dispatch_skip_epn_get(void)
+{
+	return (uint32_t)atomic_get(&udc_dwc3_event_dispatch_skip_epn_mask);
+}
+
+void udc_dwc3_trb_status_read_set(bool enable)
+{
+	atomic_set(&udc_dwc3_trb_status_read_enable, enable ? 1 : 0);
+}
+
+bool udc_dwc3_trb_status_read_get(void)
+{
+	return atomic_get(&udc_dwc3_trb_status_read_enable) != 0;
 }
 
 void udc_dwc3_event_dispatch_stats(uint32_t *enabled, uint32_t *handled, uint32_t *skipped)
@@ -1834,9 +1857,10 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		 * Avoid reading the hardware TRB writeback while UVC is active.
 		 */
 		buf->len = buf->size;
-	} else {
+	} else if (atomic_get(&udc_dwc3_trb_status_read_enable)) {
 		udc_dwc3_on_xfer_done(dev, ep_data);
 	}
+	/* else: leave buf->len as-is; skip shared-USB-RAM TRB status read */
 
 	ret = udc_submit_ep_event(dev, buf, 0);
 	if (ret != 0) {
@@ -1961,8 +1985,24 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 
 		atomic_inc(&udc_dwc3_evt_count);
 		if (atomic_get(&udc_dwc3_event_dispatch_enable)) {
-			atomic_inc(&udc_dwc3_event_dispatch_count);
-			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+			const uint32_t masked = evt & UDC_DWC3_EVT_MASK;
+			const uint32_t skip_mask =
+				(uint32_t)atomic_get(&udc_dwc3_event_dispatch_skip_epn_mask);
+			bool skip_ep = false;
+
+			/* DEPEVT: bit0 clear. DEVT: bit0 set — never skip by EPN. */
+			if ((skip_mask != 0U) && ((masked & BIT(0)) == 0U)) {
+				const uint32_t epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, masked);
+
+				skip_ep = (epn < 32U) && ((skip_mask & BIT(epn)) != 0U);
+			}
+
+			if (skip_ep) {
+				atomic_inc(&udc_dwc3_event_dispatch_skip_count);
+			} else {
+				atomic_inc(&udc_dwc3_event_dispatch_count);
+				udc_dwc3_handle_event(dev, masked);
+			}
 		} else {
 			atomic_inc(&udc_dwc3_event_dispatch_skip_count);
 		}
