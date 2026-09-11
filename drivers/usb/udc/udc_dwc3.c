@@ -47,6 +47,8 @@ static atomic_t udc_dwc3_trb_bulk_last_slot;
 static atomic_t udc_dwc3_trb_bulk_last_mismatch;
 static atomic_t udc_dwc3_event_buffer_read_enable = ATOMIC_INIT(1);
 static atomic_t udc_dwc3_event_dispatch_enable = ATOMIC_INIT(1);
+static atomic_t udc_dwc3_event_dispatch_count;
+static atomic_t udc_dwc3_event_dispatch_skip_count;
 static atomic_t udc_dwc3_event_buffer_read_delay_us;
 
 void udc_dwc3_event_buffer_read_set(bool enable)
@@ -57,6 +59,30 @@ void udc_dwc3_event_buffer_read_set(bool enable)
 void udc_dwc3_event_dispatch_set(bool enable)
 {
 	atomic_set(&udc_dwc3_event_dispatch_enable, enable ? 1 : 0);
+}
+
+void udc_dwc3_event_dispatch_stats(uint32_t *enabled, uint32_t *handled, uint32_t *skipped)
+{
+	if (enabled != NULL) {
+		*enabled = (uint32_t)atomic_get(&udc_dwc3_event_dispatch_enable);
+	}
+	if (handled != NULL) {
+		*handled = (uint32_t)atomic_get(&udc_dwc3_event_dispatch_count);
+	}
+	if (skipped != NULL) {
+		*skipped = (uint32_t)atomic_get(&udc_dwc3_event_dispatch_skip_count);
+	}
+}
+
+/*
+ * Stub for UVCM against this isolated probe tree. Deferred StartXfer is off
+ * here, so enable already StartXferts the video EP; the caller needs a symbol.
+ */
+int lattice_usb23_ensure_start_xfer(const struct device *dev, uint8_t ep_addr)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(ep_addr);
+	return 0;
 }
 
 void udc_dwc3_event_buffer_read_delay_set(uint32_t delay_us)
@@ -1935,7 +1961,10 @@ static void udc_dwc3_event_worker(struct k_work *const work)
 
 		atomic_inc(&udc_dwc3_evt_count);
 		if (atomic_get(&udc_dwc3_event_dispatch_enable)) {
+			atomic_inc(&udc_dwc3_event_dispatch_count);
 			udc_dwc3_handle_event(dev, evt & UDC_DWC3_EVT_MASK);
+		} else {
+			atomic_inc(&udc_dwc3_event_dispatch_skip_count);
 		}
 
 		/* Event contents are hardware-owned; acknowledge through GEVNTCOUNT. */

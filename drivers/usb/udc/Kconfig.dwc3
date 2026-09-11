@@ -33,6 +33,13 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
+config UDC_DWC3_DEFER_START_XFER
+	bool "Defer non-control Start Transfer until first buffer"
+	default n
+	help
+	  Compatibility symbol for an independent endpoint-lifecycle experiment.
+	  This isolated event-dispatch probe leaves it disabled.
+
 config UDC_DWC3_HEALTH_LOG
 	bool "Periodic USB health / buffer-leak logging"
 	select NET_BUF_POOL_USAGE
