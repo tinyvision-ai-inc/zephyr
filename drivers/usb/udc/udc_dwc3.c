@@ -299,6 +299,18 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_TRB_NUM >= 2,
  */
 #define UDC_DWC3_HEARTBEAT_MS					200u
 
+/*
+ * Beats between CORE debug-register samples (25 x 200 ms = 5 s).
+ *
+ * These registers were previously read ONLY inside the wedge dump, so 163
+ * captures existed with no healthy value to compare them against - which is
+ * how GDBGFIFOSPACE's DESCFETQ/WREVENTQ were misread as "full" when they are
+ * simply always zero. A bounded periodic sample builds that baseline: ~110
+ * healthy points in a 10-minute run, at 0.2 lines/s. Tighten it if the
+ * baseline turns out stable enough to want the transition pinned finer.
+ */
+#define UDC_DWC3_CORE_DBG_BEATS					25u
+
 
 /*
  * Kick the event handler if it has not COMPLETED a pass within this long while
@@ -368,7 +380,7 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_TRB_NUM >= 2,
  * How long a head slot must stay unreadable, with the ring full, before the
  * drain gives up on it and skips it.
  *
- * Comfortably past both UDC_DWC3_EVT_GAVEUP_RETRY_MS and
+ * Comfortably past both the drain's own retry window and
  * UDC_DWC3_EVT_IDLE_KICK_MS, so every cheaper remedy has been tried and has
  * failed before an event is deliberately discarded. Ordinary late writes never
  * come near this - they are resolved, or at least looked at again, in
@@ -432,11 +444,36 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_TRB_NUM >= 2,
  * Cumulative give-ups on ONE slot that prove it dead regardless of wall clock.
  *
  * The 1000 ms route below requires an UNINTERRUPTED run, which anything that
- * resets evt_gaveup_run can starve. 103 give-ups on a single slot is already
+ * resets drain.attempts can starve. 103 give-ups on a single slot is already
  * conclusive - the drain looked 103 times and the write never arrived - so this
  * gives the skip a second, reset-resistant path to the same conclusion.
  */
 #define UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS				64u
+
+/*
+ * FLOOR under every abort route. Nothing is discarded before this.
+ *
+ * The abort used to be evaluated once per 200 ms heartbeat; it is now evaluated
+ * on every give-up, which is the point of moving it into the drain - but it also
+ * made the look-ahead route reachable far earlier than it ever was in practice.
+ * Measured 2026-09-12 on rig-03: an abort at 87 ms / 11 give-ups during
+ * ENUMERATION, where every abort on record before it was 223-405 ms (n=25).
+ * The ring dump taken 2 s later shows what that cost:
+ *
+ *     RING: ... stalled slot 4
+ *     RING[00]: 0x20000000 0xffffffff 0xffffffff 0xffffffff
+ *
+ * a real event sitting at slot 0 with the drain parked on slot 4 - the read
+ * position ahead of the write position, permanently, because a credit was
+ * returned for an event that was never read. EP0 stopped answering, the host's
+ * UVC probe timed out (-110) and the video node never appeared.
+ *
+ * 200 ms sits below every abort that has ever fired and above the one that
+ * broke enumeration. It bounds how eager the new evaluation rate can be without
+ * giving back the improvement: a dead slot is still released in 200 ms rather
+ * than the ~1 s the heartbeat took.
+ */
+#define UDC_DWC3_EVT_DEAD_SLOT_MIN_MS				200u
 
 #define UDC_DWC3_EVT_DEAD_SLOT_MS				1000u
 
@@ -1320,6 +1357,58 @@ struct udc_dwc3_ep_data {
  *
  * Accessed via "udc_get_private(dev)".
  */
+/*
+ * What the event drain is doing right now.
+ *
+ * Replaces seven separate booleans that each described part of the same
+ * situation and were set and cleared in different functions. The bug that
+ * motivated this is in the history: evt_drain_gaveup was set on two paths, only
+ * one of which stamped a timestamp, so the age of a stall was read from an older
+ * stall's clock. Data that is valid in one situation cannot be read in another
+ * if the situations have names.
+ *
+ * ONLY udc_dwc3_evt_drain() and the functions it calls move this. Everything
+ * else - the heartbeat included - reads it and acts, and may not write it.
+ */
+enum udc_dwc3_drain_state {
+	UDC_DWC3_DRAIN_IDLE = 0,	/* controller owes nothing */
+	UDC_DWC3_DRAIN_RUNNING,		/* taking events */
+	UDC_DWC3_DRAIN_WAITING,		/* head slot empty, inside the budget */
+	UDC_DWC3_DRAIN_NUDGE,		/* still empty; a generic command is warranted */
+	UDC_DWC3_DRAIN_PARTIAL,		/* pass ended on a mid-pass empty slot */
+	/*
+	 * There is deliberately no STALLED. It would have meant "the budget
+	 * expired and something has yet to decide whether to abort" - and that
+	 * period stopped existing when the decision moved into the drain, which
+	 * makes it on the spot. A state nothing can distinguish is clutter.
+	 */
+};
+
+/*
+ * Drain-owned state. Every field is a 32-bit word with exactly one writer, so a
+ * reader on another thread can never see a half-written value - do NOT widen any
+ * of these to 64 bits, that guarantee is what makes the lockless read legal.
+ *
+ * slot/since/attempts/gc0/quiet/reported/counted describe one EPISODE and are
+ * meaningful only in WAITING, NUDGE and STALLED. They are set on entry to
+ * WAITING and are not to be read in any other state.
+ */
+struct udc_dwc3_drain {
+	uint32_t state;		/* enum udc_dwc3_drain_state */
+	uint32_t slot;		/* slot the episode is stuck on */
+	uint32_t since;		/* cycle stamp the episode opened */
+	uint32_t attempts;	/* consecutive give-ups on that slot */
+	uint32_t gc0;		/* GEVNTCOUNT when the episode opened */
+	uint32_t quiet;		/* nothing was printed inside this episode */
+	uint32_t counted;	/* this episode was already counted as missed */
+};
+
+/* Reset the whole drain state as one act - see the enum above. */
+static inline void udc_dwc3_drain_reset(struct udc_dwc3_drain *const d)
+{
+	*d = (struct udc_dwc3_drain){ .state = UDC_DWC3_DRAIN_IDLE };
+}
+
 struct udc_dwc3_data {
 	DEVICE_MMIO_NAMED_RAM(base);
 	/* Index within trb where to queue new TRBs */
@@ -1367,14 +1456,11 @@ struct udc_dwc3_data {
 	uint32_t ep_wedge_reports;	/* episodes reported this boot (capped) */
 	uint32_t ep_wedge_total;	/* episodes seen this boot */
 	bool ctrl_stall_captured;	/* a CTRLSTALL capture is waiting for its pair */
-	uint32_t evt_gaveup_slot;	/* slot the current give-up run is stuck on */
-	uint32_t evt_gaveup_run;		/* consecutive give-ups on that same slot */
-	uint32_t evt_gaveup_t0;		/* cycle stamp when the run started */
+	struct udc_dwc3_drain drain;	/* THE drain state - see the enum above */
 	uint32_t evt_gaveup_us_max;	/* worst UNINSTRUMENTED fill latency, us */
 	uint32_t evt_zero;		/* slots the CONTROLLER wrote as 0x00000000 */
 	uint32_t evt_missed;		/* give-up runs presumed a LOST write */
 	uint32_t evt_missed_frozen;	/* of those, with GEVNTCOUNT not moving */
-	uint32_t evt_gaveup_gc0;		/* GEVNTCOUNT when this run opened */
 	/*
 	 * Control handshake trace. Every control transfer with a data stage runs
 	 * SETUP-completes -> reported up -> stack enqueues the data buffer ->
@@ -1392,7 +1478,6 @@ struct udc_dwc3_data {
 	uint8_t  ctrl_enq_last;		/* setup|data|status of the last EP0 enqueue */
 	uint32_t evt_gaveup_gc0_max;	/* largest gc0 any run has opened with */
 	uint32_t evt_gaveup_multi;	/* runs opened owed MORE than one event */
-	bool evt_missed_counted;	/* this run already counted as missed */
 	uint32_t evt_force_t0;		/* cycle stamp of the last forced command */
 	uint32_t evt_worker_exit_t0;	/* cycle stamp when the worker last EXITED */
 	uint32_t evt_kick;		/* heartbeat had to restart a stopped drain */
@@ -1414,9 +1499,6 @@ struct udc_dwc3_data {
 	uint32_t evt_isr;		/* interrupt handler invocations */
 	uint32_t evt_worker_runs;	/* event worker passes entered */
 	uint32_t evt_skipped;		/* events discarded to free a full ring */
-	bool evt_worker_ran;		/* evt_worker_exit_t0 means something */
-	bool evt_force_ever;		/* evt_force_t0 means something */
-	bool evt_gaveup_quiet;		/* nothing was printed inside this run */
 	uint32_t evt_link_total;	/* USB/Link State Change events seen */
 	uint32_t evt_link_run;		/* consecutive events reporting the same state */
 	uint32_t evt_link_last;		/* that state, EvtInfo[3:0] */
@@ -1442,6 +1524,39 @@ struct udc_dwc3_data {
 	 */
 	struct k_timer heartbeat_timer;
 	struct k_work heartbeat_work;
+	/*
+	 * The nudge, moved off the heartbeat and onto a work item.
+	 *
+	 * Submitted by the drain on the edge into UDC_DWC3_DRAIN_NUDGE and run by
+	 * udc_dwc3_nudge_worker() on udc_get_work_q(). Two things made the old
+	 * arrangement - request a state, have the heartbeat notice it - not work:
+	 *
+	 *   - the request was not latched, so noticing it was a race. The drain
+	 *     re-enters at interrupt rate while a slot is stuck, and each entry
+	 *     rewrote the state, so NUDGE existed only between a pass ending and
+	 *     the next one starting. A 200 ms sampler saw it when it happened to.
+	 *   - the command was issued from a k_timer callback, which is the system
+	 *     clock ISR, and it could therefore land between the two register
+	 *     writes of a udc_dwc3_fifo_flush_tx() already in progress.
+	 *
+	 * An edge plus a work item fixes both: the request cannot be missed because
+	 * it is not sampled, and the command is issued in thread context where
+	 * dgcmd_lock can serialise it against the flush. Submitting an already
+	 * pending item is a no-op, so a stuck slot cannot make these pile up.
+	 */
+	struct k_work nudge_work;
+	/*
+	 * Serialises the DGCMDPAR/DGCMD pair, whose two writers are
+	 * udc_dwc3_fifo_flush_tx() on the drain thread and udc_dwc3_evt_force()
+	 * on udc_get_work_q().
+	 *
+	 * A spinlock and not the UDC mutex on purpose. The critical section is a
+	 * register read and two writes, so it must not be able to sleep; and taking
+	 * the UDC mutex here would put a work item that can block on a contended
+	 * lock onto the queue that also carries heartbeat_work, which is the
+	 * coupling that giving the drain its own thread exists to avoid.
+	 */
+	struct k_spinlock dgcmd_lock;
 	uint32_t dispatch_evt;		/* event being dispatched now, 0 = none */
 	uint32_t dispatch_t0;		/* cycle stamp when that dispatch began */
 	uint32_t hb_last_evt_handled;	/* evt_handled at the previous heartbeat */
@@ -1465,8 +1580,6 @@ struct udc_dwc3_data {
 	 */
 	uint32_t evt_copy[CONFIG_UDC_DWC3_EVENTS_NUM];
 	/* Set when a drain pass stopped on an empty slot rather than finishing. */
-	bool evt_drain_gaveup;
-	bool evt_drain_midzero;		/* pass ended on a mid-pass empty slot */
 	uint32_t evt_midzero;		/* how many passes ended that way */
 	/*
 	 * The stuck-control-claim detector.
@@ -1494,12 +1607,12 @@ struct udc_dwc3_data {
 	 */
 	uint32_t hb_last_handled;
 	uint32_t hb_drain_stuck_beats;
+	uint32_t core_dbg_beats;	/* beats since the last CORE debug sample */
 	uint32_t ctrl_quiet_t0;		/* cycle stamp of the last SETUP retired */
 	bool ctrl_quiet_logged;		/* this quiet period already reported */
 	uint32_t ctrl_unarmed;		/* EP0-OUT found with no armed TRB */
 	uint32_t ctrl_start_fail;	/* Start Transfer commands rejected */
 	bool ctrl_unarmed_seen;		/* seen on the previous beat too */
-	bool evt_gaveup_logged;		/* this run was reported, so report its recovery */
 	/*
 	 * NEVER SET - see udc_dwc3_recover().  This was meant to mean "recover()
 	 * has issued an End Transfer on a control endpoint and is waiting for its
@@ -4522,6 +4635,16 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
  * Runs with the UDC mutex held, from udc_dwc3_handle_event().
  */
 
+/* The CORE debug registers worth comparing healthy against wedged. */
+struct udc_dwc3_core_dbg {
+	uint32_t ltssm;
+	uint32_t bmu;
+	uint32_t lnmcc;
+	uint32_t lsp;
+	uint32_t epinfo0;
+	uint32_t epinfo1;
+};
+
 /*
  * Dump the controller's own view of itself.
  *
@@ -4533,13 +4656,58 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
  * GDBGBMU is the one that matters most: it is the bus master unit, and a core
  * reporting COREIDLE=0 with an armed TRB, data in the RxFIFO and no events
  * posted is either stuck in a DMA or waiting on something upstream of it.
- * GDBGFIFOSPACE walks every queue rather than the single RxFIFO the per-endpoint
- * dump reads, so a queue that has filled and stopped draining is visible here
- * and nowhere else.
+ *
+ * NOT purely passive: both the GDBGLSP mux and the GDBGFIFOSPACE queue selector
+ * are written before their value is read. Neither has a functional effect, but
+ * the claim above is no longer literally true.
+ *
+ * DESCFETQ, WREVENTQ and AUXEVENTQ were dropped from the queue walk on
+ * 2026-09-12. Across 163 captured dumps DESCFETQ and WREVENTQ read exactly 0
+ * every time while RXQ (512-517), RXINFOQ (23-26) and PSTATUSQ (14/16) all
+ * varied - they are not implemented on this core, and reading them as "queue
+ * full" was the basis of a wrong root-cause conclusion. AUXEVENTQ is worse than
+ * useless: its selector (type 8) does not stick, so the read returns TXQ's
+ * value under another name - all 163 dumps show it byte-identical to TXQ.
  */
+static void udc_dwc3_core_dbg_read(const mm_reg_t base,
+				   struct udc_dwc3_core_dbg *const s)
+{
+	/*
+	 * GDBGLSP is a muxed window, so select the source before reading it.
+	 * Every GDBGLSP value captured before this was taken with the mux left at
+	 * whatever reset selected, which is why those 25 distinct values describe
+	 * an unknown block and mean nothing.
+	 *
+	 * 0 is chosen deliberately: the device-mode field layout is undocumented
+	 * in both vendor trees in this workspace (only GDBGLSPMUX_HST is -
+	 * HOSTSELECT [13:0], logic-analyzer trace [23:16]), and 0 is the one value
+	 * that is unambiguous under any layout and leaves the trace off. It makes
+	 * the reading DETERMINISTIC, not yet interpretable; do not decode GDBGLSP
+	 * until the device-mode selector encoding is confirmed against the
+	 * databook.
+	 */
+	sys_write32(0U, base + UDC_DWC3_GDBGLSPMUX_DEV);
+
+	s->ltssm   = sys_read32(base + UDC_DWC3_GDBGLTSSM);
+	s->bmu     = sys_read32(base + UDC_DWC3_GDBGBMU);
+	s->lnmcc   = sys_read32(base + UDC_DWC3_GDBGLNMCC);
+	s->lsp     = sys_read32(base + UDC_DWC3_GDBGLSP);
+	s->epinfo0 = sys_read32(base + UDC_DWC3_GDBGEPINFO0);
+	s->epinfo1 = sys_read32(base + UDC_DWC3_GDBGEPINFO1);
+}
+
+static void udc_dwc3_core_dbg_log(const char *const tag,
+				  const struct udc_dwc3_core_dbg *const s)
+{
+	LOG_INF("  CORE%s: GDBGLTSSM=0x%08x GDBGBMU=0x%08x GDBGLNMCC=0x%08x "
+		"GDBGLSP=0x%08x GDBGEPINFO=0x%08x_%08x",
+		tag, s->ltssm, s->bmu, s->lnmcc, s->lsp, s->epinfo1, s->epinfo0);
+}
+
 static void udc_dwc3_core_state_dump(const struct device *const dev)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	struct udc_dwc3_core_dbg dbg;
 	static const struct {
 		const char *name;
 		uint32_t sel;
@@ -4550,20 +4718,10 @@ static void udc_dwc3_core_state_dump(const struct device *const dev)
 		{ "RXREQQ",   UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXREQQ },
 		{ "RXINFOQ",  UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXINFOQ },
 		{ "PSTATUSQ", UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_PROTOCOLSTATUSQ },
-		{ "DESCFETQ", UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCHQ },
-		{ "WREVENTQ", UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_WREVENTQ },
-		{ "AUXEVENTQ", UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_AUXEVENTQ },
 	};
 
-	LOG_INF("  CORE: GDBGLTSSM=0x%08x GDBGBMU=0x%08x GDBGLNMCC=0x%08x "
-		"GDBGLSP=0x%08x",
-		sys_read32(base + UDC_DWC3_GDBGLTSSM),
-		sys_read32(base + UDC_DWC3_GDBGBMU),
-		sys_read32(base + UDC_DWC3_GDBGLNMCC),
-		sys_read32(base + UDC_DWC3_GDBGLSP));
-	LOG_INF("  CORE: GDBGEPINFO=0x%08x_%08x",
-		sys_read32(base + UDC_DWC3_GDBGEPINFO1),
-		sys_read32(base + UDC_DWC3_GDBGEPINFO0));
+	udc_dwc3_core_dbg_read(base, &dbg);
+	udc_dwc3_core_dbg_log("", &dbg);
 
 	for (uint32_t i = 0; i < ARRAY_SIZE(queues); i++) {
 		uint32_t r = queues[i].sel;
@@ -5267,11 +5425,10 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 * or an age that no longer refers to anything.
 	 */
 	priv->evt_next = 0;
-	priv->evt_gaveup_run = 0;
-	priv->evt_gaveup_slot = 0;
-	priv->evt_gaveup_logged = false;
-	priv->evt_drain_gaveup = false;
-	priv->evt_drain_midzero = false;
+	udc_dwc3_drain_reset(&priv->drain);
+	/* Both stamps are valid from here, so no "is it meaningful yet" flags. */
+	priv->evt_worker_exit_t0 = k_cycle_get_32();
+	priv->evt_force_t0 = k_cycle_get_32();
 	/*
 	 * Prime every slot before the controller is told where the buffer is.
 	 *
@@ -6064,7 +6221,9 @@ static bool udc_dwc3_dgcmd_wait_idle(const mm_reg_t base)
 
 static void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t fifo)
 {
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	k_spinlock_key_t key;
 
 	if (!udc_dwc3_dgcmd_wait_idle(base)) {
 		LOG_ERR_RATELIMIT("a generic command stayed active for %u us; TxFIFO "
@@ -6072,11 +6231,33 @@ static void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t
 		return;
 	}
 
+	/*
+	 * The parameter and the command are ONE act and are locked as one.
+	 *
+	 * This runs on the drain thread - udc_dwc3_ctrl_abandon() is reached from
+	 * udc_dwc3_on_ctrl_in()/_out(), which udc_dwc3_handle_event() calls inline
+	 * during dispatch - while udc_dwc3_evt_force() writes the same two
+	 * registers from udc_get_work_q(). Unlocked, a force landing between these
+	 * two writes overwrites DGCMDPAR with 0, so the flush below is issued
+	 * against TxFIFO 0 instead of this endpoint's, and it is issued while the
+	 * force's CMDACT is still set - writing over an active generic command,
+	 * which the databook does not define.
+	 *
+	 * The wait_idle() above is deliberately left OUTSIDE: it can spin for
+	 * UDC_DWC3_DGCMD_POLL_MAX microseconds and nothing that long belongs in a
+	 * spinlock. Its result can go stale between the poll and the lock, but only
+	 * by the other writer starting a command - and that writer is excluded from
+	 * here on, so the window closes at the only place it could be used.
+	 */
+	key = k_spin_lock(&priv->dgcmd_lock);
+
 	sys_write32(UDC_DWC3_DGCMD_FIFOFLUSH_TX |
 		    FIELD_PREP(UDC_DWC3_DGCMD_FIFOFLUSH_NUM_MASK, fifo),
 		    base + UDC_DWC3_DGCMDPAR);
 	sys_write32(UDC_DWC3_DGCMD_FIFOFLUSHONE | UDC_DWC3_DGCMD_ACT,
 		    base + UDC_DWC3_DGCMD);
+
+	k_spin_unlock(&priv->dgcmd_lock, key);
 
 	/*
 	 * Wait for it. The next control stage is armed immediately after this
@@ -7452,19 +7633,27 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
  * The drain is submitted BEFORE the housekeeping, so on a shared FIFO queue
  * it also runs first - draining outranks reporting on it.
  */
+static const char *udc_dwc3_drain_state_name(const uint32_t state)
+{
+	switch (state) {
+	case UDC_DWC3_DRAIN_IDLE:	return "idle";
+	case UDC_DWC3_DRAIN_RUNNING:	return "running";
+	case UDC_DWC3_DRAIN_WAITING:	return "waiting";
+	case UDC_DWC3_DRAIN_NUDGE:	return "nudge";
+	case UDC_DWC3_DRAIN_PARTIAL:	return "partial";
+	default:			return "?";
+	}
+}
+
+static void udc_dwc3_drain_helper(const struct device *const dev);
+
 static void udc_dwc3_heartbeat_expiry(struct k_timer *const timer)
 {
 	struct udc_dwc3_data *const priv =
 		CONTAINER_OF(timer, struct udc_dwc3_data, heartbeat_timer);
 	const struct device *const dev = priv->dev;
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-	if (udc_dwc3_gevntcount(base) > 0U && priv->evt_worker_ran &&
-	    k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_worker_exit_t0) >=
-					UDC_DWC3_EVT_IDLE_KICK_MS) {
-		priv->evt_kick++;
-		k_sem_give(&priv->evt_sem);
-	}
+	udc_dwc3_drain_helper(dev);
 
 	k_work_submit_to_queue(udc_get_work_q(), &priv->heartbeat_work);
 }
@@ -7903,7 +8092,8 @@ static void udc_dwc3_wedge_core_dump(const struct device *const dev,
 
 	LOG_INF("  WEVT: handled %u late %u (worst %u polls/%u us) gaveup %u "
 		"(worst empty %u us) isr %u runs %u rearm %u kick %u skip %u "
-		"zero %u missed %u/%u midzero %u gc_hwm %u B gc0max %u B multi %u",
+		"zero %u missed %u/%u midzero %u gc_hwm %u B gc0max %u B multi %u "
+		"| drain %s slot %u attempts %u",
 		priv->evt_handled, priv->evt_late,
 		priv->evt_late_polls_max, priv->evt_late_us_max,
 		priv->evt_gaveup, priv->evt_gaveup_us_max,
@@ -7911,7 +8101,9 @@ static void udc_dwc3_wedge_core_dump(const struct device *const dev,
 		priv->evt_kick, priv->evt_skipped,
 		priv->evt_zero, priv->evt_missed, priv->evt_missed_frozen,
 		priv->evt_midzero, priv->evt_gevntcount_hwm, priv->evt_gaveup_gc0_max,
-		priv->evt_gaveup_multi);
+		priv->evt_gaveup_multi,
+		udc_dwc3_drain_state_name(priv->drain.state),
+		priv->drain.slot, priv->drain.attempts);
 
 	LOG_INF("  WDEV: DSTS=0x%08x (%s) DCTL=0x%08x DCFG=0x%08x DALEPENA=0x%08x",
 		dsts, udc_dwc3_get_devt_ulstchng_name(dsts),
@@ -8124,14 +8316,13 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	/*
 	 * How long the drain has been parked on the same empty slot, or 0 when it
 	 * is not parked at all. Only meaningful while a run is active: without one
-	 * evt_gaveup_t0 belongs to some older run.
+	 * drain.since belongs to some older episode.
 	 */
-	const uint32_t gaveup_ms = priv->evt_gaveup_run > 0U
-		? k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_gaveup_t0)
+	const uint32_t gaveup_ms = priv->drain.attempts > 0U
+		? k_cyc_to_ms_near32(k_cycle_get_32() - priv->drain.since)
 		: 0U;
-	const uint32_t idle_ms = priv->evt_worker_ran
-		? k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_worker_exit_t0)
-		: 0U;
+	const uint32_t idle_ms =
+		k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_worker_exit_t0);
 	bool drain_stuck;
 
 	if (gc > 0U && priv->evt_handled == priv->hb_last_handled) {
@@ -8166,7 +8357,21 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 			sys_read32(base + UDC_DWC3_GCTL));
 	}
 
+	/*
+	 * CORE debug baseline.
+	 *
+	 * Sampled unconditionally rather than on change: the point is to learn
+	 * what these registers look like while nothing is wrong, and a periodic
+	 * sample bounds the log cost regardless of how fast they move. Compare a
+	 * wedge dump against these lines - alone, a wedge value says nothing.
+	 */
+	if (++priv->core_dbg_beats >= UDC_DWC3_CORE_DBG_BEATS) {
+		struct udc_dwc3_core_dbg dbg;
 
+		priv->core_dbg_beats = 0U;
+		udc_dwc3_core_dbg_read(base, &dbg);
+		udc_dwc3_core_dbg_log(" hb", &dbg);
+	}
 
 	/*
 	 * Kick a handler that has stopped being scheduled.
@@ -8273,7 +8478,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		/*
 		 * Re-arm the detector, or it re-enters on every following beat.
 		 *
-		 * evt_gaveup_run and evt_gaveup_t0 are DELIBERATELY left alone. They
+		 * drain.attempts and drain.since are DELIBERATELY left alone. They
 		 * belong to the drain and are the proof udc_dwc3_evt_skip_dead_slot()
 		 * needs; the slot is still dead after this returns, so discarding that
 		 * evidence is what stopped the skip ever maturing - 460 ms was the
@@ -8505,8 +8710,28 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 				udc_dwc3_get_event_name(d_evt,
 					sys_read32(base + UDC_DWC3_DSTS)), d_evt);
 		}
-	} else if (gc > 0U && (gaveup_ms >= UDC_DWC3_EVT_GAVEUP_AGE_MS ||
+	} else if (gc > 0U && priv->drain.state != UDC_DWC3_DRAIN_WAITING &&
+		   (gaveup_ms >= UDC_DWC3_EVT_GAVEUP_AGE_MS ||
 				priv->evt_handled == priv->hb_last_evt_handled)) {
+		/*
+		 * NOT WHILE THE DRAIN IS INSIDE A WAIT. Both reports below describe a
+		 * drain that has stopped - "IDLE" says the worker never ran, "NOT
+		 * ADVANCING" says it is parked - and neither is true of a thread that
+		 * is deliberately asleep between two looks at the slot.
+		 *
+		 * This could not happen while a whole wait was 64 us of spinning. The
+		 * slow phase in udc_dwc3_evt_wait_first() makes a wait last up to
+		 * UDC_DWC3_EVT_ARRIVE_MAX_MS, which is long enough for a beat to land
+		 * in the middle of one, and the first give-up of a run has attempts ==
+		 * 0 - so it would have taken the "drain IDLE %u ms with no stall run"
+		 * branch and reported a drain that was doing exactly what it was
+		 * designed to do. A diagnostic that fires on correct behaviour is
+		 * worse than no diagnostic, because it is read back later as evidence.
+		 *
+		 * The wait is bounded, so nothing can hide behind this: a genuinely
+		 * stuck drain leaves WAITING within UDC_DWC3_EVT_ARRIVE_MAX_MS and the
+		 * next beat reports it.
+		 */
 		/*
 		 * Two different ways the ring stops being drained, and it takes both
 		 * tests to see them.
@@ -8540,12 +8765,13 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 */
 		/*
 		 * How LONG the slot has been empty is what settles it, not how many
-		 * times we looked. One give-up spans 64 polls, about 64 microseconds -
-		 * far too short to call a write lost rather than merely slow. A slot
-		 * still empty seconds later, across repeated give-ups, is not slow.
+		 * times we looked. One give-up spans a 64-poll microsecond phase and
+		 * then up to UDC_DWC3_EVT_ARRIVE_MAX_MS of timed sleeps - still far too
+		 * short to call a write lost rather than merely slow. A slot still
+		 * empty seconds later, across repeated give-ups, is not slow.
 		 *
 		 * Only meaningful while a give-up run is active: without one the drain has
-		 * not looked at this slot at all, and evt_gaveup_t0 belongs to some older
+		 * not looked at this slot at all, and drain.since belongs to some older
 		 * run, so it is reported as unchecked instead of as an age.
 		 */
 		/*
@@ -8556,89 +8782,24 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * line came to claim "none consumed" on runs where events were
 		 * flowing, and the claim was then read back as evidence.
 		 */
-		if (priv->evt_gaveup_run > 0U) {
+		if (priv->drain.attempts > 0U) {
 			LOG_ERR_RATELIMIT("%u B pending, drain NOT ADVANCING on slot %u for "
 				"%u ms over %u give-ups (handled %s since last "
 				"beat): slot holds 0x%08x, DSTS=0x%08x",
-				gc, priv->evt_next, gaveup_ms, priv->evt_gaveup_run,
+				gc, priv->evt_next, gaveup_ms, priv->drain.attempts,
 				priv->evt_handled == priv->hb_last_evt_handled ?
 					"nothing" : "events",
 				cfg->evt_buf[priv->evt_next],
 				sys_read32(base + UDC_DWC3_DSTS));
 
 			/*
-			 * Decide here whether the slot is dead, not in the drain.
-			 *
-			 * The condition is the RUN, not the level of gc: the same
-			 * slot has read the free marker across evt_gaveup_run
-			 * re-entries while gc stayed above zero, for longer than
-			 * any write has ever taken to arrive. Every term is
-			 * re-read on this beat, so a transient seen once in the
-			 * drain cannot reach the action - the observation and the
-			 * decision are separated in time on purpose.
+			 * REPORTING ONLY from here. The decision and the action
+			 * moved to udc_dwc3_drain_slot_is_dead(), called by the
+			 * drain, because acting meant writing priv->evt_next from
+			 * this thread while the drain thread was writing it too.
+			 * The heartbeat's whole remaining job on the event ring is
+			 * udc_dwc3_drain_helper(), which only reads.
 			 */
-			/*
-			 * Two ways to reach the action. The timeout is unchanged
-			 * and remains the only route when nothing downstream is
-			 * valid. The look-ahead is a proof, not a guess, so it
-			 * needs only enough of a run to exclude a transient -
-			 * and it is what stops one lost write from parking the
-			 * ring, and every endpoint on it, for a full second.
-			 */
-			const bool lost_by_lookahead =
-				gaveup_ms >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS &&
-				udc_dwc3_evt_lookahead_lost(dev, gc);
-
-			/*
-			 * A third route, immune to anything that resets the
-			 * wall-clock run: enough give-ups on this one slot.
-			 * 2026-09-11 saw 103 on a single slot while the clock
-			 * never passed 460 ms, because the control-claim
-			 * recovery kept restarting it. The drain looked 103
-			 * times and the write never came; that is the same
-			 * conclusion the timeout reaches, by counting instead
-			 * of timing.
-			 */
-			const bool lost_by_count =
-				priv->evt_gaveup_run >= UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS;
-
-			if (gc >= sizeof(uint32_t) &&
-			    (gaveup_ms >= UDC_DWC3_EVT_DEAD_SLOT_MS ||
-			     lost_by_lookahead || lost_by_count) &&
-			    cfg->evt_buf[priv->evt_next] ==
-					UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
-				const bool frozen = (gc == priv->evt_gaveup_gc0);
-
-				if (lost_by_lookahead &&
-				    gaveup_ms < UDC_DWC3_EVT_DEAD_SLOT_MS) {
-					priv->evt_lookahead_short++;
-					LOG_WRN("slot %u empty %u ms but a later "
-						"slot holds a real event: write "
-						"lost, not late - releasing now "
-						"instead of waiting %u ms (%u so "
-						"far)", priv->evt_next, gaveup_ms,
-						UDC_DWC3_EVT_DEAD_SLOT_MS,
-						priv->evt_lookahead_short);
-				}
-
-#ifdef UDC_DWC3_EVT_DEAD_SLOT_RECOVER
-				(void)udc_dwc3_evt_skip_dead_slot(dev, gc, frozen,
-								  gaveup_ms);
-#else
-				/*
-				 * Diagnostic build: describe it and leave the
-				 * ring, GEVNTCOUNT and the controller exactly as
-				 * the fault left them, so it stays reproducible.
-				 */
-				LOG_ERR("slot %u is dead (%u ms, %u give-ups, "
-					"gc %u B, %s) - NOT recovering, this "
-					"build preserves the fault",
-					priv->evt_next, gaveup_ms,
-					priv->evt_gaveup_run, gc,
-					frozen ? "GEVNTCOUNT frozen"
-					       : "GEVNTCOUNT advancing");
-#endif
-			}
 		} else {
 			/*
 			 * idle_ms, not the threshold. Printing the constant made every
@@ -8707,7 +8868,26 @@ static void udc_dwc3_setup_stuck_reset(const struct device *const dev)
 	 */
 	udc_lock_internal(dev, K_FOREVER);
 
+	/*
+	 * The ring position and the drain state are reset together - they describe
+	 * the same thing and must not survive one another. This is the one place
+	 * outside the drain that writes either, and it is a teardown: the IRQ is
+	 * masked and the core is stopped immediately below, so there is no pass in
+	 * flight to race. Steady-state writes belong to the drain alone.
+	 */
 	priv->evt_next = 0;
+	udc_dwc3_drain_reset(&priv->drain);
+
+	/*
+	 * Withdraw the nudge with the state that asked for it. A request submitted
+	 * before this point would otherwise run after the core soft reset below and
+	 * write DGCMD on a controller that is mid-reset. Non-blocking, and it does
+	 * not have to succeed: an item already executing will find CMDACT or the
+	 * event count telling it to do nothing, and SET_PERIODIC_PARAMS is the one
+	 * generic command the controller does not act on in any case.
+	 */
+	(void)k_work_cancel(&priv->nudge_work);
+
 	udc_dwc3_disable(dev);
 
 	/*
@@ -9191,11 +9371,66 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  *
  * A poll count cannot be fooled that way. 64 looks is 64 real observations of the
  * slot however the scheduler behaves, so "still zero" now means it. waited_us is
- * still reported next to it: far above the poll count says we were preempted
+ * still reported next to it: far above the poll count says we were off the CPU
  * between looks, which changes how much time the word actually had but no longer
  * changes whether we looked.
+ *
+ * That gap is now expected rather than exceptional, because the wait yields to
+ * cdc and usbd past UDC_DWC3_EVT_ARRIVE_SPIN_POLLS instead of spinning through
+ * the whole budget. waited_us therefore measures the interval the word was given
+ * and polls measures the diligence it was given it with, and the two are meant
+ * to be read together - which is the arrangement this paragraph asked for.
  */
-#define UDC_DWC3_EVT_ARRIVE_MAX_POLLS 64u
+#define UDC_DWC3_EVT_ARRIVE_FAST_POLLS 64u
+/*
+ * Wall-clock ceiling on the same wait, applied ALONGSIDE the poll count rather
+ * than instead of it.
+ *
+ * The poll count is the primary bound and the paragraph above is why: it counts
+ * real observations of the slot, so a preempted loop still looks the number of
+ * times it promised to. What it cannot bound is how long those looks take. 64
+ * polls of UDC_DWC3_EVT_ARRIVE_POLL_US is ~64 us of intended wait, but the
+ * interval is only as short as the scheduler allows - the capture that retired
+ * the old deadline measured 38 polls across 3384 us, 89 us of wall clock per
+ * look. Nothing in the loop noticed, because nothing in the loop asked.
+ *
+ * This is the backstop for that: 64 ms is three orders of magnitude above the
+ * intended wait, so it cannot fire on a merely slow poll, and it is 78x inside
+ * the host's 5 s control timeout, so a slot that somehow held this thread for
+ * that long is released while the host is still waiting. Reaching it means the
+ * loop was preempted for essentially its whole duration, which is a fault in its
+ * own right - and the give-up path below reports the poll count and waited_us
+ * side by side, so the two can be told apart afterwards.
+ *
+ * Evaluated against a cycle deadline computed once, with a signed comparison so
+ * the 32-bit cycle counter may wrap inside the loop. A k_cyc_to_ms_near32() per
+ * poll would put a division on a 1 us path.
+ */
+#define UDC_DWC3_EVT_ARRIVE_MAX_MS 64u
+/*
+ * The slow phase: how long each timeout-based yield lasts, and how many of them.
+ *
+ * UDC_DWC3_EVT_SLOW_POLL_US is ONE SYSTEM TICK. CONFIG_SYS_CLOCK_TICKS_PER_SEC
+ * is 1000 with CONFIG_TICKLESS_KERNEL off, so 1000 us is the shortest interval
+ * k_sleep() can actually express - a smaller argument rounds up to this and
+ * would only misdescribe what the code does. udc_dwc3_depcmd() uses the same
+ * figure for its own slow phase (UDC_DWC3_CMD_SLOW_POLL_US).
+ *
+ * SLOW_POLLS is set so the phase lands inside UDC_DWC3_EVT_ARRIVE_MAX_MS with
+ * room for the rounding-up: 48 sleeps of a tick is ~48 ms against a 64 ms
+ * ceiling. The ceiling stays the authority - it is checked every turn - and
+ * this count is what makes the ordinary case terminate on a stated number of
+ * looks rather than on the clock.
+ *
+ * Together the two phases bound one wait at ~48 ms, against the 64 us it was
+ * when the whole thing spun. That is the point: a give-up run now costs tens of
+ * milliseconds of WAITING instead of tens of microseconds of BURNING, the
+ * give-up rate falls from the ~650/s a capture measured to ~20/s, and
+ * UDC_DWC3_EVT_DEAD_SLOT_MS still abandons the slot at 1000 ms - about 21
+ * give-ups in, comfortably clear of UDC_DWC3_EVT_DEAD_SLOT_MIN_MS.
+ */
+#define UDC_DWC3_EVT_SLOW_POLL_US 1000u
+#define UDC_DWC3_EVT_ARRIVE_SLOW_POLLS 48u
 /*
  * Generic command used ONLY to make the controller write an event, when the slot
  * the drain is waiting on will not fill on its own.
@@ -9248,24 +9483,13 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
 #define UDC_DWC3_EVT_FORCE_MIN_GAP_MS				500u
 
 /*
- * How long a stalled drain keeps re-submitting itself before handing the slot
- * to the heartbeat.
- *
- * A stalled pass used to resubmit nothing at all, on the reasoning that the
- * interrupt is level-sensitive on GEVNTCOUNT and would re-enter the worker by
- * itself. A capture shows that failing: two heartbeat reports caught the head
- * slot HOLDING a valid event, with the give-up run at one give-up and 1.7-2.0
- * seconds old, GEVNTCOUNT at 64 B - a completely full ring - and evt_rearm
- * frozen at 283 for the whole run. The event had arrived and nothing looked at
- * it until the 1 Hz heartbeat. A full ring stops the USB, so that second is
- * not free.
- *
- * Bounded rather than unconditional because each retry costs a 400 us poll,
- * and retrying forever would hold the work queue against the USBD thread and
- * the heartbeat itself. 100 ms covers anything that is merely late and leaves
- * the genuinely stuck case to the slower path that is designed for it.
+ * UDC_DWC3_EVT_GAVEUP_RETRY_MS is gone with the block that used it. A stalled
+ * pass no longer re-submits itself for a bounded window: the drain never arms
+ * itself at all, and re-entry is udc_dwc3_drain_helper()'s decision on the next
+ * heartbeat. The capture that justified the old window - a full ring sitting
+ * 1.7-2.0 s with a valid event in the head slot and nothing looking at it -
+ * is still the reason the helper kicks unconditionally on GEVNTCOUNT.
  */
-#define UDC_DWC3_EVT_GAVEUP_RETRY_MS				100u
 #define UDC_DWC3_EVT_ARRIVE_POLL_US 1u
 #define UDC_DWC3_EVT_GAVEUP_LOG_EVERY 1021u
 /*
@@ -9293,6 +9517,7 @@ static void udc_dwc3_evt_force(const struct device *const dev)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	k_spinlock_key_t key;
 
 	/*
 	 * Only while the ring still has room. Every forced command lands an event
@@ -9314,6 +9539,11 @@ static void udc_dwc3_evt_force(const struct device *const dev)
 	 * is not the place to find out - forces are milliseconds apart and a generic
 	 * command retires in microseconds, so this should never be taken.
 	 *
+	 * Read INSIDE dgcmd_lock, because the answer is only worth having if the
+	 * other writer cannot act on it between the read and the write that depends
+	 * on it. See the lock's declaration: udc_dwc3_fifo_flush_tx() issues the
+	 * same pair from the drain thread.
+	 *
 	 * Deliberately does NOT save/clear/restore GUSB2PHYCFG the way udc_dwc3_depcmd()
 	 * does.  The requirement it serves is scoped to DCFG.DevSpd 2.0-only mode during
 	 * Disconnect handling; this controller enumerates at SuperSpeed and this is not
@@ -9323,7 +9553,10 @@ static void udc_dwc3_evt_force(const struct device *const dev)
 	 * remove a hazard this core does not have.  GUSB2PHYCFGn is also on the CSftRst
 	 * exception list, so a reset did not disturb it.
 	 */
+	key = k_spin_lock(&priv->dgcmd_lock);
+
 	if (sys_read32(base + UDC_DWC3_DGCMD) & UDC_DWC3_DGCMD_ACT) {
+		k_spin_unlock(&priv->dgcmd_lock, key);
 		return;
 	}
 
@@ -9331,8 +9564,100 @@ static void udc_dwc3_evt_force(const struct device *const dev)
 	sys_write32(UDC_DWC3_DGCMD_SET_PERIODIC_PARAMS | UDC_DWC3_DGCMD_IOC |
 		    UDC_DWC3_DGCMD_ACT, base + UDC_DWC3_DGCMD);
 
+	k_spin_unlock(&priv->dgcmd_lock, key);
+
+	/*
+	 * OUTSIDE the lock. CONFIG_LOG_MODE_MINIMAL is what the FLIR application
+	 * builds with, and that backend formats and writes to the UART in the
+	 * caller's context - this line is ~45 characters, about 3.9 ms at 115200.
+	 * Holding a spinlock across that would mask interrupts for the duration;
+	 * it used to run in the timer ISR, which was worse.
+	 */
 	LOG_WRN_RATELIMIT("forced a generic command to unstick slot %u",
 			  priv->evt_next);
+}
+
+/*
+ * Issue the nudge the drain asked for, in thread context.
+ *
+ * Owns the rate limit and evt_force_t0 outright: the drain decides THAT a nudge
+ * is wanted and this decides whether one is due, so neither field is written
+ * from two places. The gate has to live on this side of the submit anyway - the
+ * drain's edge fires once per give-up run, and the limit exists to bound the
+ * rate across runs, which is a question only the issuer can answer.
+ */
+static void udc_dwc3_nudge_worker(struct k_work *const work)
+{
+	struct udc_dwc3_data *const priv =
+		CONTAINER_OF(work, struct udc_dwc3_data, nudge_work);
+	const struct device *const dev = priv->dev;
+
+	if (k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_force_t0) <
+					UDC_DWC3_EVT_FORCE_MIN_GAP_MS) {
+		return;
+	}
+
+	udc_dwc3_evt_force(dev);
+	priv->evt_force_t0 = k_cycle_get_32();
+}
+
+/*
+ * The heartbeat's ENTIRE involvement with the event ring: restart a drain that
+ * has stopped while the controller still owes events. That is all that is left
+ * here, and it is all that was ever safe to do from this context.
+ *
+ * The nudge used to be the other half. It is gone - the drain submits
+ * nudge_work on the edge into UDC_DWC3_DRAIN_NUDGE and udc_dwc3_nudge_worker()
+ * issues the command in thread context. Sampling a state at 200 ms to decide
+ * whether to send a controller command was wrong twice over: the request was
+ * not latched, so catching it was luck, and the command went out from a k_timer
+ * callback - the system clock ISR - where it could interleave with the
+ * DGCMDPAR/DGCMD pair of a udc_dwc3_fifo_flush_tx() running on the drain
+ * thread. An edge and a work item remove the sampling and the ISR together.
+ *
+ * What remains reads nothing but two counters it owns and cannot do anything
+ * irreversible: waking a thread that is already awake does nothing. That is why
+ * the kick can stay in the timer callback while the nudge could not, and it
+ * must stay - the kick is what recovers a ring nobody is looking at, and moving
+ * it into the heartbeat WORK item would let a busy queue delay the one path
+ * that recovers it.
+ */
+static void udc_dwc3_drain_helper(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	if (udc_dwc3_gevntcount(base) == 0U) {
+		return;
+	}
+
+	/*
+	 * One state IS read, and only to answer "is this thread already awake and
+	 * working". UDC_DWC3_DRAIN_WAITING means it is inside the bounded wait in
+	 * udc_dwc3_evt_wait_first(), sleeping on a timeout between two looks at the
+	 * slot - not stopped. Kicking there is not harmful, but it counts as a kick,
+	 * and evt_kick is read as "the heartbeat had to restart a stopped drain".
+	 * A wait can now outlive a beat, so without this the counter would climb on
+	 * a drain that never stopped and the number would stop meaning anything.
+	 *
+	 * Nothing hides behind it: the wait is bounded by
+	 * UDC_DWC3_EVT_ARRIVE_MAX_MS, so a drain that is genuinely stuck leaves
+	 * WAITING and the next beat kicks it.
+	 *
+	 * Beyond that the kick is NOT gated on state, deliberately. Events can
+	 * arrive after a pass ends, leaving work behind in any other state, and the
+	 * interrupt for them has been observed not to come. That is the condition
+	 * the timer has always used.
+	 */
+	if (priv->drain.state == UDC_DWC3_DRAIN_WAITING) {
+		return;
+	}
+
+	if (k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_worker_exit_t0) >=
+					UDC_DWC3_EVT_IDLE_KICK_MS) {
+		priv->evt_kick++;
+		k_sem_give(&priv->evt_sem);
+	}
 }
 
 /*
@@ -9351,22 +9676,141 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	const uint32_t t0 = k_cycle_get_32();
+	const uint32_t deadline = t0 + k_ms_to_cyc_ceil32(UDC_DWC3_EVT_ARRIVE_MAX_MS);
 	uint32_t polls = 0;
+	uint32_t slow_polls = 0;
 	uint32_t evt;
 	uint32_t waited_us;
+	bool new_run = false;
 
 	priv->evt_late++;
+	priv->drain.state = UDC_DWC3_DRAIN_WAITING;
 
-	do {
+	/*
+	 * LOOK BEFORE WAITING. The caller read this slot as unwritten and then
+	 * spent a call frame, a counter and a state write getting here, and the
+	 * controller may well have filled it in between - a do/while spends a full
+	 * poll interval before it will even look, so an event that is already in
+	 * memory is reported as late and costs UDC_DWC3_EVT_ARRIVE_POLL_US for
+	 * nothing. Reading first costs one load.
+	 *
+	 * polls therefore counts WAITS, not reads: there are polls+1 observations
+	 * of the slot, and polls == 0 means it was there on arrival.
+	 */
+	/*
+	 * PHASE 1, the microsecond instrument: a bounded spin, no reschedule.
+	 *
+	 * This is the phase that answers the RTL question, so its interval has to
+	 * be the controller's and not the scheduler's. UDC_DWC3_EVT_ARRIVE_FAST_POLLS
+	 * looks at UDC_DWC3_EVT_ARRIVE_POLL_US is 64 us of wall clock in total -
+	 * twice udc_dwc3_depcmd()'s 32 us fast budget, bounded, and the whole
+	 * reason evt_late_us_max can report a sub-millisecond figure at all.
+	 * Yielding inside it would replace the number being measured with a
+	 * scheduling delay.
+	 */
+	for (;;) {
+		evt = cfg->evt_buf[priv->evt_next];
+		if (evt != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
+			break;
+		}
+
+		if (polls >= UDC_DWC3_EVT_ARRIVE_FAST_POLLS) {
+			break;
+		}
+
+		/*
+		 * The deadline binds this phase too, not only the slow one. 64 looks
+		 * of a microsecond cannot reach 64 ms on their own - but this thread
+		 * can be held off the CPU by interrupts between two of them, and that
+		 * is precisely the way the ORIGINAL wall-clock deadline was fooled
+		 * (38 polls across 3384 us). The count is what makes "still empty"
+		 * mean something; the clock is what stops the phase running away when
+		 * the count is not being reached at the rate it assumes. Both, always,
+		 * which is the shape the wait was specified in.
+		 *
+		 * Signed difference, so the comparison survives the 32-bit cycle
+		 * counter wrapping inside the loop. See UDC_DWC3_EVT_ARRIVE_MAX_MS.
+		 */
+		if ((int32_t)(k_cycle_get_32() - deadline) >= 0) {
+			break;
+		}
+
 		k_busy_wait(UDC_DWC3_EVT_ARRIVE_POLL_US);
 		polls++;
+	}
+
+	/*
+	 * PHASE 2, the long tail: a TIMEOUT-BASED yield, not a bare k_yield().
+	 *
+	 * k_yield() was wrong here and the objection is exact: it carries no
+	 * timing contract whatsoever. With nothing runnable it returns in a few
+	 * hundred nanoseconds, so the loop degenerates into a spin that merely
+	 * costs a scheduler pass per turn; with something runnable it returns when
+	 * that thread is finished, which is unbounded. Either way the interval
+	 * between two looks is undefined, and an interval nobody can state is not
+	 * a poll - it cannot be budgeted, and the number it produces cannot be
+	 * quoted. k_sleep() names the interval, so both hold.
+	 *
+	 * UDC_DWC3_EVT_SLOW_POLL_US IS ONE TICK AND THAT IS THE FLOOR.
+	 * CONFIG_SYS_CLOCK_TICKS_PER_SEC is 1000 and CONFIG_TICKLESS_KERNEL is
+	 * not set, so the shortest timeout the kernel can express is 1 ms; asking
+	 * for less does not get less, it gets a tick. A sub-millisecond timeout
+	 * needs a higher CONFIG_SYS_CLOCK_TICKS_PER_SEC, which is a system-wide
+	 * change and is not the driver's to make. udc_dwc3_depcmd()'s slow phase
+	 * sleeps for exactly this figure and for exactly this reason.
+	 *
+	 * This is why phase 1 exists at all: the two phases split the wait at the
+	 * resolution the kernel can actually schedule. Below a tick, measure by
+	 * spinning and pay for it in microseconds; above a tick, hand the CPU over
+	 * and come back on a stated deadline. UDC_DWC3_EVT_ARRIVE_SLOW_POLLS of
+	 * them is ~48 ms, inside UDC_DWC3_EVT_ARRIVE_MAX_MS with margin for the
+	 * rounding-up each sleep does.
+	 *
+	 * WHAT THIS RELEASES TO, and it is strictly more than a yield could:
+	 * k_sleep() blocks, so it reschedules unconditionally - cdc_thread (-9),
+	 * the usbd thread (-8), udc_get_work_q() (-1) and everything preemptible
+	 * all run, where k_yield() from this cooperative thread would have
+	 * released to the first two only. The nudge submitted below sits on that
+	 * work queue, so this is also what lets the forced command go out while
+	 * the slot is still being waited on rather than after the pass ends.
+	 *
+	 * SAFE HERE, and this is the one point in the pass where it is:
+	 * udc_dwc3_evt_drain() only calls this with n == 0, so nothing has been
+	 * copied, no slot has been handed back, and GEVNTCOUNT has not been
+	 * credited. There is no half-finished ring state to expose and no mutex or
+	 * spinlock held - the drain takes neither. A heartbeat kick arriving while
+	 * this sleeps is not lost either: k_sem_give() counts, and the pass takes
+	 * it on the next k_sem_take().
+	 */
+	while (evt == UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE &&
+	       slow_polls < UDC_DWC3_EVT_ARRIVE_SLOW_POLLS) {
+		/*
+		 * Signed difference, so the comparison survives the 32-bit cycle
+		 * counter wrapping inside the loop. See UDC_DWC3_EVT_ARRIVE_MAX_MS.
+		 */
+		if ((int32_t)(k_cycle_get_32() - deadline) >= 0) {
+			break;
+		}
+
+		k_sleep(K_USEC(UDC_DWC3_EVT_SLOW_POLL_US));
+		slow_polls++;
+
 		evt = cfg->evt_buf[priv->evt_next];
-	} while (evt == UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE &&
-		 polls < UDC_DWC3_EVT_ARRIVE_MAX_POLLS);
+	}
 
 	waited_us = k_cyc_to_us_near32(k_cycle_get_32() - t0);
 
 	if (evt != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
+		/*
+		 * FAST polls only, deliberately. This counter and evt_late_us_max
+		 * are read as a pair - "worst %u polls/%u us" - and the pair only
+		 * means anything while both come from the same clock. A slow-phase
+		 * look is a whole tick, so folding the two together would let 64
+		 * microsecond looks and 10 millisecond ones add into one number
+		 * that describes neither. The slow count is reported separately on
+		 * the give-up line below, where a large waited_us against a
+		 * saturated polls figure is what says the slow phase was entered.
+		 */
 		if (polls > priv->evt_late_polls_max) {
 			priv->evt_late_polls_max = polls;
 		}
@@ -9375,21 +9819,24 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 			priv->evt_late_us_max = waited_us;
 		}
 
+		/* The write landed: the episode is over, back to ordinary draining. */
+		priv->drain.state = UDC_DWC3_DRAIN_RUNNING;
+
 		return evt;
 	}
 
 	priv->evt_gaveup++;
 
-	if (priv->evt_gaveup_run > 0 && priv->evt_gaveup_slot == priv->evt_next) {
-		priv->evt_gaveup_run++;
+	if (priv->drain.attempts > 0 && priv->drain.slot == priv->evt_next) {
+		priv->drain.attempts++;
 	} else {
-		priv->evt_gaveup_slot = priv->evt_next;
-		priv->evt_gaveup_run = 1;
-		priv->evt_gaveup_t0 = t0;
-		priv->evt_gaveup_logged = false;
-		priv->evt_gaveup_quiet = true;
-		priv->evt_missed_counted = false;
-		priv->evt_gaveup_gc0 = udc_dwc3_gevntcount(base);
+		new_run = true;
+		priv->drain.slot = priv->evt_next;
+		priv->drain.attempts = 1;
+		priv->drain.since = t0;
+		priv->drain.quiet = true;
+		priv->drain.counted = false;
+		priv->drain.gc0 = udc_dwc3_gevntcount(base);
 
 		/*
 		 * Population data for the look-ahead in udc_dwc3_evt_skip_dead_slot():
@@ -9399,10 +9846,10 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 		 * than logged - a quiet run must stay quiet, because the interval it is
 		 * timing is shorter than one console line.
 		 */
-		if (priv->evt_gaveup_gc0 > priv->evt_gaveup_gc0_max) {
-			priv->evt_gaveup_gc0_max = priv->evt_gaveup_gc0;
+		if (priv->drain.gc0 > priv->evt_gaveup_gc0_max) {
+			priv->evt_gaveup_gc0_max = priv->drain.gc0;
 		}
-		if (priv->evt_gaveup_gc0 > sizeof(uint32_t)) {
+		if (priv->drain.gc0 > sizeof(uint32_t)) {
 			priv->evt_gaveup_multi++;
 		}
 	}
@@ -9422,26 +9869,26 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 	 * across 25 s and 16,113 give-ups, with ~53 forced commands landing
 	 * nothing.
 	 */
-	if (!priv->evt_missed_counted &&
-	    k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_gaveup_t0) >=
+	if (!priv->drain.counted &&
+	    k_cyc_to_ms_near32(k_cycle_get_32() - priv->drain.since) >=
 						UDC_DWC3_EVT_MISSED_MS) {
 		const uint32_t gc_now = udc_dwc3_gevntcount(base);
-		const bool frozen = (gc_now == priv->evt_gaveup_gc0);
+		const bool frozen = (gc_now == priv->drain.gc0);
 
-		priv->evt_missed_counted = true;
+		priv->drain.counted = true;
 		priv->evt_missed++;
 		if (frozen) {
 			priv->evt_missed_frozen++;
 		}
 
-		priv->evt_gaveup_quiet = false;
+		priv->drain.quiet = false;
 		LOG_ERR("slot %u WRITE LOST, not late: empty %u ms over %u give-ups, "
 			"GEVNTCOUNT %s (%u B now, %u B when the run opened) - %s",
 			priv->evt_next,
-			k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_gaveup_t0),
-			priv->evt_gaveup_run,
+			k_cyc_to_ms_near32(k_cycle_get_32() - priv->drain.since),
+			priv->drain.attempts,
 			frozen ? "FROZEN" : "advancing",
-			gc_now, priv->evt_gaveup_gc0,
+			gc_now, priv->drain.gc0,
 			frozen ? "core has placed nothing since; cause unknown"
 			       : "core still writing, this slot skipped");
 
@@ -9462,19 +9909,18 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 
 	/*
 	 * Anything emitted from here on sits INSIDE the window that
-	 * evt_gaveup_t0 is timing, and at 115200 baud one of these lines is 7.5 ms -
+	 * drain.since is timing, and at 115200 baud one of these lines is 7.5 ms -
 	 * larger than the latency being measured. The run is marked so the fill
 	 * path knows not to believe its own clock.
 	 */
 	if (priv->evt_gaveup % UDC_DWC3_EVT_GAVEUP_LOG_EVERY == 1) {
-		priv->evt_gaveup_logged = true;
-		priv->evt_gaveup_quiet = false;
-		LOG_DBG("slot %u empty: polls=%u waited=%uus gc %u B raw=0x%08x "
+		priv->drain.quiet = false;
+		LOG_DBG("slot %u empty: polls=%u+%u slow waited=%uus gc %u B raw=0x%08x "
 			"hwm=%u run=%u (%u so far)",
-			priv->evt_next, polls, waited_us,
+			priv->evt_next, polls, slow_polls, waited_us,
 			udc_dwc3_gevntcount(base),
 			sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)),
-			priv->evt_gevntcount_hwm, priv->evt_gaveup_run,
+			priv->evt_gevntcount_hwm, priv->drain.attempts,
 			priv->evt_gaveup);
 	}
 
@@ -9489,14 +9935,65 @@ static uint32_t udc_dwc3_evt_wait_first(const struct device *const dev)
 	 * The force logs, so it contaminates the timing window the same way the
 	 * report above does.
 	 */
-	if (!priv->evt_force_ever ||
-	    k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_force_t0) >=
-						UDC_DWC3_EVT_FORCE_MIN_GAP_MS) {
-		priv->evt_gaveup_quiet = false;
-		udc_dwc3_evt_force(dev);
-		priv->evt_force_t0 = k_cycle_get_32();
-		priv->evt_force_ever = true;
+	/*
+	 * The nudge is REQUESTED here and sent by udc_dwc3_nudge_worker(). Asking
+	 * is a drain decision; issuing a controller command from this thread is not
+	 * safe to keep - the drain holds no lock and cannot serialise against the
+	 * endpoint commands the stack is issuing.
+	 *
+	 * Submitted ONCE PER GIVE-UP RUN, on new_run - the same edge that opens the
+	 * episode above. A stuck slot re-enters the drain at interrupt rate (the
+	 * zero-credit write clears EVNT_HANDLER_BUSY and the end of the pass
+	 * unmasks the interrupt, so the controller re-asserts immediately while
+	 * GEVNTCOUNT is still non-zero), and submitting on every one of those would
+	 * be hundreds of items a second for one condition.
+	 *
+	 * new_run and NOT "the state is not already NUDGE", which is what this
+	 * tested first and which does not work: the entry at the top of this
+	 * function writes WAITING unconditionally, so the latched NUDGE is gone by
+	 * the time the test runs and every give-up submitted again. The run is the
+	 * right unit anyway - it is what a nudge addresses, and it is what
+	 * UDC_DWC3_EVT_FORCE_MIN_GAP_MS was written to bound when a stall walks
+	 * from slot to slot opening a run on each.
+	 *
+	 * One command per run, then, and the run is abandoned at
+	 * UDC_DWC3_EVT_DEAD_SLOT_MS. Repeating inside a run was never worth
+	 * anything: the capture that has ~53 forced commands against one stuck slot
+	 * landed nothing with any of them.
+	 */
+	priv->drain.state = UDC_DWC3_DRAIN_NUDGE;
+
+	if (new_run) {
+		k_work_submit_to_queue(udc_get_work_q(), &priv->nudge_work);
 	}
+
+	/*
+	 * THE BLANKET "priv->drain.quiet = false" THAT STOOD HERE IS GONE, and with
+	 * it a counter that could never report anything.
+	 *
+	 * It marked the run contaminated on the way out of EVERY give-up, including
+	 * the first - the one that had just set quiet = true three branches above.
+	 * So the flag was false again before this function returned, on every run
+	 * without exception, and the fill path's "if (priv->drain.quiet)" was dead:
+	 * evt_gaveup_us_max has been structurally pinned at 0 for as long as the
+	 * pairing has existed, which is why every stats line reports "worst empty
+	 * 0 us" however long the slot was actually empty. That is the measurement
+	 * the RTL question turns on.
+	 *
+	 * Its reason was that the forced command logs from this thread, inside the
+	 * interval drain.since is timing. That is no longer where the command is
+	 * issued: udc_dwc3_nudge_worker() runs it on udc_get_work_q(), so a
+	 * LOG_MODE_MINIMAL line formats on THAT thread's stack and in its context,
+	 * not inside this poll loop. The drain is cooperative, so the queue cannot
+	 * even run while this function does.
+	 *
+	 * What is left is honest: quiet is cleared by the two sites that actually
+	 * print from this thread - the WRITE LOST report and the 1-in-1021 debug
+	 * line - and by nothing else. A nudge logging on the work queue can still
+	 * delay this thread's next entry, so a run overlapping one is measured with
+	 * a scheduling delay inside it, but that is a delay, not a 7.5 ms
+	 * synchronous UART write in the middle of the poll.
+	 */
 
 	/* Nothing landed: report it the same way an unwritten slot reads. */
 	return UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE;
@@ -9608,7 +10105,7 @@ static bool udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
 	LOG_ERR("slot %u unreadable for %u ms over %u give-ups (holds 0x%08x, "
 		"gc %u B, %s): acknowledging %u slot%s to release the "
 		"controller, %u EVENT%s LOST (%u so far)",
-		priv->evt_next, gaveup_ms, priv->evt_gaveup_run,
+		priv->evt_next, gaveup_ms, priv->drain.attempts,
 		cfg->evt_buf[priv->evt_next], gc,
 		frozen ? "GEVNTCOUNT frozen - core blocked on us"
 		       : "GEVNTCOUNT advancing - core still writing elsewhere",
@@ -9626,10 +10123,66 @@ static bool udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
 		    UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY,
 		    base + UDC_DWC3_GEVNTCOUNT(0));
 
-	priv->evt_gaveup_run = 0;
-	priv->evt_gaveup_logged = false;
+	priv->drain.attempts = 0;
 
 	return true;
+}
+
+/*
+ * Is the slot the drain is parked on dead?
+ *
+ * MOVED HERE from udc_dwc3_heartbeat_worker(), which used to both decide this
+ * and act on it. Acting meant writing priv->evt_next - the ring read position -
+ * from the heartbeat thread while the drain thread was also writing it, with no
+ * lock between them. Two read-modify-writes on the same word. The same function
+ * refuses to do exactly this 300 lines earlier, on the grounds that the drain
+ * owns evt_next; the rule and its violation were both in the code.
+ *
+ * POLICY IS UNCHANGED. The three routes, their thresholds and their order are
+ * what the heartbeat applied. What changes is the owner, and the rate at which
+ * the question is asked: the drain asks on every give-up instead of once per
+ * 200 ms beat, so a dead slot is released in milliseconds rather than in
+ * roughly a second.
+ */
+static bool udc_dwc3_drain_slot_is_dead(const struct device *const dev,
+					const uint32_t gc, const uint32_t age_ms)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (gc < sizeof(uint32_t) ||
+	    cfg->evt_buf[priv->evt_next] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
+		return false;
+	}
+
+	/*
+	 * The floor applies to EVERY route, including the look-ahead "proof".
+	 * Discarding an event costs it permanently and desynchronises the read
+	 * position from the controller's write position; no amount of evidence
+	 * gathered inside 200 ms is worth that risk at this evaluation rate.
+	 */
+	if (age_ms < UDC_DWC3_EVT_DEAD_SLOT_MIN_MS) {
+		return false;
+	}
+
+	if (age_ms >= UDC_DWC3_EVT_DEAD_SLOT_MS ||
+	    priv->drain.attempts >= UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS) {
+		return true;
+	}
+
+	/*
+	 * The look-ahead is a proof, not a guess: a real event BEYOND this slot
+	 * means every marker between the two was issued earlier and is gone. It
+	 * needs only enough age to exclude a transient. Reaching here means the
+	 * timeout above did not fire, so this is always the early route.
+	 */
+	if (age_ms >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS &&
+	    udc_dwc3_evt_lookahead_lost(dev, gc)) {
+		priv->evt_lookahead_short++;
+		return true;
+	}
+
+	return false;
 }
 
 static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
@@ -9649,8 +10202,26 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 	uint32_t want = gc / sizeof(uint32_t);
 	uint32_t n = 0;
 
-	priv->evt_drain_gaveup = false;
-	priv->evt_drain_midzero = false;
+	/*
+	 * NUDGE SURVIVES A RE-ENTRY; everything else is re-derived from gc.
+	 *
+	 * This assignment used to be unconditional, which quietly made NUDGE
+	 * unobservable. A stuck head slot re-enters this function at interrupt rate
+	 * (the zero-credit write clears EVNT_HANDLER_BUSY, the end of the pass
+	 * unmasks the interrupt, and GEVNTCOUNT is still non-zero, so the
+	 * controller re-asserts immediately), so the state set at the end of one
+	 * pass was overwritten microseconds later at the top of the next. The
+	 * request was real and lasted tens of microseconds at a time.
+	 *
+	 * The two exits from the episode both write the state themselves - the
+	 * write landing, in udc_dwc3_evt_wait_first(), and the slot being
+	 * abandoned, below - so nothing else has to clear it, and the submit in
+	 * wait_first() now happens once per give-up run rather than once per look.
+	 */
+	if (priv->drain.state != UDC_DWC3_DRAIN_NUDGE) {
+		priv->drain.state = (gc > 0U) ? UDC_DWC3_DRAIN_RUNNING
+					      : UDC_DWC3_DRAIN_IDLE;
+	}
 
 	if (gc > priv->evt_gevntcount_hwm) {
 		priv->evt_gevntcount_hwm = gc;
@@ -9680,7 +10251,7 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 *
 			 * This must NOT mark the pass stalled, and marking it was a
 			 * defect - the one that theory was built on. The tail reads
-			 * evt_drain_gaveup as "do not come back", and lifts that
+			 * the stall state as "do not come back", and lifts that
 			 * refusal only for a pass that opened a stall RUN. This path
 			 * opens no run (runs are opened in udc_dwc3_evt_wait_first(),
 			 * the head-slot path, which is not reached here), so the
@@ -9706,27 +10277,58 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 */
 			if (n > 0) {
 				priv->evt_midzero++;
-				priv->evt_drain_midzero = true;
+				priv->drain.state = UDC_DWC3_DRAIN_PARTIAL;
 				break;
 			}
 
 			evt = udc_dwc3_evt_wait_first(dev);
 			if (evt == UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
 				/*
-				 * No decision here any more. The drain records the
-				 * run - slot, age, give-ups, gc when it opened - and
-				 * the 200 ms heartbeat decides whether the slot is
-				 * dead. Giving up on an event costs it permanently,
-				 * and that judgement does not belong in a path that
-				 * re-enters at roughly 1 kHz on a single sample.
+				 * Decided and acted on HERE, by the owner of
+				 * evt_next. wait_first() has left the state at
+				 * NUDGE, which is what the heartbeat reads to
+				 * decide whether to send a generic command.
+				 *
+				 * One abort per pass, then out: aborting in a loop
+				 * could spend the whole poll budget again on each
+				 * following slot without ever releasing this
+				 * cooperative thread. The next entry takes the next
+				 * slot, and entries are milliseconds apart.
 				 */
-				priv->evt_drain_gaveup = true;
+				const uint32_t gc_now = udc_dwc3_gevntcount(base);
+				const uint32_t age_ms = k_cyc_to_ms_near32(
+					k_cycle_get_32() - priv->drain.since);
+
+				if (udc_dwc3_drain_slot_is_dead(dev, gc_now, age_ms)) {
+#ifdef UDC_DWC3_EVT_DEAD_SLOT_RECOVER
+					(void)udc_dwc3_evt_skip_dead_slot(
+						dev, gc_now,
+						gc_now == priv->drain.gc0, age_ms);
+					priv->drain.state = UDC_DWC3_DRAIN_RUNNING;
+#else
+					/*
+					 * Diagnostic build: describe it and leave
+					 * the ring, GEVNTCOUNT and the controller
+					 * exactly as the fault left them, so it
+					 * stays reproducible.
+					 */
+					LOG_ERR("slot %u is dead (%u ms, %u "
+						"give-ups, gc %u B, %s) - NOT "
+						"recovering, this build preserves "
+						"the fault",
+						priv->evt_next, age_ms,
+						priv->drain.attempts, gc_now,
+						gc_now == priv->drain.gc0 ?
+							"GEVNTCOUNT frozen"
+						      : "GEVNTCOUNT advancing");
+#endif
+				}
 				break;
 			}
 		}
 
-		if (priv->evt_gaveup_run > 0 &&
-		    priv->evt_gaveup_slot == priv->evt_next) {
+		if (priv->drain.attempts > 0 &&
+		    priv->drain.slot == priv->evt_next) {
 			/*
 			 * How long the slot actually stayed empty - the number the RTL
 			 * question turns on, so it is taken only from runs that printed
@@ -9741,9 +10343,9 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			 * all of them, and it is reported in the periodic stats line
 			 * rather than per occurrence.
 			 */
-			if (priv->evt_gaveup_quiet) {
+			if (priv->drain.quiet) {
 				const uint32_t us = k_cyc_to_us_near32(
-					k_cycle_get_32() - priv->evt_gaveup_t0);
+					k_cycle_get_32() - priv->drain.since);
 
 				if (us > priv->evt_gaveup_us_max) {
 					priv->evt_gaveup_us_max = us;
@@ -9751,13 +10353,26 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 			} else {
 				LOG_DBG("slot %u filled after %u give-ups: 0x%08x (%s) "
 					"gc0 %u B - interval not timed, this run printed",
-					priv->evt_next, priv->evt_gaveup_run, evt,
+					priv->evt_next, priv->drain.attempts, evt,
 					udc_dwc3_get_event_name(evt,
 						sys_read32(base + UDC_DWC3_DSTS)),
-					priv->evt_gaveup_gc0);
+					priv->drain.gc0);
 			}
-			priv->evt_gaveup_run = 0;
-			priv->evt_gaveup_logged = false;
+			priv->drain.attempts = 0;
+
+			/*
+			 * THE EPISODE IS OVER, so end the nudge with it.
+			 *
+			 * This is the exit that udc_dwc3_evt_wait_first() cannot
+			 * take. Once the write lands, the head slot reads as a real
+			 * event and wait_first() is never called again for it - so
+			 * the RUNNING it writes on its own success path is
+			 * unreachable here, and without this the latch introduced at
+			 * the top of this function would hold NUDGE for the rest of
+			 * the session, re-submitting nothing but reporting a
+			 * permanent stall in every dump.
+			 */
+			priv->drain.state = UDC_DWC3_DRAIN_RUNNING;
 		}
 
 		/*
@@ -9879,6 +10494,26 @@ static uint32_t udc_dwc3_evt_drain(const struct device *const dev)
 		 */
 		sys_write32(UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY,
 			    base + UDC_DWC3_GEVNTCOUNT(0));
+	}
+
+	/*
+	 * Close the state out. A pass that took everything is no longer running,
+	 * and leaving RUNNING behind is exactly the stale-state bug this enum
+	 * exists to prevent - it would have the dump reporting a drain that is
+	 * working while it sits idle. PARTIAL describes unfinished business and
+	 * must survive the pass that set it.
+	 *
+	 * NUDGE is closed here too, and only on an empty GEVNTCOUNT. That is the
+	 * backstop for an episode that ends without this pass taking the slot it
+	 * was stuck on - the controller owing nothing means there is nothing left
+	 * to nudge for, whatever happened to the slot. The ordinary exits are the
+	 * write landing (above) and the slot being abandoned
+	 * (udc_dwc3_evt_skip_dead_slot()); both write the state themselves.
+	 */
+	if ((priv->drain.state == UDC_DWC3_DRAIN_RUNNING ||
+	     priv->drain.state == UDC_DWC3_DRAIN_NUDGE) &&
+	    udc_dwc3_gevntcount(base) == 0U) {
+		priv->drain.state = UDC_DWC3_DRAIN_IDLE;
 	}
 
 	return n;
@@ -10048,93 +10683,18 @@ static void udc_dwc3_event_drain_once(const struct device *const dev)
 	cfg->irq_enable_func();
 
 	/*
-	 * Re-enter whenever the controller still says there is something to read.
+	 * The controller still owes events, so this pass has to be re-entered.
 	 *
-	 * A clean pass resubmits because more arrived while this one was
-	 * dispatching. A STALLED pass resubmits too, for up to
-	 * UDC_DWC3_EVT_GAVEUP_RETRY_MS - which is the correction. It used to return
-	 * without resubmitting, on the assumption that the level-sensitive
-	 * interrupt re-enabled just above would bring the worker back by itself.
-	 * A capture disproves that: the heartbeat twice found the head slot holding
-	 * a valid event, the give-up run one give-up old and nearly two seconds
-	 * stale, the ring completely full, and evt_rearm frozen for the entire run.
-	 * Nothing had looked. Waiting a whole second for the heartbeat while the
-	 * ring is full is what lets the controller run out of room and stop the bus,
-	 * so the guard meant to avoid a pointless spin was buying a real outage.
+	 * Nothing is done about it here. The drain never arms itself - on a
+	 * cooperative thread a self-give is a loop with no scheduler in it - and
+	 * the two k_yield() calls that used to sit in this block yielded
+	 * immediately before returning to k_sem_take(), so they could not help
+	 * anything. What is left is the count, and the state, which is what
+	 * udc_dwc3_drain_helper() reads on the next heartbeat to decide whether to
+	 * wake this thread.
 	 */
 	if (udc_dwc3_gevntcount(base) > 0U) {
-		bool retry = !priv->evt_drain_gaveup;
-
-		/*
-		 * A mid-pass zero retries - retry is already true, because that pass
-		 * is no longer marked stalled - but it yields first, for the same
-		 * reason the stalled-pass retry below does: this queue is cooperative
-		 * and so is the usbd thread above it, so a handler that resubmits
-		 * itself without ever sleeping starves the thread that decodes SETUP.
-		 */
-		if (priv->evt_drain_midzero) {
-			k_yield();
-		}
-
-		/*
-		 * A stalled pass is retried only when a stall RUN is open.
-		 *
-		 * evt_drain_gaveup is set on two different paths and only one of them
-		 * establishes a timestamp. The head-slot stall goes through
-		 * udc_dwc3_evt_wait_first(), which opens a run and stamps
-		 * evt_gaveup_t0. The mid-pass zero - already consumed something, then
-		 * found an empty slot - does neither. Testing the age without testing
-		 * the run therefore compared against whatever an older run had left
-		 * behind, and retried a case that is not a stall at all and was never
-		 * meant to be retried.
-		 */
-		if (!retry && priv->evt_gaveup_run > 0U &&
-		    k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt_gaveup_t0) <
-						UDC_DWC3_EVT_GAVEUP_RETRY_MS) {
-			/*
-			 * Yield before going round again.
-			 *
-			 * This work queue is COOPERATIVE
-			 * (CONFIG_SYSTEM_WORKQUEUE_PRIORITY = -1), and so is the USB device
-			 * stack's own thread at K_PRIO_COOP(8) - which is the HIGHER
-			 * priority of the two, but a cooperative thread is never preempted.
-			 * A handler that resubmits itself, with the drain busy-waiting its
-			 * whole poll budget and never sleeping, therefore starves that
-			 * thread for as long as the retry window lasts. The usbd thread is
-			 * what decodes SETUP packets and queues control buffers, so
-			 * starving it desynchronises the control state machine - which is
-			 * exactly what a retry meant to protect the ring must not do.
-			 */
-			k_yield();
-			retry = true;
-		}
-
-		/*
-		 * THE DRAIN THREAD NEVER ARMS ITSELF.
-		 *
-		 * This used to k_sem_give() its own semaphore, which was harmless
-		 * while the drain was a work item - resubmitting put it at the back
-		 * of a queue shared with everything else. On a dedicated thread it is
-		 * a feedback loop with no scheduler in it: the thread gives, returns
-		 * to k_sem_take(), takes immediately, and runs again, for as long as
-		 * the retry condition holds. A cooperative thread doing that is never
-		 * preempted, and k_yield() does not help - a yielding cooperative
-		 * thread that is still ready simply resumes.
-		 *
-		 * The retry is not lost, it is handed to a timer instead of a loop.
-		 * udc_dwc3_heartbeat_expiry() runs off k_timer every
-		 * UDC_DWC3_HEARTBEAT_MS, outside every work queue, and kicks this
-		 * thread when GEVNTCOUNT is non-zero and the drain has been idle for
-		 * UDC_DWC3_EVT_IDLE_KICK_MS. That is the same condition this retry
-		 * was testing, evaluated by something that cannot starve anyone.
-		 *
-		 * evt_rearm is still counted, so the rate stays visible in the stats
-		 * line and a rise still means the ring needed more passes than the
-		 * interrupts delivered.
-		 */
-		if (retry) {
-			priv->evt_rearm++;
-		}
+		priv->evt_rearm++;
 	}
 
 	/*
@@ -10142,7 +10702,6 @@ static void udc_dwc3_event_drain_once(const struct device *const dev)
 	 * UDC_DWC3_EVT_IDLE_KICK_MS for why the exit and not the entry.
 	 */
 	priv->evt_worker_exit_t0 = k_cycle_get_32();
-	priv->evt_worker_ran = true;
 }
 
 static void udc_dwc3_irq_handler(void *const ptr)
@@ -10936,6 +11495,7 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	k_work_init_delayable(&priv->watchdog_dwork, udc_dwc3_watchdog_worker);
 	k_work_init(&priv->heartbeat_work, udc_dwc3_heartbeat_worker);
+	k_work_init(&priv->nudge_work, udc_dwc3_nudge_worker);
 	k_timer_init(&priv->heartbeat_timer, udc_dwc3_heartbeat_expiry, NULL);
 
 	data->caps.rwup = false;
@@ -11462,10 +12022,12 @@ static void udc_dwc3_dump_events(const struct device *dev, const struct shell *s
 	shell_print(sh, "drain re-armed after unmask: %u", priv->evt_rearm);
 	shell_print(sh, "link state changes %u, last state 0x%x, repeated x%u",
 		    priv->evt_link_total, priv->evt_link_last, priv->evt_link_run);
-	shell_print(sh, "GEVNTCOUNT high-water %u bytes of %u, give-up run %u on slot %u",
+	shell_print(sh, "GEVNTCOUNT high-water %u bytes of %u, drain %s, "
+		    "give-up run %u on slot %u",
 		    priv->evt_gevntcount_hwm,
 		    (unsigned int)(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t)),
-		    priv->evt_gaveup_run, priv->evt_gaveup_slot);
+		    udc_dwc3_drain_state_name(priv->drain.state),
+		    priv->drain.attempts, priv->drain.slot);
 	shell_print(sh, "control aborts: setup-pending %u, other TRBSTS %u, "
 		    "stage desync %u", priv->ctrl_setup_pending,
 		    priv->ctrl_trbsts_other, priv->ctrl_desync);
