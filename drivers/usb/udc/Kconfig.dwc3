@@ -40,6 +40,13 @@ config UDC_DWC3_DEFER_START_XFER
 	  Compatibility symbol for an independent endpoint-lifecycle experiment.
 	  This isolated event-dispatch probe leaves it disabled.
 
+config UDC_DWC3_SWEEP_COMPLETED
+	bool "Retire HWO-cleared bulk TRBs when DEPEVT is missing"
+	default n
+	help
+	  Port of HC lost-completion sweep. Default off: a late DEPEVT after a
+	  sweep can double-retire a slot. Enable only for A/B on Window1.
+
 config UDC_DWC3_HEALTH_LOG
 	bool "Periodic USB health / buffer-leak logging"
 	select NET_BUF_POOL_USAGE
