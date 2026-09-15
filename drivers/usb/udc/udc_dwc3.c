@@ -2329,7 +2329,7 @@ static void udc_dwc3_store_xferrscidx(const struct device *const dev,
 			LOG_WRN("XFERRSCIDX EP%02x = %u, SHARED with EP%02x",
 				ep_data->cfg.addr, idx, clash->cfg.addr);
 		} else {
-			LOG_INF("XFERRSCIDX EP%02x = %u", ep_data->cfg.addr, idx);
+			LOG_DBG("XFERRSCIDX EP%02x = %u", ep_data->cfg.addr, idx);
 		}
 	}
 
@@ -2955,9 +2955,11 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	LOG_DBG("PUSH %u, buf %p, data %p, size %u -> %u",
 		ep_data->head, (void *)buf, (void *)buf->data, buf->size, out_size);
 
-	/* Per-arm trace for the non-control endpoints, at INFO. */
+	/* Per-arm trace for the non-control endpoints. Debug-only: it fires
+	 * once per buffer and the console is synchronous.
+	 */
 	if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
-		LOG_INF("EP%02x: ARM s%u len=%u n=%u", ep_data->cfg.addr,
+		LOG_DBG("EP%02x: ARM s%u len=%u n=%u", ep_data->cfg.addr,
 			ep_data->head, out_size, ep_data->n_arm);
 	}
 
@@ -3013,7 +3015,7 @@ static int udc_dwc3_pop_trb(struct udc_dwc3_ep_data *const ep_data,
 	/* Retire side of the arm trace above - the two together give arm -> retire
 	 * for a slot, which is the interval the 8 s stall lives in. */
 	if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
-		LOG_INF("EP%02x: RET s%u sts=%x n=%u", ep_data->cfg.addr,
+		LOG_DBG("EP%02x: RET s%u sts=%x n=%u", ep_data->cfg.addr,
 			ep_data->tail, trb->status, ep_data->n_retire);
 	}
 
@@ -4734,14 +4736,14 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 			if (this_sp == last_sp) {
 				if ((++rep % 1024U) == 0U) {
-					LOG_INF("SETUP %016llx x%u", this_sp, rep);
+					LOG_DBG("SETUP %016llx x%u", this_sp, rep);
 				}
 			} else {
 				if (rep != 0U) {
-					LOG_INF("SETUP %016llx x%u end", last_sp, rep);
+					LOG_DBG("SETUP %016llx x%u end", last_sp, rep);
 					rep = 0U;
 				}
-				LOG_INF("SETUP %016llx", this_sp);
+				LOG_DBG("SETUP %016llx", this_sp);
 				last_sp = this_sp;
 			}
 		}
@@ -5845,11 +5847,16 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	const bool is_ovfl_evt = evt_type == UDC_DWC3_DEVT_EVNTOVERFLOW;
 	/* Generic command completions are silent for the same reason. */
 	const bool is_cmdcmplt_evt = evt_type == UDC_DWC3_DEVT_CMDCMPLT;
-	/* The four events every healthy control transfer generates. */
+	/*
+	 * The events every healthy transfer generates. Naming each one costs a
+	 * synchronous uart_poll_out in the drain thread; a failing endpoint
+	 * command is reported with its status by udc_dwc3_on_ep_cmd_cmplt().
+	 */
 	const bool is_xfer_evt =
 		udc_dwc3_evt_is_depevt(evt_type, UDC_DWC3_DEPEVT_XFERCOMPLETE(0)) ||
 		udc_dwc3_evt_is_depevt(evt_type, UDC_DWC3_DEPEVT_XFERINPROGRESS(0)) ||
-		udc_dwc3_evt_is_depevt(evt_type, UDC_DWC3_DEPEVT_XFERNOTREADY(0));
+		udc_dwc3_evt_is_depevt(evt_type, UDC_DWC3_DEPEVT_XFERNOTREADY(0)) ||
+		udc_dwc3_evt_is_depevt(evt_type, UDC_DWC3_DEPEVT_EPCMDCMPLT(0));
 	const bool is_quiet_evt = is_link_evt || is_ovfl_evt || is_cmdcmplt_evt ||
 				  is_xfer_evt;
 
