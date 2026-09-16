@@ -21,6 +21,31 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
+/*
+ * trace_tag() and friends, kept so this file is a drop-in replacement for the
+ * stock udc_dwc3.c. usbd_core.c, usbd_cdc_acm.c and usbd_ch9.c declare these
+ * themselves and call them, so a driver that does not define them cannot be
+ * swapped in without editing those files too.
+ *
+ * NO BUFFER. The stock version keeps a 128-entry cycle-stamped array, which
+ * costs 2 KB of RAM on a part that has 64 KB. Nothing in this driver reads it,
+ * so what is kept here is the linkage, not the facility.
+ *
+ * Weak, so a tree that wants the real thing can define its own and win.
+ */
+__weak void trace_tag(const char *tag)
+{
+	ARG_UNUSED(tag);
+}
+
+__weak void trace_reset(void)
+{
+}
+
+__weak void trace_dump(void)
+{
+}
+
 #include "udc_common.h"
 
 /*
@@ -37,10 +62,27 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #endif
 
-#ifndef CONFIG_UDC_DWC3_RECOVERY_TIMEOUT
-/* ms a control stage may stay outstanding before the watchdog ends the transfer. */
-#define CONFIG_UDC_DWC3_RECOVERY_TIMEOUT 1000
-#endif
+/*
+ * Wall-clock ceiling on the event-drain's wait for one event word, applied
+ * alongside its poll count. Defined here because it sets the floor for the
+ * control watchdog below; the wait itself is in udc_dwc3_evt_wait_first().
+ */
+#define UDC_DWC3_EVT_ARRIVE_MAX_MS 100u
+
+/*
+ * How long a control stage may stay outstanding before the watchdog ends the
+ * transfer.
+ *
+ * It must outlast one full arrival wait, or it recovers a drain that is still
+ * inside its normal budget and ends a control transfer that was about to
+ * complete. Written in terms of that wait so the relation cannot drift.
+ *
+ * Not a Kconfig symbol on purpose. This driver is meant to be dropped into
+ * zephyr/drivers/usb/udc/ and built as it stands, so its timing constants live
+ * here and nowhere else.
+ */
+#define UDC_DWC3_RECOVERY_TIMEOUT_MS (2u * UDC_DWC3_EVT_ARRIVE_MAX_MS)
+
 
 /*
  * Stack for the event-drain thread. The dispatch it runs is not shallow -
@@ -97,6 +139,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_TRB_CTRL_TRBCTL_ISOCHRONOUS_N			(0x7 << 4)
 #define UDC_DWC3_TRB_CTRL_TRBCTL_LINK_TRB			(0x8 << 4)
 #define UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP			(0x9 << 4)
+
 /*
  * No TRBCTL encoding is 0, so 0 is free to mean "the watchdog is pending but
  * is not guarding a control stage". The deferral in udc_dwc3_ctrl_try() uses
@@ -562,6 +605,12 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
  */
 #define UDC_DWC3_PHY_RESET_MS					100u
 #define UDC_DWC3_CORE_READY_POLLS				100
+/*
+ * How many times the reset sequence is re-driven when the register file does
+ * not come back. init() is not only a boot path - the reconnect escalation
+ * re-enters it - and a core that never leaves reset must not be configured.
+ */
+#define UDC_DWC3_CORE_RESET_ATTEMPTS				3u
 
 /*
  * Milliseconds to wait for DSTS.DEVCTRLHLT after RunStop is cleared, polled with
@@ -1027,7 +1076,6 @@ struct udc_dwc3_ep_data {
 	/* Point back to the device for work queues */
 	const struct device *dev;
 	/* Record of the descriptor most recently armed on this endpoint. */
-	struct udc_dwc3_trb trb_cache[2];
 	/* Buffer of pointers to net_buf, with index matching the position in the TRB buffers */
 	struct net_buf *net_buf[CONFIG_UDC_DWC3_TRB_NUM];
 	/* Buffer of TRB structures, with index matching the position in the net_buf buffers */
@@ -1082,13 +1130,6 @@ struct udc_dwc3_ep_data {
 	uint32_t n_retire;
 	/* Update Transfer commands refused while a descriptor was already armed. */
 	uint32_t n_update_refused;
-	/*
-	 * Length programmed into each ring slot at arm time. The hardware
-	 * rewrites BUFSIZ to the bytes NOT sent, so this is what tells a TRB
-	 * found with HWO set and BUFSIZ zero that was written back from one that
-	 * never carried data.
-	 */
-	uint32_t armed_len[CONFIG_UDC_DWC3_TRB_NUM];
 	/*
 	 * Transfer-resource pool generation this endpoint last ran DEPXFERCFG
 	 * for. DEPXFERCFG allocates resources and only DEPSTARTCFG gives them
@@ -1330,6 +1371,28 @@ struct udc_dwc3_data {
 		UDC_DWC3_CTRL_STATUS_READY,
 		UDC_DWC3_CTRL_STATUS_ARMED,
 	} ctrl_state;
+	/*
+	 * The control stage currently armed, one per direction: [0] EP0-OUT,
+	 * [1] EP0-IN. Indexed by udc_dwc3_ctrl_cache().
+	 *
+	 * CONTROL STATE, SO IT LIVES WITH THE CONTROL MACHINE. It was once a
+	 * field on every endpoint, where the seven data endpoints paid for it
+	 * and none of them ever read it - only the control arm and completion
+	 * paths touch it.
+	 *
+	 * Two jobs:
+	 *   - ctrl's TRBCTL says WHICH stage a completion belongs to
+	 *     (SETUP / DATA / STATUS);
+	 *   - a zeroed entry means the stage was abandoned, so a late or
+	 *     duplicate completion is discarded. TRBCTL has no zero encoding -
+	 *     the databook defines 1..9 - so zero can only be a value this
+	 *     driver cleared, never a transfer that really completed.
+	 *
+	 * The whole descriptor is kept, not just the type: two entries cost
+	 * 32 bytes total, and a wedge dump can then show the address and status
+	 * the stage was armed with.
+	 */
+	struct udc_dwc3_trb ctrl_trb_cache[2];
 	/*
 	 * The last transition, kept so a wedge dump can say how the machine got
 	 * to the state it is stuck in.
@@ -1876,6 +1939,17 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
  * could not be determined. Both mean the controller may still own the ring, so
  * every caller that asks this question wants the same answer for both.
  */
+/*
+ * The armed control stage for this endpoint's direction. EP0-OUT is [0],
+ * EP0-IN is [1]; no other endpoint has one.
+ */
+static inline struct udc_dwc3_trb *
+udc_dwc3_ctrl_cache(struct udc_dwc3_data *const priv,
+		    const struct udc_dwc3_ep_data *const ep_data)
+{
+	return &priv->ctrl_trb_cache[USB_EP_DIR_IS_IN(ep_data->cfg.addr) ? 1U : 0U];
+}
+
 static inline bool udc_dwc3_ep_is_ending(const struct udc_dwc3_ep_data *const ep_data)
 {
 	return ep_data->xfer_state == UDC_DWC3_EP_ENDING ||
@@ -3137,14 +3211,40 @@ static void udc_dwc3_out_size_check(const struct device *const dev,
 /*
  * Arm one buffer in the endpoint's TRB ring and advance head.
  */
+/*
+ * Bytes programmed into a descriptor for this buffer.
+ *
+ * The controller rewrites BUFSIZ to the bytes NOT transferred, so the
+ * programmed size cannot be read back from the TRB once it has been written
+ * back. It is derived from the buffer instead, which the ring already holds -
+ * an OUT descriptor must be a whole number of packets (databook 4.2.3.3), an IN
+ * one carries exactly what the buffer holds.
+ *
+ * ONE DEFINITION. The arm path and the retire path both need this number, and a
+ * per-slot copy of it used to be stored alongside the ring so they agreed.
+ */
+static uint32_t udc_dwc3_trb_programmed_len(const struct udc_dwc3_ep_data *const ep_data,
+					    const struct net_buf *const buf)
+{
+	const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
+
+	if (buf == NULL) {
+		return 0U;
+	}
+
+	if (!USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
+		return buf->len;
+	}
+
+	return (mps != 0U) ? ROUND_UP(buf->size, mps) : buf->size;
+}
+
 static void udc_dwc3_push_trb(const struct device *const dev,
 			      struct udc_dwc3_ep_data *const ep_data,
 			      struct net_buf *const buf, const uint32_t ctrl)
 {
 	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
-	const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
-	const uint32_t out_size = !USB_EP_DIR_IS_OUT(ep_data->cfg.addr) ? buf->len
-				  : (mps != 0U ? ROUND_UP(buf->size, mps) : buf->size);
+	const uint32_t out_size = udc_dwc3_trb_programmed_len(ep_data, buf);
 
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
 		udc_dwc3_out_size_check(dev, ep_data, buf->size, out_size,
@@ -3171,7 +3271,6 @@ static void udc_dwc3_push_trb(const struct device *const dev,
 	 * programmed size is rounded up to MaxPacketSize.
 	 */
 	ep_data->n_arm++;
-	ep_data->armed_len[ep_data->head] = out_size;
 
 	udc_dwc3_trb_fill(trb, (uintptr_t)buf->data, out_size, ctrl);
 
@@ -3253,9 +3352,8 @@ static int udc_dwc3_pop_trb(struct udc_dwc3_ep_data *const ep_data,
 	 * buf->size.
 	 */
 	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
-		const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
 		const uint32_t programmed =
-			(mps != 0U) ? ROUND_UP((*buf)->size, mps) : (*buf)->size;
+			udc_dwc3_trb_programmed_len(ep_data, *buf);
 		const uint32_t residual =
 			FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb->status);
 		const uint32_t received =
@@ -3387,7 +3485,7 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 	udc_dwc3_trb_fill(&trb[0], (uintptr_t)buf->data, size,
 			  ctrl | UDC_DWC3_TRB_CTRL_LST | UDC_DWC3_TRB_CTRL_HWO);
 
-	memcpy(&ep_data->trb_cache[0], (void *)&trb[0], sizeof(ep_data->trb_cache[0]));
+	*udc_dwc3_ctrl_cache(priv, ep_data) = trb[0];
 
 	/*
 	 * Report what actually happened. Discarding this and returning true made
@@ -3481,7 +3579,7 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 				  UDC_DWC3_TRB_CTRL_HWO);
 	}
 
-	memcpy(&ep_data->trb_cache[0], (void *)&trb[0], sizeof(ep_data->trb_cache[0]));
+	*udc_dwc3_ctrl_cache(priv, ep_data) = trb[0];
 
 	/* Report what actually happened - see the note in the IN path. */
 	if (!udc_dwc3_depcmd_start_xfer(dev, ep_data)) {
@@ -3606,7 +3704,7 @@ static void udc_dwc3_ctrl_arm_watchdog(const struct device *const dev,
 		priv->ctrl_setup_wd_snap_nonctrl = priv->nonctrl_done;
 	}
 
-	k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+	k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork, K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 }
 
 /*
@@ -3820,7 +3918,8 @@ static void udc_dwc3_ctrl_abandon(const struct device *const dev,
 	 */
 	memset((void *)&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
 	memset((void *)&ep_data->trb_buf[1], 0x00, sizeof(ep_data->trb_buf[1]));
-	memset((void *)&ep_data->trb_cache[0], 0x00, sizeof(ep_data->trb_cache));
+	memset(udc_dwc3_ctrl_cache(priv, ep_data), 0x00,
+	       sizeof(*udc_dwc3_ctrl_cache(priv, ep_data)));
 
 	/*
 	 * SPEC, Programming Guide 3.30b section 4.4.2 step 8, on the controller
@@ -3926,8 +4025,8 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 			priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
 		}
 
-		k_work_schedule(&priv->watchdog_dwork,
-				K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+		k_work_schedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+				K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 
 		LOG_DBG("EP%02X still concluding an End Transfer, not arming yet",
 			ep_data->cfg.addr);
@@ -3947,8 +4046,8 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
 			priv->watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
 		}
 
-		k_work_schedule(&priv->watchdog_dwork,
-				K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+		k_work_schedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+				K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 
 		LOG_DBG("EP%02X: status stage held until XferNotReady(Status)",
 			ep_data->cfg.addr);
@@ -4150,8 +4249,8 @@ static int udc_dwc3_recover(const struct device *dev)
 
 		if (released) {
 			udc_dwc3_ctrl_next(dev);
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+			k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			udc_unlock_internal(dev);
 			return 0;
 		}
@@ -4219,7 +4318,7 @@ static int udc_dwc3_recover(const struct device *dev)
 	 */
 	/* NO End Transfer on the control pair here, and no "reclaim". */
 
-	k_work_reschedule(&priv->watchdog_dwork, K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+	k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork, K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 
 	udc_unlock_internal(dev);
 
@@ -4369,7 +4468,7 @@ static void udc_dwc3_drop_xfer_state(const struct device *const dev,
 /*
  * Core soft reset (DCTL.CSFTRST) and full event-ring reinitialisation.
  */
-static void udc_dwc3_on_soft_reset(const struct device *const dev)
+static int udc_dwc3_on_soft_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
@@ -4525,11 +4624,11 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	 * RAM1_DEPTH=0 and mdwidth=0 and program every FIFO to zero depth.
 	 */
 	if (!udc_dwc3_wait_regfile_ready(dev)) {
-		LOG_ERR("FIFOMAP SKIPPED: the register file is not out of reset, so "
-			"every FIFO would be programmed to zero depth and the "
-			"controller would stop moving data for good. Leaving the "
-			"power-on map in place.");
-		goto fifomap_done;
+		LOG_ERR("the register file is not out of reset after CSftRst, so every "
+			"FIFO would be programmed to zero depth and the controller "
+			"would stop moving data for good: abandoning the "
+			"configuration rather than completing it");
+		return -EIO;
 	}
 
 	/*
@@ -4544,16 +4643,17 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		uint32_t used = 0;
 
 		/*
-		 * REFUSE, do not report and continue. The wait above should have
-		 * made this unreachable; if it is ever reached anyway, programming
-		 * the map is the one action guaranteed to kill the controller.
+		 * REFUSE. The wait above should have made this unreachable; if it
+		 * is ever reached anyway the core is still in reset, so the whole
+		 * configuration is abandoned for the same reason the wait
+		 * abandons it.
 		 */
 		if (ram1 == 0U || mdw == 0U) {
 			LOG_ERR("FIFOMAP REFUSED: core reports RAM1_DEPTH=%u "
 				"mdwidth=%u - the register file is not out of reset "
 				"and every FIFO would be programmed to zero depth",
 				ram1, mdw);
-			goto fifomap_done;
+			return -EIO;
 		}
 
 		LOG_INF("FIFOMAP: RAM1_DEPTH=%u words RAM2_DEPTH=%u words "
@@ -4598,7 +4698,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 			(uint32_t)FIELD_GET(UDC_DWC3_GHWPARAMS7_RAM2_DEPTH_MASK, hp7));
 	}
 
-fifomap_done:
 	/* Letting GRXFIFOSIZ unchanged */
 
 	/* Setup the event buffer address, size and start event reception */
@@ -4716,6 +4815,8 @@ fifomap_done:
 
 	/* Configure control endpoints */
 	udc_dwc3_depcmd_start_config(dev, true);
+
+	return 0;
 }
 
 /*
@@ -4830,12 +4931,13 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = ep_data->trb_cache[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	const uint32_t trb_trbctl = udc_dwc3_ctrl_cache(priv, ep_data)->ctrl &
+				    UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 
 	/*
 	 * A completion left over from a transfer that has already been replaced.
-	 * Every site that abandons a control transfer zeroes trb_cache[0], and
+	 * Every site that abandons a control transfer zeroes the cache, and
 	 * TRBCTL has no zero encoding - SPEC 6.3 Table "TRB Control (TRBCTL)"
 	 * defines 1..9 (1 Normal, 2 Control-Setup, 3 Control-Status-2, 4
 	 * Control-Status-3, 5 Control-Data, 6 Isochronous-First, 7 Isochronous,
@@ -4889,7 +4991,8 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 	}
 
 	memset(&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
-	memset(&ep_data->trb_cache[0], 0x00, sizeof(ep_data->trb_cache[0]));
+	memset(udc_dwc3_ctrl_cache(priv, ep_data), 0x00,
+	       sizeof(*udc_dwc3_ctrl_cache(priv, ep_data)));
 
 	udc_submit_ep_event(dev, buf, 0);
 
@@ -4910,12 +5013,13 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-	const uint32_t trb_trbctl = ep_data->trb_cache[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	const uint32_t trb_trbctl = udc_dwc3_ctrl_cache(priv, ep_data)->ctrl &
+				    UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
 	struct net_buf *buf;
 
 	/*
 	 * A completion left over from a transfer that has already been replaced.
-	 * Every site that abandons a control transfer zeroes trb_cache[0], and
+	 * Every site that abandons a control transfer zeroes the cache, and
 	 * TRBCTL has no zero encoding - SPEC 6.3 Table "TRB Control (TRBCTL)"
 	 * defines 1..9 (1 Normal, 2 Control-Setup, 3 Control-Status-2, 4
 	 * Control-Status-3, 5 Control-Data, 6 Isochronous-First, 7 Isochronous,
@@ -5046,8 +5150,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			 * udc_dwc3_on_ctrl_out(), so ep_data is the OUT
 			 * endpoint;
 			 */
-			memset(&cfg->ep_data_in[0].trb_cache[0], 0x00,
-			       sizeof(cfg->ep_data_in[0].trb_cache[0]));
+			memset(udc_dwc3_ctrl_cache(priv, &cfg->ep_data_in[0]), 0x00,
+			       sizeof(priv->ctrl_trb_cache[0]));
 		}
 	} else {
 		buf = udc_buf_get(&ep_data->cfg);
@@ -5100,7 +5204,8 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 	/* Defensive: slot 1 is not armed on this endpoint any more. */
 	memset(&ep_data->trb_buf[1], 0x00, sizeof(ep_data->trb_buf[1]));
-	memset(&ep_data->trb_cache[0], 0x00, sizeof(ep_data->trb_cache[0]));
+	memset(udc_dwc3_ctrl_cache(priv, ep_data), 0x00,
+	       sizeof(*udc_dwc3_ctrl_cache(priv, ep_data)));
 
 	/* Used when receiving a completed buffer from the hardware: mark as free */
 	udc_ep_set_busy(&ep_data->cfg, false);
@@ -6762,14 +6867,13 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
 		 */
 		LOG_INF("EPSTATE %-9s %s epn=%u par2=0x%08x depcmd=0x%08x last=0x%08x "
 			"txfifo=%u | ring=%u "
-			"head=%u tail=%u n_retire=%u arm=%u trb ctrl=0x%08x sts=0x%08x "
+			"head=%u tail=%u n_retire=%u trb ctrl=0x%08x sts=0x%08x "
 			"rscidx=0x%x", tag, names[i], epn, par2,
 			sys_read32(base + UDC_DWC3_DEPCMD(epn)),
 			ep_data->depcmd_last,
 			udc_dwc3_txfifo_space(dev, ep_data),
 			udc_dwc3_ep_ring_outstanding(ep_data) ? 1U : 0U,
 			ep_data->head, ep_data->tail, ep_data->n_retire,
-			ep_data->armed_len[ep_data->tail],
 			ep_data->trb_buf[ep_data->tail].ctrl,
 			ep_data->trb_buf[ep_data->tail].status,
 			ep_data->xferrscidx);
@@ -6835,14 +6939,20 @@ static void udc_dwc3_wedge_core_dump(const struct device *const dev,
 	 */
 	if (ep_data->trb_buf != NULL) {
 		for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
+			/*
+			 * No separate armed-length field. BUFSIZ inside sts IS
+			 * the programmed length until the controller writes the
+			 * descriptor back, after which it is the bytes NOT
+			 * transferred - so sts carries both, and which one it is
+			 * follows from HWO in ctrl.
+			 */
 			LOG_INF("  WTRB: EP%02x s%u addr=0x%08x%08x sts=0x%08x "
-				"ctrl=0x%08x armed=%u%s",
+				"ctrl=0x%08x%s",
 				ep_data->cfg.addr, i,
 				ep_data->trb_buf[i].addr_hi,
 				ep_data->trb_buf[i].addr_lo,
 				ep_data->trb_buf[i].status,
 				ep_data->trb_buf[i].ctrl,
-				ep_data->armed_len[i],
 				i == ep_data->tail ? " <-TAIL" :
 					(i == ep_data->head ? " <-HEAD" : ""));
 		}
@@ -7411,7 +7521,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 	    !udc_dwc3_ep_cmd_busy(&cfg->ep_data_in[0]) &&
 	    !udc_dwc3_ctrl_armed_setup(&cfg->ep_data_out[0]) &&
 	    k_cyc_to_ms_near32(k_cycle_get_32() - priv->ctrl_arm_t0) >=
-					CONFIG_UDC_DWC3_RECOVERY_TIMEOUT) {
+					UDC_DWC3_RECOVERY_TIMEOUT_MS) {
 		priv->ctrl_recover++;
 		LOG_ERR("control endpoint claimed %u ms with the host still asking "
 			"(%u declines, %s): recovering through controller recovery "
@@ -7790,8 +7900,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 
 		if ((dsts & UDC_DWC3_DSTS_RXFIFOEMPTY) != 0U) {
 			priv->ctrl_setup_wd_idle++;
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+			k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			return;
 		}
 
@@ -7806,8 +7916,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			priv->ctrl_setup_wd_busy++;
 			priv->ctrl_setup_wd_snap_setup = priv->ctrl_setup_done;
 			priv->ctrl_setup_wd_snap_nonctrl = priv->nonctrl_done;
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+			k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			return;
 		}
 
@@ -7834,8 +7944,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 
 			if (machine_owns) {
 				priv->ctrl_setup_wd_busy++;
-				k_work_reschedule(&priv->watchdog_dwork,
-						  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+				k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+						  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 				return;
 			}
 		}
@@ -7845,7 +7955,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			"nothing retired meanwhile (DSTS 0x%08x, TRB ctrl 0x%08x): a "
 			"received SETUP has not been retired, stalling EP0-OUT (fired "
 			"%u; suppressed idle %u, busy %u, retired %u)",
-			CONFIG_UDC_DWC3_RECOVERY_TIMEOUT, dsts, trb_ctrl,
+			UDC_DWC3_RECOVERY_TIMEOUT_MS, dsts, trb_ctrl,
 			priv->ctrl_setup_wd_fire, priv->ctrl_setup_wd_idle,
 			priv->ctrl_setup_wd_busy, priv->ctrl_setup_wd_retired);
 
@@ -7908,8 +8018,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 				priv->ctrl_setup_wd_updxfer);
 			}
 
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+			k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			return;
 		}
 
@@ -8013,8 +8123,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 			priv->ctrl_setup_wd_updxfer);
 		}
 
-		k_work_reschedule(&priv->watchdog_dwork,
-				  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+		k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+				  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 		return;
 	}
 
@@ -8052,8 +8162,8 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
 		udc_unlock_internal(dev);
 
 		if (machine_owns) {
-			k_work_reschedule(&priv->watchdog_dwork,
-					  K_MSEC(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT));
+			k_work_reschedule_for_queue(udc_get_work_q(), &priv->watchdog_dwork,
+					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			return;
 		}
 	}
@@ -8096,25 +8206,9 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
 #define UDC_DWC3_EVT_ARRIVE_FAST_POLLS 16u
 /*
  * Wall-clock ceiling on the same wait, applied ALONGSIDE the poll count rather
- * than instead of it.
+ * than instead of it. Defined at the top of this file, with the control
+ * watchdog timeout whose floor it sets.
  */
-#define UDC_DWC3_EVT_ARRIVE_MAX_MS 100u
-/*
- * The control watchdog must outlast one full arrival wait, or it recovers a
- * drain that is still inside its normal budget.
- */
-BUILD_ASSERT(CONFIG_UDC_DWC3_RECOVERY_TIMEOUT > UDC_DWC3_EVT_ARRIVE_MAX_MS,
-	     "CONFIG_UDC_DWC3_RECOVERY_TIMEOUT must exceed "
-	     "UDC_DWC3_EVT_ARRIVE_MAX_MS or the watchdog races the drain's own "
-	     "arrival wait (build_flir's 50 ms setting does not)");
-/*
- * heartbeat, nudge, watchdog and every endpoint's arm worker share one queue
- * thread, and that is what makes them mutually exclusive. Several cancel and
- * ordering arguments in this driver depend on it.
- */
-BUILD_ASSERT(!IS_ENABLED(CONFIG_UDC_WORKQUEUE),
-	     "this driver serialises its work items by sharing k_sys_work_q; "
-	     "CONFIG_UDC_WORKQUEUE=y splits them and breaks that assumption");
 /*
  * The slow phase: how long each timeout-based yield lasts, and how many of them.
  */
@@ -9657,20 +9751,41 @@ static int udc_dwc3_init(const struct device *const dev)
 	 * to see stable PHY clocks before it leaves reset: a core released onto
 	 * an unstable PIPE clock comes back with a register file that reads zero.
 	 */
-	sys_set_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
-	sys_set_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
-	sys_set_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
-	k_sleep(K_MSEC(UDC_DWC3_PHY_RESET_MS));
+	/*
+	 * Re-driven if the register file does not come back, and the whole init
+	 * fails if it never does. A core still in reset accepts no register
+	 * writes: GEVNTSIZ reads back zero, every endpoint is configured into a
+	 * void, and the driver reports itself enabled onto a controller that
+	 * will never move a byte. Failing here leaves the device off the bus,
+	 * which the caller can see and act on.
+	 */
+	for (uint32_t attempt = 1U; ; attempt++) {
+		sys_set_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+		sys_set_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
+		sys_set_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
+		k_sleep(K_MSEC(UDC_DWC3_PHY_RESET_MS));
 
-	/* Teriminate the reset of the USB2 and USB3 PHY first */
-	sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
-	sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
-	k_sleep(K_MSEC(UDC_DWC3_PHY_RESET_MS));
+		/* Teriminate the reset of the USB2 and USB3 PHY first */
+		sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
+		sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
+		k_sleep(K_MSEC(UDC_DWC3_PHY_RESET_MS));
 
-	/* Teriminate the reset of the DWC3 core after it */
-	sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+		/* Teriminate the reset of the DWC3 core after it */
+		sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
 
-	(void)udc_dwc3_wait_regfile_ready(dev);
+		if (udc_dwc3_wait_regfile_ready(dev)) {
+			break;
+		}
+
+		if (attempt >= UDC_DWC3_CORE_RESET_ATTEMPTS) {
+			LOG_ERR("core still in reset after %u reset sequences - "
+				"not configuring it", UDC_DWC3_CORE_RESET_ATTEMPTS);
+			return -EIO;
+		}
+
+		LOG_WRN("core did not leave reset, driving the sequence again "
+			"(%u of %u)", attempt, UDC_DWC3_CORE_RESET_ATTEMPTS);
+	}
 
 	//reg = sys_read32(base + UDC_DWC3_GCTL);
 	//reg &= ~UDC_DWC3_GCTL_RAMCLKSEL_MASK;
@@ -9681,7 +9796,10 @@ static int udc_dwc3_init(const struct device *const dev)
 	//sys_write32(reg, base + UDC_DWC3_GCTL);
 
 	/* The USB core was reset, configure it as documented */
-	udc_dwc3_on_soft_reset(dev);
+	ret = udc_dwc3_on_soft_reset(dev);
+	if (ret != 0) {
+		return ret;
+	}
 
 	/* Configure the control OUT endpoint */
 	ret = udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT, USB_EP_TYPE_CONTROL, 512, 0);
