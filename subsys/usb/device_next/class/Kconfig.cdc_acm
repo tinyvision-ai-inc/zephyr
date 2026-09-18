@@ -63,6 +63,17 @@ config USBD_CDC_ACM_WORKQUEUE_PRIORITY
 	  preemptible priority (>= 0) so the cooperative UDC workqueue can
 	  preempt it and make forward progress.
 
+config USBD_CDC_ACM_TX_BUF_SIZE
+	int "Bulk IN transfer buffer size (0 = bulk MPS)"
+	default 0
+	range 0 1024
+	help
+	  Size of the buffer allocated for each device-to-host transfer. The
+	  default (0) uses the bulk endpoint MPS of the fastest supported speed
+	  (1024 bytes on SuperSpeed). Boards with a small DMA pool and several
+	  CDC-ACM instances can use a smaller value: the class simply sends
+	  more, shorter transfers. OUT buffers always stay at MPS.
+
 config USBD_CDC_ACM_BUF_POOL
 	bool "Use dedicated buffer pool"
 	default y if !USBD_MAX_SPEED_FULL

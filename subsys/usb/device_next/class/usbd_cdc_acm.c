@@ -211,7 +211,13 @@ static struct net_buf *cdc_acm_buf_alloc(struct usbd_class_data *const c_data,
 static struct net_buf *cdc_acm_buf_alloc(struct usbd_class_data *const c_data,
 					 const uint8_t ep)
 {
-	return usbd_ep_buf_alloc(c_data, ep, USBD_MAX_BULK_MPS);
+	size_t size = USBD_MAX_BULK_MPS;
+
+	if (USB_EP_DIR_IS_IN(ep) && CONFIG_USBD_CDC_ACM_TX_BUF_SIZE != 0) {
+		size = MIN(size, CONFIG_USBD_CDC_ACM_TX_BUF_SIZE);
+	}
+
+	return usbd_ep_buf_alloc(c_data, ep, size);
 }
 #endif /* CONFIG_USBD_CDC_ACM_BUF_POOL */
 
@@ -949,11 +955,15 @@ static void cdc_acm_on_control_line_state(struct usbd_class_data *const c_data,
 		 * TX_FIFO_BUSY is likewise left alone; if its IN completion was
 		 * dropped, the driver's IN-completion poll retires it.
 		 */
-		ring_buf_reset(data->rx_fifo.rb);
-		ring_buf_reset(data->tx_fifo.rb);
+		/*
+		 * Do not flush TX or RX. Host bulk-write closes after the
+		 * file while RX still holds unread payload; bulk-read closes
+		 * on a stall while TX still holds unread IN. Either reset
+		 * drops the tail (WRITE lost ~2 KiB; READ died at 6771/27775).
+		 */
 		data->zlp_needed = false;
 
-		LOG_DBG("DTR deassert: ACM session buffers flushed, pipes kept armed");
+		LOG_DBG("DTR deassert: FIFOs kept, pipes armed");
 		return;
 	}
 
@@ -1218,7 +1228,7 @@ static void cdc_acm_poll_out(const struct device *dev, const unsigned char c)
 			break;
 		}
 
-		if (k_is_in_isr() || !data->flow_ctrl) {
+		if (k_is_in_isr()) {
 			LOG_WRN_ONCE("Ring buffer full, discard data");
 			break;
 		}

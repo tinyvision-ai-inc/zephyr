@@ -1,0 +1,7 @@
+# Copyright tinyVision.ai
+
+description: USB CDC ACM with lower level API
+
+compatible: "zephyr,cdc-raw"
+
+on-bus: usb

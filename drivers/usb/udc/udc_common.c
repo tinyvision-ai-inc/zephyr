@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <string.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
@@ -26,6 +27,10 @@ static inline void udc_buf_destroy(struct net_buf *buf);
 UDC_BUF_POOL_VAR_DEFINE(udc_ep_pool,
 			CONFIG_UDC_BUF_COUNT, CONFIG_UDC_BUF_POOL_SIZE,
 			sizeof(struct udc_buf_info), udc_buf_destroy);
+
+/* EP0 SETUP/DATA/STATUS stay off the shared ACM/RAW pool. */
+UDC_BUF_POOL_DEFINE(udc_ep0_pool, 8, 512,
+		    sizeof(struct udc_buf_info), udc_buf_destroy);
 
 #define USB_EP_LUT_IDX(ep) (USB_EP_DIR_IS_IN(ep) ? (ep & BIT_MASK(4)) + 16 : \
 						   ep & BIT_MASK(4))
@@ -727,8 +732,31 @@ struct net_buf *udc_ctrl_alloc(const struct device *dev,
 			       const uint8_t ep,
 			       const size_t size)
 {
-	/* TODO: for now just pass to udc_buf_alloc() */
-	return udc_ep_buf_alloc(dev, ep, size);
+	const struct udc_api *api = dev->api;
+	struct net_buf *buf = NULL;
+	struct udc_buf_info *bi;
+
+	api->lock(dev);
+
+	buf = net_buf_alloc_len(&udc_ep0_pool, size, K_NO_WAIT);
+	if (!buf) {
+		/* Large control-IN (config descriptor) falls back to the shared pool. */
+		buf = net_buf_alloc_len(&udc_ep_pool, size, K_NO_WAIT);
+	}
+	if (!buf) {
+		LOG_ERR("Failed to allocate EP0 net_buf %zd, ep 0x%02x", size, ep);
+		goto ep0_alloc_error;
+	}
+
+	bi = udc_get_buf_info(buf);
+	memset(bi, 0, sizeof(*bi));
+	bi->ep = ep;
+	LOG_DBG("Allocate EP0 net_buf %p, ep 0x%02x, size %zd", buf, ep, size);
+
+ep0_alloc_error:
+	api->unlock(dev);
+
+	return buf;
 }
 
 struct net_buf *udc_ctrl_setup_alloc(const struct device *dev)

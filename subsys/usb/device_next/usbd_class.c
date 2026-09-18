@@ -404,6 +404,10 @@ int usbd_register_all_classes(struct usbd_context *const uds_ctx,
 
 	if (USBD_SUPPORTS_SUPER_SPEED && speed == USBD_SPEED_SS) {
 		STRUCT_SECTION_FOREACH_ALTERNATE(usbd_class_ss, usbd_class_node, c_nd) {
+			if (blocklist != NULL && is_blocklisted(c_nd, blocklist)) {
+				continue;
+			}
+
 			ret = usbd_register_class(uds_ctx, c_nd->c_data->name,
 						  speed, cfg);
 			if (ret) {
