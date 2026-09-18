@@ -1058,6 +1058,7 @@ enum udc_dwc3_ep_pending {
 	UDC_DWC3_EP_PEND_RESUME		= BIT(1), /* re-establish the transfer       */
 	UDC_DWC3_EP_PEND_RESUME_MODIFY	= BIT(2), /* qualifies RESUME: DEPCFG Modify */
 	UDC_DWC3_EP_PEND_DEQUEUE	= BIT(3), /* release the ring, cancel the buffers */
+	UDC_DWC3_EP_PEND_CTRL_RECLAIM	= BIT(4), /* clear the control ring once the End reports */
 };
 
 
@@ -1432,6 +1433,12 @@ struct udc_dwc3_data {
 	/* Descriptors overwritten while the controller still owned them. */
 	uint32_t trb_stomp;
 	uint32_t ctrl_arm_refused;
+	/* Control IN descriptors the controller still owned when recovery ran. */
+	uint32_t ctrl_reclaim_tried;
+	/* Of those, the ones whose End Transfer could not be issued. */
+	uint32_t ctrl_reclaim_refused;
+	/* Reclaims completed, so the ring was cleared and the TxFIFO flushed. */
+	uint32_t ctrl_reclaim_done;
 	uint32_t nonctrl_recache;	/* re-caches issued on non-control endpoints */
 	uint32_t ctrl_setup_wd_upd_mark;
 	uint32_t ctrl_status_done;	/* status stages retired (IN and OUT) */
@@ -4210,6 +4217,40 @@ static void udc_dwc3_core_state_dump(const struct device *const dev)
 }
 
 /*
+ * Finish the reclaim of a control descriptor whose End Transfer is over.
+ *
+ * SPEC, Programming Guide 3.30b section 4.4.2 step 8: "Software has to reclaim
+ * the TRBs with HWO=1 in the skipped TRBs and flush the TxFIFO." Both halves
+ * are here, and only here: the End Transfer is what makes the descriptor the
+ * driver's to write, and the FIFO still holds whatever the controller staged
+ * for the stage that never went out.
+ *
+ * Called once the controller has reported the transfer over - from the End
+ * Transfer's completion, or from the recovery that declares it over when that
+ * completion never arrives.
+ */
+static void udc_dwc3_ctrl_reclaim_finish(const struct device *const dev,
+					 struct udc_dwc3_ep_data *const ep_data)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	memset((void *)&ep_data->trb_buf[0], 0x00, sizeof(ep_data->trb_buf[0]));
+	memset((void *)&ep_data->trb_buf[1], 0x00, sizeof(ep_data->trb_buf[1]));
+	memset(udc_dwc3_ctrl_cache(priv, ep_data), 0x00,
+	       sizeof(*udc_dwc3_ctrl_cache(priv, ep_data)));
+
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		udc_dwc3_fifo_flush_tx(dev, ep_data->cfg.addr & 0x7fU);
+	}
+
+	priv->ctrl_reclaim_done++;
+
+	LOG_WRN("control IN descriptor reclaimed on EP%02x (%u of %u attempted)",
+		ep_data->cfg.addr, priv->ctrl_reclaim_done,
+		priv->ctrl_reclaim_tried);
+}
+
+/*
  * Controller-level recovery of a stuck control transfer.
  */
 static int udc_dwc3_recover(const struct device *dev)
@@ -4244,6 +4285,24 @@ static int udc_dwc3_recover(const struct device *dev)
 				ctrl[i]->cfg.addr, priv->ctrl_deferred_arm);
 
 			udc_dwc3_ep_state_reset(ctrl[i]);
+
+			/*
+			 * An End Transfer was issued - that is what ENDING means -
+			 * and it is being declared over here. A descriptor still
+			 * marked HWO is one nothing else will ever release, so
+			 * finish the reclaim of 4.4.2 step 8 now.
+			 *
+			 * The test is HWO, not what this recovery deferred:
+			 * udc_dwc3_ctrl_next() below arms both control endpoints,
+			 * and arming is refused over a descriptor the controller
+			 * still owns, so releasing the state without clearing the
+			 * ring leaves the endpoint exactly as stuck as before.
+			 */
+			if ((ctrl[i]->trb_buf[0].ctrl &
+			     UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+				udc_dwc3_ctrl_reclaim_finish(dev, ctrl[i]);
+			}
+
 			released = true;
 		}
 
@@ -4253,6 +4312,51 @@ static int udc_dwc3_recover(const struct device *dev)
 					  K_MSEC(UDC_DWC3_RECOVERY_TIMEOUT_MS));
 			udc_unlock_internal(dev);
 			return 0;
+		}
+	}
+
+	/*
+	 * Reclaim a control IN descriptor the controller still owns.
+	 *
+	 * SPEC, Programming Guide 3.30b section 4.4.2 step 8: "Software has to
+	 * reclaim the TRBs with HWO=1 in the skipped TRBs and flush the
+	 * TxFIFO." Step 3a gives the order when a started transfer has to go
+	 * before the stall: "software must issue an End Transfer for the data
+	 * stage it has already started, then issue Set Stall."
+	 *
+	 * The Set Stall below goes on EP0-OUT - section 4.4, "Set STALL is
+	 * always issued on EP0" - so it cannot release anything held on EP0-IN.
+	 * A status stage whose completion was never written back leaves HWO set
+	 * there for good, and udc_dwc3_trb_ctrl_in() then refuses to arm over
+	 * it, which takes the control endpoint out of service.
+	 *
+	 * The descriptor is cleared from udc_dwc3_ep_end_completed(), once the
+	 * controller has reported that it has let go, or from the ENDING branch
+	 * above if that report never arrives.
+	 */
+	{
+		struct udc_dwc3_ep_data *const in0 = &cfg->ep_data_in[0];
+
+		if ((in0->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+			priv->ctrl_reclaim_tried++;
+
+			LOG_WRN("control IN descriptor still owned by the controller "
+				"(ctrl 0x%08x): ending the transfer to reclaim it "
+				"(%u so far)", in0->trb_buf[0].ctrl,
+				priv->ctrl_reclaim_tried);
+
+			if (udc_dwc3_depcmd_end_xfer(dev, in0, 0)) {
+				in0->pending |= UDC_DWC3_EP_PEND_CTRL_RECLAIM;
+			} else {
+				/*
+				 * Not issued, so the controller still owns the
+				 * descriptor and nothing may be written over it.
+				 * The Set Stall below still runs, and the next
+				 * recovery retries this once the endpoint's open
+				 * command outcome has been resolved from DEPCMD.
+				 */
+				priv->ctrl_reclaim_refused++;
+			}
 		}
 	}
 
@@ -6126,6 +6230,15 @@ static void udc_dwc3_ep_end_completed(const struct device *const dev,
 		udc_dwc3_ep_return_parked(dev, ep_data, -ECONNABORTED);
 	}
 
+	/*
+	 * The reclaim udc_dwc3_recover() asked for. The controller has reported
+	 * the transfer over, so the descriptor is the driver's to clear -
+	 * 4.4.2 step 8, completed.
+	 */
+	if ((owed & UDC_DWC3_EP_PEND_CTRL_RECLAIM) != 0U) {
+		udc_dwc3_ctrl_reclaim_finish(dev, ep_data);
+	}
+
 	if ((owed & UDC_DWC3_EP_PEND_CLEAR_STALL) != 0U) {
 		if (udc_dwc3_depcmd_clear_stall(dev, ep_data,
 						UDC_DWC3_DEPCMD_HIPRI_FORCERM)) {
@@ -7273,7 +7386,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 		 * synchronous console that is 35 ms in which the ring is not drained,
 		 * paid every time even when every counter reads zero. Abbreviations:
 		 * lt late, gu gaveup, sk skipped, ms missed, ds desync, mz midzero,
-		 * dc decline, sf startfail, swd setup-watchdog, rst core reset.
+		 * dc decline, sf startfail, swd setup-watchdog, rst core reset,
+		 * rc control-reclaim tried/done/refused.
 		 */
 		{
 			char b[248];
@@ -7313,6 +7427,9 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 			_P(priv->ctrl_stall_issued, " st%u", priv->ctrl_stall_issued);
 			_P(priv->ep_halts, " eh%u", priv->ep_halts);
 			_P(priv->trb_stomp, " sm%u", priv->trb_stomp);
+			_P(priv->ctrl_reclaim_tried || priv->ctrl_reclaim_done, " rc%u/%u/%u",
+			   priv->ctrl_reclaim_tried, priv->ctrl_reclaim_done,
+			   priv->ctrl_reclaim_refused);
 			_P(priv->out_unaligned || priv->out_unaligned_ctrl, " om%u/%u",
 			   priv->out_unaligned, priv->out_unaligned_ctrl);
 			_P(priv->evt_gaveup_multi, " mu%u", priv->evt_gaveup_multi);
