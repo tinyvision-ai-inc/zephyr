@@ -1141,7 +1141,14 @@ struct udc_dwc3_drain {
     uint32_t watched_us;    /* time actually spent looking at the slot */
     uint32_t quiet;     /* nothing was printed inside this episode */
     uint32_t counted;   /* this episode was already counted as missed */
-
+    /*
+     * The slot held back by the last skip, and whether one is being watched.
+     * Armed only when a skip stepped over less than the controller owed, so
+     * the held slot lies inside the stuck group and no newly generated event
+     * can land in it - see udc_dwc3_evt_skip_dead_slot().
+     */
+    uint32_t skip_watch_slot;
+    bool     skip_watch;
 };
 
 /* Reset the whole drain state as one act - see the enum above. */
@@ -1251,6 +1258,13 @@ struct udc_dwc3_data {
     uint32_t evt_isr;       /* interrupt handler invocations */
     uint32_t evt_worker_runs;   /* event worker passes entered */
     uint32_t evt_skipped;       /* events discarded to free a full ring */
+    /*
+     * Skips the ring later proved wrong. The slot held back by a skip filled,
+     * and the controller writes in order, so every slot stepped over ahead of
+     * it must have been written too - the words were late, not lost. Zero is
+     * the claim that skipping only ever discarded events that never arrived.
+     */
+    uint32_t evt_skip_refuted;
     uint32_t evt_link_total;    /* USB/Link State Change events seen */
     uint32_t evt_link_run;      /* consecutive events reporting the same state */
     uint32_t evt_link_last;     /* that state, EvtInfo[3:0] */
@@ -7245,7 +7259,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
          * Only what is non-zero. The full line was ~400 characters, and on a
          * synchronous console that is 35 ms in which the ring is not drained,
          * paid every time even when every counter reads zero. Abbreviations:
-         * lt late, gu gaveup, sk skipped, ms missed, ds desync, mz midzero,
+         * lt late, gu gaveup, sk skipped/refuted, ms missed, ds desync, mz midzero,
          * dc decline, sf startfail, swd setup-watchdog, rst core reset,
          * rc control-reclaim tried/done/refused.
          *
@@ -7275,7 +7289,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
                priv->evt_late_polls_max, priv->evt_late_us_max);
             _P(priv->evt_gaveup, " gu%u/%uu", priv->evt_gaveup,
                priv->evt_gaveup_us_max);
-            _P(priv->evt_skipped, " sk%u", priv->evt_skipped);
+            _P(priv->evt_skipped, " sk%u/%u", priv->evt_skipped,
+               priv->evt_skip_refuted);
             _P(priv->evt_zero, " z%u", priv->evt_zero);
             _P(priv->evt_missed, " ms%u/%u", priv->evt_missed,
                priv->evt_missed_frozen);
@@ -8483,22 +8498,45 @@ static uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
 
     /* The caller decides; this only acts. How far to advance: */
     uint32_t owed = gc / sizeof(uint32_t);
-    uint32_t skip = 1u;
-
     if (owed > (CONFIG_UDC_DWC3_EVENTS_NUM - 1u)) {
         owed = CONFIG_UDC_DWC3_EVENTS_NUM - 1u;
     }
 
     /*
-     * A written slot IS the only thing that extends the skip. Finding one
-     * proves the controller passed over the j slots before it. Finding none
-     * proves nothing - those words may still be in flight - so step over one.
+     * A WRITTEN SLOT AHEAD SHORTENS THE SKIP; FINDING NONE EXTENDS IT TO ALL
+     * BUT ONE.
+     *
+     * Written at P+j: the controller fills the ring in order, so it wrote that
+     * slot after the j before it. Those j were passed over and are gone - step
+     * over exactly them and leave the written slot to be read normally.
+     *
+     * No written slot anywhere in the owed range: nothing is proved. The words
+     * may still be in flight. But they were all counted in the same
+     * GEVNTCOUNT, and in-order writing means none of them can have landed
+     * while the head has not - so step over all but the last, and hold that
+     * one back.
+     *
+     * The held slot is a detector, not caution. It lies inside the stuck
+     * group, so no newly generated event can land in it; if it ever fills,
+     * ordering says every slot skipped ahead of it filled too and the skip was
+     * wrong. udc_dwc3_copy_valid_event() counts that as evt_skip_refuted.
      */
-    for (skip = 1u; skip < owed; skip++) {
-        const uint32_t idx = (priv->evt_next + skip) % CONFIG_UDC_DWC3_EVENTS_NUM;
-        if (cfg->evt_buf[idx] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
-            break;
+    uint32_t skip = 1;
+    bool     held_back = false;
+
+    if (owed > 1)
+    {
+        uint32_t j = 1;
+        bool slot_valid = false;
+        for (; j < owed; j++) {
+            const uint32_t idx = (priv->evt_next + j) % CONFIG_UDC_DWC3_EVENTS_NUM;
+            if (cfg->evt_buf[idx] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
+                slot_valid = true;
+                break;
+            }
         }
+        skip = (true == slot_valid) ? j : (j - 1);
+        held_back = !slot_valid;
     }
 
     /*
@@ -8519,6 +8557,15 @@ static uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
         priv->evt_next       = (priv->evt_next + skip) % CONFIG_UDC_DWC3_EVENTS_NUM;
         priv->evt_skipped   += skip;
         priv->drain.attempts = 0;
+
+        /*
+         * Watch the held slot, and only a held one. With nothing held -
+         * owed was 1, or a written slot ahead already proved the case - the
+         * next slot is where the controller writes next, and an ordinary new
+         * event landing there would refute nothing.
+         */
+        priv->drain.skip_watch      = held_back;
+        priv->drain.skip_watch_slot = priv->evt_next;
 
         /*
          * Fields: h what the slot read, skip slots stepped over, tot
@@ -8548,8 +8595,7 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
     const struct udc_dwc3_config *const cfg = dev->config;
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-    if (gc < sizeof(uint32_t) ||
-        cfg->evt_buf[priv->evt_next] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
+    if (cfg->evt_buf[priv->evt_next] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
         return false;
     }
 
@@ -8564,7 +8610,8 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
      * means two events were counted and neither has landed yet - they may
      * still be late. Only a written slot ahead tells late from lost.
      */
-    if (((priv->drain.watched_us / 1000U) >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS) &&
+    uint32_t wait_tims_ms = priv->drain.watched_us / 1000U;
+    if ((wait_tims_ms >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS) &&
         (true == udc_dwc3_evt_lookahead_lost(dev, gc)))
     {
         priv->evt_lookahead_short++;
@@ -8572,11 +8619,11 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
     }
 
     /* No proof available - fall back on the timeout routes, with the floor. */
-    if ((priv->drain.watched_us / 1000U) < UDC_DWC3_EVT_DEAD_SLOT_MIN_MS) {
+    if (wait_tims_ms < UDC_DWC3_EVT_DEAD_SLOT_MIN_MS) {
         return false;
     }
 
-    if ((priv->drain.watched_us / 1000U) >= UDC_DWC3_EVT_DEAD_SLOT_MS ||
+    if (wait_tims_ms >= UDC_DWC3_EVT_DEAD_SLOT_MS ||
         priv->drain.attempts >= UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS) {
         return true;
     }
@@ -8606,6 +8653,19 @@ static void udc_dwc3_copy_valid_event (struct udc_dwc3_data *const priv,
 {
     priv->evt_copy[copy_idx]   = evt;
     cfg->evt_buf[evt_idx % CONFIG_UDC_DWC3_EVENTS_NUM] = UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE;
+
+    /*
+     * Did the slot a skip held back fill? Then the words were late, not lost,
+     * and the slots stepped over ahead of it were live events thrown away.
+     * One shot: the watch is dropped on the first event out of the ring
+     * either way, so a later unrelated event cannot be counted as a refusal.
+     */
+    if (priv->drain.skip_watch) {
+        if ((evt_idx % CONFIG_UDC_DWC3_EVENTS_NUM) == priv->drain.skip_watch_slot) {
+            priv->evt_skip_refuted++;
+        }
+        priv->drain.skip_watch = false;
+    }
 
     /* Only when an arrival wait preceded this event. */
     if (priv->drain.since > 0)
