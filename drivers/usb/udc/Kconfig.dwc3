@@ -207,4 +207,14 @@ config UDC_DWC3_DEPCMD_MAILBOX
 	  is unused. Requires the doorbell bitstream with DepCmdArbiter.
 	  Leave n on IEBM bits (CPU writes DEPCMD directly).
 
+config UDC_DWC3_USB_ENGINE
+	bool "Post ACM/RAW through UsbEngine BulkRing (Track B)"
+	depends on UDC_DWC3_DEPCMD_MAILBOX
+	help
+	  After ENG_CTRL.ENABLE, RTL owns GEVNTCOUNT and ACM/RAW DEPCMD.
+	  CPU posts DESC_* and drains FWD_POP / CMPL_*. Video stays on the
+	  doorbell. Leave n on Track A (800 us QUIET_OTHER). Probe MAGIC
+	  0x5533 at 0xb400B000 before enabling; a Track A bit stays on the
+	  mailbox path.
+
 endif # UDC_DWC3

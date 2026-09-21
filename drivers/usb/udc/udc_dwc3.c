@@ -21,6 +21,7 @@
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
+#include <zephyr/drivers/usb/udc/udc_dwc3_usb_engine.h>
 
 /* TRB memory buffer fields */
 #define UDC_DWC3_TRB_STATUS_BUFSIZ_MASK				GENMASK(23, 0)
@@ -905,7 +906,21 @@ void udc_dwc3_health_print(void)
 	       udc_dwc3_health_setup_pending, udc_dwc3_health_ep0_rst,
 	       udc_dwc3_evt_errors.overflow, udc_dwc3_evt_errors.unknown);
 	udc_dwc3_acm_health_dump();
+	udc_dwc3_engine_dump();
 }
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+void udc_dwc3_engine_reprime_acm(const struct device *dev)
+{
+	/*
+	 * Do not rewrite in-flight CPU TRBs. BulkRing LST=1 + UpdateXfer on
+	 * an already-armed 0x01 slot races the core and never completes.
+	 * Existing ACM TRBs stay CPU-owned; new enqueues kick via RTL.
+	 */
+	ARG_UNUSED(dev);
+	printk("engine: reprime skip (keep armed ACM TRBs)\n");
+}
+#endif
 
 /*
  * Phase 0 park dump: two snapshots 100 ms apart decide whether TX DMA
@@ -1770,6 +1785,10 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)
 {
+	if (udc_dwc3_engine_owns(ep_data->cfg.addr)) {
+		(void)udc_dwc3_engine_cmd(ep_data->cfg.addr, USB_ENGINE_DESC_CTRL_STALL);
+		return;
+	}
 	if (udc_dwc3_ep_refuse_if_hw_owned(ep_data, "SetStall")) {
 		return;
 	}
@@ -1782,6 +1801,10 @@ static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
+	if (udc_dwc3_engine_owns(ep_data->cfg.addr)) {
+		(void)udc_dwc3_engine_cmd(ep_data->cfg.addr, USB_ENGINE_DESC_CTRL_CLEAR);
+		return;
+	}
 	if (udc_dwc3_ep_refuse_if_hw_owned(ep_data, "ClearStall")) {
 		return;
 	}
@@ -1910,6 +1933,16 @@ static void udc_dwc3_depcmd_start_xfer_trb(const struct device *const dev,
 		ep_data->xfer_active = true;
 		LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 			ep_data->cfg.addr, ep_data->xferrscidx);
+		if (usb_engine_bulk_idx(ep_data->cfg.addr) >= 0) {
+			const struct udc_dwc3_config *const cfg = dev->config;
+
+			udc_dwc3_engine_program_ep(dev, ep_data->cfg.addr,
+				(uint32_t)(DEVICE_MMIO_NAMED_GET(dev, base) +
+					   UDC_DWC3_DEPCMD(ep_data->epn)),
+				ep_data->xferrscidx,
+				(uint32_t)(uintptr_t)cfg->evt_buf,
+				CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
+		}
 		return;
 	}
 
@@ -3739,6 +3772,7 @@ static void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 	/* The RTL must not keep ringing a video endpoint the host just reset */
 	udc_dwc3_hw_owned_revoke_all(dev, "usb-reset");
+	udc_dwc3_engine_disable();
 
 	/* Host will re-enumerate; non-control pool must be reallocated. */
 	DEV_DATA(dev)->startcfg_nonctrl_done = false;
@@ -4482,6 +4516,46 @@ static void udc_dwc3_out_stall_refresh_tick(const struct device *const dev)
 #define UDC_DWC3_IN_PARK_BACKOFF_MS 5000
 #define UDC_DWC3_IN_NUDGE_EP_MASK CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK
 
+#if CONFIG_UDC_DWC3_HW_IN_EP_MASK != 0
+/*
+ * 0x82 HWO+unchanged remain for 100 ms is the normal ACM IN wait under
+ * 60 fps Y16: the host is chewing video URBs and has not IN-polled ACM
+ * yet. EndXfer+StartXfer of that live ring is what we sampled at every
+ * UVC+SRP abort (EP82 back to STARTXFER, uvcvideo -71, 9-byte timeout).
+ * Hold recover for the whole STREAMON. SRP-only still recovers.
+ */
+static bool udc_dwc3_hw_video_live(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	uint32_t mask = CONFIG_UDC_DWC3_HW_IN_EP_MASK;
+
+	if (udc_dwc3_engine_vid_live()) {
+		return true;
+	}
+
+	while (mask != 0U) {
+		const uint8_t idx = (uint8_t)__builtin_ctz(mask);
+		const struct udc_dwc3_ep_data *ep;
+
+		mask &= ~BIT(idx);
+		if (idx >= cfg->num_in_eps) {
+			continue;
+		}
+		ep = &cfg->ep_data_in[idx];
+		if (ep->hw_mgr_base != 0U) {
+			if ((sys_read32(ep->hw_mgr_base +
+					UDC_DWC3_UVCMGR_CONTROL_STATUS) &
+			     BIT(0)) != 0U) {
+				return true;
+			}
+		} else if (udc_dwc3_ep_is_hw_in(ep) && ep->xfer_active) {
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
 static void udc_dwc3_in_park_retake(const struct device *const dev,
 				    struct udc_dwc3_ep_data *const ep_data)
 {
@@ -4684,6 +4758,21 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 static void udc_dwc3_in_recover_tick(const struct device *const dev)
 {
 	uint32_t mask = CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK;
+#if CONFIG_UDC_DWC3_HW_IN_EP_MASK != 0
+	static bool held;
+
+	if (udc_dwc3_hw_video_live(dev)) {
+		if (!held) {
+			printk("IN-RECOVER: hold (video live)\n");
+			held = true;
+		}
+		return;
+	}
+	if (held) {
+		printk("IN-RECOVER: release\n");
+		held = false;
+	}
+#endif
 
 	while (mask != 0U) {
 		const uint8_t idx = (uint8_t)__builtin_ctz(mask);
@@ -4789,7 +4878,16 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	static uint32_t ev85;
 
 	if ((evt_raw & 1U) == 0U) { /* DEPEVT: tally per physical epn */
-		udc_dwc3_nv_evt[(evt_raw >> 1) & 0x1fU]++;
+		const uint8_t epn = (uint8_t)((evt_raw >> 1) & 0x1fU);
+		const uint8_t addr = (uint8_t)((epn >> 1) | ((epn & 1U) ? 0x80U : 0U));
+
+		udc_dwc3_nv_evt[epn]++;
+		/*
+		 * EVT_OWN=0: CPU still owns the event ring. Do not swallow
+		 * ACM DEPEVT — BulkRing is doorbell-only until it actually
+		 * completes (cmpl stays 0 if we hide the event from Zephyr).
+		 */
+		ARG_UNUSED(addr);
 	} else {
 		udc_dwc3_nv_evt[0]++; /* DEVT bucket */
 	}
@@ -4837,6 +4935,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 	case UDC_DWC3_DEVT_DISCONNEVT:
 		LOG_DBG("DEVT_DISCONNEVT");
 		udc_dwc3_hw_owned_revoke_all(dev, "disconnect");
+		udc_dwc3_engine_disable();
 		break;
 	case UDC_DWC3_DEVT_USBRST:
 		LOG_DBG("DEVT_USBRST");
@@ -4951,6 +5050,10 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 			udc_dwc3_rateprobe_print();
 		}
 
+		if (udc_dwc3_engine_enabled()) {
+			udc_dwc3_engine_poll(dev, udc_dwc3_handle_event);
+		}
+
 #if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
 		/* ACM/EP0 events the ISR lifted off the HW ring. */
 		for (;;) {
@@ -4968,6 +5071,10 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 
 		do {
 			bool yield_video = false;
+
+			if (udc_dwc3_engine_evt_own()) {
+				break;
+			}
 
 			for (;;) {
 				/*
@@ -5059,6 +5166,10 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 			 * and re-check (DWC3 does not always IRQ for events
 			 * that were already pending at unmask). Only then sleep.
 			 */
+			if (udc_dwc3_engine_evt_own()) {
+				break;
+			}
+
 			{
 				unsigned int key = irq_lock();
 				uint32_t cnt = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0));
@@ -5082,7 +5193,7 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 #if defined(CONFIG_UDC_DWC3_EVENT_BACKSTOP)
 		ret = k_sem_take(&priv->evt_sem,
 				 udc_dwc3_evt_fast ? K_MSEC(2) : K_MSEC(100));
-		if (ret == -EAGAIN &&
+		if (ret == -EAGAIN && !udc_dwc3_engine_evt_own() &&
 		    sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0 &&
 		    (sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) & UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK)) {
 			LOG_WRN("event ring serviced by timeout backstop (lost wakeup)");
@@ -5154,7 +5265,9 @@ __ramfunc static void udc_dwc3_irq_handler(void *const ptr)
 	 * used instead of the system workqueue so large control transfers are
 	 * not delayed.
 	 */
-	sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	if (!udc_dwc3_engine_evt_own()) {
+		sys_set_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
+	}
 	k_sem_give(&priv->evt_sem);
 }
 
@@ -5197,6 +5310,13 @@ static int udc_dwc3_ep_dequeue(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg)
 {
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+
+	if (udc_dwc3_engine_owns(ep_data->cfg.addr)) {
+		(void)udc_dwc3_engine_cmd(ep_data->cfg.addr, USB_ENGINE_DESC_CTRL_END);
+		udc_ep_cancel_queued(dev, ep_cfg);
+		udc_ep_set_busy(ep_cfg, false);
+		return 0;
+	}
 
 	if (ep_data->hw_owned) {
 		/* Class-level teardown of a live video EP: take it back cleanly */
@@ -5363,11 +5483,24 @@ static int udc_dwc3_enable(const struct device *const dev)
 
 	/* Enable the DWC3 events */
 	sys_set_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+	/* Keep U1/U2 off. BOS still advertises LPM; SET_FEATURE is ACKed
+	 * in software but the core must not INIT/ACCEPT U1/U2.
+	 */
+	udc_dwc3_disable_u1u2(dev);
 
 	/* Enable the IRQ (for now, just schedule a first work queue job) */
 	cfg->irq_enable_func();
 
 	return 0;
+}
+
+void udc_dwc3_disable_u1u2(const struct device *const dev)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t mask = UDC_DWC3_DCTL_INITU1ENA | UDC_DWC3_DCTL_ACCEPTU1ENA |
+			      UDC_DWC3_DCTL_INITU2ENA | UDC_DWC3_DCTL_ACCEPTU2ENA;
+
+	sys_clear_bits(base + UDC_DWC3_DCTL, mask);
 }
 
 static int udc_dwc3_disable(const struct device *const dev)
