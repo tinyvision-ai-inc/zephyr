@@ -24,6 +24,7 @@
 static bool engine_seen;
 static bool engine_on;
 static bool engine_evt_own;
+static bool engine_ovf_seen;
 static uint8_t programmed;
 static uint32_t saved_evt_base;
 static uint32_t saved_evt_size;
@@ -193,6 +194,7 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	engine_on = true;
 	engine_evt_own = false;
 	engine_seen = true;
+	engine_ovf_seen = false;
 	printk("engine: ENABLE=1 EVT_OWN=0 ACM_BR snoop id=0x%08x evt=0x%08x/%u map=0x%08x\n",
 	       id, evt_base, evt_size, sys_read32(base + USB_ENGINE_EP_MAP));
 }
@@ -361,18 +363,28 @@ void udc_dwc3_engine_poll(const struct device *dev,
 	}
 
 	/*
-	 * EVT_OWN=0: CPU already walks GEVNTCOUNT. Draining FWD_POP here
-	 * re-runs the same EP0 events and eats the SETUP buffer (then -71).
+	 * The EventDrain snoops the ring whatever EVT_OWN says, so FWD has to
+	 * be popped either way. Leaving it unread fills the FIFO, raises
+	 * EVT_OVF and the engine then stops retiring video descriptors.
+	 * With EVT_OWN=0 the CPU already ran this event off GEVNTCOUNT:
+	 * discard it here, replaying it eats the SETUP buffer (-71).
 	 */
-	if (engine_evt_own) {
-		for (;;) {
-			ev = sys_read32(base + USB_ENGINE_FWD_POP);
-			if (ev == 0U) {
-				break;
-			}
-			if (fwd != NULL) {
-				fwd(dev, ev);
-			}
+	for (;;) {
+		ev = sys_read32(base + USB_ENGINE_FWD_POP);
+		if (ev == 0U) {
+			break;
+		}
+		if (engine_evt_own && fwd != NULL) {
+			fwd(dev, ev);
+		}
+	}
+
+	if ((sys_read32(base + USB_ENGINE_ENG_STATUS) & USB_ENGINE_STAT_EVT_OVF) != 0U) {
+		sys_write32(USB_ENGINE_IRQ_ERR, base + USB_ENGINE_ENG_IRQ);
+		if (!engine_ovf_seen) {
+			engine_ovf_seen = true;
+			printk("engine: EVT_OVF (evt=%u) cleared, FWD drained\n",
+			       sys_read32(base + USB_ENGINE_EVT_COUNT));
 		}
 	}
 

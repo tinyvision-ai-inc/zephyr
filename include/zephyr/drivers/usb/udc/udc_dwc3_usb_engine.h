@@ -254,6 +254,14 @@ static inline void udc_dwc3_engine_poll(const struct device *dev,
 /* Always available: keep DWC3 out of U1/U2 during bulk UVC. */
 void udc_dwc3_disable_u1u2(const struct device *dev);
 
+/*
+ * Windows and Linux ResetPipe the bulk VS endpoint at STREAMON
+ * (CLEAR_FEATURE ENDPOINT_HALT). That is not STREAMOFF. Arm a grace
+ * window at COMMIT so the first halt keeps RTL ownership.
+ */
+void udc_dwc3_video_pipe_reset_grace(uint32_t ms);
+bool udc_dwc3_video_pipe_reset_pending(void);
+
 #ifdef __cplusplus
 }
 #endif

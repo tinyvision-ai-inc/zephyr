@@ -379,6 +379,17 @@ static int sreq_set_feature(struct usbd_context *const uds_ctx)
 		}
 		break;
 	case USB_REQTYPE_RECIPIENT_INTERFACE:
+		/* USB 3.0 FUNCTION_SUSPEND (wValue=0). Windows toggles this
+		 * on the UVC VC interface around STREAMON. ACK, do not park
+		 * bulk video — a real suspend would look like no capture.
+		 */
+		if (setup->wValue == USB_SFS_ENDPOINT_HALT) {
+			printk("usb: FUNCTION_SUSPEND if=%u opt=0x%02x (ack, keep stream)\n",
+			       (uint8_t)setup->wIndex, (uint8_t)(setup->wIndex >> 8));
+			break;
+		}
+		errno = -ENOTSUP;
+		return 0;
 	default:
 		break;
 	}

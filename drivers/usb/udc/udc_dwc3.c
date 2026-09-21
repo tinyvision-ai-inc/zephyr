@@ -786,6 +786,7 @@ static uint32_t udc_dwc3_health_spin_sum;
 static uint32_t udc_dwc3_health_spin_max;
 static uint32_t udc_dwc3_health_halt_to;
 static uint32_t udc_dwc3_health_setup_pending;
+static uint8_t udc_dwc3_last_setup[8];
 static uint32_t udc_dwc3_health_ep0_rst;
 static int64_t udc_dwc3_health_last_ms;
 static const struct device *udc_dwc3_health_dev;
@@ -907,6 +908,13 @@ void udc_dwc3_health_print(void)
 	       udc_dwc3_evt_errors.overflow, udc_dwc3_evt_errors.unknown);
 	udc_dwc3_acm_health_dump();
 	udc_dwc3_engine_dump();
+	printk("ep0: last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
+	       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
+	       udc_dwc3_last_setup[4], udc_dwc3_last_setup[5],
+	       udc_dwc3_last_setup[6], udc_dwc3_last_setup[7]);
+	printk("uvcmgr: sts=0x%x bytes=%u\n",
+	       sys_read32(0xb4000000u + 0x10u), sys_read32(0xb4000000u + 0x18u));
 }
 
 #if defined(CONFIG_UDC_DWC3_USB_ENGINE)
@@ -3509,6 +3517,19 @@ static void udc_dwc3_ep0_flush_pending(const struct device *const dev, const int
 	udc_ep_set_busy(&cfg->ep_data_in[0].cfg, false);
 }
 
+static void udc_dwc3_next_ctrl(const struct device *const dev,
+			       struct udc_dwc3_ep_data *const ep_data);
+
+static void udc_dwc3_print_last_setup(const char *const why)
+{
+	printk("ep0: %s last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	       why,
+	       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
+	       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
+	       udc_dwc3_last_setup[4], udc_dwc3_last_setup[5],
+	       udc_dwc3_last_setup[6], udc_dwc3_last_setup[7]);
+}
+
 static void udc_dwc3_ep0_stall_and_restart(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -3523,7 +3544,71 @@ static void udc_dwc3_ep0_stall_and_restart(const struct device *const dev)
 	udc_dwc3_depcmd_set_stall(dev, &cfg->ep_data_out[0]);
 	udc_dwc3_depcmd_set_stall(dev, &cfg->ep_data_in[0]);
 	udc_dwc3_ep0_flush_pending(dev, -ECONNRESET);
+	udc_dwc3_print_last_setup("stall-and-restart");
 	LOG_WRN("EP0 stall-and-restart");
+}
+
+/*
+ * STATUS/DATA IN completed with TRBSTS_SETUPPENDING: the host already
+ * sent the next SETUP. USBD queued that SETUP on EP0 OUT at the same
+ * time as STATUS IN (wLength=0 CLEAR_FEATURE). Do not EndXfer OUT —
+ * that discarded the new SETUP and Windows retried four times.
+ */
+static void udc_dwc3_ep0_in_setup_pending(const struct device *const dev,
+					  const char *const why)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	struct udc_dwc3_ep_data *const out = &cfg->ep_data_out[0];
+	const uint32_t out_trbctl = out->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_TRBCTL_MASK;
+	struct net_buf *buf;
+
+	priv->ep0_setup_pending = false;
+	priv->ep0_status_nrd = false;
+	priv->ep0_data_inflight = false;
+	priv->ep0_data_dir = 0U;
+
+	/*
+	 * GET_CUR PROBE queues STATUS OUT then SETUP on EP0 OUT, but STATUS
+	 * is not armed until XferNotReady. The STATUS buf sits at the head
+	 * and next_ctrl refuses to arm it — so the host's next SETUP has no
+	 * TRB. Drop STATUS/DATA OUT; keep a SETUP buf if one is already there.
+	 */
+	if (udc_ep_is_busy(&out->cfg) &&
+	    out_trbctl != UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
+		udc_dwc3_depcmd_end_xfer(dev, out, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		udc_ep_set_busy(&out->cfg, false);
+	}
+
+	while ((buf = udc_buf_peek(&out->cfg)) != NULL) {
+		struct udc_buf_info *const bi = udc_get_buf_info(buf);
+
+		if (bi->setup) {
+			break;
+		}
+		(void)udc_buf_get(&out->cfg);
+		udc_submit_ep_event(dev, buf, -ECONNRESET);
+	}
+
+	udc_dwc3_print_last_setup(why);
+	udc_dwc3_next_ctrl(dev, out);
+}
+
+static void udc_dwc3_ep0_restart_for_setup(const struct device *const dev,
+					   const char *const why)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	priv->ep0_setup_pending = false;
+	priv->ep0_status_nrd = false;
+	priv->ep0_data_inflight = false;
+	priv->ep0_data_dir = 0U;
+
+	udc_dwc3_depcmd_end_xfer(dev, &cfg->ep_data_in[0], UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	udc_dwc3_ep0_flush_pending(dev, -ECONNRESET);
+	udc_dwc3_print_last_setup(why);
+	udc_dwc3_next_ctrl(dev, &cfg->ep_data_out[0]);
 }
 
 static bool udc_dwc3_ep0_trb_setup_pending(struct udc_dwc3_ep_data *const ep_data)
@@ -3939,7 +4024,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 			udc_submit_ep_event(dev, buf, -ECONNRESET);
 		}
 		udc_ep_set_busy(&ep_data->cfg, false);
-		udc_dwc3_ep0_stall_and_restart(dev);
+		udc_dwc3_ep0_in_setup_pending(dev, "IN-setup-pending");
 		return;
 	}
 
@@ -4004,7 +4089,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			udc_submit_ep_event(dev, buf, -ECONNRESET);
 		}
 		udc_ep_set_busy(&ep_data->cfg, false);
-		udc_dwc3_ep0_stall_and_restart(dev);
+		udc_dwc3_ep0_restart_for_setup(dev, "OUT-setup-pending");
 		return;
 	}
 
@@ -4030,6 +4115,12 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 
 		/* Update the size to what the hardware reports */
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
+		memcpy(udc_dwc3_last_setup, buf->data, sizeof(udc_dwc3_last_setup));
+		printk("ep0: SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
+		       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
+		       udc_dwc3_last_setup[4], udc_dwc3_last_setup[5],
+		       udc_dwc3_last_setup[6], udc_dwc3_last_setup[7]);
 
 		LOG_HEXDUMP_DBG(buf->data, buf->len, "SETUP received");
 
@@ -4091,7 +4182,7 @@ static void udc_dwc3_on_xfer_not_ready(const struct device *const dev,
 	case UDC_DWC3_DEPEVT_STATUS_B3_CONTROL_STATUS:
 		LOG_DBG("UDC_DWC3_DEPEVT_XFERNOTREADY_CONTROL_STATUS");
 		if (priv->ep0_setup_pending) {
-			udc_dwc3_ep0_stall_and_restart(dev);
+			udc_dwc3_ep0_restart_for_setup(dev, "STATUS-setup-pending");
 			break;
 		}
 		priv->ep0_status_nrd = true;
@@ -5388,6 +5479,11 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 		udc_dwc3_depcmd_set_stall(dev, ep_data);
 		break;
 	default:
+		if (ep_data->hw_owned) {
+			printk("dwc3: ep 0x%02x set-halt ignored (keep RTL)\n",
+			       ep_data->cfg.addr);
+			return 0;
+		}
 		if (udc_dwc3_ep_refuse_if_hw_owned(ep_data, "SetHalt")) {
 			return -EBUSY;
 		}
@@ -5409,16 +5505,17 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 
 	if (ep_data->hw_owned) {
 		/*
-		 * Bulk UVC has no alternate setting, so uvcvideo (Linux and
-		 * Windows) signals STREAMOFF with CLEAR_FEATURE(ENDPOINT_HALT)
-		 * on the video endpoint. Take the endpoint back from the RTL
-		 * first (UsbMgr halt + EndXfer), then ClearStall so the
-		 * SuperSpeed sequence number restarts at 0 like the host's,
-		 * then re-arm an empty ring for the next STREAMON.
+		 * Bulk video is RTL-owned. Windows ResetPipe
+		 * (CLEAR_FEATURE HALT) at STREAMON and at close; Linux
+		 * only does it at close. Either way, rewind SeqNum with
+		 * DEPCSTALL and leave Soft-IP in charge. Revoking here
+		 * is what made Windows enum-OK / stream-fail: the host
+		 * SeqNum goes to 0 and then every burst is dropped.
 		 */
-		udc_dwc3_hw_owned_revoke(dev, ep_data, "clear-halt", true);
-		udc_dwc3_depcmd_clear_stall(dev, ep_data);
-		udc_dwc3_hw_owned_rearm(dev, ep_data);
+		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+				UDC_DWC3_DEPCMD_DEPCSTALL);
+		printk("dwc3: ep 0x%02x pipe reset: SeqNum cleared, RTL kept\n",
+		       ep_data->cfg.addr);
 		ep_data->cfg.stat.halted = false;
 		return 0;
 	}
@@ -5501,6 +5598,18 @@ void udc_dwc3_disable_u1u2(const struct device *const dev)
 			      UDC_DWC3_DCTL_INITU2ENA | UDC_DWC3_DCTL_ACCEPTU2ENA;
 
 	sys_clear_bits(base + UDC_DWC3_DCTL, mask);
+}
+
+static int64_t udc_dwc3_video_grace_until;
+
+void udc_dwc3_video_pipe_reset_grace(uint32_t ms)
+{
+	udc_dwc3_video_grace_until = k_uptime_get() + (int64_t)ms;
+}
+
+bool udc_dwc3_video_pipe_reset_pending(void)
+{
+	return k_uptime_get() < udc_dwc3_video_grace_until;
 }
 
 static int udc_dwc3_disable(const struct device *const dev)
