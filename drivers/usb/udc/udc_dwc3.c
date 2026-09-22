@@ -2064,14 +2064,43 @@ udc_dwc3_cmd_outcome(const struct device *const dev,
 }
 
 /*
+ * The operands of one endpoint command.
+ *
+ * DEPCMDPAR0/1/2 are not registers in their own right: they are the operands of
+ * the command in DEPCMD, and the databook does not say they are latched when
+ * CmdAct is written. They must therefore be treated as live for as long as
+ * CmdAct is set, which makes writing them subject to the same rule as writing
+ * DEPCMD - never over a command still executing on this endpoint.
+ *
+ * They are passed in here rather than written at the call site because the call
+ * site is on the wrong side of that rule: it runs BEFORE the pre-poll in
+ * udc_dwc3_depcmd(), so operands written there land on the previous command
+ * while it is still running. Everything in this struct is written after the
+ * pre-poll and immediately before CmdAct.
+ *
+ * n is how many of PAR0, PAR1, PAR2 the command actually uses, so a command
+ * carrying two operands does not disturb the third register - DEPGETSTATE
+ * returns its result in PAR2.
+ */
+struct udc_dwc3_depcmd_par {
+    uint32_t par0;
+    uint32_t par1;
+    uint32_t par2;
+    uint8_t n;
+};
+
+/*
  * Issue one endpoint command and collect its result.
+ *
+ * par is the command's operands, or NULL for a command that carries none.
  *
  * Returns 0 when the command completed with status OK, and
  * UDC_DWC3_XFERRSCIDX_INVALID when it was rejected OR was still executing when
  * the poll expired - callers that must tell those apart re-read DEPCMD.CmdAct.
  */
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
-                const uint32_t addr, const uint32_t cmd)
+                const uint32_t addr, const uint32_t cmd,
+                const struct udc_dwc3_depcmd_par *const par)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
     const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
@@ -2150,6 +2179,25 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
             (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER ||
              cmdtyp == UDC_DWC3_DEPCMD_DEPENDXFER)) {
             ep->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
+        }
+    }
+
+    /*
+     * The operands, then the command: ONE act, and the pre-poll above now
+     * covers both. This ordering is the whole point of passing them in - it
+     * makes it impossible to land operands on a command that is still
+     * executing, including on the give-up path above, which returns having
+     * touched nothing.
+     */
+    if (par != NULL && epn < UDC_DWC3_MAX_EPN) {
+        if (par->n > 0U) {
+            sys_write32(par->par0, base + UDC_DWC3_DEPCMDPAR0(epn));
+        }
+        if (par->n > 1U) {
+            sys_write32(par->par1, base + UDC_DWC3_DEPCMDPAR1(epn));
+        }
+        if (par->n > 2U) {
+            sys_write32(par->par2, base + UDC_DWC3_DEPCMDPAR2(epn));
         }
     }
 
@@ -2394,10 +2442,16 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
         break;
     }
 
-    sys_write32(param0, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
-    sys_write32(param1, base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
+    {
+        const struct udc_dwc3_depcmd_par par = {
+            .par0 = param0,
+            .par1 = param1,
+            .n = 2U,
+        };
 
-    udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPCFG);
+        udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+                UDC_DWC3_DEPCMD_DEPCFG, &par);
+    }
 }
 
 /*
@@ -2407,14 +2461,15 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
                        struct udc_dwc3_ep_data *const ep_data)
 {
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
+    const struct udc_dwc3_depcmd_par par = {
+        .par0 = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1),
+        .n = 1U,
+    };
 
     LOG_DBG("DepXferConfig: EP%02x", ep_data->cfg.addr);
 
-    reg = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1);
-    sys_write32(reg, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
-    udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
+    udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+            UDC_DWC3_DEPCMD_DEPXFERCFG, &par);
 }
 
 /*
@@ -2431,7 +2486,7 @@ static bool udc_dwc3_depcmd_set_stall(const struct device *const dev,
      * be decoded as one.
      */
     if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
-                UDC_DWC3_DEPCMD_DEPSETSTALL) != 0U) {
+                UDC_DWC3_DEPCMD_DEPSETSTALL, NULL) != 0U) {
         return false;
     }
 
@@ -2459,7 +2514,7 @@ static bool udc_dwc3_depcmd_clear_stall(const struct device *const dev,
      * for failure - it does NOT return the DEPCMD register, so this must not
      * be decoded as one.
      */
-    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags) != 0U) {
+    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, NULL) != 0U) {
         return false;
     }
 
@@ -2529,6 +2584,8 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
                        struct udc_dwc3_ep_data *const ep_data)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    /* Filled in below; issued with the command, not before it. */
+    struct udc_dwc3_depcmd_par par = { .n = 2U };
     uint32_t idx;
     uint32_t cmd;
     uint32_t reg;
@@ -2623,8 +2680,8 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
                            ? 0U : ep_data->tail;
         const uintptr_t trb0 = (uintptr_t)&ep_data->trb_buf[first];
 
-        sys_write32(HI32(trb0), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
-        sys_write32(LO32(trb0), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
+        par.par0 = HI32(trb0);
+        par.par1 = LO32(trb0);
     }
 
     /*
@@ -2650,7 +2707,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
      */
     (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_STARTING);
 
-    idx = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), cmd);
+    idx = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), cmd, &par);
 
     /*
      * Keep the previous index when the command failed. The controller only
@@ -2910,7 +2967,7 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
      * has already logged the endpoint, the command and the reason, which is
      * the one place the failure belongs.
      */
-    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags) ==
+    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, NULL) ==
         UDC_DWC3_XFERRSCIDX_INVALID) {
         return false;
     }
@@ -2964,7 +3021,7 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
             flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
             if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
-                        flags) == 0U) {
+                        flags, NULL) == 0U) {
                 return true;
             }
 
@@ -3040,7 +3097,7 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
      * A failed return means the command was never issued - the previous one
      * on this endpoint was still active when the pre-poll gave up.
      */
-    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags) ==
+    if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, NULL) ==
         UDC_DWC3_XFERRSCIDX_INVALID) {
         /*
          * "STILL ACTIVE" IS NOT "NOT ISSUED". udc_dwc3_depcmd() returns
@@ -3100,7 +3157,7 @@ static void udc_dwc3_depcmd_start_config(const struct device *const dev,
     flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
     flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
-    udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(0), flags);
+    udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(0), flags, NULL);
 
     /*
      * DEPSTARTCFG reassigns the controller's transfer resources, so every
@@ -6846,8 +6903,10 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
          * PAR2 - that is what produced a bogus 0x00000004 in the first
          * capture of every earlier run.
          */
-        udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE);
-        udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE);
+        udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE,
+                NULL);
+        udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn), UDC_DWC3_DEPCMD_DEPGETSTATE,
+                NULL);
         par2 = sys_read32(base + UDC_DWC3_DEPCMDPAR2(epn));
 
         if (ep_data->trb_buf == NULL) {
@@ -7945,7 +8004,7 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
              */
             udc_lock_internal(dev, K_FOREVER);
             udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn),
-                    UDC_DWC3_DEPCMD_DEPGETSTATE);
+                    UDC_DWC3_DEPCMD_DEPGETSTATE, NULL);
             udc_unlock_internal(dev);
 
             LOG_INF("  CORE: EP0-OUT EPSTATE=0x%08x",
