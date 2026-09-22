@@ -365,11 +365,6 @@ __weak void trace_dump(void)
  */
 #define UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE           0xFFFFFFFFu
 #define UDC_DWC3_DISPATCH_STUCK_MS              250u
-/*
- * Consecutive refused event-ring acknowledgements before the ring is declared
- * untrustworthy and the controller is recovered.
- */
-#define UDC_DWC3_EVT_ACK_DEAD_MAX               3u
 #define UDC_DWC3_DEVT_VNDRDEVTSTRCVED               (BIT(0) | (0xc << 8))
 
 /* Device Endpoint Commands and Parameters */
@@ -1450,18 +1445,6 @@ struct udc_dwc3_data {
      */
     uint32_t hb_expiries;
     uint32_t hb_coalesced;
-    uint32_t evt_ack_dead;      /* consecutive acks that GEVNTCOUNT ignored */
-    /*
-     * The one outstanding event-ring credit. Writing GEVNTCOUNT is a posted
-     * MMIO write, so a read-back can still show the previous value while the
-     * write is in flight - "unchanged" does not mean "refused". This record
-     * stops a repeat credit landing twice for one skipped event, which would
-     * let the controller overwrite a slot software has never read.
-     */
-    bool evt_credit_pending;
-    uint32_t evt_credit_slot;   /* evt_next when the credit was issued   */
-    uint32_t evt_credit_skip;   /* slots it credited                     */
-    uint32_t evt_credit_gc;     /* GEVNTCOUNT observed just before it    */
 };
 
 /*
