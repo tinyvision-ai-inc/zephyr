@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright tinyVision.ai Inc.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Track B UsbEngine CSRs at 0xb400B000. See fresh/docs/USB_ENGINE_TRACK_B.md.
+ * UsbEngine CSRs at 0xb400B000.
  */
 #ifndef ZEPHYR_INCLUDE_DRIVERS_USB_UDC_DWC3_USB_ENGINE_H
 #define ZEPHYR_INCLUDE_DRIVERS_USB_UDC_DWC3_USB_ENGINE_H

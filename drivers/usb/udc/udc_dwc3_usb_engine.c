@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: Copyright tinyVision.ai Inc.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Track B UsbEngine backend: post DESC_*, drain FWD_POP / CMPL_*.
- * ENABLE=0 (or missing MAGIC) leaves Track A mailbox + GEVNTCOUNT path.
+ * UsbEngine backend: post DESC_*, drain FWD_POP / CMPL_*.
+ * ENABLE=0 (or missing MAGIC) leaves the DepCmd mailbox + GEVNTCOUNT path.
  */
 
 #include <zephyr/drivers/usb/udc.h>
@@ -172,7 +172,7 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	}
 	id = sys_read32(base + USB_ENGINE_ENG_ID);
 	if ((id & 0xffffU) != USB_ENGINE_MAGIC) {
-		printk("engine: no MAGIC at 0x%x (id=0x%08x), stay Track A\n",
+		printk("engine: no MAGIC at 0x%x (id=0x%08x), mailbox path\n",
 		       (uint32_t)base, id);
 		return;
 	}
@@ -195,7 +195,7 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	engine_evt_own = false;
 	engine_seen = true;
 	engine_ovf_seen = false;
-	printk("engine: ENABLE=1 EVT_OWN=0 ACM_BR snoop id=0x%08x evt=0x%08x/%u map=0x%08x\n",
+	printk("engine: ENABLE=1 EVT_OWN=0 id=0x%08x evt=0x%08x/%u map=0x%08x\n",
 	       id, evt_base, evt_size, sys_read32(base + USB_ENGINE_EP_MAP));
 }
 
