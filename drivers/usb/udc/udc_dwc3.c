@@ -846,6 +846,7 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 }
 
+
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
 					 bool is_control)
 {
@@ -949,6 +950,17 @@ static void udc_dwc3_trb_nonctrl_init(const struct device *const dev,
 
 	/* Start the transfer now, update it later */
 	udc_dwc3_depcmd_start_xfer(dev, ep_data);
+}
+
+void lattice_usb23_restart_xfer(const struct device *dev, uint8_t ep_addr)
+{
+	struct udc_dwc3_ep_data *ep_data = (void *)udc_get_ep_cfg(dev, ep_addr);
+
+	/* Stream-off already ended the transfer via ClearStall. Ending it
+	 * again with the stale resource index sticks CmdAct and the next
+	 * control transfer times out. Rebuild the ring and start once.
+	 */
+	udc_dwc3_trb_nonctrl_init(dev, ep_data);
 }
 
 static void udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf *const buf,

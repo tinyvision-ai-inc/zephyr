@@ -240,6 +240,11 @@ static int sreq_clear_feature(struct usbd_context *const uds_ctx)
 		break;
 	case USB_REQTYPE_RECIPIENT_ENDPOINT:
 		if (setup->wValue == USB_SFS_ENDPOINT_HALT) {
+			/* Stop class DMA before ClearStall. A hardware stream
+			 * that is still ringing DEPCMD will stick CmdAct and
+			 * the next control transfer times out.
+			 */
+			sreq_feature_halt_notify(uds_ctx, ep, false);
 			/* UDC checks if endpoint is enabled */
 			ret = usbd_ep_clear_halt(uds_ctx, ep);
 			if (ret != -EPERM) {
