@@ -1050,6 +1050,29 @@ struct udc_dwc3_ep_data {
      */
     uint32_t xferrscidx;
     /*
+     * The index the outstanding End Transfer was posted against. Posting it
+     * invalidates xferrscidx, because an End that succeeds gives the resource
+     * back; one the controller refuses does not, and the transfer carries on
+     * holding it. Kept here, not on the stack of the call that posted it,
+     * because the refusal can be learnt long after that call has returned -
+     * by udc_dwc3_ep_resolve_cmd(), from ENDING or END_UNKNOWN. Without it
+     * that path returns the endpoint to RUNNING with no index: Update
+     * Transfer is refused for want of one, and no End can be posted to
+     * reclaim the resource. Meaningful only while an End is outstanding.
+     */
+    uint32_t end_idx;
+    /*
+     * DEPCMD as it read for this endpoint's open Start or End Transfer at the
+     * moment another command was posted over it. DEPCMD is the only record of
+     * how that command ended that survives a lost Command Complete, and any
+     * later command - a DEPGETSTATE, a Set Stall from the stack - overwrites
+     * it. udc_dwc3_depcmd() saves it here from its pre-poll, which has just
+     * read it, and udc_dwc3_cmd_outcome() reads it back when DEPCMD itself
+     * has moved on. Zero, which is no command type, when there is none; a new
+     * Start or End clears it.
+     */
+    uint32_t cmd_record;
+    /*
      * What this endpoint is doing; see enum udc_dwc3_ep_state for the rules.
      *
      * cfg.stat.busy is NOT a second opinion about this. It belongs to the
@@ -1843,15 +1866,22 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
         { UDC_DWC3_EP_STARTING,     UDC_DWC3_EP_START_UNKNOWN },
         { UDC_DWC3_EP_ENDING,       UDC_DWC3_EP_END_UNKNOWN },
         /*
-         * An UNKNOWN state is left only on PROOF: DEPCMD reports the same
-         * command type with CmdAct clear, and no command has been issued
-         * on this endpoint since - which the Start/End refusals below
-         * guarantee. Absent that proof the way out is
+         * An UNKNOWN state is left only on PROOF: DEPCMD - or, once a
+         * later command has overwritten it, the record udc_dwc3_depcmd()
+         * kept - reports the same command type with CmdAct clear. The
+         * Start/End refusals below guarantee no second Start or End
+         * replaces it. Absent that proof the way out is
          * udc_dwc3_ep_state_reset(), the quiescence door.
          */
         { UDC_DWC3_EP_START_UNKNOWN,    UDC_DWC3_EP_RUNNING },
         { UDC_DWC3_EP_START_UNKNOWN,    UDC_DWC3_EP_IDLE },
         { UDC_DWC3_EP_END_UNKNOWN,  UDC_DWC3_EP_IDLE },
+        /*
+         * The same proof, reporting the End REFUSED: it never ended the
+         * transfer, which is still running and still owns its resource.
+         * udc_dwc3_ep_end_refused() restores the index first.
+         */
+        { UDC_DWC3_EP_END_UNKNOWN,  UDC_DWC3_EP_RUNNING },
         { UDC_DWC3_EP_RUNNING,      UDC_DWC3_EP_ENDING },
         /*
          * The End Transfer was never issued - the pre-poll found the
@@ -1983,6 +2013,8 @@ static void udc_dwc3_ep_state_reset(struct udc_dwc3_ep_data *const ep_data)
 
     ep_data->xfer_state = UDC_DWC3_EP_IDLE;
     ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
+    ep_data->end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
+    ep_data->cmd_record = 0U;
 
     /*
      * There is no End Transfer any more, so nothing is owed to one. Dropping
@@ -2012,27 +2044,59 @@ static void udc_dwc3_ep_end_completed(const struct device *const dev,
  * set means the controller is EXECUTING the command, which is neither success
  * nor rejection, and collapsing it onto either one is how a resource the
  * controller really took ends up with no handle in this driver.
+ *
+ * And a fourth that is not an outcome at all: DEPCMD holds a DIFFERENT command,
+ * so it says nothing about the one asked after.
  */
 enum udc_dwc3_cmd_outcome {
     UDC_DWC3_CMD_UNKNOWN = 0,   /* CmdAct set: still executing          */
     UDC_DWC3_CMD_OK,        /* CmdAct clear, CmdStatus OK           */
     UDC_DWC3_CMD_ERROR,     /* CmdAct clear, CmdStatus not OK       */
+    UDC_DWC3_CMD_OTHER,     /* DEPCMD holds another command type    */
 };
 
 /*
- * Classify DEPCMD for this endpoint. The only place this rule is written.
+ * Classify DEPCMD for this endpoint, as the outcome of the command of type
+ * cmdtyp. The only place this rule is written.
  *
  * CmdAct alone is not enough: clear means the command finished, not that it
  * failed. CmdStatus says which. A caller that tests CmdAct on its own reads a
  * command that succeeded late as a refusal.
+ *
+ * Nor is CmdStatus enough without the command type. DEPCMD describes the LAST
+ * command posted on the endpoint, and something other than the Start or End
+ * being resolved can be posted after it - the DEPGETSTATE of a diagnostic
+ * dump, or a command whose pre-poll found ours still active and gave up
+ * without posting, leaving DEPCMD on the command before. Reading that one's
+ * status as ours proves a completion that never happened: an End Transfer the
+ * controller refused would release a ring under a live transfer. When a later
+ * command did overwrite ours, udc_dwc3_depcmd() kept the value it replaced in
+ * cmd_record, and that answers instead. CMD_OTHER means neither holds it: at
+ * a call site that has just posted, the pre-poll gave up and nothing was.
  */
 static enum udc_dwc3_cmd_outcome
 udc_dwc3_cmd_outcome(const struct device *const dev,
              const struct udc_dwc3_ep_data *const ep_data,
+             const uint32_t cmdtyp,
              uint32_t *const reg_out)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const uint32_t reg = sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
+    uint32_t reg = sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
+
+    /*
+     * Overwritten: answer from the record udc_dwc3_depcmd() kept when it
+     * posted the command that did it, if that is the command asked after.
+     * The record is only ever taken with CmdAct clear.
+     */
+    if ((reg & UDC_DWC3_DEPCMD_CMDTYP_MASK) != cmdtyp) {
+        if ((ep_data->cmd_record & UDC_DWC3_DEPCMD_CMDTYP_MASK) != cmdtyp) {
+            if (reg_out != NULL) {
+                *reg_out = reg;
+            }
+            return UDC_DWC3_CMD_OTHER;
+        }
+        reg = ep_data->cmd_record;
+    }
 
     if (reg_out != NULL) {
         *reg_out = reg;
@@ -2096,7 +2160,22 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     struct udc_dwc3_ep_data *const ep = _EPN_IS_VALID(cfg, epn)
                          ? _EP_DATA_FROM_EPN(cfg, epn) : NULL;
     const bool first_on_ep = (ep == NULL) || !ep->cmd_issued;
+    /* A Start or End Transfer: the commands whose outcome is tracked. */
+    const bool opens = ((cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) ==
+                UDC_DWC3_DEPCMD_DEPSTRTXFER) ||
+               ((cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) ==
+                UDC_DWC3_DEPCMD_DEPENDXFER);
     uint32_t reg = 0;
+
+    /*
+     * A new Start or End supersedes any saved record, and must, before the
+     * pre-poll: if the pre-poll gives up and nothing is posted, the caller
+     * reads the outcome back, and an older command of the same type must not
+     * answer for this one.
+     */
+    if (ep != NULL && opens) {
+        ep->cmd_record = 0U;
+    }
 
     /*
      * Never write a command over one still running: CmdAct is R/W1S and the
@@ -2115,6 +2194,22 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
             udc_dwc3_get_devt_ulstchng_name(sys_read32(base + UDC_DWC3_DSTS)));
         priv->depcmd_n_notissued++;
         return UDC_DWC3_XFERRSCIDX_INVALID;
+    }
+
+    /*
+     * About to be overwritten: if what DEPCMD holds is the outcome of the
+     * endpoint's open Start or End, keep it - see cmd_record. Read here
+     * rather than by the resolver, whose next pass would find this command
+     * instead. The state is read before the adoption below, which may close
+     * the Start.
+     */
+    if (!first_on_ep && !opens && udc_dwc3_ep_cmd_busy(ep)) {
+        const uint32_t typ = reg & UDC_DWC3_DEPCMD_CMDTYP_MASK;
+
+        if (typ == UDC_DWC3_DEPCMD_DEPSTRTXFER ||
+            typ == UDC_DWC3_DEPCMD_DEPENDXFER) {
+            ep->cmd_record = reg;
+        }
     }
 
     if (!first_on_ep) {
@@ -2697,8 +2792,14 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     if (idx == UDC_DWC3_XFERRSCIDX_INVALID) {
         struct udc_dwc3_data *const priv = udc_get_private(dev);
         uint32_t done = 0U;
+        /*
+         * CMD_OTHER falls through to the not-issued path below, and that
+         * is what it means here: the pre-poll gave up, so DEPCMD still
+         * holds the command before, and no Start was ever posted.
+         */
         const enum udc_dwc3_cmd_outcome out =
-            udc_dwc3_cmd_outcome(dev, ep_data, &done);
+            udc_dwc3_cmd_outcome(dev, ep_data, UDC_DWC3_DEPCMD_DEPSTRTXFER,
+                         &done);
 
         /*
          * Still executing IS not NOT-ISSUED, and this IS the one that
@@ -2958,6 +3059,26 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 }
 
 /*
+ * The End Transfer posted on this endpoint did not end the transfer - the
+ * controller refused it, or it was never posted - so the transfer is still
+ * running and still owns the resource it had. Give the endpoint its index back
+ * and return it to RUNNING. ONE PLACE, because this is learnt two ways: from
+ * the post itself in udc_dwc3_depcmd_end_xfer(), and later by
+ * udc_dwc3_ep_resolve_cmd(), from ENDING or END_UNKNOWN.
+ */
+static void udc_dwc3_ep_end_refused(const struct device *const dev,
+                    struct udc_dwc3_ep_data *const ep_data)
+{
+    if (ep_data->end_idx != UDC_DWC3_XFERRSCIDX_INVALID) {
+        udc_dwc3_store_xferrscidx(dev, ep_data, ep_data->end_idx);
+    }
+    ep_data->end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
+    ep_data->cmd_record = 0U;
+
+    (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_RUNNING);
+}
+
+/*
  * Issue End Transfer. Returns true when the command was issued AND will report
  * an Endpoint Command Complete event, which is what a caller needs to know
  * before deciding to wait for one.
@@ -2968,7 +3089,6 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    uint32_t saved_idx;
 
     udc_dwc3_peek_xferrscidx(dev, ep_data);
 
@@ -3067,9 +3187,10 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
      * transfer is still running and still owns the resource, and the
      * endpoint goes back to RUNNING below. RUNNING with an invalid index is
      * a dead end - Update Transfer is refused for want of a resource, and no
-     * second End Transfer can be issued to reclaim it.
+     * second End Transfer can be issued to reclaim it. Kept on the endpoint,
+     * not here, because the refusal can also be learnt after this returns.
      */
-    saved_idx = ep_data->xferrscidx;
+    ep_data->end_idx = ep_data->xferrscidx;
 
     /*
      * A failed return means the command was never issued - the previous one
@@ -3081,10 +3202,23 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
          * "STILL ACTIVE" IS NOT "NOT ISSUED". udc_dwc3_depcmd() returns
          * XFERRSCIDX_INVALID for both - a command it never issued, where
          * the transfer is still running and still holds its resource, and
-         * a command still executing. DEPCMD.CmdAct separates them.
+         * a command still executing. DEPCMD separates them: CmdAct, and
+         * first the command type, because a pre-poll that gave up leaves
+         * DEPCMD on the command before - still active, and not ours.
+         * Reading its CmdAct as our End's put the endpoint in ENDING to
+         * wait for a completion that no posted command would ever send.
          */
         const enum udc_dwc3_cmd_outcome out =
-            udc_dwc3_cmd_outcome(dev, ep_data, NULL);
+            udc_dwc3_cmd_outcome(dev, ep_data, UDC_DWC3_DEPCMD_DEPENDXFER,
+                         NULL);
+
+        if (out == UDC_DWC3_CMD_OTHER) {
+            udc_dwc3_ep_end_refused(dev, ep_data);
+            LOG_ERR("End Transfer NOT ISSUED on EP%02x: the previous "
+                "command on it was still active; transfer left running",
+                ep_data->cfg.addr);
+            return false;
+        }
 
         if (out == UDC_DWC3_CMD_UNKNOWN) {
             LOG_WRN("EP%02x End Transfer still executing past the poll "
@@ -3096,7 +3230,7 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 
         /*
          * IT ended while the failure was being logged, so the resource
-         * really did come back. Restoring saved_idx here - which testing
+         * really did come back. Restoring end_idx here - which testing
          * CmdAct alone did - leaves RUNNING paired with an index the
          * controller has reassigned, and the next Update Transfer
          * addresses somebody else's transfer.
@@ -3107,10 +3241,7 @@ static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
         }
 
         /* Refused, so the resource never came back - see above. */
-        if (saved_idx != UDC_DWC3_XFERRSCIDX_INVALID) {
-            udc_dwc3_store_xferrscidx(dev, ep_data, saved_idx);
-        }
-        (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_RUNNING);
+        udc_dwc3_ep_end_refused(dev, ep_data);
         LOG_ERR("End Transfer REJECTED on EP%02x (CmdAct clear, so the "
             "controller refused it rather than still running it)",
             ep_data->cfg.addr);
@@ -6877,6 +7008,22 @@ static void udc_dwc3_epstate_dump(const struct device *const dev, const char *co
         ep_data = dir_in ? &cfg->ep_data_in[log_ep] : &cfg->ep_data_out[log_ep];
 
         /*
+         * NOT on an endpoint with a command outcome open. DEPCMD is the only
+         * record of how a Start or End Transfer ended that survives a lost
+         * Command Complete, and a DEPGETSTATE posted after it overwrites
+         * it. The diagnosis must not become part of what it diagnoses.
+         * Both callers hold the UDC mutex, so the state read here is the
+         * one the commands below would have been posted against.
+         */
+        if (udc_dwc3_ep_cmd_busy(ep_data)) {
+            LOG_INF("EPSTATE %-9s %s epn=%u skipped: %s, DEPCMD 0x%08x "
+                "left for its command", tag, names[i], epn,
+                udc_dwc3_ep_state_name(ep_data->xfer_state),
+                sys_read32(base + UDC_DWC3_DEPCMD(epn)));
+            continue;
+        }
+
+        /*
          * Twice. The first DEPGETSTATE on an endpoint can return a stale
          * PAR2 - that is what produced a bogus 0x00000004 in the first
          * capture of every earlier run.
@@ -7009,19 +7156,40 @@ static void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
     const bool ending = (ep_data->xfer_state == UDC_DWC3_EP_ENDING) ||
                 (ep_data->xfer_state == UDC_DWC3_EP_END_UNKNOWN);
     uint32_t reg = 0U;
+    enum udc_dwc3_cmd_outcome out;
 
     if (!starting && !ending) {
         return;
     }
 
-    switch (udc_dwc3_cmd_outcome(dev, ep_data, &reg)) {
+    out = udc_dwc3_cmd_outcome(dev, ep_data,
+                   starting ? UDC_DWC3_DEPCMD_DEPSTRTXFER
+                        : UDC_DWC3_DEPCMD_DEPENDXFER,
+                   &reg);
+
+    switch (out) {
+    case UDC_DWC3_CMD_OTHER:
+        /*
+         * DEPCMD has been overwritten since and no record was kept - see
+         * udc_dwc3_cmd_outcome() - so nothing says how our command ended,
+         * and nothing can be proven. Not expected: every overwrite goes
+         * through udc_dwc3_depcmd()'s pre-poll, which keeps the record,
+         * short of the first command on an endpoint. Wait exactly as for
+         * a command still
+         * executing: the Command Complete event requested with CMDIOC
+         * still resolves it, and past the deadline the endpoint goes to
+         * UNKNOWN for the quiescence door.
+         */
+        __fallthrough;
+
     case UDC_DWC3_CMD_UNKNOWN:
         /*
          * Still executing is not unknown, until the deadline passes.
          * After it, say so plainly instead of leaving the endpoint in a
          * state that reads like an ordinary wait. The UNKNOWN states
-         * refuse every further command, so DEPCMD keeps describing this
-         * command and stays readable however long it takes.
+         * refuse every further Start and End, so this command's outcome
+         * - in DEPCMD, or in cmd_record once anything else is posted
+         * over it - stays readable however long it takes.
          */
         if (udc_dwc3_ep_is_unknown(ep_data) ||
             k_cyc_to_ms_near32(k_cycle_get_32() - ep_data->cmd_t0) <
@@ -7033,10 +7201,13 @@ static void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
                         starting ? UDC_DWC3_EP_START_UNKNOWN
                              : UDC_DWC3_EP_END_UNKNOWN);
         ((struct udc_dwc3_data *)udc_get_private(dev))->ep_cmd_unknown++;
-        LOG_ERR("EP%02x %s Transfer has been executing for %u ms: outcome "
+        LOG_ERR("EP%02x %s Transfer %s for %u ms: outcome "
             "undetermined (DEPCMD 0x%08x), no further command will be "
             "posted on this endpoint until it resolves",
             ep_data->cfg.addr, starting ? "Start" : "End",
+            (out == UDC_DWC3_CMD_OTHER)
+                ? "unresolved, DEPCMD since overwritten,"
+                : "has been executing",
             UDC_DWC3_CMD_UNKNOWN_MS, reg);
         return;
 
@@ -7044,12 +7215,13 @@ static void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
         if (ending) {
             /*
              * Refused: the transfer was never ended, so it is still
-             * running and still owns its resource.
+             * running and still owns its resource - and must get its
+             * index back with it, or RUNNING is a dead end.
              */
             LOG_WRN("EP%02x End Transfer had failed unobserved "
                 "(0x%08x); the transfer is still running",
                 ep_data->cfg.addr, reg);
-            (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_RUNNING);
+            udc_dwc3_ep_end_refused(dev, ep_data);
             return;
         }
         /*
@@ -7065,10 +7237,11 @@ static void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
     default:
         if (ending) {
             /*
-             * PROOF, not a timeout: DEPCMD reports our End Transfer
-             * complete and successful, and no command has been posted
-             * on this endpoint since - the Start and End refusals
-             * guarantee that - so the resource really is back.
+             * PROOF, not a timeout: DEPCMD, or the record kept when
+             * it was overwritten, reports our End Transfer complete
+             * and successful - the type is checked, and the Start and
+             * End refusals guarantee it is this one - so the resource
+             * really is back.
              */
             if (ep_data->xfer_state == UDC_DWC3_EP_END_UNKNOWN) {
                 LOG_WRN("EP%02x End Transfer resolved late: the "
@@ -7980,13 +8153,30 @@ static void udc_dwc3_watchdog_worker(struct k_work *work)
              * udc_dwc3_depcmd_start_xfer() through ep_enqueue on
              * these same endpoint command registers.
              */
+            bool skipped;
+
+            /*
+             * And re-checked under it: the busy test above released
+             * the lock, and the log and dump since took long enough
+             * for a Start to be posted here. A DEPGETSTATE over it
+             * would overwrite the only record of how it ended - see
+             * udc_dwc3_cmd_outcome().
+             */
             udc_lock_internal(dev, K_FOREVER);
-            udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn),
-                    UDC_DWC3_DEPCMD_DEPGETSTATE, NULL);
+            skipped = udc_dwc3_ep_cmd_busy(ep0_out);
+            if (!skipped) {
+                udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(epn),
+                        UDC_DWC3_DEPCMD_DEPGETSTATE, NULL);
+            }
             udc_unlock_internal(dev);
 
-            LOG_INF("  CORE: EP0-OUT EPSTATE=0x%08x",
-                sys_read32(base + UDC_DWC3_DEPCMDPAR2(epn)));
+            if (skipped) {
+                LOG_INF("  CORE: EP0-OUT EPSTATE skipped: a command "
+                    "outcome is open on it");
+            } else {
+                LOG_INF("  CORE: EP0-OUT EPSTATE=0x%08x",
+                    sys_read32(base + UDC_DWC3_DEPCMDPAR2(epn)));
+            }
         }
 
         /*
@@ -9349,12 +9539,31 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
                 "still own them", ep_cfg->addr, done);
             /*
              * DALEPENA is already clear and the driver still owns the
-             * ring, which is not ENDING and has no other name. Say so:
-             * END_UNKNOWN refuses every further command on this
-             * endpoint and is released only by proven quiescence, which
-             * is exactly the contract this path needs.
+             * ring. What is still executing decides the state, and it
+             * is only an End Transfer if one was posted:
+             *
+             * ENDING - ours, from above. END_UNKNOWN says so: it
+             *   refuses every further command on this endpoint and is
+             *   released only by proven quiescence.
+             *
+             * STARTING / START_UNKNOWN - the End above was declined,
+             *   so what is executing is the START, and the state
+             *   already says that and already refuses every command.
+             *   Relabelling it END_UNKNOWN would be a lie the resolver
+             *   acts on: it reads a pending End from the state, and
+             *   would take the Start's completion for the End's and
+             *   release the ring under the transfer that Start began.
+             *   Left as it is; the resolver settles the Start.
              */
-            (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_END_UNKNOWN);
+            if (udc_dwc3_ep_is_ending(ep_data)) {
+                (void)udc_dwc3_ep_state_set(ep_data,
+                                UDC_DWC3_EP_END_UNKNOWN);
+            } else {
+                LOG_ERR("EP%02x disabled with its %s outcome open: "
+                    "ring held, no End Transfer posted",
+                    ep_cfg->addr,
+                    udc_dwc3_ep_state_name(ep_data->xfer_state));
+            }
             udc_ep_set_busy(ep_cfg, false);
             return -EBUSY;
         }
