@@ -1843,7 +1843,10 @@ static const char *udc_dwc3_ep_state_name(const uint8_t st)
 }
 
 /*
- * The ONLY writer of xfer_state.
+ * The writer of xfer_state for every TRANSITION. The one other writer is
+ * udc_dwc3_ep_state_reset(), which is not a transition: it declares the
+ * endpoint over and returns it to IDLE from anywhere. Every return to IDLE goes
+ * through it, so the table below has no row ending in IDLE.
  */
 static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
                   const uint8_t next)
@@ -1857,7 +1860,6 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
          */
         { UDC_DWC3_EP_RUNNING,      UDC_DWC3_EP_STARTING },
         { UDC_DWC3_EP_STARTING,     UDC_DWC3_EP_RUNNING },
-        { UDC_DWC3_EP_STARTING,     UDC_DWC3_EP_IDLE },
         /*
          * The deadline passed with the command still executing. The
          * outcome is now undetermined, which is neither success nor
@@ -1871,11 +1873,10 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
          * kept - reports the same command type with CmdAct clear. The
          * Start/End refusals below guarantee no second Start or End
          * replaces it. Absent that proof the way out is
-         * udc_dwc3_ep_state_reset(), the quiescence door.
+         * udc_dwc3_ep_state_reset(), the quiescence door, which is also
+         * how a Start proven refused or an End proven complete leaves.
          */
         { UDC_DWC3_EP_START_UNKNOWN,    UDC_DWC3_EP_RUNNING },
-        { UDC_DWC3_EP_START_UNKNOWN,    UDC_DWC3_EP_IDLE },
-        { UDC_DWC3_EP_END_UNKNOWN,  UDC_DWC3_EP_IDLE },
         /*
          * The same proof, reporting the End REFUSED: it never ended the
          * transfer, which is still running and still owns its resource.
@@ -1884,12 +1885,11 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
         { UDC_DWC3_EP_END_UNKNOWN,  UDC_DWC3_EP_RUNNING },
         { UDC_DWC3_EP_RUNNING,      UDC_DWC3_EP_ENDING },
         /*
-         * The End Transfer was never issued - the pre-poll found the
-         * previous command on this endpoint still active and gave up.
+         * The End Transfer did not end the transfer: never issued - the
+         * pre-poll found the previous command on this endpoint still
+         * active and gave up - or refused by the controller.
          */
         { UDC_DWC3_EP_ENDING,       UDC_DWC3_EP_RUNNING },
-        { UDC_DWC3_EP_RUNNING,      UDC_DWC3_EP_IDLE },
-        { UDC_DWC3_EP_ENDING,       UDC_DWC3_EP_IDLE },
     };
 
     if (ep_data->xfer_state == next) {
