@@ -2061,15 +2061,14 @@ udc_dwc3_cmd_outcome(const struct device *const dev,
  * while it is still running. Everything in this struct is written after the
  * pre-poll and immediately before CmdAct.
  *
- * n is how many of PAR0, PAR1, PAR2 the command actually uses, so a command
- * carrying two operands does not disturb the third register - DEPGETSTATE
- * returns its result in PAR2.
+ * A command that carries operands writes all three; the ones it does not use
+ * are zero, as the reference driver writes them. DEPGETSTATE passes no operands
+ * at all, so PAR2 is left alone to carry its result.
  */
 struct udc_dwc3_depcmd_par {
     uint32_t par0;
     uint32_t par1;
     uint32_t par2;
-    uint8_t n;
 };
 
 /*
@@ -2173,15 +2172,9 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
      * touched nothing.
      */
     if (par != NULL && epn < UDC_DWC3_MAX_EPN) {
-        if (par->n > 0U) {
-            sys_write32(par->par0, base + UDC_DWC3_DEPCMDPAR0(epn));
-        }
-        if (par->n > 1U) {
-            sys_write32(par->par1, base + UDC_DWC3_DEPCMDPAR1(epn));
-        }
-        if (par->n > 2U) {
-            sys_write32(par->par2, base + UDC_DWC3_DEPCMDPAR2(epn));
-        }
+        sys_write32(par->par0, base + UDC_DWC3_DEPCMDPAR0(epn));
+        sys_write32(par->par1, base + UDC_DWC3_DEPCMDPAR1(epn));
+        sys_write32(par->par2, base + UDC_DWC3_DEPCMDPAR2(epn));
     }
 
     sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
@@ -2429,7 +2422,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
         const struct udc_dwc3_depcmd_par par = {
             .par0 = param0,
             .par1 = param1,
-            .n = 2U,
+            .par2 = 0U,
         };
 
         udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
@@ -2446,7 +2439,8 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 {
     const struct udc_dwc3_depcmd_par par = {
         .par0 = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1),
-        .n = 1U,
+        .par1 = 0U,
+        .par2 = 0U,
     };
 
     LOG_DBG("DepXferConfig: EP%02x", ep_data->cfg.addr);
@@ -2568,7 +2562,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
     /* Filled in below; issued with the command, not before it. */
-    struct udc_dwc3_depcmd_par par = { .n = 2U };
+    struct udc_dwc3_depcmd_par par;
     uint32_t idx;
     uint32_t cmd;
     uint32_t reg;
@@ -2665,6 +2659,7 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 
         par.par0 = HI32(trb0);
         par.par1 = LO32(trb0);
+        par.par2 = 0U;
     }
 
     /*
