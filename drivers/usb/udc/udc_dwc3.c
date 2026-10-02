@@ -3846,6 +3846,23 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
         return;
     }
 
+    /*
+     * Arm the SETUP only while the stack's SETUP buffer is queued on EP0-OUT, so a
+     * SETUP never arrives before the stack is ready for it. Otherwise
+     * udc_setup_received() caches it (setup_pending) and udc_ep_enqueue() later
+     * completes the stack's buffer itself; if the stack's message queue is full at
+     * that moment, the stack takes -ENOMSG as "not queued" and drops a reference to
+     * a buffer that is still queued. udc_dwc3_ep_enqueue() calls back here when the
+     * stack queues the buffer.
+     */
+    {
+        struct net_buf *const head = udc_buf_peek(&out0->cfg);
+
+        if (head == NULL || !udc_get_buf_info(head)->setup) {
+            return;
+        }
+    }
+
     memset(cfg->setup_buf, 0x00, 8U);
     udc_dwc3_trb_fill(&out0->trb_buf[0], (uintptr_t)cfg->setup_buf, 8U,
               UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP |
