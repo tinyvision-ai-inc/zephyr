@@ -218,6 +218,18 @@ config UDC_DWC3_QUIET_OTHER_CYCLES
 	  engine path writes 0 at STREAMON and parks video with the
 	  uvcmanager HALT bit instead.
 
+config UDC_DWC3_CONSOLE_DEBUG
+	hex "Reset value of the UDC console-print gate"
+	default 0x0
+	help
+	  Initial value of udc_dwc3_dbg. bit0 enables the per-event console
+	  traces (ACM01/ACM82/SETUP/PARK0/IN-HOLD/IN-RECOVER/ring kicks),
+	  bit1 the 10 s summaries (RATEPROBE, DWC3HEALTH, ACM ring, engine
+	  dump). The console UART is polled, so these prints block the DWC3
+	  event thread for several ms per line. Fault prints are not gated.
+	  Keep 0x0 for production; set at runtime with the shell
+	  (devmem <&udc_dwc3_dbg> 32 0x3) when tracing in the lab.
+
 config UDC_DWC3_USB_ENGINE
 	bool "Post ACM/RAW through UsbEngine BulkRing (Track B)"
 	depends on UDC_DWC3_DEPCMD_MAILBOX

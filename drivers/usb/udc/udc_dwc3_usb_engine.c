@@ -97,7 +97,7 @@ void udc_dwc3_engine_dump(void)
 	if (!engine_on) {
 		return;
 	}
-	printk("engine: st=0x%x evt=%u cmd=%u own=0x%x post=%u/%u/%u kick82=%u/%u kick84=%u/%u kick02=%u/%u abort=%u sync=%u/%u/%u\n",
+	DWC3_STATS("engine: st=0x%x evt=%u cmd=%u own=0x%x post=%u/%u/%u kick82=%u/%u kick84=%u/%u kick02=%u/%u abort=%u sync=%u/%u/%u\n",
 	       sys_read32(base + USB_ENGINE_ENG_STATUS),
 	       sys_read32(base + USB_ENGINE_EVT_COUNT),
 	       sys_read32(base + USB_ENGINE_CMD_COUNT),
@@ -110,7 +110,7 @@ void udc_dwc3_engine_dump(void)
 	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
 		const mm_reg_t epb = usb_engine_ep_base(i);
 
-		printk("engine: ep%u 0x%02x free=%u cmpl=%u st=0x%x\n",
+		DWC3_STATS("engine: ep%u 0x%02x free=%u cmpl=%u st=0x%x\n",
 		       i, bulk_addr[i],
 		       sys_read32(epb + USB_ENGINE_EP_DESC_FREE),
 		       sys_read32(epb + USB_ENGINE_EP_CMPL_LEVEL),
@@ -267,7 +267,7 @@ void udc_dwc3_engine_program_ep(const struct device *dev, uint8_t addr,
 	programmed |= (uint8_t)BIT(idx);
 	saved_evt_base = evt_base;
 	saved_evt_size = evt_size;
-	printk("engine: program ep=0x%02x slot=%d depcmd=0x%08x idx=%u (%u/3)\n",
+	DWC3_TRACE("engine: program ep=0x%02x slot=%d depcmd=0x%08x idx=%u (%u/3)\n",
 	       addr, idx, depcmd_addr, xfer_idx, (uint32_t)__builtin_popcount(programmed));
 	/* ENABLE is STREAMON (`udc_dwc3_engine_go`): video RTL owns 0x85
 	 * first so VID_CREDIT does not starve EP0 during probe.
@@ -316,7 +316,7 @@ int udc_dwc3_engine_ring_sync(uint8_t addr, uint32_t trb_base, uint8_t ring_n,
 	sys_write32(((uint32_t)slot << 8) | ring_n,
 		    eng_base() + USB_ENGINE_RING_CFG(idx));
 	ring_synced[idx] = true;
-	printk("engine: ring sync ep=0x%02x base=0x%08x n=%u slot=%u idx=%u\n",
+	DWC3_TRACE("engine: ring sync ep=0x%02x base=0x%08x n=%u slot=%u idx=%u\n",
 	       addr, trb_base, ring_n, slot,
 	       sys_read32(epb + USB_ENGINE_EP_XFER_IDX));
 	return 0;
@@ -427,7 +427,7 @@ int udc_dwc3_engine_cmd(uint8_t addr, uint32_t ctrl)
 	}
 	epb = usb_engine_ep_base(idx);
 	if (addr == 0x02U || addr == 0x82U) {
-		printk("ENGCMD t=%u ep=0x%02x ctrl=0x%x post=%u st=0x%x\n",
+		DWC3_TRACE("ENGCMD t=%u ep=0x%02x ctrl=0x%x post=%u st=0x%x\n",
 		       (uint32_t)k_uptime_get(), addr, ctrl, post_n[idx],
 		       sys_read32(epb + USB_ENGINE_EP_STATE));
 	}
@@ -490,7 +490,7 @@ bool udc_dwc3_engine_restart_ate(uint8_t addr)
 
 static void acm82_note(const char *why, uint32_t st, uint32_t len, uint32_t stat)
 {
-	printk("ACM82 t=%u %s st=0x%x len=%u stat=0x%x\n",
+	DWC3_TRACE("ACM82 t=%u %s st=0x%x len=%u stat=0x%x\n",
 	       (uint32_t)k_uptime_get(), why, st, len, stat);
 }
 

@@ -14,6 +14,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/sys/device_mmio.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
 #ifdef __cplusplus
@@ -386,6 +387,36 @@ void udc_dwc3_disable_u1u2(const struct device *dev);
  */
 void udc_dwc3_video_pipe_reset_grace(uint32_t ms);
 bool udc_dwc3_video_pipe_reset_pending(void);
+
+/*
+ * Runtime console-print gate for the UDC. The console is a polled 115200
+ * UART, so every printk blocks its caller (~87 us per character). The
+ * per-event traces (ACM01/ACM82/SETUP/PARK0/IN-*) run in the DWC3 event
+ * thread and the 10 s summaries (RATEPROBE/DWC3HEALTH/ACM ring) in the
+ * health timer; both are off unless a bit is set here. Faults (DEPCMD
+ * timeouts, event overflow, StartXfer failures, the IN-HOLD drop and
+ * its PARK0 snapshot) and the one-shot init / STREAMON lines are not
+ * gated: they fire once per fault and are the only in-the-moment
+ * evidence in a default-quiet build.
+ *
+ *   bit0 UDC_DWC3_DBG_TRACE  per-event traces
+ *   bit1 UDC_DWC3_DBG_STATS  periodic summaries
+ *
+ * Reset value: CONFIG_UDC_DWC3_CONSOLE_DEBUG (default 0). Change at
+ * runtime from the shell: devmem <&udc_dwc3_dbg> 32 <mask>.
+ *
+ * The gate test lives in the XIP helpers, not at the call site: UDC code
+ * is relocated to RAM (64 KB, ~99.7 % used) and an inline test at ~95
+ * sites does not fit. A call to the helper costs the same RAM as the
+ * printk call it replaces.
+ */
+extern uint32_t udc_dwc3_dbg;
+#define UDC_DWC3_DBG_TRACE BIT(0)
+#define UDC_DWC3_DBG_STATS BIT(1)
+void udc_dwc3_trace(const char *fmt, ...);
+void udc_dwc3_stats(const char *fmt, ...);
+#define DWC3_TRACE(...) udc_dwc3_trace(__VA_ARGS__)
+#define DWC3_STATS(...) udc_dwc3_stats(__VA_ARGS__)
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,7 @@
 #define DT_DRV_COMPAT snps_dwc3
 
 #include <string.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -876,7 +877,7 @@ static void udc_dwc3_acm_note_cmd(uint8_t addr, uint32_t cmd, uint32_t result)
 	udc_dwc3_acm_cmd_n++;
 	if (sts != 0U) {
 		udc_dwc3_acm_cmd_err++;
-		printk("dwc3: ACM CMDSTATUS ep=0x%02x kind=%u sts=%u result=0x%08x\n",
+		DWC3_TRACE("dwc3: ACM CMDSTATUS ep=0x%02x kind=%u sts=%u result=0x%08x\n",
 		       addr, kind, sts, result);
 	}
 }
@@ -903,7 +904,7 @@ static void udc_dwc3_park_stats_print(void)
 
 	/* rph bins (ring parks, from HALT_ACK to release): <300 <500 <700
 	 * <1000 <2000 >=2000 us. The eng03 ring holds ~700 us of video. */
-	printk(" park=%u/%uus/%uus acq84=%u acq82=%u acqcpu=%u rpm=%u relisr=%u/%u rpark=%uus/%uus sync=%u/%u/%u rph=%u/%u/%u/%u/%u/%u",
+	DWC3_STATS(" park=%u/%uus/%uus acq84=%u acq82=%u acqcpu=%u rpm=%u relisr=%u/%u rpark=%uus/%uus sync=%u/%u/%u rph=%u/%u/%u/%u/%u/%u",
 	       udc_dwc3_in_vid_park_n, udc_dwc3_in_vid_park_sum_us,
 	       udc_dwc3_in_vid_park_max_us, udc_dwc3_in_vid_acq_n[0],
 	       udc_dwc3_in_vid_acq_n[1], udc_dwc3_in_vid_acq_n[2],
@@ -923,7 +924,7 @@ static void udc_dwc3_acm_health_dump(void)
 	static const uint8_t eps[] = { 0x01U, 0x82U };
 	int i;
 
-	printk("ACM cmd_n=%u cmd_err=%u last:",
+	DWC3_STATS("ACM cmd_n=%u cmd_err=%u last:",
 	       udc_dwc3_acm_cmd_n, udc_dwc3_acm_cmd_err);
 	for (i = 0; i < (int)UDC_DWC3_ACM_TRACE_N; i++) {
 		const uint8_t idx =
@@ -931,19 +932,19 @@ static void udc_dwc3_acm_health_dump(void)
 		const uint8_t ep = udc_dwc3_acm_cmd[idx].ep;
 
 		if (ep != 0U) {
-			printk(" 0x%02x/%u/%u/0x%08x", ep,
+			DWC3_STATS(" 0x%02x/%u/%u/0x%08x", ep,
 			       udc_dwc3_acm_cmd[idx].kind,
 			       udc_dwc3_acm_cmd[idx].sts,
 			       udc_dwc3_acm_cmd[idx].result);
 		}
 	}
-	printk(" evt01=%u ret01=%u evt82=%u ret82=%u\n",
+	DWC3_STATS(" evt01=%u ret01=%u evt82=%u ret82=%u\n",
 	       udc_dwc3_acm_xfer_evt[0], udc_dwc3_acm_xfer_ret[0],
 	       udc_dwc3_acm_xfer_evt[1], udc_dwc3_acm_xfer_ret[1]);
 	if (dev == NULL) {
 		return;
 	}
-	printk("ACM ring:");
+	DWC3_STATS("ACM ring:");
 	for (i = 0; i < 2; i++) {
 		struct udc_dwc3_ep_data *const ep =
 			(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, eps[i]);
@@ -958,7 +959,7 @@ static void udc_dwc3_acm_health_dump(void)
 				nb++;
 			}
 		}
-		printk(" 0x%02x:xa=%u idx=%u hd=%u tl=%u f=%u hwo=0x%x nb=%u",
+		DWC3_STATS(" 0x%02x:xa=%u idx=%u hd=%u tl=%u f=%u hwo=0x%x nb=%u",
 		       ep->cfg.addr, ep->xfer_active, ep->xferrscidx,
 		       ep->head, ep->tail, ep->full,
 		       udc_dwc3_ring_data_hwo_mask(ep), nb);
@@ -978,7 +979,7 @@ static void udc_dwc3_acm_health_dump(void)
 		extern uint32_t udc_dwc3_open_hold_max_ms;
 		extern uint32_t udc_dwc3_open_hold_sum_ms;
 
-		printk(" settle_to=%u settle_max=%uus settle_sts=0x%x cpuhold=%u/%uus/%uus to=%u en=%u cap=%u open=%u/%ums/%ums",
+		DWC3_STATS(" settle_to=%u settle_max=%uus settle_sts=0x%x cpuhold=%u/%uus/%uus to=%u en=%u cap=%u open=%u/%ums/%ums",
 		       udc_dwc3_in_vid_settle_to,
 		       (uint32_t)((uint64_t)udc_dwc3_in_vid_settle_max * 1000000U /
 				  sys_clock_hw_cycles_per_sec()),
@@ -993,7 +994,7 @@ static void udc_dwc3_acm_health_dump(void)
 		udc_dwc3_park_stats_print();
 	}
 #endif
-	printk("\n");
+	DWC3_STATS("\n");
 }
 
 #if defined(CONFIG_UDC_DWC3_USB_ENGINE)
@@ -1006,7 +1007,7 @@ void udc_dwc3_health_print(void)
 	const uint32_t n = udc_dwc3_health_cmd_n;
 	const uint32_t mean = n ? (udc_dwc3_health_spin_sum / n) : 0U;
 
-	printk("DWC3HEALTH cmd=%u spin_mean=%u spin_max=%u halt_to=%u "
+	DWC3_STATS("DWC3HEALTH cmd=%u spin_mean=%u spin_max=%u halt_to=%u "
 	       "setup_pend=%u ep0_rst=%u ovf=%u unk=%u ulst=%u lnk=%u\n",
 	       n, mean, udc_dwc3_health_spin_max, udc_dwc3_health_halt_to,
 	       udc_dwc3_health_setup_pending, udc_dwc3_health_ep0_rst,
@@ -1016,12 +1017,12 @@ void udc_dwc3_health_print(void)
 			   UDC_DWC3_DSTS_USBLNKST_MASK) >> 18));
 	udc_dwc3_acm_health_dump();
 	udc_dwc3_engine_dump();
-	printk("ep0: last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	DWC3_STATS("ep0: last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
 	       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
 	       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
 	       udc_dwc3_last_setup[4], udc_dwc3_last_setup[5],
 	       udc_dwc3_last_setup[6], udc_dwc3_last_setup[7]);
-	printk("uvcmgr: sts=0x%x bytes=%u\n",
+	DWC3_STATS("uvcmgr: sts=0x%x bytes=%u\n",
 	       sys_read32(0xb4000000u + 0x10u), sys_read32(0xb4000000u + 0x18u));
 #if defined(CONFIG_UDC_DWC3_USB_ENGINE)
 	udc_dwc3_vid_gap_probe();
@@ -1037,7 +1038,7 @@ void udc_dwc3_engine_reprime_acm(const struct device *dev)
 	 * Existing ACM TRBs stay CPU-owned; new enqueues kick via RTL.
 	 */
 	ARG_UNUSED(dev);
-	printk("engine: reprime skip (keep armed ACM TRBs)\n");
+	DWC3_TRACE("engine: reprime skip (keep armed ACM TRBs)\n");
 }
 #endif
 
@@ -1535,7 +1536,7 @@ static void udc_dwc3_vid_cmd_poll(const mm_reg_t mbx)
 	}
 	sys_write32(0U, mbx + 0x58U);
 	udc_dwc3_vid_polled = true;
-	printk("vidcmd: poll bit0=%u quiet=%u hold=%u\n",
+	DWC3_TRACE("vidcmd: poll bit0=%u quiet=%u hold=%u\n",
 	       sys_read32(mbx + 0x58U) & 1U,
 	       sys_read32(mbx + 0x38U),
 	       sys_read32(mbx + 0x54U));
@@ -1631,6 +1632,33 @@ static uint32_t udc_dwc3_depcmd_mailbox_raw(const struct device *const dev,
  * rs12b: the first SRP open wedged TX with this at 0 as well, so the park
  * is not the trigger; default off while the EP0/DEPEVT trace locates it. */
 uint32_t udc_dwc3_cpu_hold_en = 0U;
+
+/* Console print gate, see DWC3_TRACE / DWC3_STATS in udc_dwc3_usb_engine.h. */
+uint32_t udc_dwc3_dbg = CONFIG_UDC_DWC3_CONSOLE_DEBUG;
+
+UDC_DWC3_XIP void udc_dwc3_trace(const char *fmt, ...)
+{
+	va_list ap;
+
+	if ((udc_dwc3_dbg & UDC_DWC3_DBG_TRACE) == 0U) {
+		return;
+	}
+	va_start(ap, fmt);
+	vprintk(fmt, ap);
+	va_end(ap);
+}
+
+UDC_DWC3_XIP void udc_dwc3_stats(const char *fmt, ...)
+{
+	va_list ap;
+
+	if ((udc_dwc3_dbg & UDC_DWC3_DBG_STATS) == 0U) {
+		return;
+	}
+	va_start(ap, fmt);
+	vprintk(fmt, ap);
+	va_end(ap);
+}
 
 UDC_DWC3_XIP static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
 						     const uint32_t addr,
@@ -1752,13 +1780,13 @@ UDC_DWC3_XIP static void udc_dwc3_rateprobe_print(void)
 		cmd85 = sys_read32(base + UDC_DWC3_DEPCMD(11));
 	}
 
-	printk("RATEPROBE t=%u mbx=%u qarm=%u qhit=%u qto=%u csi_fc=%u\n",
+	DWC3_STATS("RATEPROBE t=%u mbx=%u qarm=%u qhit=%u qto=%u csi_fc=%u\n",
 	       (uint32_t)k_uptime_get(), mbx_n,
 	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_ARM),
 	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_HIT),
 	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_TO),
 	       sys_read32(UDC_DWC3_FLIR_STATS_FRAME_COUNT));
-	printk("STALL sts=0x%x qlast=%u tocmd=0x%08x toexp=0x%08x "
+	DWC3_STATS("STALL sts=0x%x qlast=%u tocmd=0x%08x toexp=0x%08x "
 	       "cmd01=0x%08x cmd82=0x%08x cmd85=0x%08x\n",
 	       sys_read32(mbx + UDC_DWC3_MBX_STATUS),
 	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_LAST),
@@ -1877,7 +1905,7 @@ static bool udc_dwc3_ep_refuse_if_hw_owned(struct udc_dwc3_ep_data *const ep_dat
 	}
 
 	ep_data->hw_owned_refused++;
-	printk("dwc3: ep 0x%02x RTL-owned: refusing %s (n=%u)\n", ep_data->cfg.addr, what,
+	DWC3_TRACE("dwc3: ep 0x%02x RTL-owned: refusing %s (n=%u)\n", ep_data->cfg.addr, what,
 	       ep_data->hw_owned_refused);
 	__ASSERT(false, "Zephyr %s on RTL-owned endpoint 0x%02x", what, ep_data->cfg.addr);
 
@@ -1971,7 +1999,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 
 	if (hw_in_isoc) {
 		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
-		printk("dwc3: HW_IN isoc ep=0x%02x: XferNotReady enabled (Linux isoc)\n",
+		DWC3_TRACE("dwc3: HW_IN isoc ep=0x%02x: XferNotReady enabled (Linux isoc)\n",
 		       ep_data->cfg.addr);
 	} else if (!hw_in) {
 		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
@@ -2006,7 +2034,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 		}
 #endif
 	} else {
-		printk("dwc3: HW_IN ep=0x%02x: DEPEVT disabled (event-ring guard)\n",
+		DWC3_TRACE("dwc3: HW_IN ep=0x%02x: DEPEVT disabled (event-ring guard)\n",
 		       ep_data->cfg.addr);
 	}
 
@@ -2271,7 +2299,7 @@ static int udc_dwc3_isoc_start_with_uf(const struct device *const dev,
 			ep_data->xferrscidx =
 				FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg);
 			ep_data->xfer_active = true;
-			printk("dwc3: isoc StartXfer (NRDY) ep=0x%02x evt=%u cur=%u uf=%u idx=0x%x\n",
+			DWC3_TRACE("dwc3: isoc StartXfer (NRDY) ep=0x%02x evt=%u cur=%u uf=%u idx=0x%x\n",
 			       ep_data->cfg.addr, event_uf, cur_uf, uf,
 			       ep_data->xferrscidx);
 			return 0;
@@ -2373,7 +2401,7 @@ int lattice_usb23_isoc_arm(const struct device *dev, uint8_t ep_addr,
 		k_msleep(1);
 	}
 
-	printk("dwc3: isoc armed+primed ep=0x%02x hwo0=%u hwo1=%u — wait NRDY\n",
+	DWC3_TRACE("dwc3: isoc armed+primed ep=0x%02x hwo0=%u hwo1=%u — wait NRDY\n",
 	       ep_addr,
 	       (ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U,
 	       (ep_data->trb_buf[1].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U);
@@ -2407,7 +2435,7 @@ void lattice_usb23_isoc_disarm(const struct device *dev, uint8_t ep_addr)
 					      UDC_DWC3_DEPCMD_HIPRI_FORCERM |
 					      FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
 							 xferrscidx));
-		printk("dwc3: isoc EndXfer(ForceRM) ep=0x%02x idx=0x%x\n",
+		DWC3_TRACE("dwc3: isoc EndXfer(ForceRM) ep=0x%02x idx=0x%x\n",
 		       ep_addr, xferrscidx);
 	}
 
@@ -2476,7 +2504,7 @@ static void udc_dwc3_on_isoc_xfer_not_ready(const struct device *const dev,
 		    udc_dwc3_isoc_arm.softip_base + UDC_DWC3_SOFTIP_CTRL_OFF);
 	udc_dwc3_isoc_arm.pending = false;
 
-	printk("dwc3: isoc Soft-IP primed+StartXfer ep=0x%02x depupdxfer=0x%08x hwo0=%u\n",
+	DWC3_TRACE("dwc3: isoc Soft-IP primed+StartXfer ep=0x%02x depupdxfer=0x%08x hwo0=%u\n",
 	       ep_data->cfg.addr, depupdxfer,
 	       (ep_data->trb_buf[0].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U);
 }
@@ -2688,7 +2716,7 @@ static void udc_dwc3_hw_owned_revoke(const struct device *const dev,
 		return;
 	}
 
-	printk("dwc3: ep 0x%02x <- RTL forced revoke (%s) evts=%u refused=%u\n",
+	DWC3_TRACE("dwc3: ep 0x%02x <- RTL forced revoke (%s) evts=%u refused=%u\n",
 	       ep_data->cfg.addr, reason, ep_data->hw_owned_evts, ep_data->hw_owned_refused);
 
 #if CONFIG_UDC_DWC3_HW_IN_EP_MASK != 0
@@ -2734,7 +2762,7 @@ int lattice_usb23_ep_give_to_rtl(const struct device *dev, uint8_t ep_addr,
 	 * handed off: on any other endpoint the CPU would pop the RTL's TRBs.
 	 */
 	if (!udc_dwc3_ep_is_hw_in(ep_data)) {
-		printk("dwc3: ep 0x%02x not in UDC_DWC3_HW_IN_EP_MASK, cannot give to RTL\n",
+		DWC3_TRACE("dwc3: ep 0x%02x not in UDC_DWC3_HW_IN_EP_MASK, cannot give to RTL\n",
 		       ep_addr);
 		return -EACCES;
 	}
@@ -2749,7 +2777,7 @@ int lattice_usb23_ep_give_to_rtl(const struct device *dev, uint8_t ep_addr,
 
 	for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
 		if (ep_data->net_buf[i] != NULL) {
-			printk("dwc3: ep 0x%02x has CPU buffers queued, cannot give to RTL\n",
+			DWC3_TRACE("dwc3: ep 0x%02x has CPU buffers queued, cannot give to RTL\n",
 			       ep_addr);
 			return -EBUSY;
 		}
@@ -2758,7 +2786,7 @@ int lattice_usb23_ep_give_to_rtl(const struct device *dev, uint8_t ep_addr,
 	if (!isoc && !ep_data->xfer_active) {
 		udc_dwc3_hw_owned_rearm(dev, ep_data);
 		if (!ep_data->xfer_active) {
-			printk("dwc3: ep 0x%02x has no live transfer resource\n", ep_addr);
+			DWC3_TRACE("dwc3: ep 0x%02x has no live transfer resource\n", ep_addr);
 			return -EIO;
 		}
 	}
@@ -2774,7 +2802,7 @@ int lattice_usb23_ep_give_to_rtl(const struct device *dev, uint8_t ep_addr,
 			      FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	}
 
-	printk("dwc3: ep 0x%02x -> RTL (xferrscidx=0x%x)\n", ep_addr, ep_data->xferrscidx);
+	DWC3_TRACE("dwc3: ep 0x%02x -> RTL (xferrscidx=0x%x)\n", ep_addr, ep_data->xferrscidx);
 
 	return 0;
 }
@@ -2792,7 +2820,7 @@ int lattice_usb23_ep_take_from_rtl(const struct device *dev, uint8_t ep_addr)
 		return -EALREADY;
 	}
 
-	printk("dwc3: ep 0x%02x <- RTL (stream off) evts=%u refused=%u\n", ep_addr,
+	DWC3_TRACE("dwc3: ep 0x%02x <- RTL (stream off) evts=%u refused=%u\n", ep_addr,
 	       ep_data->hw_owned_evts, ep_data->hw_owned_refused);
 
 	udc_dwc3_hw_owned_release(dev, ep_data, true);
@@ -3119,7 +3147,7 @@ static void udc_dwc3_nv_ep_dump(const struct udc_dwc3_ep_data *ep_data)
 	for (uint32_t i = 0U; i < CONFIG_UDC_DWC3_TRB_NUM - 1U; i++) {
 		nb += ep_data->net_buf[i] != NULL;
 	}
-	printk(" %02x:xa=%u hd=%u tl=%u f=%u hwo=0x%x nb=%u", ep_data->cfg.addr,
+	DWC3_STATS(" %02x:xa=%u hd=%u tl=%u f=%u hwo=0x%x nb=%u", ep_data->cfg.addr,
 	       ep_data->xfer_active, ep_data->head, ep_data->tail, ep_data->full,
 	       udc_dwc3_ring_data_hwo_mask(ep_data), nb);
 }
@@ -3128,15 +3156,15 @@ void lattice_usb23_iebm_fast_health(const struct device *dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 
-	printk("nv: drop_nb=%u drop_hwo=%u full=%u retake=%u ev:",
+	DWC3_STATS("nv: drop_nb=%u drop_hwo=%u full=%u retake=%u ev:",
 	       udc_dwc3_nv_drop_nb_null, udc_dwc3_nv_drop_hwo, udc_dwc3_nv_full,
 	       udc_dwc3_nv_retake);
 	for (uint32_t i = 0U; i < 8U; i++) {
 		if (udc_dwc3_nv_evt[i] != 0U) {
-			printk(" %u=%u", i, udc_dwc3_nv_evt[i]);
+			DWC3_STATS(" %u=%u", i, udc_dwc3_nv_evt[i]);
 		}
 	}
-	printk("\nnv-ep:");
+	DWC3_STATS("\nnv-ep:");
 	for (int i = 1; i < cfg->num_in_eps; i++) {
 		if (cfg->ep_data_in[i].cfg.addr != 0x85) {
 			udc_dwc3_nv_ep_dump(&cfg->ep_data_in[i]);
@@ -3145,14 +3173,14 @@ void lattice_usb23_iebm_fast_health(const struct device *dev)
 	for (int i = 1; i < cfg->num_out_eps; i++) {
 		udc_dwc3_nv_ep_dump(&cfg->ep_data_out[i]);
 	}
-	printk("\n");
-	printk("iebm-fast: isr=%u evts=%u ret=%u push=%u starts=%u(slot=%u idx=0x%x) kicks=%u def=%u spin_max=%u err=%u ovf=%u swq=%u full=%u\n",
+	DWC3_STATS("\n");
+	DWC3_STATS("iebm-fast: isr=%u evts=%u ret=%u push=%u starts=%u(slot=%u idx=0x%x) kicks=%u def=%u spin_max=%u err=%u ovf=%u swq=%u full=%u\n",
 	       iebm_fast.isr_calls, iebm_fast.isr_evts, iebm_fast.retired, iebm_fast.pushed,
 	       iebm_fast.starts, iebm_fast.last_start_slot, iebm_fast.last_start_idx,
 	       iebm_fast.kicks, iebm_fast.kicks_deferred,
 	       iebm_fast.kick_spin_max, iebm_fast.kick_err, udc_dwc3_evt_errors.overflow,
 	       iebm_fast.swq_push, iebm_fast.swq_full);
-	printk("iebm-cyc: svc=%u retire/svc=%u refill/svc=%u kick/kick=%u evt_thr=%u cyc/evt=%u\n",
+	DWC3_STATS("iebm-cyc: svc=%u retire/svc=%u refill/svc=%u kick/kick=%u evt_thr=%u cyc/evt=%u\n",
 	       iebm_fast.n_service,
 	       iebm_fast.n_service ? iebm_fast.cyc_retire / iebm_fast.n_service : 0U,
 	       iebm_fast.n_service ? iebm_fast.cyc_refill / iebm_fast.n_service : 0U,
@@ -3224,7 +3252,7 @@ int lattice_usb23_iebm_abort(const struct device *dev, uint8_t ep_addr)
 		did_rearm = true;
 	}
 	irq_unlock(key);
-	printk("dwc3: 0x%02x leftover EndXfer=%d drop=%u rearm=%d xa=%d idx=0x%x\n",
+	DWC3_TRACE("dwc3: 0x%02x leftover EndXfer=%d drop=%u rearm=%d xa=%d idx=0x%x\n",
 	       ep_addr, did_end, leftover, did_rearm, ep_data->xfer_active,
 	       ep_data->xferrscidx);
 	return 0;
@@ -3286,7 +3314,7 @@ static void udc_dwc3_trb_norm_init(const struct device *const dev,
 	if (isoc) {
 		ep_data->xfer_active = false;
 		ep_data->xferrscidx = 0;
-		printk("dwc3: isoc ep=0x%02x TRB ring ready (StartXfer deferred)\n",
+		DWC3_TRACE("dwc3: isoc ep=0x%02x TRB ring ready (StartXfer deferred)\n",
 		       ep_data->cfg.addr);
 		return;
 	}
@@ -3715,7 +3743,7 @@ static int udc_dwc3_acm_ring_kick(const struct device *const dev,
 	}
 	udc_dwc3_acm_kicks++;
 	if (udc_dwc3_acm_kicks <= 8U) {
-		printk("dwc3: 0x%02x ring kick slot=%u len=%u idx=0x%x\n",
+		DWC3_TRACE("dwc3: 0x%02x ring kick slot=%u len=%u idx=0x%x\n",
 		       addr, (uint32_t)(trb - &ep_data->trb_buf[0]), buf->len,
 		       ep_data->xferrscidx);
 	}
@@ -3753,14 +3781,14 @@ void udc_dwc3_engine_slot_aborted(const struct device *dev, uint8_t addr,
 			    (udc_ep_buf_has_zlp(buf) ? UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP :
 						       UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL);
 		udc_dwc3_trb_fence(trb);
-		printk("dwc3: 0x%02x ring abort -> CPU arm slot=%u len=%u xa=%d\n",
+		DWC3_TRACE("dwc3: 0x%02x ring abort -> CPU arm slot=%u len=%u xa=%d\n",
 		       addr, i, buf->len, ep_data->xfer_active);
 		if (ep_data->xfer_active && ep_data->xferrscidx != 0U) {
 			udc_dwc3_depcmd_update_xfer(dev, ep_data);
 		}
 		return;
 	}
-	printk("dwc3: 0x%02x ring abort data=0x%08x not on ring\n", addr, data_addr);
+	DWC3_TRACE("dwc3: 0x%02x ring abort data=0x%08x not on ring\n", addr, data_addr);
 }
 #endif /* CONFIG_UDC_DWC3_USB_ENGINE */
 
@@ -3775,12 +3803,12 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 
 	if (ep_data->full) {
 		if (ep_data->cfg.addr == 0x85) {
-			printk("dwc3: 0x85 trb_bulk full head=%u tail=%u\n",
+			DWC3_TRACE("dwc3: 0x85 trb_bulk full head=%u tail=%u\n",
 			       ep_data->head, ep_data->tail);
 		} else {
 			udc_dwc3_nv_full++;
 			if (udc_dwc3_nv_full <= 4U) {
-				printk("dwc3: nv full ep=0x%02x hd=%u tl=%u hwo=0x%x\n",
+				DWC3_TRACE("dwc3: nv full ep=0x%02x hd=%u tl=%u hwo=0x%x\n",
 				       ep_data->cfg.addr, ep_data->head, ep_data->tail,
 				       udc_dwc3_ring_data_hwo_mask(ep_data));
 			}
@@ -3853,7 +3881,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	 * so a second StartXfer does not hit CMDERR/no-resource.
 	 */
 	if (ep_data->cfg.addr == 0x85 && resume_from_park && !iebm_uvc_unparked) {
-		printk("dwc3: 0x85 unpark EndXfer (empty ring)\n");
+		DWC3_TRACE("dwc3: 0x85 unpark EndXfer (empty ring)\n");
 		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 		iebm_uvc_unparked = true;
 	}
@@ -3865,7 +3893,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		static uint32_t n85;
 
 		if (n85 < 6U) {
-			printk("dwc3: 0x85 push slot=%u data=%p len=%u ctrl=0x%x xa=%d\n",
+			DWC3_TRACE("dwc3: 0x85 push slot=%u data=%p len=%u ctrl=0x%x xa=%d\n",
 			       push_slot, (void *)buf->data, buf->len, ctrl,
 			       ep_data->xfer_active);
 			n85++;
@@ -3883,7 +3911,7 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			udc_dwc3_depcmd_start_xfer_trb(dev, ep_data,
 						       &ep_data->trb_buf[push_slot]);
 			if (n85s < 3U) {
-				printk("dwc3: 0x85 StartXfer slot=%u xa=%d idx=0x%x trb=0x%x\n",
+				DWC3_TRACE("dwc3: 0x85 StartXfer slot=%u xa=%d idx=0x%x trb=0x%x\n",
 				       push_slot, ep_data->xfer_active,
 				       ep_data->xferrscidx,
 				       ep_data->trb_buf[push_slot].ctrl);
@@ -3992,7 +4020,7 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
 
 static void udc_dwc3_print_last_setup(const char *const why)
 {
-	printk("ep0: %s last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	DWC3_TRACE("ep0: %s last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
 	       why,
 	       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
 	       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
@@ -4614,7 +4642,7 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 			udc_dwc3_open_hold_dtr(udc_dwc3_last_setup[2] & 0x01U);
 		}
 #endif
-		printk("ep0: SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		DWC3_TRACE("ep0: SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
 		       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
 		       udc_dwc3_last_setup[4], udc_dwc3_last_setup[5],
@@ -4741,13 +4769,13 @@ static void udc_dwc3_on_xfer_not_ready_norm(const struct device *const dev,
 	static uint8_t notready_escalated[16];
 
 	if (oidx < ARRAY_SIZE(notready_escalated) && notready_escalated[oidx] == 0U) {
-		printk("OUT-NOTREADY ep=0x%02x armed, UpdateXfer (tail=%u)\n",
+		DWC3_TRACE("OUT-NOTREADY ep=0x%02x armed, UpdateXfer (tail=%u)\n",
 		       ep_data->cfg.addr, ep_data->tail);
 		udc_dwc3_depcmd_update_xfer(dev, ep_data);
 		notready_escalated[oidx] = 1U;
 	} else {
 		/* Prefer UpdateXfer-only under Soft-IP; EndXfer kept as last resort. */
-		printk("OUT-NOTREADY ep=0x%02x armed, UpdateXfer-retry (tail=%u)\n",
+		DWC3_TRACE("OUT-NOTREADY ep=0x%02x armed, UpdateXfer-retry (tail=%u)\n",
 		       ep_data->cfg.addr, ep_data->tail);
 		udc_dwc3_depcmd_update_xfer(dev, ep_data);
 		if (oidx < ARRAY_SIZE(notready_escalated)) {
@@ -4802,7 +4830,7 @@ __attribute__((noinline, section(".text")))
 static void udc_dwc3_acm01_trace(uint32_t evt, const struct net_buf *buf,
 				 uint32_t sts, const struct udc_dwc3_ep_data *ep_data)
 {
-	printk("ACM01 t=%u evt=0x%08x len=%u sts=0x%08x tl=%u hd=%u d=%02x%02x%02x%02x\n",
+	DWC3_TRACE("ACM01 t=%u evt=0x%08x len=%u sts=0x%08x tl=%u hd=%u d=%02x%02x%02x%02x\n",
 	       (uint32_t)k_uptime_get(), evt, buf->len, sts, ep_data->tail,
 	       ep_data->head, buf->len > 0U ? buf->data[0] : 0U,
 	       buf->len > 1U ? buf->data[1] : 0U, buf->len > 2U ? buf->data[2] : 0U,
@@ -4825,7 +4853,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		udc_dwc3_acm_xfer_evt[acm_slot]++;
 	}
 	if (ep_data->cfg.addr == 0x82U) {
-		printk("ACM82 t=%u evt=0x%08x hwo=%u nb=%u tl=%u hd=%u\n",
+		DWC3_TRACE("ACM82 t=%u evt=0x%08x hwo=%u nb=%u tl=%u hd=%u\n",
 		       (uint32_t)k_uptime_get(), evt,
 		       (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U,
 		       ep_data->net_buf[ep_data->tail] != NULL,
@@ -4846,7 +4874,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		static uint32_t n85d;
 
 		if (n85d < 0U) { /* off: see ev85 */
-			printk("dwc3: 0x85 xfer_done hw_owned=%d hwin=%d tail=%u hwo=%d nb=%p\n",
+			DWC3_TRACE("dwc3: 0x85 xfer_done hw_owned=%d hwin=%d tail=%u hwo=%d nb=%p\n",
 			       ep_data->hw_owned, udc_dwc3_ep_is_hw_in(ep_data),
 			       ep_data->tail,
 			       (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U,
@@ -4858,13 +4886,13 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	if (ep_data->hw_owned) {
 		ep_data->hw_owned_evts++;
 		if (ep_data->cfg.addr == 0x82U) {
-			printk("ACM82 t=%u drop hw_owned\n", (uint32_t)k_uptime_get());
+			DWC3_TRACE("ACM82 t=%u drop hw_owned\n", (uint32_t)k_uptime_get());
 		}
 		return;
 	}
 	if (udc_dwc3_ep_is_hw_in(ep_data)) {
 		if (ep_data->cfg.addr == 0x82U) {
-			printk("ACM82 t=%u drop hwin\n", (uint32_t)k_uptime_get());
+			DWC3_TRACE("ACM82 t=%u drop hwin\n", (uint32_t)k_uptime_get());
 		}
 		return;
 	}
@@ -4880,7 +4908,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	if (ep_data->net_buf[ep_data->tail] == NULL) {
 		udc_dwc3_nv_drop_nb_null++;
 		if (ep_data->cfg.addr == 0x82U) {
-			printk("ACM82 t=%u drop nobuf\n", (uint32_t)k_uptime_get());
+			DWC3_TRACE("ACM82 t=%u drop nobuf\n", (uint32_t)k_uptime_get());
 		}
 		return;
 	}
@@ -4892,7 +4920,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
 		udc_dwc3_nv_drop_hwo++;
 		if (udc_dwc3_nv_drop_hwo <= 8U) {
-			printk("dwc3: nv hwo-set ep=0x%02x tl=%u hd=%u ctrl=0x%08x sts=0x%08x evt=0x%08x\n",
+			DWC3_TRACE("dwc3: nv hwo-set ep=0x%02x tl=%u hd=%u ctrl=0x%08x sts=0x%08x evt=0x%08x\n",
 			       ep_data->cfg.addr, ep_data->tail, ep_data->head,
 			       trb->ctrl, trb->status, evt);
 		}
@@ -4901,7 +4929,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* Slot posted to the BulkRing and not yet written by it. */
 	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_SW_PENDING) != 0U) {
 		if (ep_data->cfg.addr == 0x82U) {
-			printk("ACM82 t=%u drop pending tl=%u\n",
+			DWC3_TRACE("ACM82 t=%u drop pending tl=%u\n",
 			       (uint32_t)k_uptime_get(), ep_data->tail);
 		}
 		return;
@@ -4923,7 +4951,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		 * UDC_EVT_ERROR here used to take ACM down mid-SRP.
 		 */
 		if (ep_data->cfg.addr == 0x82U) {
-			printk("ACM82 t=%u drop pop\n", (uint32_t)k_uptime_get());
+			DWC3_TRACE("ACM82 t=%u drop pop\n", (uint32_t)k_uptime_get());
 		}
 		return;
 	}
@@ -4933,7 +4961,7 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		udc_dwc3_acm_xfer_ret[acm_slot]++;
 	}
 	if (ep_data->cfg.addr == 0x82U) {
-		printk("ACM82 t=%u ret len=%u sts=0x%08x\n",
+		DWC3_TRACE("ACM82 t=%u ret len=%u sts=0x%08x\n",
 		       (uint32_t)k_uptime_get(), buf->len, trb_status_done);
 	}
 	udc_dwc3_on_xfer_done(dev, ep_data);
@@ -5016,7 +5044,7 @@ void udc_dwc3_engine_slot_done(const struct device *dev, uint8_t addr,
 	if ((trb->ctrl & (UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_SW_PENDING)) != 0U) {
 		trb->ctrl &= ~(UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_SW_PENDING);
 		if (nret < 8U) {
-			printk("dwc3: engine retire ep=0x%02x addr=%08x\n",
+			DWC3_TRACE("dwc3: engine retire ep=0x%02x addr=%08x\n",
 			       addr, data_addr);
 		}
 		nret++;
@@ -5088,7 +5116,7 @@ static void udc_dwc3_in_completion_poll_tick(const struct device *const dev)
 				irq_unlock(key);
 				continue;
 			}
-			printk("IN-POLL: retire lost-cmpl ep=0x%02x tail=%u\n",
+			DWC3_TRACE("IN-POLL: retire lost-cmpl ep=0x%02x tail=%u\n",
 			       ep_data->cfg.addr, ep_data->tail);
 			udc_dwc3_on_xfer_done_norm(dev,
 				UDC_DWC3_DEPEVT_XFERINPROGRESS(ep_data->epn));
@@ -5141,7 +5169,7 @@ static void udc_dwc3_out_completion_poll_tick(const struct device *const dev)
 				irq_unlock(key);
 				continue;
 			}
-			printk("OUT-POLL: retire lost-cmpl ep=0x%02x tail=%u\n",
+			DWC3_TRACE("OUT-POLL: retire lost-cmpl ep=0x%02x tail=%u\n",
 			       ep_data->cfg.addr, ep_data->tail);
 			udc_dwc3_on_xfer_done_norm(dev,
 				UDC_DWC3_DEPEVT_XFERINPROGRESS(ep_data->epn));
@@ -5391,7 +5419,7 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 		 * tick. Three retakes, then 30 s quiet.
 		 */
 		if (ep_data->cfg.addr == 0x82 && park->nudges >= 3U) {
-			printk("IN-RECOVER: quiet ep=0x82 remain=%u\n", remain);
+			DWC3_TRACE("IN-RECOVER: quiet ep=0x82 remain=%u\n", remain);
 			park->nudges = 0;
 			park->since = now;
 			/* 30 s left the host 9-byte read dead. 2 s is enough
@@ -5403,7 +5431,7 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 		if (udc_dwc3_nv_retake < 8U)
 #endif
 		{
-			printk("IN-RECOVER: retake ep=0x%02x tail=%u remain=%u n=%u\n",
+			DWC3_TRACE("IN-RECOVER: retake ep=0x%02x tail=%u remain=%u n=%u\n",
 			       ep_data->cfg.addr, tail, remain, park->nudges);
 		}
 		udc_dwc3_in_park_retake(dev, ep_data);
@@ -5415,7 +5443,7 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 #endif
 
 	if (park->nudges >= UDC_DWC3_IN_PARK_NUDGE_CAP) {
-		printk("IN-RECOVER: backoff ep=0x%02x remain=%u nudges=%u\n",
+		DWC3_TRACE("IN-RECOVER: backoff ep=0x%02x remain=%u nudges=%u\n",
 		       ep_data->cfg.addr, remain, park->nudges);
 		park->nudges = 0;
 		park->since = now;
@@ -5426,12 +5454,12 @@ static void udc_dwc3_in_recover_one(const struct device *const dev,
 	if (!udc_dwc3_depcmd_is_idle(dev, ep_data->epn)) {
 		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
-		printk("IN-RECOVER: busy ep=0x%02x cmd=0x%08x — NoResp nudge\n",
+		DWC3_TRACE("IN-RECOVER: busy ep=0x%02x cmd=0x%08x — NoResp nudge\n",
 		       ep_data->cfg.addr,
 		       sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn)));
 	}
 
-	printk("IN-RECOVER: park ep=0x%02x nudge remain=%u n=%u\n",
+	DWC3_TRACE("IN-RECOVER: park ep=0x%02x nudge remain=%u n=%u\n",
 	       ep_data->cfg.addr, remain, park->nudges);
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 	park->nudges++;
@@ -5447,13 +5475,13 @@ static void udc_dwc3_in_recover_tick(const struct device *const dev)
 
 	if (udc_dwc3_hw_video_live(dev)) {
 		if (!held) {
-			printk("IN-RECOVER: hold (video live)\n");
+			DWC3_TRACE("IN-RECOVER: hold (video live)\n");
 			held = true;
 		}
 		return;
 	}
 	if (held) {
-		printk("IN-RECOVER: release\n");
+		DWC3_TRACE("IN-RECOVER: release\n");
 		held = false;
 	}
 #endif
@@ -5515,7 +5543,7 @@ static void udc_dwc3_cdc_trace_ep(const struct device *const dev,
 	}
 
 	tr->last_print = now;
-	printk("CDC-TRACE ep=0x%02x act=%u hd=%u tl=%u nb=%u hwo=%u rem=%u "
+	DWC3_TRACE("CDC-TRACE ep=0x%02x act=%u hd=%u tl=%u nb=%u hwo=%u rem=%u "
 	       "sts=0x%08x depcmd=0x%08x dsts=0x%08x quiet_ms=%lld\n",
 	       ep_data->cfg.addr, ep_data->xfer_active, ep_data->head, tail,
 	       armed, hwo,
@@ -5578,7 +5606,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 
 	/* Physical epn 11 = 0x85 IN. Print the first few DEPEVTs. */
 	if (((evt_raw >> 1) & 0x1f) == 11U && ev85 < 0U) { /* off: evt thread printk (~6 ms) overflows the ring */
-		printk("dwc3: evt 0x85 raw=0x%08x\n", evt_raw);
+		DWC3_TRACE("dwc3: evt 0x85 raw=0x%08x\n", evt_raw);
 		ev85++;
 	}
 
@@ -5894,7 +5922,7 @@ UDC_DWC3_XIP static void udc_dwc3_vid_gap_probe(void)
 			break;
 		}
 	}
-	printk("VIDGAP run=%u cmds=%u max=%uus fsm=%u n=%u s6=%u s2=%u s1=%u\n",
+	DWC3_TRACE("VIDGAP run=%u cmds=%u max=%uus fsm=%u n=%u s6=%u s2=%u s1=%u\n",
 	       udc_dwc3_vid_gap_runs, last_cmd - cmds,
 	       (uint32_t)((uint64_t)gap_max * 1000000U / hz), gap_fsm,
 	       n, s6, s2, s1);
@@ -6383,7 +6411,7 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_bulk(const struct device *const dev
 			/* Still in WAIT_EVT. Another pass after the hold. */
 			since[idx] = now;
 		}
-		printk("IN-RESTART ep=0x%02x old=%u end=0x%08x start=0x%08x st=0x%x ate=%u post=%d trb=0x%08x\n",
+		DWC3_TRACE("IN-RESTART ep=0x%02x old=%u end=0x%08x start=0x%08x st=0x%x ate=%u post=%d trb=0x%08x\n",
 		       addr, rsc, reg, started, st,
 		       udc_dwc3_engine_restart_ate(addr) ? 1U : 0U,
 		       post, LO32((uintptr_t)trb));
@@ -6455,7 +6483,7 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_video(const struct device *const de
 		*(volatile uint32_t *)(uintptr_t)(trb + 12U) |= UDC_DWC3_TRB_CTRL_HWO;
 	}
 	started = udc_dwc3_restart_start(dev, ep, trb);
-	printk("IN-RESTART ep=0x85 old=%u trb=0x%08x end=0x%08x start=0x%08x db=%u\n",
+	DWC3_TRACE("IN-RESTART ep=0x85 old=%u trb=0x%08x end=0x%08x start=0x%08x db=%u\n",
 	       rsc, trb, reg, started, db);
 	key = irq_lock();
 	udc_dwc3_uvcmgr_resume_doorbell(paused == 1);
@@ -6480,7 +6508,7 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 	udc_dwc3_health_dev = dev;
-	printk("PARK0 fence+snap ready (TRB/PAR readback, A/B dump on 0x82 park)\n");
+	DWC3_TRACE("PARK0 fence+snap ready (TRB/PAR readback, A/B dump on 0x82 park)\n");
 
 	while (true) {
 		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -6868,7 +6896,7 @@ static int udc_dwc3_ep_disable(const struct device *const dev,
 	if (ep_data->xfer_active && ep_data->xferrscidx != 0U &&
 	    (sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0U) {
 		udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
-		printk("dwc3: ep_disable 0x%02x EndXfer\n", ep_data->cfg.addr);
+		DWC3_TRACE("dwc3: ep_disable 0x%02x EndXfer\n", ep_data->cfg.addr);
 	}
 	ep_data->xfer_active = false;
 	ep_data->xferrscidx = 0;
@@ -6899,7 +6927,7 @@ static int udc_dwc3_ep_set_halt(const struct device *const dev,
 		break;
 	default:
 		if (ep_data->hw_owned) {
-			printk("dwc3: ep 0x%02x set-halt ignored (keep RTL)\n",
+			DWC3_TRACE("dwc3: ep 0x%02x set-halt ignored (keep RTL)\n",
 			       ep_data->cfg.addr);
 			return 0;
 		}
@@ -6933,7 +6961,7 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 		 */
 		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
 				UDC_DWC3_DEPCMD_DEPCSTALL);
-		printk("dwc3: ep 0x%02x pipe reset: SeqNum cleared, RTL kept\n",
+		DWC3_TRACE("dwc3: ep 0x%02x pipe reset: SeqNum cleared, RTL kept\n",
 		       ep_data->cfg.addr);
 		ep_data->cfg.stat.halted = false;
 		return 0;
@@ -7081,7 +7109,7 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 		for (int epn = 1; epn < cfg->num_out_eps; epn++) {
 			cfg->ep_data_out[epn].xfer_rsc_allocated = false;
 		}
-		printk("dwc3: DEPSTARTCFG non-control pool (first ep=0x%02x)\n",
+		DWC3_TRACE("dwc3: DEPSTARTCFG non-control pool (first ep=0x%02x)\n",
 		       ep_data->cfg.addr);
 	}
 
@@ -7099,7 +7127,7 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
 		udc_dwc3_trb_norm_init(dev, ep_data);
 		if (ep_data->xfer_active) {
-			printk("dwc3: ep_enable 0x%02x StartXfer xferrscidx=0x%x\n",
+			DWC3_TRACE("dwc3: ep_enable 0x%02x StartXfer xferrscidx=0x%x\n",
 			       ep_data->cfg.addr, ep_data->xferrscidx);
 		}
 	}
@@ -7209,7 +7237,7 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
 
 	if (ep_data->cfg.stat.halted) {
 		if (ep_data->cfg.addr == 0x85) {
-			printk("dwc3: 0x85 worker skip halted\n");
+			DWC3_TRACE("dwc3: 0x85 worker skip halted\n");
 		}
 		LOG_DBG("endpoint is halted, not processing buffers");
 		return;
