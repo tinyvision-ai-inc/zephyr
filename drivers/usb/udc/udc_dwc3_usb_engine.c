@@ -23,6 +23,7 @@
 
 static bool engine_seen;
 static bool engine_on;
+static bool engine_held_off;
 static bool engine_evt_own;
 static bool engine_ovf_seen;
 static uint8_t programmed;
@@ -34,9 +35,16 @@ static struct net_buf *posted[USB_ENGINE_BULK_N][USB_ENGINE_POST_DEPTH];
 static uint8_t post_hd[USB_ENGINE_BULK_N];
 static uint8_t post_tl[USB_ENGINE_BULK_N];
 static uint8_t post_n[USB_ENGINE_BULK_N];
+/* Slots posted into the CPU's own TRB ring (ring_sync + post_slot).
+ * A normal completion retires the matching IN net_buf from drain_cmpl.
+ * Not counted in post_n, so stall/clear/dequeue stay CPU. */
+static uint32_t kicked[USB_ENGINE_BULK_N];
+static uint32_t kicked_total[USB_ENGINE_BULK_N];
+static uint32_t kicked_abort[USB_ENGINE_BULK_N];
+static bool ring_synced[USB_ENGINE_BULK_N];
 
 static const uint8_t bulk_addr[USB_ENGINE_BULK_N] = {
-	0x81, 0x82, 0x01,
+	0x84, 0x82, 0x02,
 };
 
 static mm_reg_t eng_base(void)
@@ -68,7 +76,11 @@ bool udc_dwc3_engine_evt_own(void)
 
 bool udc_dwc3_engine_owns(uint8_t addr)
 {
-	return engine_on && usb_engine_bulk_idx(addr) >= 0;
+	const int idx = usb_engine_bulk_idx(addr);
+
+	/* Stall, clear, and dequeue follow the ring only while it holds a
+	 * descriptor. With post_n == 0 the CPU TRB ring owns the endpoint. */
+	return engine_on && idx >= 0 && post_n[idx] > 0U;
 }
 
 bool udc_dwc3_engine_posted(uint8_t addr)
@@ -85,12 +97,16 @@ void udc_dwc3_engine_dump(void)
 	if (!engine_on) {
 		return;
 	}
-	printk("engine: st=0x%x evt=%u cmd=%u own=0x%x post=%u/%u/%u\n",
+	printk("engine: st=0x%x evt=%u cmd=%u own=0x%x post=%u/%u/%u kick82=%u/%u kick84=%u/%u kick02=%u/%u abort=%u sync=%u/%u/%u\n",
 	       sys_read32(base + USB_ENGINE_ENG_STATUS),
 	       sys_read32(base + USB_ENGINE_EVT_COUNT),
 	       sys_read32(base + USB_ENGINE_CMD_COUNT),
 	       sys_read32(base + USB_ENGINE_EP_OWN),
-	       post_n[0], post_n[1], post_n[2]);
+	       post_n[0], post_n[1], post_n[2],
+	       kicked_total[1], kicked[1], kicked_total[0], kicked[0],
+	       kicked_total[2], kicked[2],
+	       kicked_abort[1] + kicked_abort[0] + kicked_abort[2],
+	       ring_synced[1], ring_synced[0], ring_synced[2]);
 	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
 		const mm_reg_t epb = usb_engine_ep_base(i);
 
@@ -163,7 +179,10 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	uint32_t id;
 	uint32_t ctrl;
 
-	if (engine_on || programmed != 0x07U) {
+	/* Bit 1 is ACM IN 0x82, programmed before STREAMON. Bits 0 and 2 are
+	 * RAW 0x84 / 0x02, which start on the first SRP transfer and must not
+	 * hold ENABLE off. */
+	if (engine_on || engine_held_off || (programmed & 0x02U) != 0x02U) {
 		return;
 	}
 	if (evt_base == 0U) {
@@ -182,21 +201,33 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	/* Fair-share: yield to mailbox after this many video grants. */
 	sys_write32(32U, base + USB_ENGINE_VID_CREDIT);
 	sys_write32(0U, base + USB_ENGINE_QUIET_OTHER);
+	/* Mailbox quiet is 0, so everyOther does not arm. A CPU command still
+	 * occupies the arbiter until CMDACT clears. HOLD_SEL stays at its reset 0.
+	 * VID_CMD bit0 resets to 1, which writes a video UpdateXfer with CMDACT
+	 * clear and grants the next command without waiting. */
+	sys_write32(0U, (mm_reg_t)0xb4008000U + 0x38U);
+	sys_write32(0U, (mm_reg_t)0xb4008000U + 0x58U);
 	sys_write32(USB_ENGINE_IRQ_FWD | USB_ENGINE_IRQ_CMPL | USB_ENGINE_IRQ_ERR,
 		    base + USB_ENGINE_ENG_IRQ_ENA);
 	/*
-	 * ENABLE at STREAMON. EVT_OWN stays 0 so CPU keeps GEVNTCOUNT.
-	 * EventDrain still snoops the ring (RTL) and completes BulkRing.
+	 * ENABLE at STREAMON. EVT_OWN stays 0 so the CPU keeps GEVNTCOUNT.
+	 * EventDrain still snoops the ring. Mailbox quiet is 0, so a CPU
+	 * command does not arm the 800 µs hold.
 	 */
 	ctrl = USB_ENGINE_CTRL_ENABLE | USB_ENGINE_CTRL_CREDIT_EN |
 	       USB_ENGINE_CTRL_IRQ_EN;
 	sys_write32(ctrl, base + USB_ENGINE_ENG_CTRL);
 	engine_on = true;
+	engine_held_off = false;
 	engine_evt_own = false;
 	engine_seen = true;
 	engine_ovf_seen = false;
-	printk("engine: ENABLE=1 EVT_OWN=0 ACM_BR snoop id=0x%08x evt=0x%08x/%u map=0x%08x\n",
-	       id, evt_base, evt_size, sys_read32(base + USB_ENGINE_EP_MAP));
+	printk("engine: ENABLE=1 EVT_OWN=0 id=0x%08x evt=0x%08x/%u map=0x%08x ctrl=0x%08x quiet=%u hold=%u vid=%u\n",
+	       id, evt_base, evt_size, sys_read32(base + USB_ENGINE_EP_MAP),
+	       sys_read32(base + USB_ENGINE_ENG_CTRL),
+	       sys_read32((mm_reg_t)0xb4008000U + 0x38U),
+	       sys_read32((mm_reg_t)0xb4008000U + 0x54U),
+	       sys_read32((mm_reg_t)0xb4008000U + 0x58U) & 1U);
 }
 
 static void engine_go_fn(struct k_work *work)
@@ -231,6 +262,8 @@ void udc_dwc3_engine_program_ep(const struct device *dev, uint8_t addr,
 		    epb + USB_ENGINE_EP_TRB_BASE);
 	sys_write32(depcmd_addr, epb + USB_ENGINE_EP_DEPCMD_ADDR);
 	sys_write32(xfer_idx, epb + USB_ENGINE_EP_XFER_IDX);
+	/* New resource: the ring slot must be reloaded before the next kick. */
+	ring_synced[idx] = false;
 	programmed |= (uint8_t)BIT(idx);
 	saved_evt_base = evt_base;
 	saved_evt_size = evt_size;
@@ -251,12 +284,88 @@ void udc_dwc3_engine_disable(void)
 		sys_write32(0, eng_base() + USB_ENGINE_ENG_CTRL);
 	}
 	engine_on = false;
+	engine_held_off = false;
 	engine_evt_own = false;
 	programmed = 0;
 	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
 		posted_clear(i);
+		/* Queued slots abort on ENABLE=0; drain_cmpl hands them back. */
+		ring_synced[i] = false;
 	}
-	printk("engine: ENABLE=0\n");
+	printk("engine: ENABLE=0 kick82=%u pending=%u abort=%u\n",
+	       kicked_total[1], kicked[1], kicked_abort[1]);
+}
+
+int udc_dwc3_engine_ring_sync(uint8_t addr, uint32_t trb_base, uint8_t ring_n,
+			      uint8_t slot)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+	mm_reg_t epb;
+
+	if (!engine_on || idx < 0) {
+		return -EINVAL;
+	}
+	epb = usb_engine_ep_base(idx);
+	/* slotLoad resets the ring's write slot and resource ownership. Never
+	 * move it under a descriptor that is queued or in flight. */
+	if ((sys_read32(epb + USB_ENGINE_EP_STATE) & USB_ENGINE_EP_STATE_PENDING) != 0U ||
+	    kicked[idx] != 0U) {
+		return -EBUSY;
+	}
+	sys_write32(trb_base, epb + USB_ENGINE_EP_TRB_BASE);
+	sys_write32(((uint32_t)slot << 8) | ring_n,
+		    eng_base() + USB_ENGINE_RING_CFG(idx));
+	ring_synced[idx] = true;
+	printk("engine: ring sync ep=0x%02x base=0x%08x n=%u slot=%u idx=%u\n",
+	       addr, trb_base, ring_n, slot,
+	       sys_read32(epb + USB_ENGINE_EP_XFER_IDX));
+	return 0;
+}
+
+bool udc_dwc3_engine_ring_synced(uint8_t addr)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+
+	return engine_on && idx >= 0 && ring_synced[idx];
+}
+
+void udc_dwc3_engine_ring_unsync(uint8_t addr)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+
+	if (idx >= 0) {
+		ring_synced[idx] = false;
+	}
+}
+
+int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+	mm_reg_t epb;
+
+	if (!engine_on || idx < 0 || buf == NULL || !ring_synced[idx]) {
+		return -EINVAL;
+	}
+	epb = usb_engine_ep_base(idx);
+	if (sys_read32(epb + USB_ENGINE_EP_DESC_FREE) == 0U) {
+		return -EBUSY;
+	}
+	kicked[idx]++;
+	kicked_total[idx]++;
+	sys_write32((uint32_t)(uintptr_t)buf->data, epb + USB_ENGINE_EP_DESC_ADDR);
+	sys_write32(USB_EP_DIR_IS_IN(addr) ? buf->len : buf->size,
+		    epb + USB_ENGINE_EP_DESC_LEN);
+	/* DESC_CTRL write is the post. TRB dword3 comes from the TRB_CTRL
+	 * template (HWO|CSP|NORMAL|IOC); IOC/ZLP bits here force IOC / ZLP. */
+	sys_write32(post_ctrl, epb + USB_ENGINE_EP_DESC_CTRL);
+	return 0;
+}
+
+uint32_t udc_dwc3_engine_kicked(uint8_t addr)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+
+	return idx >= 0 ? kicked[idx] : 0U;
 }
 
 int udc_dwc3_engine_post(const struct device *dev, uint8_t addr,
@@ -317,6 +426,11 @@ int udc_dwc3_engine_cmd(uint8_t addr, uint32_t ctrl)
 		return -EINVAL;
 	}
 	epb = usb_engine_ep_base(idx);
+	if (addr == 0x02U || addr == 0x82U) {
+		printk("ENGCMD t=%u ep=0x%02x ctrl=0x%x post=%u st=0x%x\n",
+		       (uint32_t)k_uptime_get(), addr, ctrl, post_n[idx],
+		       sys_read32(epb + USB_ENGINE_EP_STATE));
+	}
 	if (sys_read32(epb + USB_ENGINE_EP_DESC_FREE) == 0U) {
 		return -EBUSY;
 	}
@@ -324,6 +438,60 @@ int udc_dwc3_engine_cmd(uint8_t addr, uint32_t ctrl)
 	sys_write32(0, epb + USB_ENGINE_EP_DESC_LEN);
 	sys_write32(ctrl, epb + USB_ENGINE_EP_DESC_CTRL);
 	return 0;
+}
+
+/* EP_STATE: bit1 active, bit3 restarted after an IN miss. */
+static uint32_t acm82_prev;
+static bool acm82_saw_cmpl;
+
+/* Bit per bulk index. The EndXfer that restarts a stuck IN also posts
+ * a transfer-complete, and the ring would hand that buffer to the class
+ * before the host has it. Eat that one completion. */
+static uint8_t restart_swallow;
+static uint8_t restart_ate;
+
+static int restart_idx(uint8_t addr)
+{
+	const int idx = usb_engine_bulk_idx(addr);
+
+	if (idx < 0 || idx >= USB_ENGINE_BULK_N) {
+		return -1;
+	}
+	return idx;
+}
+
+void udc_dwc3_engine_restart_arm(uint8_t addr)
+{
+	const int idx = restart_idx(addr);
+
+	if (idx < 0) {
+		return;
+	}
+	restart_ate &= (uint8_t)~BIT(idx);
+	restart_swallow |= (uint8_t)BIT(idx);
+}
+
+void udc_dwc3_engine_restart_disarm(uint8_t addr)
+{
+	const int idx = restart_idx(addr);
+
+	if (idx < 0) {
+		return;
+	}
+	restart_swallow &= (uint8_t)~BIT(idx);
+}
+
+bool udc_dwc3_engine_restart_ate(uint8_t addr)
+{
+	const int idx = restart_idx(addr);
+
+	return idx >= 0 && (restart_ate & BIT(idx)) != 0U;
+}
+
+static void acm82_note(const char *why, uint32_t st, uint32_t len, uint32_t stat)
+{
+	printk("ACM82 t=%u %s st=0x%x len=%u stat=0x%x\n",
+	       (uint32_t)k_uptime_get(), why, st, len, stat);
 }
 
 static void drain_cmpl(const struct device *dev, int idx)
@@ -338,7 +506,37 @@ static void drain_cmpl(const struct device *dev, int idx)
 		uint32_t cstat = sys_read32(epb + USB_ENGINE_EP_CMPL_STAT);
 		int16_t err = (int16_t)(cstat & 0xffffU);
 
+		/* Slots posted into the CPU ring. Abort re-arms. A normal
+		 * completion retires the matching net_buf here: the DEPEVT
+		 * for this TRB is dropped while HWO or SW_PENDING is set
+		 * and is never retried, which leaves the class waiting.
+		 */
+		if (kicked[idx] != 0U && post_n[idx] == 0U) {
+			if ((restart_swallow & BIT(idx)) != 0U) {
+				restart_swallow &= (uint8_t)~BIT(idx);
+				restart_ate |= (uint8_t)BIT(idx);
+				kicked[idx]--;
+				continue;
+			}
+			kicked[idx]--;
+			if (idx == 1) {
+				acm82_saw_cmpl = true;
+			}
+			if ((cstat & 0xffffU) == USB_ENGINE_CMPL_STAT_ABORT) {
+				kicked_abort[idx]++;
+				udc_dwc3_engine_slot_aborted(dev, addr, caddr);
+			} else if (USB_EP_DIR_IS_IN(addr)) {
+				udc_dwc3_engine_slot_done(dev, addr, caddr, clen);
+			}
+			continue;
+		}
+
 		buf = posted_take(idx, caddr);
+		if (idx == 1) {
+			acm82_saw_cmpl = true;
+			acm82_note(buf != NULL ? "cmpl" : "drop",
+				   sys_read32(epb + USB_ENGINE_EP_STATE), clen, cstat);
+		}
 		if (buf == NULL) {
 			continue;
 		}
@@ -350,6 +548,37 @@ static void drain_cmpl(const struct device *dev, int idx)
 		}
 		udc_submit_ep_event(dev, buf, err);
 	}
+}
+
+int udc_dwc3_engine_restart_resync(const struct device *dev, uint8_t addr,
+				   uint32_t trb_base, uint8_t ring_n,
+				   uint8_t slot)
+{
+	const int idx = restart_idx(addr);
+	mm_reg_t epb;
+	int spins;
+
+	if (idx < 0) {
+		return -EINVAL;
+	}
+	/* slotLoad clears the ring's own resource index. A later kick is
+	 * then a StartXfer, because the CSR index is written back to 0
+	 * and an End command clears `started`. */
+	if (udc_dwc3_engine_ring_sync(addr, trb_base, ring_n, slot) != 0) {
+		return -EBUSY;
+	}
+	epb = usb_engine_ep_base(idx);
+	sys_write32(0U, epb + USB_ENGINE_EP_XFER_IDX);
+	if (udc_dwc3_engine_cmd(addr, USB_ENGINE_DESC_CTRL_END) != 0) {
+		return -EBUSY;
+	}
+	/* EndXfer of an idle resource. The completion is an abort with
+	 * nothing in flight, so drain drops it and `started` is clear. */
+	k_busy_wait(500);
+	for (spins = 0; spins < 8; spins++) {
+		drain_cmpl(dev, idx);
+	}
+	return 0;
 }
 
 void udc_dwc3_engine_poll(const struct device *dev,
@@ -390,5 +619,30 @@ void udc_dwc3_engine_poll(const struct device *dev,
 
 	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
 		drain_cmpl(dev, i);
+	}
+
+	/* 0x82 is ep index 1. Print the edges the 5 s dump misses. With every
+	 * ACM reply on the ring these edges are per packet: first 8 only,
+	 * restarts always. */
+	{
+		static uint32_t acm82_edges;
+		const mm_reg_t epb = usb_engine_ep_base(1);
+		const uint32_t st = sys_read32(epb + USB_ENGINE_EP_STATE);
+		const uint32_t prev = acm82_prev;
+
+		if ((st & BIT(1)) && !(prev & BIT(1))) {
+			acm82_saw_cmpl = false;
+			if (acm82_edges < 8U) {
+				acm82_edges++;
+				acm82_note("active", st, 0U, 0U);
+			}
+		}
+		if ((st & BIT(3)) && !(prev & BIT(3))) {
+			acm82_note("restart", st, 0U, 0U);
+		}
+		if (!(st & BIT(1)) && (prev & BIT(1)) && !acm82_saw_cmpl) {
+			acm82_note("idle", st, 0U, 0U);
+		}
+		acm82_prev = st;
 	}
 }

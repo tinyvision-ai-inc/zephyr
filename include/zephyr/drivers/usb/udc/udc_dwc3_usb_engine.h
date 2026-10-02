@@ -27,7 +27,8 @@ extern "C" {
 #define USB_ENGINE_BULK_N		3
 #define USB_ENGINE_BULK_WINDOW		0x30U
 #define USB_ENGINE_BULK_BASE		0x100U
-#define USB_ENGINE_EP_OWN_DEFAULT	0x00020006U
+/* IN bit 2 = 0x82, bit 4 = 0x84. OUT bit 18 = RAW OUT 0x02 (phys 4 >> 1 + 16). */
+#define USB_ENGINE_EP_OWN_DEFAULT	0x00040014U
 #define USB_ENGINE_VIDEO_ADDR		0x85U
 #define USB_ENGINE_TRB_BASE_DEFAULT	0xb1300400U
 
@@ -52,6 +53,8 @@ extern "C" {
 #define USB_ENGINE_TRACE_R		0x48U
 #define USB_ENGINE_TRACE_D		0x4cU
 #define USB_ENGINE_EP_MAP		0x50U
+/* CPU DEPEVT the snoop missed. Write pulses ownedEvt into BulkRing. */
+#define USB_ENGINE_EVT_INJ		0x54U
 
 #define USB_ENGINE_CTRL_ENABLE		BIT(0)
 #define USB_ENGINE_CTRL_EVT_OWN		BIT(1)
@@ -78,6 +81,8 @@ extern "C" {
 #define USB_ENGINE_DESC_CTRL_CLEAR	BIT(5)
 #define USB_ENGINE_DESC_CTRL_END	BIT(6)
 #define USB_ENGINE_DESC_CTRL_START	BIT(7)
+/* Post bit 8. The ring ORs this into TRB dword3 bit 2 (CHN). */
+#define USB_ENGINE_DESC_CTRL_CHN	BIT(8)
 
 #define USB_ENGINE_EP_DESC_ADDR		0x00U
 #define USB_ENGINE_EP_DESC_LEN		0x04U
@@ -92,6 +97,22 @@ extern "C" {
 #define USB_ENGINE_EP_XFER_IDX		0x28U
 #define USB_ENGINE_EP_STATE		0x2cU
 
+/* After the per-EP windows: EPi_RING_CFG at 0x190 + 8*i, EPi_TRB_CTRL at +4.
+ * RING_CFG[7:0] = data slots (0 = fixed TRB at TRB_BASE), [15:8] = slot
+ * loaded on write. TRB_CTRL is the dword3 template (reset HWO|CSP|NORMAL|IOC). */
+#define USB_ENGINE_RING_CFG_BASE	0x190U
+#define USB_ENGINE_RING_CFG(i)		(USB_ENGINE_RING_CFG_BASE + 8U * (uint32_t)(i))
+#define USB_ENGINE_RING_TRB_CTRL(i)	(USB_ENGINE_RING_CFG(i) + 4U)
+
+/* EP_STATE bits */
+#define USB_ENGINE_EP_STATE_PENDING	BIT(0)	/* descriptor queued or active */
+#define USB_ENGINE_EP_STATE_ACTIVE	BIT(1)
+#define USB_ENGINE_EP_STATE_STALLED	BIT(2)
+#define USB_ENGINE_EP_STATE_RESTARTED	BIT(3)
+
+/* CMPL_STAT low half when the ring aborted the descriptor (ENABLE fell). */
+#define USB_ENGINE_CMPL_STAT_ABORT	0xff99U
+
 #if DT_HAS_COMPAT_STATUS_OKAY(tinyvision_usb_engine)
 #define USB_ENGINE_BASE \
 	((mm_reg_t)DT_REG_ADDR(DT_COMPAT_GET_ANY_STATUS_OKAY(tinyvision_usb_engine)))
@@ -102,11 +123,11 @@ extern "C" {
 static inline int usb_engine_bulk_idx(uint8_t addr)
 {
 	switch (addr) {
-	case 0x81:
+	case 0x84:
 		return 0;
 	case 0x82:
 		return 1;
-	case 0x01:
+	case 0x02:
 		return 2;
 	default:
 		return -1;
@@ -143,10 +164,86 @@ int udc_dwc3_engine_kick(uint8_t addr, uint32_t trb_addr,
 			 uint32_t data_addr, uint32_t len, uint32_t ctrl);
 int udc_dwc3_engine_cmd(uint8_t addr, uint32_t ctrl);
 
+/*
+ * Single-master ACM IN: the BulkRing writes the TRB into the CPU's own
+ * link-TRB ring and rings UpdateXfer with the CPU's xferrscidx. The CPU
+ * keeps ring bookkeeping and the DEPEVT completion path.
+ *
+ * ring_sync points the ring at trb_base with ring_n data slots and loads
+ * the write slot. Refused (-EBUSY) while a descriptor is queued or active.
+ * post_slot queues one buffer; -EBUSY when the descriptor FIFO is full.
+ * ring_synced reports whether the ring slot still tracks the CPU head;
+ * ring_unsync marks a CPU-side TRB write that broke that tracking.
+ */
+int udc_dwc3_engine_ring_sync(uint8_t addr, uint32_t trb_base, uint8_t ring_n,
+			      uint8_t slot);
+bool udc_dwc3_engine_ring_synced(uint8_t addr);
+void udc_dwc3_engine_ring_unsync(uint8_t addr);
+int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl);
+uint32_t udc_dwc3_engine_kicked(uint8_t addr);
+
+/* udc_dwc3.c: a posted slot the ring aborted (ENABLE fell) must be armed
+ * again from the CPU TRB path. data_addr is the buffer the ring reported. */
+void udc_dwc3_engine_slot_aborted(const struct device *dev, uint8_t addr,
+				  uint32_t data_addr);
+/* Normal completion of a CPU-ring slot. Retire the net_buf whose data
+ * pointer is data_addr when it is still the tail. A DEPEVT that already
+ * popped it is a miss. */
+void udc_dwc3_engine_slot_done(const struct device *dev, uint8_t addr,
+			       uint32_t data_addr, uint32_t len);
+
 void udc_dwc3_engine_poll(const struct device *dev,
 			  void (*fwd)(const struct device *dev, uint32_t evt));
 
+/* One-shot IN restart. arm() makes the next completion FIFO pop drop
+ * the buffer instead of retiring it (EndXfer looks like a packet).
+ * ate() is that pop. disarm() stops the drop. resync() reloads the
+ * write slot and clears the ring resource so the next kick is a
+ * StartXfer; refused while the ring is still active. */
+void udc_dwc3_engine_restart_arm(uint8_t addr);
+void udc_dwc3_engine_restart_disarm(uint8_t addr);
+bool udc_dwc3_engine_restart_ate(uint8_t addr);
+int udc_dwc3_engine_restart_resync(const struct device *dev, uint8_t addr,
+				   uint32_t trb_base, uint8_t ring_n,
+				   uint8_t slot);
+
 #else /* !CONFIG_UDC_DWC3_USB_ENGINE */
+
+static inline int udc_dwc3_engine_ring_sync(uint8_t addr, uint32_t trb_base,
+					    uint8_t ring_n, uint8_t slot)
+{
+	ARG_UNUSED(addr);
+	ARG_UNUSED(trb_base);
+	ARG_UNUSED(ring_n);
+	ARG_UNUSED(slot);
+	return -ENOTSUP;
+}
+
+static inline bool udc_dwc3_engine_ring_synced(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+	return false;
+}
+
+static inline void udc_dwc3_engine_ring_unsync(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+}
+
+static inline int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf,
+					    uint32_t post_ctrl)
+{
+	ARG_UNUSED(addr);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(post_ctrl);
+	return -ENOTSUP;
+}
+
+static inline uint32_t udc_dwc3_engine_kicked(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+	return 0;
+}
 
 static inline bool udc_dwc3_engine_present(void)
 {
@@ -247,6 +344,34 @@ static inline void udc_dwc3_engine_poll(const struct device *dev,
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(fwd);
+}
+
+static inline void udc_dwc3_engine_restart_arm(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+}
+
+static inline void udc_dwc3_engine_restart_disarm(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+}
+
+static inline bool udc_dwc3_engine_restart_ate(uint8_t addr)
+{
+	ARG_UNUSED(addr);
+	return false;
+}
+
+static inline int udc_dwc3_engine_restart_resync(const struct device *dev,
+						 uint8_t addr, uint32_t trb_base,
+						 uint8_t ring_n, uint8_t slot)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(addr);
+	ARG_UNUSED(trb_base);
+	ARG_UNUSED(ring_n);
+	ARG_UNUSED(slot);
+	return -ENOTSUP;
 }
 
 #endif /* CONFIG_UDC_DWC3_USB_ENGINE */
