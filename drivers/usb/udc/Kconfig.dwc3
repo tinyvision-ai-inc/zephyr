@@ -207,6 +207,17 @@ config UDC_DWC3_DEPCMD_MAILBOX
 	  is unused. Requires the doorbell bitstream with DepCmdArbiter.
 	  Leave n on IEBM bits (CPU writes DEPCMD directly).
 
+config UDC_DWC3_QUIET_OTHER_CYCLES
+	int "DepCmd QUIET_OTHER video hold (75 MHz cycles)"
+	default 60000
+	depends on UDC_DWC3_DEPCMD_MAILBOX
+	help
+	  Accepted for configuration compatibility with the
+	  udc-quiet-acm-recover driver line (int_flir app_flir/prj.conf sets
+	  it). This driver does not program QUIET_OTHER from Kconfig: the
+	  engine path writes 0 at STREAMON and parks video with the
+	  uvcmanager HALT bit instead.
+
 config UDC_DWC3_USB_ENGINE
 	bool "Post ACM/RAW through UsbEngine BulkRing (Track B)"
 	depends on UDC_DWC3_DEPCMD_MAILBOX

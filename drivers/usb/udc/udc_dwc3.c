@@ -892,10 +892,6 @@ static void udc_dwc3_park_stats_print(void)
 	extern uint32_t udc_dwc3_in_vid_acq_n[3];
 
 	extern uint32_t udc_dwc3_ring_park_mode;
-	extern uint32_t udc_dwc3_in_vid_align_en;
-	extern uint32_t udc_dwc3_in_vid_align_ok;
-	extern uint32_t udc_dwc3_in_vid_align_to;
-	extern uint32_t udc_dwc3_in_vid_align_max_us;
 	extern uint32_t udc_dwc3_ring_rel_isr;
 	extern uint32_t udc_dwc3_ring_rel_isr_n;
 	extern uint32_t udc_dwc3_in_vid_rpark_sum_us;
@@ -903,24 +899,21 @@ static void udc_dwc3_park_stats_print(void)
 	extern uint32_t udc_dwc3_ring_sync_us;
 	extern uint32_t udc_dwc3_ring_sync_ok;
 	extern uint32_t udc_dwc3_ring_sync_to;
-	extern uint32_t udc_dwc3_ring_seg_us[3];
-	extern uint32_t udc_dwc3_in_vid_rpark_h[6];
+	extern uint16_t udc_dwc3_in_vid_rpark_h[6];
 
-	printk(" park=%u/%uus/%uus acq84=%u acq82=%u acqcpu=%u rpm=%u align=%u/%u/%u/%uus relisr=%u/%u rpark=%uus/%uus sync=%u/%u/%u rph=%u/%u/%u/%u/%u/%u seg=%u/%u/%uus",
+	/* rph bins (ring parks, from HALT_ACK to release): <300 <500 <700
+	 * <1000 <2000 >=2000 us. The eng03 ring holds ~700 us of video. */
+	printk(" park=%u/%uus/%uus acq84=%u acq82=%u acqcpu=%u rpm=%u relisr=%u/%u rpark=%uus/%uus sync=%u/%u/%u rph=%u/%u/%u/%u/%u/%u",
 	       udc_dwc3_in_vid_park_n, udc_dwc3_in_vid_park_sum_us,
 	       udc_dwc3_in_vid_park_max_us, udc_dwc3_in_vid_acq_n[0],
 	       udc_dwc3_in_vid_acq_n[1], udc_dwc3_in_vid_acq_n[2],
-	       udc_dwc3_ring_park_mode, udc_dwc3_in_vid_align_en,
-	       udc_dwc3_in_vid_align_ok, udc_dwc3_in_vid_align_to,
-	       udc_dwc3_in_vid_align_max_us, udc_dwc3_ring_rel_isr,
+	       udc_dwc3_ring_park_mode, udc_dwc3_ring_rel_isr,
 	       udc_dwc3_ring_rel_isr_n, udc_dwc3_in_vid_rpark_sum_us,
 	       udc_dwc3_in_vid_rpark_max_us, udc_dwc3_ring_sync_us,
 	       udc_dwc3_ring_sync_ok, udc_dwc3_ring_sync_to,
 	       udc_dwc3_in_vid_rpark_h[0], udc_dwc3_in_vid_rpark_h[1],
 	       udc_dwc3_in_vid_rpark_h[2], udc_dwc3_in_vid_rpark_h[3],
-	       udc_dwc3_in_vid_rpark_h[4], udc_dwc3_in_vid_rpark_h[5],
-	       udc_dwc3_ring_seg_us[0], udc_dwc3_ring_seg_us[1],
-	       udc_dwc3_ring_seg_us[2]);
+	       udc_dwc3_in_vid_rpark_h[4], udc_dwc3_in_vid_rpark_h[5]);
 }
 #endif
 
@@ -3114,7 +3107,7 @@ static uint32_t udc_dwc3_nv_drop_nb_null;
 static uint32_t udc_dwc3_nv_drop_hwo;
 static uint32_t udc_dwc3_nv_full;
 static uint32_t udc_dwc3_nv_retake;
-static uint32_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8 for RAM */
+static uint16_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8; rs18: u16 for RAM */
 
 static void udc_dwc3_nv_ep_dump(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -3172,7 +3165,7 @@ static uint32_t udc_dwc3_nv_drop_nb_null;
 static uint32_t udc_dwc3_nv_drop_hwo;
 static uint32_t udc_dwc3_nv_full;
 static uint32_t udc_dwc3_nv_retake;
-static uint32_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8 for RAM */
+static uint16_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8; rs18: u16 for RAM */
 #endif /* !CONFIG_UDC_DWC3_RTL_DOORBELL */
 
 int lattice_usb23_iebm_abort(const struct device *dev, uint8_t ep_addr)
@@ -3589,7 +3582,6 @@ uint32_t udc_dwc3_ring_sync_ok;
 uint32_t udc_dwc3_ring_sync_to;
 /* rs17e: where the parked time goes. seg0 = FSM parked -> engine post
  * returned, seg1 = post -> ring wrote HWO, seg2 = HWO set -> HWO clear. */
-uint32_t udc_dwc3_ring_seg_us[3];
 
 UDC_DWC3_XIP static void udc_dwc3_ring_sync_wait(volatile struct udc_dwc3_trb *const trb,
 						 uint8_t addr, uint32_t t_acq)
@@ -3618,13 +3610,8 @@ UDC_DWC3_XIP static void udc_dwc3_ring_sync_wait(volatile struct udc_dwc3_trb *c
 	}
 	udc_dwc3_ring_sync_ok++;
 	udc_dwc3_in_vid_rel(addr);
-	{
-		const uint32_t t_done = k_cycle_get_32();
-
-		udc_dwc3_ring_seg_us[0] += (uint32_t)((uint64_t)(t0 - t_acq) * 1000000U / hz);
-		udc_dwc3_ring_seg_us[1] += (uint32_t)((uint64_t)(t_hwo - t0) * 1000000U / hz);
-		udc_dwc3_ring_seg_us[2] += (uint32_t)((uint64_t)(t_done - t_hwo) * 1000000U / hz);
-	}
+	(void)t_acq;
+	(void)t_hwo;
 }
 
 static uint32_t udc_dwc3_acm_kicks;
@@ -5796,10 +5783,16 @@ uint32_t udc_dwc3_in_vid_settle_max;
 uint32_t udc_dwc3_in_vid_settle_sts;
 
 /*
- * Spin until the manager FSM is parked (IDLE or WAIT_US, the only states
- * haltReq gates) and the mailbox command counter has been still for
- * quiet cycles. Returns 0 parked, -1 after cap cycles. *sts_out gets the
- * last control/status word.
+ * Spin until the manager reports HALT_ACK and the mailbox command counter
+ * has been still for quiet cycles. Returns 0 parked, -1 after cap cycles.
+ * *sts_out gets the last control/status word.
+ *
+ * eng03 (UsbEngine version 0x0009): HALT only defers the video UpdateXfer;
+ * the sink keeps committing TRBs into the ring while halted, so the FSM
+ * no longer parks in IDLE/WAIT_US. HALT_ACK = halted with no UpdateXfer
+ * posted or in flight, and is the only valid park indication. On the
+ * eng02nr bit HALT_ACK mirrors HALT (always set once written), so this
+ * firmware must not run on that bit.
  */
 UDC_DWC3_XIP static int udc_dwc3_in_vid_wait_parked(uint32_t quiet, uint32_t cap,
 						    uint32_t *sts_out)
@@ -5815,16 +5808,13 @@ UDC_DWC3_XIP static int udc_dwc3_in_vid_wait_parked(uint32_t quiet, uint32_t cap
 	for (;;) {
 		const uint32_t cmd = sys_read32(cnt);
 		const uint32_t now = k_cycle_get_32();
-		uint32_t fsm;
 
 		if (cmd != last_cmd) {
 			last_cmd = cmd;
 			t_cmd = now;
 		}
 		sts = sys_read32(reg);
-		fsm = FIELD_GET(UDC_DWC3_IN_HOLD_FSM_MASK, sts);
-		if ((fsm == UDC_DWC3_IN_HOLD_FSM_IDLE ||
-		     fsm == UDC_DWC3_IN_HOLD_FSM_WAIT) &&
+		if ((sts & UDC_DWC3_IN_HOLD_ACK) != 0U &&
 		    (now - t_cmd) >= quiet) {
 			rc = 0;
 			break;
@@ -5931,71 +5921,11 @@ uint32_t udc_dwc3_in_vid_acq_n[3];
 uint32_t udc_dwc3_in_vid_rpark_sum_us;
 uint32_t udc_dwc3_in_vid_rpark_max_us;
 /* rs17e: ring park length histogram: <100 <150 <200 <300 <500 >=500 us. */
-uint32_t udc_dwc3_in_vid_rpark_h[6];
+uint16_t udc_dwc3_in_vid_rpark_h[6]; /* rs18: bins <300 <500 <700 <1000 <2000 >=2000 us */
 static uint32_t udc_dwc3_in_vid_park_t0;
 
-/*
- * rs17: frame-aligned park. haltReq only gates IDLE->READ, so a HALT
- * written mid-frame parks the manager after the TRB in flight and the
- * rest of that frame is aborted (one frame per park, rs16c). A HALT
- * written while the manager is on the LAST TRB of a frame parks it in
- * IDLE at the frame end, and the whole vertical blanking (~5.8 ms at
- * 60 fps) is free park time. Frame start = first doorbell after a
- * >= ALIGN_QUIET_US gap (intra-frame gaps are <= 0.55 ms); the frame is
- * 161 doorbells (49258 / 306 frames = 160.97). Write HALT right after
- * doorbell #160, while the manager is on TRB #161. If anything times
- * out, fall through to the old behaviour (one frame lost, never worse).
- * Knob: udc_dwc3_in_vid_align_en (devmem), 1 = on.
- */
-#define UDC_DWC3_ALIGN_QUIET_US 1000U
-#define UDC_DWC3_ALIGN_HALT_AFTER_DB 160U
-#define UDC_DWC3_ALIGN_CAP_US 24000U
-uint32_t udc_dwc3_in_vid_align_en = 0U; /* rs17b: off, blanking is ~0.5 ms (VIDGAP max 545 us) */
-uint32_t udc_dwc3_in_vid_align_ok;
-uint32_t udc_dwc3_in_vid_align_to;
-uint32_t udc_dwc3_in_vid_align_max_us;
-
-UDC_DWC3_XIP static void udc_dwc3_in_vid_align(uint32_t hz)
-{
-	const mm_reg_t cnt = UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT;
-	const uint32_t quiet = (uint32_t)((uint64_t)hz * UDC_DWC3_ALIGN_QUIET_US / 1000000U);
-	const uint32_t cap = (uint32_t)((uint64_t)hz * UDC_DWC3_ALIGN_CAP_US / 1000000U);
-	const uint32_t t0 = k_cycle_get_32();
-	uint32_t last = sys_read32(cnt);
-	uint32_t t_last = t0;
-	uint32_t c0 = 0U, us;
-	int phase = 0; /* 0 wait gap, 1 wait frame start, 2 count */
-
-	for (;;) {
-		const uint32_t c = sys_read32(cnt);
-		const uint32_t now = k_cycle_get_32();
-
-		if ((now - t0) >= cap) {
-			udc_dwc3_in_vid_align_to++;
-			return;
-		}
-		if (phase == 0) {
-			if (c != last) {
-				last = c;
-				t_last = now;
-			} else if ((now - t_last) >= quiet) {
-				phase = 1;
-			}
-		} else if (phase == 1) {
-			if (c != last) {
-				c0 = c;
-				phase = 2;
-			}
-		} else if ((c - c0) >= (UDC_DWC3_ALIGN_HALT_AFTER_DB - 1U)) {
-			break; /* c0 already counts doorbell #1 */
-		}
-	}
-	udc_dwc3_in_vid_align_ok++;
-	us = (uint32_t)((uint64_t)(k_cycle_get_32() - t0) * 1000000U / hz);
-	if (us > udc_dwc3_in_vid_align_max_us) {
-		udc_dwc3_in_vid_align_max_us = us;
-	}
-}
+/* rs18: the rs17 frame-align probe (udc_dwc3_in_vid_align) was removed;
+ * blanking is ~0.5 ms (VIDGAP max 545 us), nothing to align into. */
 
 /* rs15: the rs11 first-hold probe (1 ms pre-sample) was removed for RAM. */
 UDC_DWC3_XIP static int udc_dwc3_in_vid_pause(void)
@@ -6007,10 +5937,6 @@ UDC_DWC3_XIP static int udc_dwc3_in_vid_pause(void)
 
 	if ((sts & UDC_DWC3_IN_HOLD_EN) == 0U) {
 		return 0;
-	}
-	if (udc_dwc3_in_vid_align_en != 0U) {
-		udc_dwc3_in_vid_align(hz);
-		sts = sys_read32(reg);
 	}
 	sys_write32(sts | UDC_DWC3_IN_HOLD_HALT, reg);
 
@@ -6050,7 +5976,7 @@ UDC_DWC3_XIP static void udc_dwc3_in_vid_unpause(bool ring)
 			udc_dwc3_in_vid_park_max_us = us;
 		}
 		if (ring) {
-			static const uint16_t lim[5] = {100U, 150U, 200U, 300U, 500U};
+			static const uint16_t lim[5] = {300U, 500U, 700U, 1000U, 2000U};
 			int b = 0;
 
 			while (b < 5 && us >= lim[b]) {

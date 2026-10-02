@@ -28,8 +28,14 @@ UDC_BUF_POOL_VAR_DEFINE(udc_ep_pool,
 			CONFIG_UDC_BUF_COUNT, CONFIG_UDC_BUF_POOL_SIZE,
 			sizeof(struct udc_buf_info), udc_buf_destroy);
 
-/* EP0 SETUP/DATA/STATUS stay off the shared ACM/RAW pool. */
-UDC_BUF_POOL_DEFINE(udc_ep0_pool, 8, 512,
+/* EP0 SETUP/DATA/STATUS stay off the shared ACM/RAW pool.
+ * 1024 B covers multi-frame UVC config descriptors (int_flir main advertises
+ * the full shrimp FPS set: wTotalLength 703, which 512 truncated and left
+ * the UVC streaming interface with no endpoint on the host); count 4 keeps
+ * the same 4 KiB footprint as the previous 8x512 pool. Same change as
+ * TinyVision 894b100.
+ */
+UDC_BUF_POOL_DEFINE(udc_ep0_pool, 4, 1024,
 		    sizeof(struct udc_buf_info), udc_buf_destroy);
 
 #define USB_EP_LUT_IDX(ep) (USB_EP_DIR_IS_IN(ep) ? (ep & BIT_MASK(4)) + 16 : \
