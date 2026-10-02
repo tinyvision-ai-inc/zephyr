@@ -55,6 +55,13 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_TRB_CTRL_PCM1_MASK				GENMASK(25, 24)
 #define UDC_DWC3_TRB_CTRL_SPR					26
 #define UDC_DWC3_TRB_CTRL_SIDSOFN_MASK				GENMASK(29, 14)
+/*
+ * Software-only marker (TRB ctrl bit 30 is reserved and ignored with HWO=0).
+ * A slot handed to the UsbEngine BulkRing carries it until the ring writes
+ * the real dword3. Completion paths must not retire such a slot: HWO=0 there
+ * means "not armed yet", not "done".
+ */
+#define UDC_DWC3_TRB_CTRL_SW_PENDING				BIT(30)
 
 /* Incomplete coverage of all fields, but suited for what this driver supports */
 #define UDC_DWC3_EVT_MASK					GENMASK(11, 0)
@@ -261,6 +268,10 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GCTL_SCALEDOWN_MASK				GENMASK(5, 4)
 #define UDC_DWC3_GCTL_DISSCRAMBLE				BIT(3)
 #define UDC_DWC3_GCTL_DSBLCLKGTNG				BIT(0)
+
+/* Global User Control Register 1 (Linux DWC3_GUCTL1) */
+#define UDC_DWC3_GUCTL1						0xc11c
+#define UDC_DWC3_GUCTL1_PARKMODE_DISABLE_SS			BIT(17)
 
 /* Global User Control Register */
 #define UDC_DWC3_GUCTL						0xc12c
@@ -611,12 +622,30 @@ static struct {
  */
 #define UDC_DWC3_EVT_TRACE_N 32U
 static uint32_t udc_dwc3_evt_trace[UDC_DWC3_EVT_TRACE_N];
+/* Per entry: uptime ms (low 16) << 16 | arbiter CMD_COUNT (low 16). The
+ * command counter is ~98 % video UpdateXfers, so the entry at which it
+ * stops advancing is the one that killed the stream. Also dumped by
+ * PARK0 snapshots. EP0 DepCmds are traced as 0x4E00_0000 | epn<<16 |
+ * cmd[15:0] (not a DEPEVT encoding: bit0=0, epn field 7:1 = 0). */
+static uint32_t udc_dwc3_evt_trace_t[UDC_DWC3_EVT_TRACE_N];
 static uint32_t udc_dwc3_evt_trace_idx;
 static uint32_t udc_dwc3_evt_trace_total;
+#define UDC_DWC3_EVT_TRACE_CMD_TAG 0x4E000000U
 
-static inline void udc_dwc3_evt_trace_add(uint32_t evt_raw, bool isr)
+/* XIP (RAM is full): ~400 calls/s from the event thread, none from the
+ * ISR under CONFIG_UDC_DWC3_RTL_DOORBELL. */
+__attribute__((noinline, section(".text")))
+static void udc_dwc3_evt_trace_add(uint32_t evt_raw, bool isr)
 {
 	udc_dwc3_evt_trace[udc_dwc3_evt_trace_idx] = evt_raw | (isr ? BIT(31) : 0U);
+	udc_dwc3_evt_trace_t[udc_dwc3_evt_trace_idx] =
+#if defined(CONFIG_UDC_DWC3_DEPCMD_MAILBOX)
+		/* DepCmdArbiter CMD_COUNT (UDC_DWC3_MBX_BASE + 0x10, defined below) */
+		(k_uptime_get_32() << 16) |
+		(sys_read32((mm_reg_t)0xb4008010U) & 0xffffU);
+#else
+		k_uptime_get_32() << 16;
+#endif
 	udc_dwc3_evt_trace_idx = (udc_dwc3_evt_trace_idx + 1U) % UDC_DWC3_EVT_TRACE_N;
 	udc_dwc3_evt_trace_total++;
 }
@@ -795,8 +824,13 @@ static const struct device *udc_dwc3_health_dev;
  */
 static bool udc_dwc3_evt_fast;
 
+/* One DEPEVT to ignore: the XferComplete that EndXfer posts for a restart.
+ * The buffer stays on the ring so the following StartXfer can resend it. */
+static uint8_t udc_dwc3_restart_skip_ep;
+static uint32_t udc_dwc3_ulst_n;
+
 /* ACM 0x01 / 0x82: last retired DEPCMD words + event vs retire counts. */
-#define UDC_DWC3_ACM_TRACE_N 8U
+#define UDC_DWC3_ACM_TRACE_N 2U /* rs17e: 4 -> 2 for RAM */
 static struct {
 	uint8_t ep;
 	uint8_t kind;
@@ -847,6 +881,49 @@ static void udc_dwc3_acm_note_cmd(uint8_t addr, uint32_t cmd, uint32_t result)
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/* rs16c: HALT park accounting (see udc_dwc3_in_vid_park_n). */
+__attribute__((noinline, section(".text")))
+static void udc_dwc3_park_stats_print(void)
+{
+	extern uint32_t udc_dwc3_in_vid_park_n;
+	extern uint32_t udc_dwc3_in_vid_park_sum_us;
+	extern uint32_t udc_dwc3_in_vid_park_max_us;
+	extern uint32_t udc_dwc3_in_vid_acq_n[3];
+
+	extern uint32_t udc_dwc3_ring_park_mode;
+	extern uint32_t udc_dwc3_in_vid_align_en;
+	extern uint32_t udc_dwc3_in_vid_align_ok;
+	extern uint32_t udc_dwc3_in_vid_align_to;
+	extern uint32_t udc_dwc3_in_vid_align_max_us;
+	extern uint32_t udc_dwc3_ring_rel_isr;
+	extern uint32_t udc_dwc3_ring_rel_isr_n;
+	extern uint32_t udc_dwc3_in_vid_rpark_sum_us;
+	extern uint32_t udc_dwc3_in_vid_rpark_max_us;
+	extern uint32_t udc_dwc3_ring_sync_us;
+	extern uint32_t udc_dwc3_ring_sync_ok;
+	extern uint32_t udc_dwc3_ring_sync_to;
+	extern uint32_t udc_dwc3_ring_seg_us[3];
+	extern uint32_t udc_dwc3_in_vid_rpark_h[6];
+
+	printk(" park=%u/%uus/%uus acq84=%u acq82=%u acqcpu=%u rpm=%u align=%u/%u/%u/%uus relisr=%u/%u rpark=%uus/%uus sync=%u/%u/%u rph=%u/%u/%u/%u/%u/%u seg=%u/%u/%uus",
+	       udc_dwc3_in_vid_park_n, udc_dwc3_in_vid_park_sum_us,
+	       udc_dwc3_in_vid_park_max_us, udc_dwc3_in_vid_acq_n[0],
+	       udc_dwc3_in_vid_acq_n[1], udc_dwc3_in_vid_acq_n[2],
+	       udc_dwc3_ring_park_mode, udc_dwc3_in_vid_align_en,
+	       udc_dwc3_in_vid_align_ok, udc_dwc3_in_vid_align_to,
+	       udc_dwc3_in_vid_align_max_us, udc_dwc3_ring_rel_isr,
+	       udc_dwc3_ring_rel_isr_n, udc_dwc3_in_vid_rpark_sum_us,
+	       udc_dwc3_in_vid_rpark_max_us, udc_dwc3_ring_sync_us,
+	       udc_dwc3_ring_sync_ok, udc_dwc3_ring_sync_to,
+	       udc_dwc3_in_vid_rpark_h[0], udc_dwc3_in_vid_rpark_h[1],
+	       udc_dwc3_in_vid_rpark_h[2], udc_dwc3_in_vid_rpark_h[3],
+	       udc_dwc3_in_vid_rpark_h[4], udc_dwc3_in_vid_rpark_h[5],
+	       udc_dwc3_ring_seg_us[0], udc_dwc3_ring_seg_us[1],
+	       udc_dwc3_ring_seg_us[2]);
+}
+#endif
+
 static void udc_dwc3_acm_health_dump(void)
 {
 	const struct device *dev = udc_dwc3_health_dev;
@@ -893,8 +970,43 @@ static void udc_dwc3_acm_health_dump(void)
 		       ep->head, ep->tail, ep->full,
 		       udc_dwc3_ring_data_hwo_mask(ep), nb);
 	}
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	{
+		extern uint32_t udc_dwc3_in_vid_settle_to;
+		extern uint32_t udc_dwc3_in_vid_settle_max;
+		extern uint32_t udc_dwc3_in_vid_settle_sts;
+		extern uint32_t udc_dwc3_cpu_hold_us;
+		extern uint32_t udc_dwc3_cpu_hold_n;
+		extern uint32_t udc_dwc3_cpu_hold_max;
+		extern uint32_t udc_dwc3_cpu_hold_to;
+		extern uint32_t udc_dwc3_cpu_hold_en;
+		extern uint32_t udc_dwc3_in_hold_cap_us;
+		extern uint32_t udc_dwc3_open_hold_n;
+		extern uint32_t udc_dwc3_open_hold_max_ms;
+		extern uint32_t udc_dwc3_open_hold_sum_ms;
+
+		printk(" settle_to=%u settle_max=%uus settle_sts=0x%x cpuhold=%u/%uus/%uus to=%u en=%u cap=%u open=%u/%ums/%ums",
+		       udc_dwc3_in_vid_settle_to,
+		       (uint32_t)((uint64_t)udc_dwc3_in_vid_settle_max * 1000000U /
+				  sys_clock_hw_cycles_per_sec()),
+		       udc_dwc3_in_vid_settle_sts,
+		       udc_dwc3_cpu_hold_n,
+		       (uint32_t)((uint64_t)udc_dwc3_cpu_hold_max * 1000000U /
+				  sys_clock_hw_cycles_per_sec()),
+		       udc_dwc3_cpu_hold_us, udc_dwc3_cpu_hold_to,
+		       udc_dwc3_cpu_hold_en, udc_dwc3_in_hold_cap_us,
+		       udc_dwc3_open_hold_n, udc_dwc3_open_hold_max_ms,
+		       udc_dwc3_open_hold_sum_ms);
+		udc_dwc3_park_stats_print();
+	}
+#endif
 	printk("\n");
 }
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+static void udc_dwc3_vid_gap_probe(void);
+static void udc_dwc3_open_hold_dtr(uint8_t dtr);
+#endif
 
 void udc_dwc3_health_print(void)
 {
@@ -902,10 +1014,13 @@ void udc_dwc3_health_print(void)
 	const uint32_t mean = n ? (udc_dwc3_health_spin_sum / n) : 0U;
 
 	printk("DWC3HEALTH cmd=%u spin_mean=%u spin_max=%u halt_to=%u "
-	       "setup_pend=%u ep0_rst=%u ovf=%u unk=%u\n",
+	       "setup_pend=%u ep0_rst=%u ovf=%u unk=%u ulst=%u lnk=%u\n",
 	       n, mean, udc_dwc3_health_spin_max, udc_dwc3_health_halt_to,
 	       udc_dwc3_health_setup_pending, udc_dwc3_health_ep0_rst,
-	       udc_dwc3_evt_errors.overflow, udc_dwc3_evt_errors.unknown);
+	       udc_dwc3_evt_errors.overflow, udc_dwc3_evt_errors.unknown,
+	       udc_dwc3_ulst_n,
+	       (uint32_t)((sys_read32(0xb0000000u + UDC_DWC3_DSTS) &
+			   UDC_DWC3_DSTS_USBLNKST_MASK) >> 18));
 	udc_dwc3_acm_health_dump();
 	udc_dwc3_engine_dump();
 	printk("ep0: last SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -915,6 +1030,9 @@ void udc_dwc3_health_print(void)
 	       udc_dwc3_last_setup[6], udc_dwc3_last_setup[7]);
 	printk("uvcmgr: sts=0x%x bytes=%u\n",
 	       sys_read32(0xb4000000u + 0x10u), sys_read32(0xb4000000u + 0x18u));
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	udc_dwc3_vid_gap_probe();
+#endif
 }
 
 #if defined(CONFIG_UDC_DWC3_USB_ENGINE)
@@ -938,7 +1056,11 @@ void udc_dwc3_engine_reprime_acm(const struct device *dev)
  */
 #define UDC_DWC3_GDBGLSPMUX_EPSELECT_PHYS(epn)	UDC_DWC3_GDBGLSPMUX_EPSELECT(epn)
 
-static uint32_t udc_dwc3_dbg_fifo_avail(const mm_reg_t base, uint32_t fifo_num,
+/* Keep diagnostics in XIP: udc_dwc3.c text is relocated into the 64 KiB
+ * SRAM and that region is nearly full. */
+#define UDC_DWC3_XIP __attribute__((noinline, section(".text")))
+
+UDC_DWC3_XIP static uint32_t udc_dwc3_dbg_fifo_avail(const mm_reg_t base, uint32_t fifo_num,
 					uint32_t qtype)
 {
 	uint32_t sel = (fifo_num & 0x1fU) | qtype;
@@ -948,7 +1070,7 @@ static uint32_t udc_dwc3_dbg_fifo_avail(const mm_reg_t base, uint32_t fifo_num,
 			 sys_read32(base + UDC_DWC3_GDBGFIFOSPACE));
 }
 
-static void udc_dwc3_dbg_epinfo(const mm_reg_t base, uint32_t epn,
+UDC_DWC3_XIP static void udc_dwc3_dbg_epinfo(const mm_reg_t base, uint32_t epn,
 				uint32_t *info0, uint32_t *info1)
 {
 	sys_write32(UDC_DWC3_GDBGLSPMUX_EPSELECT_PHYS(epn),
@@ -1397,16 +1519,43 @@ static inline void udc_dwc3_depcmd_hw_doorbell_sync(const mm_reg_t base)
 #define UDC_DWC3_MBX_QUIET_ARM	0x18U
 #define UDC_DWC3_MBX_QUIET_HIT	0x1cU
 #define UDC_DWC3_MBX_QUIET_TO	0x20U
+#define UDC_DWC3_MBX_QUIET_LAST	0x28U
+#define UDC_DWC3_MBX_TO_CMD	0x2cU
+#define UDC_DWC3_MBX_TO_EXPECT	0x34U
+#define UDC_DWC3_MBX_RD_ADDR	0x40U
+#define UDC_DWC3_MBX_RD_ID	0x4cU
 #define UDC_DWC3_MBX_STATUS_BUSY	BIT(0)
 #define UDC_DWC3_MBX_STATUS_DONE	BIT(1)
 #define UDC_DWC3_MBX_STATUS_ERR		BIT(2)
 
 static struct k_spinlock udc_dwc3_mbx_lock;
 static uint32_t udc_dwc3_mbx_trb;
+static bool udc_dwc3_vid_polled;
+
+/* VID_CMD bit0 resets to 1: a video UpdateXfer is posted with CMDACT clear
+ * and the next command can be granted immediately. 0 makes the arbiter poll
+ * that command before the next grant. Quiet and HOLD_SEL stay at reset. */
+static void udc_dwc3_vid_cmd_poll(const mm_reg_t mbx)
+{
+	if (udc_dwc3_vid_polled) {
+		return;
+	}
+	sys_write32(0U, mbx + 0x58U);
+	udc_dwc3_vid_polled = true;
+	printk("vidcmd: poll bit0=%u quiet=%u hold=%u\n",
+	       sys_read32(mbx + 0x58U) & 1U,
+	       sys_read32(mbx + 0x38U),
+	       sys_read32(mbx + 0x54U));
+}
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+static void udc_dwc3_cpu_vid_acq(void);
+static void udc_dwc3_cpu_vid_rel(void);
+#endif
 
 /* Post {addr, cmd} to the RTL mailbox; return the retired DEPCMD word. */
-static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
-					const uint32_t addr, const uint32_t cmd)
+static uint32_t udc_dwc3_depcmd_mailbox_raw(const struct device *const dev,
+					    const uint32_t addr, const uint32_t cmd)
 {
 	const mm_reg_t dwc = DEVICE_MMIO_NAMED_GET(dev, base);
 	const mm_reg_t mbx = UDC_DWC3_MBX_BASE;
@@ -1415,6 +1564,7 @@ static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
 	uint32_t sts;
 	uint32_t reg;
 
+	udc_dwc3_vid_cmd_poll(mbx);
 	/* One poster. A DATA write while BUSY is dropped by RTL. */
 	key = k_spin_lock(&udc_dwc3_mbx_lock);
 	while ((sys_read32(mbx + UDC_DWC3_MBX_STATUS) & UDC_DWC3_MBX_STATUS_BUSY) != 0U) {
@@ -1459,6 +1609,12 @@ static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
 	if ((sts & UDC_DWC3_MBX_STATUS_ERR) != 0U) {
 		printk("DEPCMD mailbox ERR: cmd 0x%08x result 0x%08x\n", cmd, reg);
 	}
+	/* Trace EP0 (phys 0/1) commands next to the DEPEVTs they answer. */
+	if (addr < UDC_DWC3_DEPCMD(2)) {
+		udc_dwc3_evt_trace_add(UDC_DWC3_EVT_TRACE_CMD_TAG |
+				       (((addr - UDC_DWC3_DEPCMD(0)) >> 4) << 16) |
+				       (cmd & 0xffffU), false);
+	}
 
 	udc_dwc3_health_cmd_n++;
 	udc_dwc3_health_spin_sum += spins;
@@ -1468,34 +1624,81 @@ static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
 
 	return reg;
 }
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/*
+ * The non-mailbox path kept HALT_DOORBELL asserted for the life of every
+ * CPU DepCmd (see udc_dwc3_depcmd_ex). The mailbox path dropped that, so
+ * EP0 status stages and the 0x01 OUT re-arm ran next to live video
+ * UpdateXfers. rs7/rs8: video mbx froze ~1 s before the dead 0x82 reply,
+ * at the DTR open (21 22 03 / 21 22 01) of the next srp_cli session.
+ * Park the manager around every mailbox command.
+ */
+/* devmem knob: 0 = CPU DepCmds run without the video park (rs8 behaviour).
+ * rs12b: the first SRP open wedged TX with this at 0 as well, so the park
+ * is not the trigger; default off while the EP0/DEPEVT trace locates it. */
+uint32_t udc_dwc3_cpu_hold_en = 0U;
+
+UDC_DWC3_XIP static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const dev,
+						     const uint32_t addr,
+						     const uint32_t cmd)
+{
+	uint32_t reg;
+
+	if (udc_dwc3_cpu_hold_en == 0U) {
+		return udc_dwc3_depcmd_mailbox_raw(dev, addr, cmd);
+	}
+	udc_dwc3_cpu_vid_acq();
+	reg = udc_dwc3_depcmd_mailbox_raw(dev, addr, cmd);
+	udc_dwc3_cpu_vid_rel();
+	return reg;
+}
+#else
+#define udc_dwc3_depcmd_mailbox udc_dwc3_depcmd_mailbox_raw
+#endif
 #endif
 
-static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag)
+UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t i0_82, i1_82, i0_85, i1_85;
-	uint32_t tx2, tx5, evc, dsts, buserr;
-	uint32_t cmd5, cmd11, mbx_n = 0U;
+	uint32_t tx2, tx5, txreq, descq, evc, dsts, buserr, gsts;
+	uint32_t cmd5, cmd11, mbx_n = 0U, rd_addr = 0U, rd_id = 0U;
+	uint32_t vid_db = 0U;
 	struct udc_dwc3_ep_data *ep82;
 	struct udc_dwc3_ep_data *ep85;
+
+	if (dev == NULL) {
+		return;
+	}
 
 	udc_dwc3_dbg_epinfo(base, 5U, &i0_82, &i1_82);
 	udc_dwc3_dbg_epinfo(base, 11U, &i0_85, &i1_85);
 	tx2 = udc_dwc3_dbg_fifo_avail(base, 2U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
 	tx5 = udc_dwc3_dbg_fifo_avail(base, 5U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
+	txreq = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXREQ);
+	descq = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH);
 	evc = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0));
 	dsts = sys_read32(base + UDC_DWC3_DSTS);
+	gsts = sys_read32(base + UDC_DWC3_GSTS);
 	buserr = sys_read32(base + UDC_DWC3_GBUSERRADDR_LO);
 	cmd5 = sys_read32(base + UDC_DWC3_DEPCMD(5));
 	cmd11 = sys_read32(base + UDC_DWC3_DEPCMD(11));
 #if defined(CONFIG_UDC_DWC3_DEPCMD_MAILBOX)
 	mbx_n = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT);
+	rd_addr = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_RD_ADDR);
+	rd_id = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_RD_ID);
+#endif
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	vid_db = sys_read32(USB_ENGINE_BASE + USB_ENGINE_VID_DB_COUNT);
 #endif
 	printk("PARK0 %s t=%u cmd5=0x%08x cmd11=0x%08x mbx=%u evc=0x%08x "
-	       "dsts=0x%08x buserr=0x%08x tx2=%u tx5=%u "
+	       "dsts=0x%08x gsts=0x%08x buserr=0x%08x tx2=%u tx5=%u "
+	       "txreq=%u descq=%u rd=0x%08x id=0x%08x db=%u "
 	       "ep82=0x%08x/0x%08x ep85=0x%08x/0x%08x\n",
 	       tag, (uint32_t)k_uptime_get(), cmd5, cmd11, mbx_n, evc, dsts,
-	       buserr, tx2, tx5, i0_82, i1_82, i0_85, i1_85);
+	       gsts, buserr, tx2, tx5, txreq, descq, rd_addr, rd_id, vid_db,
+	       i0_82, i1_82, i0_85, i1_85);
 
 	ep82 = (struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, 0x82);
 	ep85 = (struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, 0x85);
@@ -1513,7 +1716,15 @@ static void udc_dwc3_park_snapshot(const struct device *const dev, const char *t
 		       tag, ep85->xfer_active, ep85->xferrscidx,
 		       ep85->head, ep85->tail, udc_dwc3_ring_data_hwo_mask(ep85));
 	}
-	udc_dwc3_health_print();
+	/* Oldest first: evt/ms<<16|cmdcount. See udc_dwc3_evt_trace_t. */
+	printk("PARK0 %s trace total=%u now=%u mbx=%u:", tag, udc_dwc3_evt_trace_total,
+	       k_uptime_get_32(), mbx_n);
+	for (uint32_t i = 0; i < UDC_DWC3_EVT_TRACE_N; i++) {
+		const uint32_t j = (udc_dwc3_evt_trace_idx + i) % UDC_DWC3_EVT_TRACE_N;
+
+		printk(" %08x/%08x", udc_dwc3_evt_trace[j], udc_dwc3_evt_trace_t[j]);
+	}
+	printk("\n");
 }
 
 /*
@@ -1524,16 +1735,43 @@ static void udc_dwc3_park_snapshot(const struct device *const dev, const char *t
  * Y16 + CDC-RAW/ACM), instead of the theoretical/never-measured
  * estimates in docs/usb_ep_ownership.md and docs/IEBM_PORT_FINDINGS.md.
  */
-static void udc_dwc3_rateprobe_print(void)
+/* CameraStats (FLIR_STATS_BASE in tvai_uvcmgr_iebm.c): CSI-side frames in.
+ * rs16b: lets a doorbell deficit be split into "camera produced fewer
+ * frames" vs "USB sent fewer frames" (fps dips during SRP bulk/I2C phases). */
+#define UDC_DWC3_FLIR_STATS_FRAME_COUNT 0xb4030014U
+
+UDC_DWC3_XIP static void udc_dwc3_rateprobe_print(void)
 {
 #if defined(CONFIG_UDC_DWC3_DEPCMD_MAILBOX)
-	uint32_t mbx_n = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT);
+	const mm_reg_t mbx = UDC_DWC3_MBX_BASE;
+	uint32_t mbx_n = sys_read32(mbx + UDC_DWC3_MBX_CMD_COUNT);
+	uint32_t cmd01 = 0U;
+	uint32_t cmd82 = 0U;
+	uint32_t cmd85 = 0U;
 
-	printk("RATEPROBE t=%u mbx=%u qarm=%u qhit=%u qto=%u\n",
+	/* phys 2 = ACM OUT 0x01, phys 5 = ACM IN 0x82, phys 11 = video 0x85.
+	 * Bit 10 set across two prints means that DEPCMD never left CMDACT. */
+	if (udc_dwc3_health_dev != NULL) {
+		const mm_reg_t base = DEVICE_MMIO_NAMED_GET(udc_dwc3_health_dev, base);
+
+		cmd01 = sys_read32(base + UDC_DWC3_DEPCMD(2));
+		cmd82 = sys_read32(base + UDC_DWC3_DEPCMD(5));
+		cmd85 = sys_read32(base + UDC_DWC3_DEPCMD(11));
+	}
+
+	printk("RATEPROBE t=%u mbx=%u qarm=%u qhit=%u qto=%u csi_fc=%u\n",
 	       (uint32_t)k_uptime_get(), mbx_n,
-	       sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_QUIET_ARM),
-	       sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_QUIET_HIT),
-	       sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_QUIET_TO));
+	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_ARM),
+	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_HIT),
+	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_TO),
+	       sys_read32(UDC_DWC3_FLIR_STATS_FRAME_COUNT));
+	printk("STALL sts=0x%x qlast=%u tocmd=0x%08x toexp=0x%08x "
+	       "cmd01=0x%08x cmd82=0x%08x cmd85=0x%08x\n",
+	       sys_read32(mbx + UDC_DWC3_MBX_STATUS),
+	       sys_read32(mbx + UDC_DWC3_MBX_QUIET_LAST),
+	       sys_read32(mbx + UDC_DWC3_MBX_TO_CMD),
+	       sys_read32(mbx + UDC_DWC3_MBX_TO_EXPECT),
+	       cmd01, cmd82, cmd85);
 #endif
 }
 
@@ -1753,6 +1991,20 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 		    USB_EP_TYPE_CONTROL) {
 			param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
 		}
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+		/*
+		 * Diagnostic (TX wedge at the cdc-acm port open): a
+		 * XferNotReady on 0x81/0x82/0x84 marks the moment the host
+		 * starts polling that IN pipe with no TRB armed. One event
+		 * per poll start (SS NRDY/ERDY flow control), no handler acts
+		 * on it (on_xfer_not_ready_norm returns for IN).
+		 */
+		if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) !=
+			    USB_EP_TYPE_CONTROL) {
+			param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		}
+#endif
 #if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
 		if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
 		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) ==
@@ -2862,7 +3114,7 @@ static uint32_t udc_dwc3_nv_drop_nb_null;
 static uint32_t udc_dwc3_nv_drop_hwo;
 static uint32_t udc_dwc3_nv_full;
 static uint32_t udc_dwc3_nv_retake;
-static uint32_t udc_dwc3_nv_evt[32];
+static uint32_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8 for RAM */
 
 static void udc_dwc3_nv_ep_dump(const struct udc_dwc3_ep_data *ep_data)
 {
@@ -2886,7 +3138,7 @@ void lattice_usb23_iebm_fast_health(const struct device *dev)
 	printk("nv: drop_nb=%u drop_hwo=%u full=%u retake=%u ev:",
 	       udc_dwc3_nv_drop_nb_null, udc_dwc3_nv_drop_hwo, udc_dwc3_nv_full,
 	       udc_dwc3_nv_retake);
-	for (uint32_t i = 0U; i < 32U; i++) {
+	for (uint32_t i = 0U; i < 8U; i++) {
 		if (udc_dwc3_nv_evt[i] != 0U) {
 			printk(" %u=%u", i, udc_dwc3_nv_evt[i]);
 		}
@@ -2920,7 +3172,7 @@ static uint32_t udc_dwc3_nv_drop_nb_null;
 static uint32_t udc_dwc3_nv_drop_hwo;
 static uint32_t udc_dwc3_nv_full;
 static uint32_t udc_dwc3_nv_retake;
-static uint32_t udc_dwc3_nv_evt[32];
+static uint32_t udc_dwc3_nv_evt[8]; /* rs17e: 16 -> 8 for RAM */
 #endif /* !CONFIG_UDC_DWC3_RTL_DOORBELL */
 
 int lattice_usb23_iebm_abort(const struct device *dev, uint8_t ep_addr)
@@ -3309,6 +3561,222 @@ static void udc_dwc3_in_park_resume(const struct device *const dev,
 	udc_dwc3_depcmd_update_xfer(dev, ep_data);
 }
 
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+static void udc_dwc3_in_vid_acq(uint8_t addr);
+static void udc_dwc3_in_vid_rel(uint8_t addr);
+/*
+ * rs16d devmem knob: video park around ACM/RAW IN ring posts.
+ *   1 = park from post until the buffer completes (rs16c and earlier)
+ *   2 = park only across the post itself (released at engine DONE)
+ *   0 = no park for ring posts (port-open hold unaffected)
+ * rs16c: every park that overlaps active video costs one frame whatever
+ * its length (34 parks / 89 ms parked / 21.6 frames lost in a BULK_READ
+ * interval), so the lever is the park count, not the duration.
+ */
+uint32_t udc_dwc3_ring_park_mode = 1U;
+/*
+ * rs17d: synchronous release of the ring park. rs17c measured the ring
+ * parks at 0.7 ms mean (rpark=55781us/80) with the ISR release in place:
+ * the DEPEVT only reaches the ISR when the event interrupt is unmasked,
+ * and the thread keeps it masked from the first event until it drains
+ * the ring, so the release still ran at thread pace (2 ms backstop). The
+ * core writes dword3 back with HWO clear the moment the TRB is done; the
+ * posting thread spins on that instead, for at most ring_sync_us, then
+ * releases the park itself. 0 = off (thread/ISR release only).
+ */
+uint32_t udc_dwc3_ring_sync_us = 0U; /* rs17f: OFF. rs17e wedged on a parked post 190 s in (tx5=122): HWO clears when the data is in TxFIFO, not when it is on the wire; releasing video there is the historical TX wedge. */
+uint32_t udc_dwc3_ring_sync_ok;
+uint32_t udc_dwc3_ring_sync_to;
+/* rs17e: where the parked time goes. seg0 = FSM parked -> engine post
+ * returned, seg1 = post -> ring wrote HWO, seg2 = HWO set -> HWO clear. */
+uint32_t udc_dwc3_ring_seg_us[3];
+
+UDC_DWC3_XIP static void udc_dwc3_ring_sync_wait(volatile struct udc_dwc3_trb *const trb,
+						 uint8_t addr, uint32_t t_acq)
+{
+	const uint32_t hz = sys_clock_hw_cycles_per_sec();
+	const uint32_t cap = (uint32_t)((uint64_t)hz * udc_dwc3_ring_sync_us / 1000000U);
+	const uint32_t t0 = k_cycle_get_32();
+	uint32_t t_hwo = t0;
+	bool armed = false;
+
+	for (;;) {
+		const uint32_t ctrl = trb->ctrl;
+
+		if ((ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+			if (!armed) {
+				t_hwo = k_cycle_get_32();
+			}
+			armed = true;
+		} else if (armed || (ctrl & UDC_DWC3_TRB_CTRL_SW_PENDING) == 0U) {
+			break;
+		}
+		if ((k_cycle_get_32() - t0) >= cap) {
+			udc_dwc3_ring_sync_to++;
+			return;
+		}
+	}
+	udc_dwc3_ring_sync_ok++;
+	udc_dwc3_in_vid_rel(addr);
+	{
+		const uint32_t t_done = k_cycle_get_32();
+
+		udc_dwc3_ring_seg_us[0] += (uint32_t)((uint64_t)(t0 - t_acq) * 1000000U / hz);
+		udc_dwc3_ring_seg_us[1] += (uint32_t)((uint64_t)(t_hwo - t0) * 1000000U / hz);
+		udc_dwc3_ring_seg_us[2] += (uint32_t)((uint64_t)(t_done - t_hwo) * 1000000U / hz);
+	}
+}
+
+static uint32_t udc_dwc3_acm_kicks;
+static uint32_t udc_dwc3_acm_kick_busy;
+static uint32_t udc_dwc3_acm_kick_aborted;
+
+/*
+ * Single-master bulk (ACM IN 0x82, RAW IN 0x84, RAW OUT 0x02). The BulkRing writes the TRB into this
+ * endpoint's own link-TRB ring at the CPU head slot and rings UpdateXfer
+ * with the CPU's xferrscidx, the way one Linux dwc3 lock covers TRB write
+ * plus doorbell. The CPU keeps head/tail/net_buf and the DEPEVT retire
+ * path. A continuing IN buffer sets DESC_CTRL bit 8 and the ring
+ * writes TRB CHN, so the 1024-byte SRP chunks stay on the ring with
+ * the short tail. The CPU mailbox is StartXfer and abort only.
+ *
+ * -ENOTSUP: not an engine case, use the CPU TRB path.
+ * -EBUSY: ring not ready, keep the buffer queued (worker retries on the
+ *         next completion).
+ */
+static int udc_dwc3_acm_ring_kick(const struct device *const dev,
+				  struct udc_dwc3_ep_data *const ep_data,
+				  struct net_buf *const buf)
+{
+	const uint8_t addr = ep_data->cfg.addr;
+	const bool zlp = udc_ep_buf_has_zlp(buf);
+	volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->head];
+	uint32_t post_ctrl = USB_ENGINE_DESC_CTRL_IOC;
+	uint32_t t_acq = 0U;
+	int ret;
+
+	if ((addr != 0x82U && addr != 0x84U && addr != 0x02U) || !udc_dwc3_engine_enabled() ||
+	    !ep_data->xfer_active || ep_data->xferrscidx == 0U) {
+		return -ENOTSUP;
+	}
+	/* Same rule as the CPU path: an exact MPS multiple continues an IN
+	 * transfer. OUT TRBs carry CSP and no LST, so the transfer already
+	 * stays open across them; no CHN there. IOC stays set so each TRB
+	 * produces an event and the one-deep ring can post the next buffer. */
+	if (USB_EP_DIR_IS_IN(addr) && !zlp && ep_data->cfg.mps != 0U &&
+	    ((ep_data->total + buf->len) % ep_data->cfg.mps) == 0U) {
+		post_ctrl |= USB_ENGINE_DESC_CTRL_CHN;
+	}
+
+	if (!udc_dwc3_engine_ring_synced(addr)) {
+		ret = udc_dwc3_engine_ring_sync(addr,
+						(uint32_t)(uintptr_t)&ep_data->trb_buf[0],
+						(uint8_t)(CONFIG_UDC_DWC3_TRB_NUM - 1U),
+						(uint8_t)ep_data->head);
+		if (ret != 0) {
+			udc_dwc3_acm_kick_busy++;
+			return -EBUSY;
+		}
+	}
+
+	/*
+	 * Mark the slot before the post so a DEPEVT that lands between the
+	 * post and the ring's dword3 write cannot retire it (HWO is still 0
+	 * from the previous completion). HWO stays clear: the core ignores
+	 * this word, and the ring overwrites it.
+	 */
+	trb->ctrl = UDC_DWC3_TRB_CTRL_SW_PENDING;
+	udc_dwc3_trb_fence(trb);
+
+	if (zlp) {
+		post_ctrl |= USB_ENGINE_DESC_CTRL_ZLP;
+	}
+	/* Ring UpdateXfer does not arm the quiet hold. A video doorbell in
+	 * the gap drops this IN (command OK, HWO stuck, host read times out).
+	 * Keep the manager silent until this buffer completes. */
+	if (USB_EP_DIR_IS_IN(addr) && udc_dwc3_ring_park_mode != 0U) {
+		udc_dwc3_in_vid_acq(addr);
+		t_acq = k_cycle_get_32();
+	}
+	ret = udc_dwc3_engine_post_slot(addr, buf, post_ctrl);
+	if (ret != 0) {
+		trb->ctrl = 0U;
+		if (USB_EP_DIR_IS_IN(addr)) {
+			udc_dwc3_in_vid_rel(addr);
+		}
+		udc_dwc3_acm_kick_busy++;
+		return -EBUSY;
+	}
+	if (USB_EP_DIR_IS_IN(addr) && udc_dwc3_ring_park_mode == 2U) {
+		udc_dwc3_in_vid_rel(addr);
+	} else if (USB_EP_DIR_IS_IN(addr) && udc_dwc3_ring_park_mode == 1U &&
+		   udc_dwc3_ring_sync_us != 0U) {
+		udc_dwc3_ring_sync_wait(trb, addr, t_acq);
+	}
+
+	/* Same bookkeeping as udc_dwc3_push_trb; the ring writes the words. */
+	ep_data->net_buf[ep_data->head] = buf;
+	udc_dwc3_ring_inc(&ep_data->head, CONFIG_UDC_DWC3_TRB_NUM - 1);
+	ep_data->full = (ep_data->head == ep_data->tail);
+	if (zlp) {
+		ep_data->total = 0;
+	} else {
+		ep_data->total += buf->len;
+		if (ep_data->total % ep_data->cfg.mps != 0U) {
+			ep_data->total = 0;
+		}
+	}
+	udc_dwc3_acm_kicks++;
+	if (udc_dwc3_acm_kicks <= 8U) {
+		printk("dwc3: 0x%02x ring kick slot=%u len=%u idx=0x%x\n",
+		       addr, (uint32_t)(trb - &ep_data->trb_buf[0]), buf->len,
+		       ep_data->xferrscidx);
+	}
+	return 0;
+}
+
+/*
+ * The ring aborted a posted slot (ENABLE fell before it armed, or while it
+ * waited for the completion). Arm it from the CPU path so the buffer still
+ * goes out. A slot the core already took is rewritten with identical words.
+ */
+void udc_dwc3_engine_slot_aborted(const struct device *dev, uint8_t addr,
+				  uint32_t data_addr)
+{
+	struct udc_dwc3_ep_data *const ep_data =
+		(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, addr);
+	uint32_t i;
+
+	if (ep_data == NULL || ep_data->trb_buf == NULL) {
+		return;
+	}
+	udc_dwc3_acm_kick_aborted++;
+	for (i = 0U; i < CONFIG_UDC_DWC3_TRB_NUM - 1U; i++) {
+		struct net_buf *const buf = ep_data->net_buf[i];
+		volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[i];
+
+		if (buf == NULL || (uint32_t)(uintptr_t)buf->data != data_addr) {
+			continue;
+		}
+		trb->addr_lo = LO32((uintptr_t)buf->data);
+		trb->addr_hi = HI32((uintptr_t)buf->data);
+		trb->status = USB_EP_DIR_IS_IN(addr) ? buf->len : buf->size;
+		trb->ctrl = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP |
+			    UDC_DWC3_TRB_CTRL_IOC |
+			    (udc_ep_buf_has_zlp(buf) ? UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP :
+						       UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL);
+		udc_dwc3_trb_fence(trb);
+		printk("dwc3: 0x%02x ring abort -> CPU arm slot=%u len=%u xa=%d\n",
+		       addr, i, buf->len, ep_data->xfer_active);
+		if (ep_data->xfer_active && ep_data->xferrscidx != 0U) {
+			udc_dwc3_depcmd_update_xfer(dev, ep_data);
+		}
+		return;
+	}
+	printk("dwc3: 0x%02x ring abort data=0x%08x not on ring\n", addr, data_addr);
+}
+#endif /* CONFIG_UDC_DWC3_USB_ENGINE */
+
 static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
@@ -3332,6 +3800,21 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 		}
 		return -EBUSY;
 	}
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	{
+		const int kret = udc_dwc3_acm_ring_kick(dev, ep_data, buf);
+
+		if (kret != -ENOTSUP) {
+			return kret;
+		}
+	}
+	/* CPU path on an engine EP: the ring's write slot no longer tracks
+	 * head. Resync before the next kick. */
+	if (usb_engine_bulk_idx(ep_data->cfg.addr) >= 0) {
+		udc_dwc3_engine_ring_unsync(ep_data->cfg.addr);
+	}
+#endif
 
 	if (udc_ep_buf_has_zlp(buf)) {
 		LOG_DBG("Buffer has a ZLP flag, terminating the transfer");
@@ -3692,6 +4175,23 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
 
 	/*
+	 * SS bulk "park mode" (GUCTL1[17]=0, the reset default) lets the
+	 * core park one bursting bulk IN endpoint and keep scheduling it.
+	 * Linux carries snps,parkmode-disable-ss-quirk for exactly the
+	 * failure seen here: with several SS bulk IN endpoints active
+	 * (0x85 video burst + 0x82/0x84 ACM), the host starting/stopping
+	 * its reads on another bulk IN pipe (cdc-acm port open/close, 16
+	 * read URBs) occasionally hangs the whole DP transmit path — link
+	 * U0, OUT and EP0 TPs fine, TxFIFO5 full, host -71 EPROTO, only
+	 * RUN/STOP recovers. rs13 trace: video doorbells stop within the
+	 * SET_CONTROL_LINE_STATE pair of the open, no CPU DepCmd but EP0.
+	 * GUCTL1 read 0x0004198a on the wedged board (bit 17 clear).
+	 */
+	sys_set_bits(base + UDC_DWC3_GUCTL1, UDC_DWC3_GUCTL1_PARKMODE_DISABLE_SS);
+	printk("dwc3: GUCTL1=0x%08x (SS park mode off)\n",
+	       sys_read32(base + UDC_DWC3_GUCTL1));
+
+	/*
 	 * After TX FIFO rebalance, isoc FIFONUM3 is ~16KiB — allow up to 8
 	 * packet bursts (still below full Mult=16 so underruns stay rare).
 	 */
@@ -4025,6 +4525,7 @@ static void udc_dwc3_on_ctrl_in(const struct device *const dev)
 		}
 		udc_ep_set_busy(&ep_data->cfg, false);
 		udc_dwc3_ep0_in_setup_pending(dev, "IN-setup-pending");
+		udc_dwc3_park_snapshot(dev, "setup");
 		return;
 	}
 
@@ -4116,6 +4617,16 @@ static void udc_dwc3_on_ctrl_out(const struct device *const dev)
 		/* Update the size to what the hardware reports */
 		buf->len = buf->size - FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb_status);
 		memcpy(udc_dwc3_last_setup, buf->data, sizeof(udc_dwc3_last_setup));
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+		/* CDC SET_CONTROL_LINE_STATE: park video only on the DTR 0->1
+		 * edge (acm_port_activate submits its 16 read URBs right after
+		 * this status stage). rs15 armed on every 21 22 incl. close, so
+		 * one hold spanned close -> reopen gap -> 03 -> 01: ~5 frames
+		 * per command instead of ~1. */
+		if (udc_dwc3_last_setup[0] == 0x21U && udc_dwc3_last_setup[1] == 0x22U) {
+			udc_dwc3_open_hold_dtr(udc_dwc3_last_setup[2] & 0x01U);
+		}
+#endif
 		printk("ep0: SETUP %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		       udc_dwc3_last_setup[0], udc_dwc3_last_setup[1],
 		       udc_dwc3_last_setup[2], udc_dwc3_last_setup[3],
@@ -4299,6 +4810,18 @@ static bool udc_dwc3_ep_is_hw_in(const struct udc_dwc3_ep_data *ep_data)
 	return (CONFIG_UDC_DWC3_HW_IN_EP_MASK & BIT(USB_EP_GET_IDX(addr))) != 0U;
 }
 
+/* rs15c: OUT-side counterpart of the ACM82 trace (SRP CRC_ERR on 0x01). */
+__attribute__((noinline, section(".text")))
+static void udc_dwc3_acm01_trace(uint32_t evt, const struct net_buf *buf,
+				 uint32_t sts, const struct udc_dwc3_ep_data *ep_data)
+{
+	printk("ACM01 t=%u evt=0x%08x len=%u sts=0x%08x tl=%u hd=%u d=%02x%02x%02x%02x\n",
+	       (uint32_t)k_uptime_get(), evt, buf->len, sts, ep_data->tail,
+	       ep_data->head, buf->len > 0U ? buf->data[0] : 0U,
+	       buf->len > 1U ? buf->data[1] : 0U, buf->len > 2U ? buf->data[2] : 0U,
+	       buf->len > 3U ? buf->data[3] : 0U);
+}
+
 static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 				       const uint32_t evt)
 {
@@ -4313,6 +4836,18 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	if (acm_slot >= 0) {
 		udc_dwc3_acm_xfer_evt[acm_slot]++;
+	}
+	if (ep_data->cfg.addr == 0x82U) {
+		printk("ACM82 t=%u evt=0x%08x hwo=%u nb=%u tl=%u hd=%u\n",
+		       (uint32_t)k_uptime_get(), evt,
+		       (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U,
+		       ep_data->net_buf[ep_data->tail] != NULL,
+		       ep_data->tail, ep_data->head);
+	}
+	if (udc_dwc3_restart_skip_ep != 0U &&
+	    ep_data->cfg.addr == udc_dwc3_restart_skip_ep) {
+		udc_dwc3_restart_skip_ep = 0U;
+		return;
 	}
 
 	/*
@@ -4335,9 +4870,15 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 	if (ep_data->hw_owned) {
 		ep_data->hw_owned_evts++;
+		if (ep_data->cfg.addr == 0x82U) {
+			printk("ACM82 t=%u drop hw_owned\n", (uint32_t)k_uptime_get());
+		}
 		return;
 	}
 	if (udc_dwc3_ep_is_hw_in(ep_data)) {
+		if (ep_data->cfg.addr == 0x82U) {
+			printk("ACM82 t=%u drop hwin\n", (uint32_t)k_uptime_get());
+		}
 		return;
 	}
 
@@ -4351,6 +4892,9 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* No CPU buffer at tail: residual HWO=0 on an idle slot — ignore. */
 	if (ep_data->net_buf[ep_data->tail] == NULL) {
 		udc_dwc3_nv_drop_nb_null++;
+		if (ep_data->cfg.addr == 0x82U) {
+			printk("ACM82 t=%u drop nobuf\n", (uint32_t)k_uptime_get());
+		}
 		return;
 	}
 
@@ -4364,6 +4908,14 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 			printk("dwc3: nv hwo-set ep=0x%02x tl=%u hd=%u ctrl=0x%08x sts=0x%08x evt=0x%08x\n",
 			       ep_data->cfg.addr, ep_data->tail, ep_data->head,
 			       trb->ctrl, trb->status, evt);
+		}
+		return;
+	}
+	/* Slot posted to the BulkRing and not yet written by it. */
+	if ((trb->ctrl & UDC_DWC3_TRB_CTRL_SW_PENDING) != 0U) {
+		if (ep_data->cfg.addr == 0x82U) {
+			printk("ACM82 t=%u drop pending tl=%u\n",
+			       (uint32_t)k_uptime_get(), ep_data->tail);
 		}
 		return;
 	}
@@ -4383,12 +4935,19 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 		 * matching CPU net_buf (stale / HW-IN bleed). Raising
 		 * UDC_EVT_ERROR here used to take ACM down mid-SRP.
 		 */
+		if (ep_data->cfg.addr == 0x82U) {
+			printk("ACM82 t=%u drop pop\n", (uint32_t)k_uptime_get());
+		}
 		return;
 	}
 
 	LOG_DBG("XFER_DONE_NORM: EP 0x%02x, data %p", ep_data->cfg.addr, (void *)buf->data);
 	if (acm_slot >= 0) {
 		udc_dwc3_acm_xfer_ret[acm_slot]++;
+	}
+	if (ep_data->cfg.addr == 0x82U) {
+		printk("ACM82 t=%u ret len=%u sts=0x%08x\n",
+		       (uint32_t)k_uptime_get(), buf->len, trb_status_done);
 	}
 	udc_dwc3_on_xfer_done(dev, ep_data);
 
@@ -4399,6 +4958,9 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 
 		buf->len = (residual <= buf->size) ? (buf->size - residual) : 0U;
 		udc_dwc3_out_data_fence(buf);
+		if (ep_data->cfg.addr == 0x01U) {
+			udc_dwc3_acm01_trace(evt, buf, trb_status_done, ep_data);
+		}
 	}
 
 #if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
@@ -4433,6 +4995,50 @@ static void udc_dwc3_on_xfer_done_norm(const struct device *const dev,
 	/* We just made some room for a new buffer, check if something more to enqueue */
 	k_work_submit(&ep_data->work);
 }
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/*
+ * BulkRing pushed a completion for this buffer and the CPU ring still
+ * holds it. The matching DEPEVT is dropped when HWO or SW_PENDING is
+ * set, and that event is not retried. Clear those bits and retire this
+ * tail only. A later DEPEVT then sees an empty slot or the next buffer
+ * still owned, and does not pop it.
+ */
+void udc_dwc3_engine_slot_done(const struct device *dev, uint8_t addr,
+			       uint32_t data_addr, uint32_t len)
+{
+	struct udc_dwc3_ep_data *const ep_data =
+		(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, addr);
+	struct net_buf *buf;
+	volatile struct udc_dwc3_trb *trb;
+	uint32_t epn;
+	static uint32_t nret;
+
+	ARG_UNUSED(len);
+	if (ep_data == NULL || ep_data->trb_buf == NULL) {
+		return;
+	}
+	buf = ep_data->net_buf[ep_data->tail];
+	if (buf == NULL || (uint32_t)(uintptr_t)buf->data != data_addr) {
+		return;
+	}
+	if (USB_EP_DIR_IS_IN(addr)) {
+		udc_dwc3_in_vid_rel(addr);
+	}
+	trb = &ep_data->trb_buf[ep_data->tail];
+	if ((trb->ctrl & (UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_SW_PENDING)) != 0U) {
+		trb->ctrl &= ~(UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_SW_PENDING);
+		if (nret < 8U) {
+			printk("dwc3: engine retire ep=0x%02x addr=%08x\n",
+			       addr, data_addr);
+		}
+		nret++;
+	}
+	epn = ((uint32_t)USB_EP_GET_IDX(addr) << 1) |
+	      (USB_EP_DIR_IS_IN(addr) ? 1U : 0U);
+	udc_dwc3_on_xfer_done_norm(dev, epn << 1);
+}
+#endif
 
 #if defined(CONFIG_UDC_DWC3_IN_COMPLETION_POLL)
 /*
@@ -4972,7 +5578,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		const uint8_t epn = (uint8_t)((evt_raw >> 1) & 0x1fU);
 		const uint8_t addr = (uint8_t)((epn >> 1) | ((epn & 1U) ? 0x80U : 0U));
 
-		udc_dwc3_nv_evt[epn]++;
+		udc_dwc3_nv_evt[epn & 0x7U]++;
 		/*
 		 * EVT_OWN=0: CPU still owns the event ring. Do not swallow
 		 * ACM DEPEVT — BulkRing is doorbell-only until it actually
@@ -5037,6 +5643,7 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_connect_done(dev);
 		break;
 	case UDC_DWC3_DEVT_ULSTCHNG:
+		udc_dwc3_ulst_n++;
 		LOG_DBG("DEVT_ULSTCHNG");
 		udc_dwc3_on_link_state_event(dev);
 		break;
@@ -5110,6 +5717,833 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		}
 	}
 }
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/* A ring UpdateXfer on 0x82/0x84 does not arm quiet. Video doorbells in
+ * that window drop the IN: the command returns OK, HWO stays set, and the
+ * host read times out. Hold the manager doorbell from the post until the
+ * buffer completes. EndXfer+StartXfer does not revive that TRB. Quiet
+ * stays 0.
+ *
+ * These functions stay in XIP. udc_dwc3.c text is copied into the 64 KiB
+ * SRAM; putting this path there filled RAM and the image never reached
+ * the console. noinline so the bodies are not copied back into the
+ * SRAM-resident event thread. */
+#define UDC_DWC3_IN_RESTART_MS 250U
+#define UDC_DWC3_VID_RESTART_MS 100U
+#define UDC_DWC3_XIP __attribute__((noinline, section(".text")))
+
+UDC_DWC3_XIP static uint32_t udc_dwc3_restart_start(const struct device *const dev,
+				       struct udc_dwc3_ep_data *const ep,
+				       uint32_t trb_lo)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t reg;
+
+	sys_write32(0U, base + UDC_DWC3_DEPCMDPAR0(ep->epn));
+	sys_write32(trb_lo, base + UDC_DWC3_DEPCMDPAR1(ep->epn));
+#if defined(CONFIG_UDC_DWC3_DEPCMD_MAILBOX)
+	udc_dwc3_mbx_trb = trb_lo;
+#endif
+	reg = udc_dwc3_depcmd_reg(dev, UDC_DWC3_DEPCMD(ep->epn),
+				  UDC_DWC3_DEPCMD_DEPSTRTXFER, true);
+	return reg;
+}
+
+/* idx 0 = 0x84, idx 1 = 0x82. owned: this IN is holding the video
+ * doorbell. acked: haltAck was seen, so the last release must clear it.
+ * The mailbox build stubs udc_dwc3_uvcmgr_pause_doorbell(), so this
+ * writes HALT_DOORBELL itself. Quiet stays 0. */
+static uint8_t udc_dwc3_in_vid_owned;
+static uint8_t udc_dwc3_in_vid_acked;
+static uint32_t udc_dwc3_in_vid_since[3];
+static uint32_t udc_dwc3_in_vid_mask;
+
+/* idx 2: CPU mailbox DepCmd (EP0, 0x01 re-arm, ring sync). */
+#define UDC_DWC3_IN_HOLD_CPU     0x00U
+#define UDC_DWC3_IN_HOLD_CPU_IDX 2
+
+#define UDC_DWC3_IN_HOLD_STS  0x0010U
+#define UDC_DWC3_IN_HOLD_EN   BIT(0)
+#define UDC_DWC3_IN_HOLD_HALT BIT(15)
+#define UDC_DWC3_IN_HOLD_ACK  BIT(16)
+
+/* Only the manager at 0xb4000000 exists in the flashed bit. The dts also
+ * lists uvcmanager@b4000400 but the bus faults there (mtval b4000410). */
+#define UDC_DWC3_IN_HOLD_BASE 0xb4000000U
+
+/* uvcmanager control/status bits 5:2: TRBRamSink FSM state. haltReq only
+ * gates IDLE->READ and WAIT_US, so after HALT the FSM can still finish a
+ * sequence and ring one more doorbell. */
+#define UDC_DWC3_IN_HOLD_FSM_MASK GENMASK(5, 2)
+#define UDC_DWC3_IN_HOLD_FSM_IDLE 1U
+#define UDC_DWC3_IN_HOLD_FSM_WAIT 2U
+#define UDC_DWC3_IN_HOLD_SETTLE_US 10U
+/*
+ * rs9: the first CPU hold under video timed out at 500 us with the FSM
+ * in WRITE_TRB_SZ (6): haltReq does not gate that state, it is waiting
+ * for the next frame data (vertical blanking is ms long). The command
+ * then went out unparked and the next doorbell wedged TX. Wait out the
+ * blanking: the FSM finishes the sequence, rings once, and parks in IDLE.
+ * rs10: 4 ms was still short (4 of the first 8 holds timed out in state
+ * 6). One 60 fps frame period plus margin: a park is then certain unless
+ * the stream itself is dead.
+ */
+#define UDC_DWC3_IN_HOLD_WAIT_US 20000U
+
+uint32_t udc_dwc3_in_vid_settle_to;
+uint32_t udc_dwc3_in_vid_settle_max;
+uint32_t udc_dwc3_in_vid_settle_sts;
+
+/*
+ * Spin until the manager FSM is parked (IDLE or WAIT_US, the only states
+ * haltReq gates) and the mailbox command counter has been still for
+ * quiet cycles. Returns 0 parked, -1 after cap cycles. *sts_out gets the
+ * last control/status word.
+ */
+UDC_DWC3_XIP static int udc_dwc3_in_vid_wait_parked(uint32_t quiet, uint32_t cap,
+						    uint32_t *sts_out)
+{
+	const mm_reg_t reg = UDC_DWC3_IN_HOLD_BASE + UDC_DWC3_IN_HOLD_STS;
+	const mm_reg_t cnt = UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT;
+	const uint32_t t0 = k_cycle_get_32();
+	uint32_t last_cmd = sys_read32(cnt);
+	uint32_t t_cmd = t0;
+	uint32_t sts;
+	int rc;
+
+	for (;;) {
+		const uint32_t cmd = sys_read32(cnt);
+		const uint32_t now = k_cycle_get_32();
+		uint32_t fsm;
+
+		if (cmd != last_cmd) {
+			last_cmd = cmd;
+			t_cmd = now;
+		}
+		sts = sys_read32(reg);
+		fsm = FIELD_GET(UDC_DWC3_IN_HOLD_FSM_MASK, sts);
+		if ((fsm == UDC_DWC3_IN_HOLD_FSM_IDLE ||
+		     fsm == UDC_DWC3_IN_HOLD_FSM_WAIT) &&
+		    (now - t_cmd) >= quiet) {
+			rc = 0;
+			break;
+		}
+		if ((now - t0) >= cap) {
+			rc = -1;
+			break;
+		}
+	}
+	if (sts_out != NULL) {
+		*sts_out = sts;
+	}
+	return rc;
+}
+
+/*
+ * Diagnostic: for the first few 5 s health prints with the manager
+ * enabled, watch the mailbox counter and FSM for 40 ms (event thread,
+ * blocking). Reports the longest gap between video doorbells, the FSM
+ * state during that gap, and how many samples sat in WRITE_TRB_SZ (6)
+ * vs WAIT_US (2). Tells whether a multi-ms state-6 dwell is normal
+ * blanking or a dead stream.
+ */
+/* rs11/rs12 measured: ~9800 doorbells/s, max gap 545 us, FSM 6 ~98 %.
+ * 0 = off (each run blocks the event thread for 40 ms). */
+#define UDC_DWC3_VID_GAP_RUNS 0U
+#define UDC_DWC3_VID_GAP_MS   40U
+static uint8_t udc_dwc3_vid_gap_runs;
+
+UDC_DWC3_XIP static void udc_dwc3_vid_gap_probe(void)
+{
+	const mm_reg_t reg = UDC_DWC3_IN_HOLD_BASE + UDC_DWC3_IN_HOLD_STS;
+	const mm_reg_t cnt = UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT;
+	const uint32_t hz = sys_clock_hw_cycles_per_sec();
+	const uint32_t win = (uint32_t)((uint64_t)hz * UDC_DWC3_VID_GAP_MS / 1000U);
+	uint32_t t0, last_cmd, t_cmd, gap_max = 0U, gap_fsm = 0U;
+	uint32_t n = 0U, s6 = 0U, s2 = 0U, s1 = 0U, cmds;
+	uint32_t fsm_cur = 0U;
+
+	if ((uint32_t)udc_dwc3_vid_gap_runs + 1U > UDC_DWC3_VID_GAP_RUNS ||
+	    (sys_read32(reg) & UDC_DWC3_IN_HOLD_EN) == 0U) {
+		return;
+	}
+	udc_dwc3_vid_gap_runs++;
+
+	t0 = k_cycle_get_32();
+	last_cmd = sys_read32(cnt);
+	cmds = last_cmd;
+	t_cmd = t0;
+	for (;;) {
+		const uint32_t cmd = sys_read32(cnt);
+		const uint32_t now = k_cycle_get_32();
+		const uint32_t fsm = FIELD_GET(UDC_DWC3_IN_HOLD_FSM_MASK, sys_read32(reg));
+
+		n++;
+		if (fsm == 6U) {
+			s6++;
+		} else if (fsm == UDC_DWC3_IN_HOLD_FSM_WAIT) {
+			s2++;
+		} else if (fsm == UDC_DWC3_IN_HOLD_FSM_IDLE) {
+			s1++;
+		}
+		if (cmd != last_cmd) {
+			if ((now - t_cmd) > gap_max) {
+				gap_max = now - t_cmd;
+				gap_fsm = fsm_cur;
+			}
+			last_cmd = cmd;
+			t_cmd = now;
+		}
+		fsm_cur = fsm;
+		if ((now - t0) >= win) {
+			if ((now - t_cmd) > gap_max) {
+				gap_max = now - t_cmd;
+				gap_fsm = fsm_cur;
+			}
+			break;
+		}
+	}
+	printk("VIDGAP run=%u cmds=%u max=%uus fsm=%u n=%u s6=%u s2=%u s1=%u\n",
+	       udc_dwc3_vid_gap_runs, last_cmd - cmds,
+	       (uint32_t)((uint64_t)gap_max * 1000000U / hz), gap_fsm,
+	       n, s6, s2, s1);
+}
+
+/*
+ * eng02rs7 wedge (video + 0x82 + EP0 IN dead, link U0, OUT fine): the
+ * 0x82 UpdateXfer landed while the hold was "acked" but the manager was
+ * mid-sequence, so a video doorbell went to the core back-to-back with
+ * it. haltAck is wired to haltReq in RTL, so it says nothing about the
+ * FSM. Wait for the FSM to park (IDLE or WAIT_US) and for the mailbox
+ * command counter to sit still for SETTLE_US before the ring posts.
+ */
+/* Runtime knob (devmem): park cap in us. */
+uint32_t udc_dwc3_in_hold_cap_us = UDC_DWC3_IN_HOLD_WAIT_US;
+/* rs16c: parked-time accounting. Every HALT park (ring post, port open)
+ * costs about one frame regardless of length; park_n vs the doorbell
+ * deficit says whether count or duration is what drops frames. */
+uint32_t udc_dwc3_in_vid_park_n;
+uint32_t udc_dwc3_in_vid_park_sum_us;
+uint32_t udc_dwc3_in_vid_park_max_us;
+uint32_t udc_dwc3_in_vid_acq_n[3];
+/* rs17c: parked time (FSM IDLE -> HALT clear) of ring (0x82/0x84) parks only. */
+uint32_t udc_dwc3_in_vid_rpark_sum_us;
+uint32_t udc_dwc3_in_vid_rpark_max_us;
+/* rs17e: ring park length histogram: <100 <150 <200 <300 <500 >=500 us. */
+uint32_t udc_dwc3_in_vid_rpark_h[6];
+static uint32_t udc_dwc3_in_vid_park_t0;
+
+/*
+ * rs17: frame-aligned park. haltReq only gates IDLE->READ, so a HALT
+ * written mid-frame parks the manager after the TRB in flight and the
+ * rest of that frame is aborted (one frame per park, rs16c). A HALT
+ * written while the manager is on the LAST TRB of a frame parks it in
+ * IDLE at the frame end, and the whole vertical blanking (~5.8 ms at
+ * 60 fps) is free park time. Frame start = first doorbell after a
+ * >= ALIGN_QUIET_US gap (intra-frame gaps are <= 0.55 ms); the frame is
+ * 161 doorbells (49258 / 306 frames = 160.97). Write HALT right after
+ * doorbell #160, while the manager is on TRB #161. If anything times
+ * out, fall through to the old behaviour (one frame lost, never worse).
+ * Knob: udc_dwc3_in_vid_align_en (devmem), 1 = on.
+ */
+#define UDC_DWC3_ALIGN_QUIET_US 1000U
+#define UDC_DWC3_ALIGN_HALT_AFTER_DB 160U
+#define UDC_DWC3_ALIGN_CAP_US 24000U
+uint32_t udc_dwc3_in_vid_align_en = 0U; /* rs17b: off, blanking is ~0.5 ms (VIDGAP max 545 us) */
+uint32_t udc_dwc3_in_vid_align_ok;
+uint32_t udc_dwc3_in_vid_align_to;
+uint32_t udc_dwc3_in_vid_align_max_us;
+
+UDC_DWC3_XIP static void udc_dwc3_in_vid_align(uint32_t hz)
+{
+	const mm_reg_t cnt = UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT;
+	const uint32_t quiet = (uint32_t)((uint64_t)hz * UDC_DWC3_ALIGN_QUIET_US / 1000000U);
+	const uint32_t cap = (uint32_t)((uint64_t)hz * UDC_DWC3_ALIGN_CAP_US / 1000000U);
+	const uint32_t t0 = k_cycle_get_32();
+	uint32_t last = sys_read32(cnt);
+	uint32_t t_last = t0;
+	uint32_t c0 = 0U, us;
+	int phase = 0; /* 0 wait gap, 1 wait frame start, 2 count */
+
+	for (;;) {
+		const uint32_t c = sys_read32(cnt);
+		const uint32_t now = k_cycle_get_32();
+
+		if ((now - t0) >= cap) {
+			udc_dwc3_in_vid_align_to++;
+			return;
+		}
+		if (phase == 0) {
+			if (c != last) {
+				last = c;
+				t_last = now;
+			} else if ((now - t_last) >= quiet) {
+				phase = 1;
+			}
+		} else if (phase == 1) {
+			if (c != last) {
+				c0 = c;
+				phase = 2;
+			}
+		} else if ((c - c0) >= (UDC_DWC3_ALIGN_HALT_AFTER_DB - 1U)) {
+			break; /* c0 already counts doorbell #1 */
+		}
+	}
+	udc_dwc3_in_vid_align_ok++;
+	us = (uint32_t)((uint64_t)(k_cycle_get_32() - t0) * 1000000U / hz);
+	if (us > udc_dwc3_in_vid_align_max_us) {
+		udc_dwc3_in_vid_align_max_us = us;
+	}
+}
+
+/* rs15: the rs11 first-hold probe (1 ms pre-sample) was removed for RAM. */
+UDC_DWC3_XIP static int udc_dwc3_in_vid_pause(void)
+{
+	const mm_reg_t reg = UDC_DWC3_IN_HOLD_BASE + UDC_DWC3_IN_HOLD_STS;
+	const uint32_t hz = sys_clock_hw_cycles_per_sec();
+	uint32_t sts = sys_read32(reg);
+	uint32_t t0, dt;
+
+	if ((sts & UDC_DWC3_IN_HOLD_EN) == 0U) {
+		return 0;
+	}
+	if (udc_dwc3_in_vid_align_en != 0U) {
+		udc_dwc3_in_vid_align(hz);
+		sts = sys_read32(reg);
+	}
+	sys_write32(sts | UDC_DWC3_IN_HOLD_HALT, reg);
+
+	t0 = k_cycle_get_32();
+	if (udc_dwc3_in_vid_wait_parked(
+		    (uint32_t)((uint64_t)hz * UDC_DWC3_IN_HOLD_SETTLE_US / 1000000U),
+		    (uint32_t)((uint64_t)hz * udc_dwc3_in_hold_cap_us / 1000000U),
+		    &sts) != 0) {
+		udc_dwc3_in_vid_settle_to++;
+		udc_dwc3_in_vid_settle_sts = sts;
+	}
+	dt = k_cycle_get_32() - t0;
+	if (dt > udc_dwc3_in_vid_settle_max) {
+		udc_dwc3_in_vid_settle_max = dt;
+	}
+	udc_dwc3_in_vid_mask = 1U;
+	/* rs17c: park time counts from the FSM park, not the HALT write
+	 * (settle_max showed the FSM runs the frame out first, up to 15 ms). */
+	udc_dwc3_in_vid_park_t0 = k_cycle_get_32();
+	udc_dwc3_in_vid_park_n++;
+	return 1;
+}
+
+UDC_DWC3_XIP static void udc_dwc3_in_vid_unpause(bool ring)
+{
+	const mm_reg_t reg = UDC_DWC3_IN_HOLD_BASE + UDC_DWC3_IN_HOLD_STS;
+
+	if (udc_dwc3_in_vid_mask != 0U) {
+		const uint32_t sts = sys_read32(reg);
+		const uint32_t us = (uint32_t)((uint64_t)(k_cycle_get_32() -
+						       udc_dwc3_in_vid_park_t0) *
+					       1000000U / sys_clock_hw_cycles_per_sec());
+
+		sys_write32(sts & ~UDC_DWC3_IN_HOLD_HALT, reg);
+		udc_dwc3_in_vid_park_sum_us += us;
+		if (us > udc_dwc3_in_vid_park_max_us) {
+			udc_dwc3_in_vid_park_max_us = us;
+		}
+		if (ring) {
+			static const uint16_t lim[5] = {100U, 150U, 200U, 300U, 500U};
+			int b = 0;
+
+			while (b < 5 && us >= lim[b]) {
+				b++;
+			}
+			udc_dwc3_in_vid_rpark_h[b]++;
+			udc_dwc3_in_vid_rpark_sum_us += us;
+			if (us > udc_dwc3_in_vid_rpark_max_us) {
+				udc_dwc3_in_vid_rpark_max_us = us;
+			}
+		}
+	}
+	udc_dwc3_in_vid_mask = 0U;
+}
+
+static int udc_dwc3_in_vid_idx(uint8_t addr)
+{
+	if (addr == 0x84U) {
+		return 0;
+	}
+	if (addr == 0x82U) {
+		return 1;
+	}
+	if (addr == UDC_DWC3_IN_HOLD_CPU) {
+		return UDC_DWC3_IN_HOLD_CPU_IDX;
+	}
+	return -1;
+}
+
+UDC_DWC3_XIP static void udc_dwc3_in_vid_acq(uint8_t addr)
+{
+	const int idx = udc_dwc3_in_vid_idx(addr);
+	unsigned int key;
+	int rc;
+
+	if (idx < 0) {
+		return;
+	}
+	key = irq_lock();
+	if ((udc_dwc3_in_vid_owned & BIT(idx)) != 0U) {
+		irq_unlock(key);
+		return;
+	}
+	/* Claim first; the park wait can now be ms long (blanking), so it
+	 * runs with IRQs on. A second owner pausing in parallel only
+	 * rewrites HALT. */
+	udc_dwc3_in_vid_owned |= (uint8_t)BIT(idx);
+	udc_dwc3_in_vid_since[idx] = k_uptime_get_32();
+	udc_dwc3_in_vid_acq_n[idx]++;
+	irq_unlock(key);
+
+	rc = udc_dwc3_in_vid_pause();
+
+	key = irq_lock();
+	if (rc == 1 && (udc_dwc3_in_vid_owned & BIT(idx)) != 0U) {
+		udc_dwc3_in_vid_acked |= (uint8_t)BIT(idx);
+	} else if (rc == 1 && udc_dwc3_in_vid_owned == 0U) {
+		/* Released underneath us: do not leave HALT set. */
+		udc_dwc3_in_vid_unpause(false);
+	}
+	irq_unlock(key);
+}
+
+UDC_DWC3_XIP static void udc_dwc3_in_vid_rel(uint8_t addr)
+{
+	const int idx = udc_dwc3_in_vid_idx(addr);
+	unsigned int key;
+	bool clear;
+
+	if (idx < 0) {
+		return;
+	}
+	key = irq_lock();
+	if ((udc_dwc3_in_vid_owned & BIT(idx)) == 0U) {
+		irq_unlock(key);
+		return;
+	}
+	udc_dwc3_in_vid_owned &= (uint8_t)~BIT(idx);
+	clear = (udc_dwc3_in_vid_owned == 0U) &&
+		(udc_dwc3_in_vid_acked != 0U);
+	if (udc_dwc3_in_vid_owned == 0U) {
+		udc_dwc3_in_vid_acked = 0U;
+	}
+	if (clear) {
+		udc_dwc3_in_vid_unpause(idx != UDC_DWC3_IN_HOLD_CPU_IDX);
+	}
+	irq_unlock(key);
+}
+
+/*
+ * Port-open hold. rs13/rs14 traces (identical doorbell deltas in both):
+ * the video doorbells stop in the ~0.3 ms after the status stage of the
+ * open's SET_CONTROL_LINE_STATE(DTR|RTS) completes, before the next
+ * SETUP (21 22 01). That is where the Linux cdc-acm open submits its 16
+ * bulk IN read URBs on 0x82, i.e. the host restarts polling a second SS
+ * bulk IN pipe while 0x85 is bursting. No CPU DepCmd but EP0 is in
+ * flight, hold en=0, SS park mode off (rs14) — none of that mattered.
+ * Keep the uvcmanager halted from the first 21 22 / 21 20 SETUP until
+ * UDC_DWC3_OPEN_HOLD_MS after the last one, so the host's restart poll
+ * and the remaining EP0 traffic meet an idle 0x85. Released from the
+ * 2 ms event-thread tick. Cost ~20 ms of video per port open.
+ */
+#define UDC_DWC3_OPEN_HOLD_MS 10U
+uint32_t udc_dwc3_open_hold_n;
+uint32_t udc_dwc3_open_hold_max_ms;
+uint32_t udc_dwc3_open_hold_sum_ms;
+static uint32_t udc_dwc3_open_hold_t0;
+static uint32_t udc_dwc3_open_hold_start;
+static bool udc_dwc3_open_hold_on;
+static bool udc_dwc3_open_hold_dtr_prev;
+
+UDC_DWC3_XIP static void udc_dwc3_open_hold_dtr(uint8_t dtr)
+{
+	const bool rise = (dtr != 0U) && !udc_dwc3_open_hold_dtr_prev;
+
+	udc_dwc3_open_hold_dtr_prev = (dtr != 0U);
+	if (!rise) {
+		return;
+	}
+	if (!udc_dwc3_open_hold_on) {
+		udc_dwc3_open_hold_on = true;
+		udc_dwc3_open_hold_start = k_uptime_get_32();
+		udc_dwc3_open_hold_n++;
+		udc_dwc3_in_vid_acq(UDC_DWC3_IN_HOLD_CPU);
+	}
+	/* rs17b: stamp AFTER the park is in place. rs17 stamped before a
+	 * 24 ms align wait, the timer had expired by the time HALT landed,
+	 * and the tick released the park as the status stage was armed:
+	 * the URB submission ran unprotected and the 10th open wedged. */
+	udc_dwc3_open_hold_t0 = k_uptime_get_32();
+}
+
+UDC_DWC3_XIP static void udc_dwc3_open_hold_tick(void)
+{
+	uint32_t now, held;
+
+	if (!udc_dwc3_open_hold_on) {
+		return;
+	}
+	now = k_uptime_get_32();
+	if ((now - udc_dwc3_open_hold_t0) < UDC_DWC3_OPEN_HOLD_MS) {
+		return;
+	}
+	udc_dwc3_open_hold_on = false;
+	udc_dwc3_in_vid_rel(UDC_DWC3_IN_HOLD_CPU);
+	held = now - udc_dwc3_open_hold_start;
+	udc_dwc3_open_hold_sum_ms += held;
+	if (held > udc_dwc3_open_hold_max_ms) {
+		udc_dwc3_open_hold_max_ms = held;
+	}
+}
+
+/*
+ * CPU mailbox DepCmd hold. Pause before the post (FSM parked + mailbox
+ * counter still), keep the park UDC_DWC3_CPU_HOLD_US past DONE so the
+ * core's TRB fetch for that command does not meet a video UpdateXfer,
+ * then release. Depth-counted: EP0 and a 0x01 re-arm can overlap.
+ * udc_dwc3_cpu_hold_us is a plain global: `devmem <addr> 32 <us>`.
+ */
+uint32_t udc_dwc3_cpu_hold_us = 200U;
+uint32_t udc_dwc3_cpu_hold_n;
+uint32_t udc_dwc3_cpu_hold_max;
+uint32_t udc_dwc3_cpu_hold_to;
+static uint32_t udc_dwc3_cpu_hold_t0;
+static uint8_t udc_dwc3_cpu_hold_depth;
+
+UDC_DWC3_XIP static void udc_dwc3_cpu_vid_acq(void)
+{
+	const unsigned int key = irq_lock();
+
+	if (udc_dwc3_cpu_hold_depth++ == 0U) {
+		udc_dwc3_cpu_hold_t0 = k_cycle_get_32();
+		udc_dwc3_in_vid_acq(UDC_DWC3_IN_HOLD_CPU);
+	}
+	irq_unlock(key);
+}
+
+UDC_DWC3_XIP static void udc_dwc3_cpu_vid_rel(void)
+{
+	unsigned int key = irq_lock();
+	bool engaged;
+	uint32_t dt;
+
+	if (udc_dwc3_cpu_hold_depth == 0U || --udc_dwc3_cpu_hold_depth != 0U) {
+		irq_unlock(key);
+		return;
+	}
+	engaged = (udc_dwc3_in_vid_acked & BIT(UDC_DWC3_IN_HOLD_CPU_IDX)) != 0U;
+	irq_unlock(key);
+
+	if (engaged) {
+		const uint32_t hz = sys_clock_hw_cycles_per_sec();
+
+		/* Parked (not mid-sequence) and no doorbell for hold_us
+		 * after DONE. A sequence in flight at DONE rings once
+		 * (haltReq cannot stop it) and then parks; wait that out. */
+		if (udc_dwc3_in_vid_wait_parked(
+			    (uint32_t)((uint64_t)hz * udc_dwc3_cpu_hold_us / 1000000U),
+			    (uint32_t)((uint64_t)hz * udc_dwc3_in_hold_cap_us / 1000000U),
+			    NULL) != 0) {
+			udc_dwc3_cpu_hold_to++;
+		}
+		udc_dwc3_cpu_hold_n++;
+	}
+	udc_dwc3_in_vid_rel(UDC_DWC3_IN_HOLD_CPU);
+	dt = k_cycle_get_32() - udc_dwc3_cpu_hold_t0;
+	if (engaged && dt > udc_dwc3_cpu_hold_max) {
+		udc_dwc3_cpu_hold_max = dt;
+	}
+}
+
+/* Drop a hold the host has not finished. Releasing before the IN lands
+ * is what sticks HWO, so this is only the backstop. */
+UDC_DWC3_XIP static void udc_dwc3_in_restart_bulk(const struct device *const dev, int idx)
+{
+	const uint8_t addr = (idx == 0) ? 0x84U : 0x82U;
+	uint32_t now;
+
+	if (idx > 1 || (udc_dwc3_in_vid_owned & BIT(idx)) == 0U) {
+		return;
+	}
+	now = k_uptime_get_32();
+	if ((now - udc_dwc3_in_vid_since[idx]) < 500U) {
+		return;
+	}
+	printk("IN-HOLD drop ep=0x%02x age=%u\n",
+	       addr, now - udc_dwc3_in_vid_since[idx]);
+	udc_dwc3_park_snapshot(dev, "hold");
+	udc_dwc3_in_vid_rel(addr);
+#if 0
+	static uint32_t since[2];
+	static uint32_t held[2];
+	static uint8_t tries[2];
+	static bool fired[2];
+	/* Set when the re-post left the ring idle. kicked is then 0, so
+	 * the active-bit gate would drop a buffer the host still has not
+	 * taken. */
+	static bool idle_arm[2];
+	const uint8_t addr = (idx == 0) ? 0x84U : 0x82U;
+	struct udc_dwc3_ep_data *const ep =
+		(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, addr);
+	const mm_reg_t epb = USB_ENGINE_BASE + USB_ENGINE_BULK_BASE +
+			     (uint32_t)idx * USB_ENGINE_BULK_WINDOW;
+	volatile struct udc_dwc3_trb *trb;
+	uint32_t st;
+	uint32_t data;
+	uint32_t now;
+	uint32_t live;
+	uint32_t rsc;
+	uint32_t reg;
+	unsigned int key;
+	int paused;
+
+	if (idx > 1 || ep == NULL || ep->trb_buf == NULL ||
+	    !udc_dwc3_engine_enabled()) {
+		return;
+	}
+	trb = &ep->trb_buf[ep->tail];
+	data = (ep->net_buf[ep->tail] != NULL) ?
+	       (uint32_t)(uintptr_t)ep->net_buf[ep->tail]->data : 0U;
+	st = sys_read32(epb + USB_ENGINE_EP_STATE);
+	now = k_uptime_get_32();
+	{
+		const bool ring_stuck = udc_dwc3_engine_kicked(addr) != 0U &&
+			(st & USB_ENGINE_EP_STATE_ACTIVE) != 0U;
+
+		if (data == 0U || (trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U ||
+		    (!ring_stuck && !idle_arm[idx])) {
+			since[idx] = 0U;
+			held[idx] = 0U;
+			fired[idx] = false;
+			tries[idx] = 0U;
+			idle_arm[idx] = false;
+			return;
+		}
+	}
+	if (held[idx] != data) {
+		held[idx] = data;
+		since[idx] = now;
+		fired[idx] = false;
+		tries[idx] = 0U;
+		idle_arm[idx] = false;
+		return;
+	}
+	if (fired[idx] || (now - since[idx]) < UDC_DWC3_IN_RESTART_MS) {
+		return;
+	}
+	if (tries[idx] >= 8U) {
+		fired[idx] = true;
+		return;
+	}
+	tries[idx]++;
+
+	live = sys_read32(DEVICE_MMIO_NAMED_GET(dev, base) +
+			  UDC_DWC3_DEPCMD(ep->epn));
+	rsc = FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, live);
+	if (rsc == 0U) {
+		rsc = ep->xferrscidx;
+	}
+	/* The EndXfer completion is not the host taking the buffer. */
+	udc_dwc3_restart_skip_ep = addr;
+	udc_dwc3_engine_restart_arm(addr);
+	key = irq_lock();
+	paused = udc_dwc3_uvcmgr_pause_doorbell();
+	irq_unlock(key);
+	reg = udc_dwc3_depcmd_reg(dev, UDC_DWC3_DEPCMD(ep->epn),
+				  FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, rsc) |
+				  UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+				  UDC_DWC3_DEPCMD_DEPENDXFER,
+				  true);
+	k_busy_wait(200);
+	udc_dwc3_engine_poll(dev, NULL);
+	st = sys_read32(epb + USB_ENGINE_EP_STATE);
+	/* EVT_OWN is off, so the ring does not see this CPU EndXfer.
+	 * Inject the XferComplete it is waiting on. StartXfer on top of
+	 * WAIT_EVT leaves lastCmd 7 and the host never takes the IN. */
+	if (!udc_dwc3_engine_restart_ate(addr) &&
+	    (st & USB_ENGINE_EP_STATE_ACTIVE) != 0U) {
+		sys_write32(UDC_DWC3_DEPEVT_XFERCOMPLETE(ep->epn),
+			    USB_ENGINE_BASE + USB_ENGINE_EVT_INJ);
+		k_busy_wait(50);
+		udc_dwc3_engine_poll(dev, NULL);
+		st = sys_read32(epb + USB_ENGINE_EP_STATE);
+	}
+#if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
+	{
+		uint32_t stolen;
+		unsigned int skey;
+		int n;
+
+		for (n = 0; n < 8; n++) {
+			skey = irq_lock();
+			if (!iebm_swq_get(&stolen)) {
+				irq_unlock(skey);
+				break;
+			}
+			irq_unlock(skey);
+			udc_dwc3_handle_event(dev, stolen);
+		}
+	}
+#endif
+	if (udc_dwc3_restart_skip_ep == addr) {
+		/* No EndXfer event arrived. Do not eat the host completion. */
+		udc_dwc3_restart_skip_ep = 0U;
+	}
+	if (udc_dwc3_engine_restart_ate(addr) &&
+	    (st & USB_ENGINE_EP_STATE_ACTIVE) == 0U &&
+	    ep->head != ep->tail) {
+		/* slotLoad onto the stuck slot. XFER_IDX is written 0 and
+		 * the End command clears `started`, so the following post
+		 * is a ring StartXfer of that TRB, then wrSlot advances
+		 * back to head. */
+		(void)udc_dwc3_engine_restart_resync(dev, addr,
+			(uint32_t)(uintptr_t)&ep->trb_buf[0],
+			(uint8_t)(CONFIG_UDC_DWC3_TRB_NUM - 1U),
+			(uint8_t)ep->tail);
+		st = sys_read32(epb + USB_ENGINE_EP_STATE);
+	}
+	udc_dwc3_engine_restart_disarm(addr);
+	{
+		uint32_t started = 0U;
+		int post = -1;
+
+		if ((st & USB_ENGINE_EP_STATE_ACTIVE) == 0U &&
+		    ep->net_buf[ep->tail] != NULL) {
+			struct net_buf *const buf = ep->net_buf[ep->tail];
+			const uint32_t old_ctrl = trb->ctrl;
+			uint32_t post_ctrl = USB_ENGINE_DESC_CTRL_IOC;
+
+			if ((old_ctrl & UDC_DWC3_TRB_CTRL_CHN) != 0U) {
+				post_ctrl |= USB_ENGINE_DESC_CTRL_CHN;
+			}
+			if (((old_ctrl >> 4) & 0x3fU) == 9U) {
+				post_ctrl |= USB_ENGINE_DESC_CTRL_ZLP;
+			}
+			/* Ring overwrites dword3. SW_PENDING keeps a
+			 * completion that lands first from retiring it. */
+			trb->ctrl = UDC_DWC3_TRB_CTRL_SW_PENDING;
+			udc_dwc3_trb_fence(trb);
+			post = udc_dwc3_engine_post_slot(addr, buf, post_ctrl);
+			k_busy_wait(200);
+			udc_dwc3_engine_poll(dev, NULL);
+			st = sys_read32(epb + USB_ENGINE_EP_STATE);
+			started = sys_read32(DEVICE_MMIO_NAMED_GET(dev, base) +
+					     UDC_DWC3_DEPCMD(ep->epn));
+			if (post == 0 &&
+			    (started & UDC_DWC3_DEPCMD_STATUS_MASK) ==
+			    UDC_DWC3_DEPCMD_STATUS_OK &&
+			    (started & 0xfU) == UDC_DWC3_DEPCMD_DEPSTRTXFER) {
+				ep->xferrscidx =
+					FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
+						  started);
+				ep->xfer_active = true;
+				sys_write32(ep->xferrscidx,
+					    epb + USB_ENGINE_EP_XFER_IDX);
+			}
+			/* Ring went active: the normal stuck gate watches
+			 * it. Still idle: keep the HWO buffer armed for
+			 * another pass instead of dropping it. */
+			idle_arm[idx] =
+				(st & USB_ENGINE_EP_STATE_ACTIVE) == 0U;
+			since[idx] = k_uptime_get_32();
+		} else {
+			/* Still in WAIT_EVT. Another pass after the hold. */
+			since[idx] = now;
+		}
+		printk("IN-RESTART ep=0x%02x old=%u end=0x%08x start=0x%08x st=0x%x ate=%u post=%d trb=0x%08x\n",
+		       addr, rsc, reg, started, st,
+		       udc_dwc3_engine_restart_ate(addr) ? 1U : 0U,
+		       post, LO32((uintptr_t)trb));
+	}
+	key = irq_lock();
+	udc_dwc3_uvcmgr_resume_doorbell(paused == 1);
+	irq_unlock(key);
+#endif
+}
+
+UDC_DWC3_XIP static void udc_dwc3_in_restart_video(const struct device *const dev)
+{
+	static uint32_t seen;
+	static uint32_t since;
+	static bool fired;
+	struct udc_dwc3_ep_data *const ep =
+		(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, 0x85U);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t db;
+	uint32_t now;
+	uint32_t trb;
+	uint32_t rsc;
+	uint32_t reg;
+	uint32_t started;
+	unsigned int key;
+	int paused;
+
+	if (ep == NULL || !udc_dwc3_engine_enabled() ||
+	    (udc_dwc3_engine_status() & USB_ENGINE_STAT_VID_LIVE) == 0U) {
+		seen = 0U;
+		since = 0U;
+		fired = false;
+		return;
+	}
+	db = sys_read32(USB_ENGINE_BASE + USB_ENGINE_VID_DB_COUNT);
+	now = k_uptime_get_32();
+	if (db == 0U || db != seen) {
+		seen = db;
+		since = now;
+		fired = false;
+		return;
+	}
+	if ((now - since) < UDC_DWC3_VID_RESTART_MS) {
+		return;
+	}
+	if (!fired) {
+		udc_dwc3_park_snapshot(dev, "vid");
+	}
+	trb = sys_read32(base + UDC_DWC3_DEPCMDPAR1(ep->epn));
+	if (trb == 0U) {
+		fired = true;
+		return;
+	}
+	if (fired) {
+		return;
+	}
+	fired = true;
+	rsc = FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
+			sys_read32(base + UDC_DWC3_DEPCMD(ep->epn)));
+	key = irq_lock();
+	paused = udc_dwc3_uvcmgr_pause_doorbell();
+	irq_unlock(key);
+	reg = udc_dwc3_depcmd_reg(dev, UDC_DWC3_DEPCMD(ep->epn),
+				  FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, rsc) |
+				  UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+				  UDC_DWC3_DEPCMD_DEPENDXFER,
+				  true);
+	if (trb >= 0x80000000U) {
+		*(volatile uint32_t *)(uintptr_t)(trb + 12U) |= UDC_DWC3_TRB_CTRL_HWO;
+	}
+	started = udc_dwc3_restart_start(dev, ep, trb);
+	printk("IN-RESTART ep=0x85 old=%u trb=0x%08x end=0x%08x start=0x%08x db=%u\n",
+	       rsc, trb, reg, started, db);
+	key = irq_lock();
+	udc_dwc3_uvcmgr_resume_doorbell(paused == 1);
+	irq_unlock(key);
+}
+
+UDC_DWC3_XIP static void udc_dwc3_in_restart_tick(const struct device *const dev)
+{
+	udc_dwc3_open_hold_tick();
+	udc_dwc3_in_restart_bulk(dev, 1);
+	udc_dwc3_in_restart_bulk(dev, 0);
+	udc_dwc3_in_restart_video(dev);
+}
+#endif /* CONFIG_UDC_DWC3_USB_ENGINE */
 
 static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -5244,6 +6678,9 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 #if defined(CONFIG_UDC_DWC3_IN_PARK_RECOVER)
 		udc_dwc3_in_recover_tick(dev);
 #endif
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+		udc_dwc3_in_restart_tick(dev);
+#endif
 #if defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
 		udc_dwc3_out_stall_refresh_tick(dev);
 #endif
@@ -5278,16 +6715,19 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 		}
 
 		/*
-		 * Backstop: if a wakeup is still lost (mask set, ring
-		 * pending, sem = 0) drain shortly instead of wedging.
+		 * Backstop: sem timed out and the ring still has events.
+		 * Drain on the next loop pass even when the interrupt mask
+		 * is already clear. A lost wakeup in that state used to be
+		 * ignored, and the controller then stopped posting.
 		 */
 #if defined(CONFIG_UDC_DWC3_EVENT_BACKSTOP)
 		ret = k_sem_take(&priv->evt_sem,
 				 udc_dwc3_evt_fast ? K_MSEC(2) : K_MSEC(100));
 		if (ret == -EAGAIN && !udc_dwc3_engine_evt_own() &&
-		    sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0 &&
-		    (sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) & UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK)) {
-			LOG_WRN("event ring serviced by timeout backstop (lost wakeup)");
+		    sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) > 0U) {
+			LOG_WRN("event ring serviced by timeout backstop (lost wakeup%s)",
+				(sys_read32(base + UDC_DWC3_GEVNTSIZ(0)) &
+				 UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK) ? "" : ", mask clear");
 		}
 #else
 		ret = k_sem_take(&priv->evt_sem, K_FOREVER);
@@ -5296,11 +6736,64 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/*
+ * rs17b: release the ACM/RAW IN ring park from the ISR, on the hardware
+ * completion DEPEVT (XferComplete/XferInProgress on phys 5 = 0x82 or
+ * phys 9 = 0x84), instead of waiting for the event thread to reach the
+ * engine completion (mode 1, ~1.7 ms, 2 ms backstop jitter). By the time
+ * the core posts that event the TRB has been fetched and sent, so the
+ * lost-doorbell hazard the park guards is over. Every park that lasts
+ * longer than the manager's input buffering costs a frame (rs16c), so
+ * the shorter the park the more of them fall under that threshold.
+ * Peek only: the thread still consumes the events. Knob udc_dwc3_ring_rel_isr.
+ */
+uint32_t udc_dwc3_ring_rel_isr = 0U; /* rs17f: OFF, same reason as ring_sync_us (DEPEVT = data fetched, not sent). */
+uint32_t udc_dwc3_ring_rel_isr_n;
+
+__attribute__((noinline, section(".text")))
+static void udc_dwc3_isr_ring_rel(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t n, idx;
+
+	if (udc_dwc3_ring_rel_isr == 0U || udc_dwc3_engine_evt_own()) {
+		return;
+	}
+	n = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) / sizeof(uint32_t);
+	if (n > 16U) {
+		n = 16U;
+	}
+	idx = priv->evt_next;
+	while (n-- != 0U) {
+		const uint32_t raw = cfg->evt_buf[idx];
+		const uint32_t evt = raw & UDC_DWC3_EVT_MASK;
+
+		if (evt == UDC_DWC3_DEPEVT_XFERCOMPLETE(5) ||
+		    evt == UDC_DWC3_DEPEVT_XFERINPROGRESS(5)) {
+			udc_dwc3_in_vid_rel(0x82U);
+			udc_dwc3_ring_rel_isr_n++;
+		} else if (evt == UDC_DWC3_DEPEVT_XFERCOMPLETE(9) ||
+			   evt == UDC_DWC3_DEPEVT_XFERINPROGRESS(9)) {
+			udc_dwc3_in_vid_rel(0x84U);
+			udc_dwc3_ring_rel_isr_n++;
+		}
+		idx = (idx + 1U) % CONFIG_UDC_DWC3_EVENTS_NUM;
+	}
+}
+#endif
+
 __ramfunc static void udc_dwc3_irq_handler(void *const ptr)
 {
 	const struct device *const dev = ptr;
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	udc_dwc3_isr_ring_rel(dev);
+#endif
 
 #if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
 	/*
