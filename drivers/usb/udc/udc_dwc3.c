@@ -1352,6 +1352,8 @@ struct udc_dwc3_data {
     uint32_t ctrl_quiet_t0;     /* cycle stamp of the last SETUP retired */
     bool ctrl_quiet_logged;     /* this quiet period already reported */
     uint32_t ctrl_start_fail;   /* Start Transfer commands rejected */
+    /* Stage buffers of abandoned transfers returned in the Setup phase. */
+    uint32_t ctrl_stale_returned;
     /* The control endpoint and stage the watchdog is guarding. */
     struct udc_dwc3_ep_data *watchdog_ep;
     uint32_t watchdog_type;
@@ -3834,12 +3836,13 @@ static void udc_dwc3_ctrl_ep_recover(const struct device *const dev);
 
 /*
  * Return every buffer queued on this control endpoint that belongs to the
- * transfer being abandoned, stopping at a SETUP.
+ * transfer being abandoned, stopping at a SETUP. Returns how many.
  */
-static UDC_DWC3_COLD void udc_dwc3_ctrl_drain_abandoned(const struct device *const dev,
+static UDC_DWC3_COLD uint32_t udc_dwc3_ctrl_drain_abandoned(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data)
 {
     struct net_buf *buf;
+    uint32_t n = 0U;
 
     while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
         if (udc_get_buf_info(buf)->setup) {
@@ -3852,7 +3855,10 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_drain_abandoned(const struct device *con
         }
 
         udc_submit_ep_event(dev, buf, -ECONNRESET);
+        n++;
     }
+
+    return n;
 }
 
 /*
@@ -3894,6 +3900,27 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
     if (priv->ctrl_state != UDC_DWC3_CTRL_IDLE || priv->ctrl_recovering ||
         out0->xfer_state != UDC_DWC3_EP_IDLE) {
         return;
+    }
+
+    /*
+     * In the Setup phase no transfer is live, so a stage buffer at the head of
+     * either control queue belongs to a transfer already abandoned: the state
+     * leaves IDLE before a SETUP reaches the stack, and the stack queues a
+     * request's stage buffers before its next SETUP buffer. The stack can queue
+     * them after the driver has taken that transfer back to Step 1 (its thread
+     * may be preempted between enqueues), and left in place they would hold the
+     * gate below shut for good. Return them - Figure 4-2 goes straight back to
+     * the Setup TRB after an abandoned transfer.
+     */
+    {
+        struct udc_dwc3_ep_data *const in0 = &cfg->ep_data_in[0];
+        const struct net_buf *const oh = udc_buf_peek(&out0->cfg);
+        const struct net_buf *const ih = udc_buf_peek(&in0->cfg);
+
+        if ((oh != NULL && !udc_get_buf_info(oh)->setup) || ih != NULL) {
+            priv->ctrl_stale_returned += udc_dwc3_ctrl_drain_abandoned(dev, out0) +
+                             udc_dwc3_ctrl_drain_abandoned(dev, in0);
+        }
     }
 
     /*
@@ -4393,7 +4420,7 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_recover_continue(const struct device *co
             udc_dwc3_ep_state_reset(h);
         }
 
-        udc_dwc3_ctrl_drain_abandoned(dev, h);
+        (void)udc_dwc3_ctrl_drain_abandoned(dev, h);
         udc_ep_set_busy(&h->cfg, false);
     }
 
@@ -7272,6 +7299,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             _P(priv->evt_rearm, " ra%u", priv->evt_rearm);
             _P(priv->evt_kick, " kk%u", priv->evt_kick);
             _P(priv->ctrl_setup_pending, " sp%u", priv->ctrl_setup_pending);
+            _P(priv->ctrl_stale_returned, " sr%u", priv->ctrl_stale_returned);
             _P(priv->ctrl_stall_issued, " st%u", priv->ctrl_stall_issued);
             _P(priv->ep_halts, " eh%u", priv->ep_halts);
             _P(priv->trb_stomp, " sm%u", priv->trb_stomp);
