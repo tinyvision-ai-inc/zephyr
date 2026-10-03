@@ -638,6 +638,7 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DCTL_ACCEPTU1ENA               BIT(9)
 #define UDC_DWC3_DCTL_ULSTCHNGREQ_MASK              GENMASK(8, 5)
 #define UDC_DWC3_DCTL_ULSTCHNGREQ_REMOTEWAKEUP          (0x8 << 5)
+#define UDC_DWC3_DCTL_ULSTCHNGREQ_RXDETECT              (0x5 << 5)
 #define UDC_DWC3_DCTL_TSTCTL_MASK               GENMASK(4, 1)
 
 /* USB Device Event Enable Register */
@@ -1406,8 +1407,14 @@ struct udc_dwc3_data {
     bool ctrl_recover_stall;
     uint32_t ctrl_recoveries;   /* returns to Step 1 by the error path */
     uint32_t ctrl_evt_ignored;  /* EP0/EP1 events that were not a Figure 4-2 edge */
-    /* SPEC 4.1.10: a link state change into U3 was seen and not yet left. */
+    /*
+     * SPEC 4.1.10: a link state change into U3 was seen and not yet left, and
+     * the physical endpoints that held an active transfer at that moment.
+     */
     bool link_in_u3;
+    uint32_t u3_active_eps;
+    /* SPEC 3.3.2: ErrticErr seen; the heartbeat resets the controller. */
+    bool erratic_reset_pending;
     uint32_t u3_exit_nrdy;      /* Set Endpoint NRDY commands issued on U3 exit */
     /*
      * The last transition, kept so a wedge dump can say how the machine got
@@ -1605,6 +1612,37 @@ static int udc_dwc3_shutdown(const struct device *const dev)
     }
 
     return 0;
+}
+
+
+/*
+ * DCTL.ULSTCHNGREQ is write-only, and every value written to it is a link state
+ * request: "If software is updating other fields of the DCTL register and not
+ * intending to force any link state change, then it must write a 0 to this
+ * field." (DCTL, 3.30b). Every DCTL write goes through here.
+ */
+static UDC_DWC3_COLD void udc_dwc3_dctl_write(const mm_reg_t base, const uint32_t value)
+{
+    sys_write32(value & ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK, base + UDC_DWC3_DCTL);
+}
+
+static UDC_DWC3_COLD void udc_dwc3_dctl_update(const mm_reg_t base, const uint32_t clr,
+                         const uint32_t set)
+{
+    udc_dwc3_dctl_write(base, (sys_read32(base + UDC_DWC3_DCTL) & ~clr) | set);
+}
+
+/*
+ * The one intended link state request. "If software wants to issue the same
+ * request back-to-back, it must write a 0 to this field between the two
+ * requests" - so 0 first, then the request.
+ */
+static UDC_DWC3_COLD void udc_dwc3_dctl_link_request(const mm_reg_t base, const uint32_t req)
+{
+    const uint32_t v = sys_read32(base + UDC_DWC3_DCTL) & ~UDC_DWC3_DCTL_ULSTCHNGREQ_MASK;
+
+    sys_write32(v, base + UDC_DWC3_DCTL);
+    sys_write32(v | (req & UDC_DWC3_DCTL_ULSTCHNGREQ_MASK), base + UDC_DWC3_DCTL);
 }
 
 /*
@@ -4500,7 +4538,7 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
      */
     reg = UDC_DWC3_DCTL_CSFTRST;
     reg |= FIELD_PREP(UDC_DWC3_DCTL_LPM_NYET_THRES_MASK, 15);
-    sys_write32(reg, base + UDC_DWC3_DCTL);
+    udc_dwc3_dctl_write(base, reg);
 
     /*
      * Bounded, in two phases, so a controller that never clears CSftRst
@@ -4579,6 +4617,22 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
         sys_read32(base + UDC_DWC3_GUSB2PHYCFG),
         sys_read32(base + UDC_DWC3_GUSB3PIPECTL),
         sys_read32(base + UDC_DWC3_GTXTHRCFG));
+
+    /*
+     * The build parameters behind the U3/P3 settings the guide leaves to the
+     * integration: GHWPARAMS0[1:0] mode (0 device, 1 host, 2 DRD - for DRD,
+     * GUSB3PIPECTL.SuspendEnable is the application's to set after init),
+     * GHWPARAMS1[25:24] power options (2 = hibernation), and GCTL for
+     * PwrDnScale (suspend_clk periods per 16 kHz tick).
+     */
+    {
+        const uint32_t hw0 = sys_read32(base + UDC_DWC3_GHWPARAMS0);
+        const uint32_t hw1 = sys_read32(base + UDC_DWC3_GHWPARAMS1);
+
+        LOG_INF("HW params: GHWPARAMS0=0x%08x (mode %u) GHWPARAMS1=0x%08x "
+            "(pwropt %u) GCTL=0x%08x", hw0, hw0 & 0x3U, hw1, (hw1 >> 24) & 0x3U,
+            sys_read32(base + UDC_DWC3_GCTL));
+    }
 
     sys_write32(UDC_DWC3_GSBUSCFG0_INCR16BRSTENA |
             UDC_DWC3_GSBUSCFG0_INCR8BRSTENA |
@@ -4819,7 +4873,10 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
      * all, so they are not set either.
      */
     reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
-    reg |= UDC_DWC3_DEVTEN_HIBERNATIONREQEVTEN;
+    /*
+     * HibernationReqEvtEn stays off: this driver implements no hibernation, and
+     * the event obliges software "to start the hibernation process" (3.3.2).
+     */
     reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
     /*
      * Link state change events are ENABLED.  With USB Reset and Connection Done
@@ -4855,6 +4912,7 @@ static UDC_DWC3_COLD void udc_dwc3_on_usb_reset(const struct device *const dev)
     priv->first_ep = 0U;
     /* A reset ends any U3 session: 4.1.2 applies, not 4.1.10. */
     priv->link_in_u3 = false;
+    priv->u3_active_eps = 0U;
 
     /* SPEC 3.30b 4.1.2, with the same primitives every other path uses. */
     udc_dwc3_bus_reset_state(dev);
@@ -5037,8 +5095,62 @@ static void udc_dwc3_ctrl_data_done(const struct device *const dev,
  * completed either way (the reference driver does the same): the request was
  * served, only the host's ACK of it is in doubt.
  */
+/*
+ * DCTL U1/U2 controls, from the request whose status stage just completed:
+ * AcceptU1/U2Ena - "Software sets this bit after receiving a SetConfiguration
+ * command"; InitU1/U2Ena - "Software sets this bit after receiving
+ * SetFeature(U1/U2_ENABLE), and clears this bit when ClearFeature(U1/U2_ENABLE)
+ * is received". Hardware clears all four on USB reset. Applied only once the
+ * stack has accepted the request (its status stage completed normally).
+ */
+static UDC_DWC3_COLD void udc_dwc3_ctrl_apply_link_pm(const struct device *const dev)
+{
+    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const struct usb_setup_packet *const setup = &priv->setup_packet;
+    const uint16_t value = sys_le16_to_cpu(setup->wValue);
+    const bool ss = (sys_read32(base + UDC_DWC3_DSTS) & UDC_DWC3_DSTS_CONNECTSPD_MASK) ==
+            UDC_DWC3_DSTS_CONNECTSPD_SS;
+    uint32_t bit;
+
+    if (!ss || setup->RequestType.type != USB_REQTYPE_TYPE_STANDARD ||
+        setup->RequestType.recipient != USB_REQTYPE_RECIPIENT_DEVICE) {
+        return;
+    }
+
+    switch (setup->bRequest) {
+    case USB_SREQ_SET_CONFIGURATION:
+        if (value != 0U) {
+            udc_dwc3_dctl_update(base, 0U, UDC_DWC3_DCTL_ACCEPTU1ENA |
+                                   UDC_DWC3_DCTL_ACCEPTU2ENA);
+        } else {
+            udc_dwc3_dctl_update(base, UDC_DWC3_DCTL_ACCEPTU1ENA | UDC_DWC3_DCTL_INITU1ENA |
+                           UDC_DWC3_DCTL_ACCEPTU2ENA | UDC_DWC3_DCTL_INITU2ENA, 0U);
+        }
+        break;
+    case USB_SREQ_SET_FEATURE:
+    case USB_SREQ_CLEAR_FEATURE:
+        if (value == USB_SFS_U1_ENABLE) {
+            bit = UDC_DWC3_DCTL_INITU1ENA;
+        } else if (value == USB_SFS_U2_ENABLE) {
+            bit = UDC_DWC3_DCTL_INITU2ENA;
+        } else {
+            break;
+        }
+        if (setup->bRequest == USB_SREQ_SET_FEATURE) {
+            udc_dwc3_dctl_update(base, 0U, bit);
+        } else {
+            udc_dwc3_dctl_update(base, bit, 0U);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void udc_dwc3_ctrl_status_done(const struct device *const dev,
-                      struct udc_dwc3_ep_data *const h)
+                      struct udc_dwc3_ep_data *const h,
+                      const uint32_t sts)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
     struct net_buf *const buf = udc_buf_get(&h->cfg);
@@ -5049,6 +5161,9 @@ static void udc_dwc3_ctrl_status_done(const struct device *const dev,
         udc_submit_ep_event(dev, buf, 0);
     }
     priv->ctrl_status_done++;
+    if (sts == UDC_DWC3_TRB_STATUS_TRBSTS_OK) {
+        udc_dwc3_ctrl_apply_link_pm(dev);
+    }
     udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
     udc_dwc3_ctrl_next(dev);
 }
@@ -5115,7 +5230,7 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, const uint32_t evt)
         break;
     case UDC_DWC3_CTRL_STATUS_ARMED:
         if (is_in == udc_dwc3_ctrl_status_is_in(priv)) {
-            udc_dwc3_ctrl_status_done(dev, h);
+            udc_dwc3_ctrl_status_done(dev, h, status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK);
             return;
         }
         break;
@@ -5232,38 +5347,90 @@ static UDC_DWC3_COLD void udc_dwc3_fifo_flush_tx(const struct device *const dev,
  * U3 the transfer waits for an ERDY that never comes. "Should be used only for
  * device initialization after U3 exit."
  *
- * An active transfer is one holding a transfer resource: RUNNING, or a Start
- * whose outcome is still open.
  */
+/*
+ * An active transfer for 4.1.10: one holding a transfer resource (RUNNING, or a
+ * Start whose outcome is still open). On the control endpoint only a data or
+ * status stage counts: a Setup TRB does not make the endpoint active (4.9.1:
+ * "Software may prepare a Setup TRB for control endpoints without affecting the
+ * ability of the link going into low power"), and a SETUP is never
+ * flow-controlled, so no ERDY can be owed for it.
+ */
+static UDC_DWC3_COLD bool udc_dwc3_ep_active_for_u3(const struct udc_dwc3_data *const priv,
+                      const uint32_t epn,
+                      const struct udc_dwc3_ep_data *const ep_data)
+{
+    if (ep_data->xfer_state != UDC_DWC3_EP_RUNNING &&
+        ep_data->xfer_state != UDC_DWC3_EP_STARTING &&
+        ep_data->xfer_state != UDC_DWC3_EP_START_UNKNOWN) {
+        return false;
+    }
+
+    return epn >= 2U || priv->ctrl_state != UDC_DWC3_CTRL_IDLE;
+}
+
 static UDC_DWC3_COLD void udc_dwc3_on_link_state(const struct device *const dev, const uint32_t evt)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
     struct udc_dwc3_data *const priv = udc_get_private(dev);
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
     const uint32_t link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
+    uint32_t owed;
 
-    if (link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U3)) {
-        priv->link_in_u3 = true;
+    /*
+     * 4.1.10 is about U3, a SuperSpeed state. In HS/FS the same field encodes
+     * On/Sleep/Suspend (DSTS), so a non-SS event is never a U3 entry or exit.
+     */
+    if ((evt & UDC_DWC3_DEVT_EVTINFO_SS) == 0U) {
+        priv->link_in_u3 = false;
+        priv->u3_active_eps = 0U;
         return;
     }
 
-    if (link != FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U0) ||
-        !priv->link_in_u3) {
+    /*
+     * U3 entry: record which endpoints are active NOW - "an active transfer
+     * on an endpoint prior to the entry into U3". A repeated U3 event must not
+     * re-record: anything started since was not active before the entry.
+     */
+    if (link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U3)) {
+        if (!priv->link_in_u3) {
+            priv->u3_active_eps = 0U;
+            for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
+                if (_EPN_IS_VALID(cfg, epn) &&
+                    udc_dwc3_ep_active_for_u3(priv, epn, _EP_DATA_FROM_EPN(cfg, epn))) {
+                    priv->u3_active_eps |= BIT(epn);
+                }
+            }
+            priv->link_in_u3 = true;
+        }
+        return;
+    }
+
+    /*
+     * Only U3 -> U0 is the exit 4.1.10 describes (U3 exit passes through
+     * Recovery, whose entry is not reported - 3.3.2). Any other state seen in
+     * between means the link left U3 some other way; a U0 without a preceding
+     * U3 is a Recovery, U1 or U2 exit. Neither gets the command: "It should not
+     * to be used in any other scenario."
+     */
+    if (link != FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U0)) {
+        priv->link_in_u3 = false;
+        priv->u3_active_eps = 0U;
+        return;
+    }
+    if (!priv->link_in_u3) {
         return;
     }
     priv->link_in_u3 = false;
+    owed = priv->u3_active_eps;
+    priv->u3_active_eps = 0U;
 
+    /* "... and also detects that there are transfers still active on the endpoint". */
     for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
-        const struct udc_dwc3_ep_data *ep_data;
         k_spinlock_key_t key;
 
-        if (!_EPN_IS_VALID(cfg, epn)) {
-            continue;
-        }
-        ep_data = _EP_DATA_FROM_EPN(cfg, epn);
-        if (ep_data->xfer_state != UDC_DWC3_EP_RUNNING &&
-            ep_data->xfer_state != UDC_DWC3_EP_STARTING &&
-            ep_data->xfer_state != UDC_DWC3_EP_START_UNKNOWN) {
+        if ((owed & BIT(epn)) == 0U || !_EPN_IS_VALID(cfg, epn) ||
+            !udc_dwc3_ep_active_for_u3(priv, epn, _EP_DATA_FROM_EPN(cfg, epn))) {
             continue;
         }
 
@@ -6182,6 +6349,10 @@ static void udc_dwc3_dispatch_event(const struct device *const dev, const uint32
          * outstanding is not coming.
          */
         udc_dwc3_bus_reset_state(dev);
+        priv->link_in_u3 = false;
+        priv->u3_active_eps = 0U;
+        /* SPEC 4.1.7: "it must set DCTL[8:5] to 5" (Rx.Detect). */
+        udc_dwc3_dctl_link_request(base, UDC_DWC3_DCTL_ULSTCHNGREQ_RXDETECT);
         break;
     /*
      * XferNotReady on a NON-CONTROL endpoint. NOT ignored - this is the one
@@ -6208,9 +6379,16 @@ static void udc_dwc3_dispatch_event(const struct device *const dev, const uint32
          * here clears the fault - the link does not come back on its own,
          * so the controller is free to raise this again on every pass.
          */
-        LOG_ERR_RATELIMIT("DEVT_ERRTICERR: PHY erratic error - the link is "
-            "suspended and needs a disconnect/reconnect to recover");
+        LOG_ERR_RATELIMIT("DEVT_ERRTICERR: PHY erratic error - resetting "
+            "the controller");
         udc_submit_event(dev, UDC_EVT_ERROR, -EIO);
+        /*
+         * SPEC 3.3.2: "Software must reset the controller on receiving the
+         * erratic error" (SuperSpeed); in HS/FS only a soft disconnect
+         * recovers. The device-initiated disconnect, soft reset and reconnect
+         * covers both. It sleeps, so the heartbeat runs it, not this thread.
+         */
+        priv->erratic_reset_pending = true;
         break;
     case UDC_DWC3_DEVT_EVNTOVERFLOW:
         /*
@@ -6218,6 +6396,13 @@ static void udc_dwc3_dispatch_event(const struct device *const dev, const uint32
          * "end" are suppressed above.
          */
         LOG_ERR_RATELIMIT("evt ring ovfl");
+        /*
+         * SPEC 3.3.2: device-specific events after this one may have been
+         * dropped (endpoint events are not). A U0 seen later may not be the
+         * exit from the U3 recorded here, so 4.1.10 cannot be applied to it.
+         */
+        priv->link_in_u3 = false;
+        priv->u3_active_eps = 0U;
         break;
     default:
         /* Skip the event, do not assume it cannot happen. */
@@ -6262,7 +6447,8 @@ static const char *udc_dwc3_drain_state_name(const uint32_t state)
 }
 
 #ifdef UDC_DWC3_SETUP_STUCK_RESET
-static void udc_dwc3_setup_stuck_reset(const struct device *const dev);
+static void udc_dwc3_setup_stuck_reset(const struct device *const dev,
+                       const char *const reason);
 #endif
 
 static void udc_dwc3_drain_helper(const struct device *const dev);
@@ -7185,6 +7371,12 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
               UDC_DWC3_HB_DRAIN_STUCK_MS;
 
 #ifdef UDC_DWC3_SETUP_STUCK_RESET
+    if (priv->erratic_reset_pending) {
+        priv->erratic_reset_pending = false;
+        udc_dwc3_setup_stuck_reset(dev, "PHY erratic error");
+        return;
+    }
+
     /*
      * A ring that stopped gets A route back. Past this threshold the drain is
      * not slow, it is dead: the controller owes events, none has been handled
@@ -7204,7 +7396,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             "reconnecting (%u so far)",
             UDC_DWC3_HB_DRAIN_DEAD_MS, gc, priv->drain_dead_resets);
 
-        udc_dwc3_setup_stuck_reset(dev);
+        udc_dwc3_setup_stuck_reset(dev, "event ring not advancing");
         return;
     }
 #endif
@@ -7429,9 +7621,10 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
 
 #ifdef UDC_DWC3_SETUP_STUCK_RESET
 /*
- * Last resort for a SETUP the controller has received and will not retire.
+ * Last resort: device-initiated disconnect, core soft reset, reconnect.
  */
-static void udc_dwc3_setup_stuck_reset(const struct device *const dev)
+static void udc_dwc3_setup_stuck_reset(const struct device *const dev,
+                       const char *const reason)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
     const struct udc_dwc3_config *const cfg = dev->config;
@@ -7439,10 +7632,10 @@ static void udc_dwc3_setup_stuck_reset(const struct device *const dev)
     const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
     int ret;
 
-    LOG_ERR("SETUP still stuck after the Set Stall: GSTS=0x%08x "
+    LOG_ERR("%s: GSTS=0x%08x "
         "BusErrAddrVld=%u GBUSERRADDR=0x%08x%08x, DSTS=0x%08x - "
-        "escalating to a device-initiated disconnect/reconnect (%u so far)",
-        gsts, (gsts & UDC_DWC3_GSTS_BUSERRADDRVLD) ? 1U : 0U,
+        "device-initiated disconnect, soft reset, reconnect (%u so far)",
+        reason, gsts, (gsts & UDC_DWC3_GSTS_BUSERRADDRVLD) ? 1U : 0U,
         sys_read32(base + UDC_DWC3_GBUSERRADDR_HI),
         sys_read32(base + UDC_DWC3_GBUSERRADDR_LO),
         sys_read32(base + UDC_DWC3_DSTS), priv->ctrl_setup_wd_reset);
@@ -7485,7 +7678,7 @@ static void udc_dwc3_setup_stuck_reset(const struct device *const dev)
      * unmasked on purpose: udc_dwc3_disable() would mask it here, and a
      * controller whose events nobody acknowledges never reaches DEVCTRLHLT.
      */
-    sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+    udc_dwc3_dctl_update(base, UDC_DWC3_DCTL_RUNSTOP, 0U);
 
     udc_unlock_internal(dev);
 
@@ -8887,15 +9080,20 @@ static int udc_dwc3_enable(const struct device *const dev)
         return ret;
     }
 
-    /* U1/U2 OFF, EXPLICITLY, AND NOT BY LUCK. */
-    sys_clear_bits(base + UDC_DWC3_DCTL,
-               UDC_DWC3_DCTL_ACCEPTU1ENA | UDC_DWC3_DCTL_INITU1ENA |
-               UDC_DWC3_DCTL_ACCEPTU2ENA | UDC_DWC3_DCTL_INITU2ENA);
+    /*
+     * U1/U2 off until the host configures the device: DCTL says software sets
+     * AcceptU1/U2Ena "after receiving a SetConfiguration command" and
+     * InitU1/U2Ena after SetFeature(U1/U2_ENABLE) - see
+     * udc_dwc3_ctrl_apply_link_pm().
+     */
+    udc_dwc3_dctl_update(base,
+                 UDC_DWC3_DCTL_ACCEPTU1ENA | UDC_DWC3_DCTL_INITU1ENA |
+                 UDC_DWC3_DCTL_ACCEPTU2ENA | UDC_DWC3_DCTL_INITU2ENA, 0U);
 
     /* First packet to be expected */
 
     /* Enable the DWC3 events */
-    sys_set_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+    udc_dwc3_dctl_update(base, 0U, UDC_DWC3_DCTL_RUNSTOP);
 
     /* Enable the IRQ (for now, just schedule a first work queue job) */
     cfg->irq_enable_func();
@@ -8923,7 +9121,7 @@ static int udc_dwc3_disable(const struct device *const dev)
 
     k_timer_stop(&priv->heartbeat_timer);
 
-    sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+    udc_dwc3_dctl_update(base, UDC_DWC3_DCTL_RUNSTOP, 0U);
 
     /*
      * With RunStop cleared the controller raises no further Endpoint Command
