@@ -347,12 +347,11 @@ __weak void trace_dump(void)
 #define UDC_DWC3_LOG_EVERY_SETUP
 
 /*
- * Escalate a stuck SETUP to a device-initiated disconnect and reconnect, when
- * the Set Stall that normally clears it has failed twice running. The reset is
- * sanctioned only with the controller already halted, so the sequence ends
- * transfers first, leaves the interrupt live, and waits for DEVCTRLHLT.
+ * Build in udc_dwc3_controller_recover(): device-initiated disconnect, core soft
+ * reset and reconnect, run from the heartbeat for an erratic error or an event
+ * ring that has stopped advancing.
  */
-#define UDC_DWC3_SETUP_STUCK_RESET
+#define UDC_DWC3_CONTROLLER_RECOVER
 
 /*
  * How long a slot must stay empty before the event write is presumed lost
@@ -4573,7 +4572,7 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
      *
      * Phase 1: bounded reads with no delay - the core normally clears
      * CSftRst well inside this. Phase 2: sleeps, because this is reachable
-     * at runtime as well as at boot - udc_dwc3_setup_stuck_reset() -> init() ->
+     * at runtime as well as at boot - udc_dwc3_controller_recover() -> init() ->
      * here, on the work queue with the UDC mutex held. A non-yielding spin
      * there starved every thread including the drain for the whole wait.
      */
@@ -4937,9 +4936,6 @@ static UDC_DWC3_COLD void udc_dwc3_on_usb_reset(const struct device *const dev)
      */
     priv->cfg_pool_assigned = false;
     priv->first_ep = 0U;
-    /* A reset ends any U3 session: 4.1.2 applies, not 4.1.10. */
-    priv->link_in_u3 = false;
-    priv->u3_active_eps = 0U;
 
     /* SPEC 3.30b 4.1.2, with the same primitives every other path uses. */
     udc_dwc3_bus_reset_state(dev);
@@ -5356,6 +5352,24 @@ static UDC_DWC3_COLD void udc_dwc3_fifo_flush_tx(const struct device *const dev,
 }
 
 /*
+ * Link and bus events - the one place this driver reacts to the state of the
+ * link (SPEC 3.30b):
+ *
+ *   USB Reset        4.1.2  return to the default state, DevAddr 0
+ *   Connect Done     4.1.3  adopt the speed, resize EP0
+ *   Disconnect       4.1.7  "it must set DCTL[8:5] to 5" (Rx.Detect)
+ *   Link State Chg   3.3.2  "generated in SuperSpeed when the link LTSSM state
+ *                           changes, except when LTSSM exits from HOT_RESET, POLL
+ *                           or LTSSM enters into RECOVERY" - so a U0 event is also
+ *                           the end of every Recovery
+ *   Erratic error    3.3.2  "Software must reset the controller on receiving the
+ *                           erratic error" (SS); in HS/FS only a soft disconnect
+ *                           recovers - both by udc_dwc3_controller_recover()
+ *   Buffer overflow  3.3.2  "one or more Device-specific events may have been
+ *                           dropped after this event. Endpoint-Specific events will
+ *                           not be dropped"
+ *   Wakeup, Suspend         nothing owed (no remote wakeup, no hibernation)
+ *
  * SPEC 3.30b 4.1.10, Initialization after U3 Exit:
  *
  *   "When a device exits from U3 to U0, if there is an active transfer on an
@@ -5396,30 +5410,31 @@ static UDC_DWC3_COLD bool udc_dwc3_ep_active_for_u3(const struct udc_dwc3_data *
     return epn >= 2U || priv->ctrl_state != UDC_DWC3_CTRL_IDLE;
 }
 
-static UDC_DWC3_COLD void udc_dwc3_on_link_state(const struct device *const dev, const uint32_t evt)
+static UDC_DWC3_COLD void udc_dwc3_link_event(const struct device *const dev, const uint32_t evt)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
     struct udc_dwc3_data *const priv = udc_get_private(dev);
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const uint32_t type = evt & UDC_DWC3_EVT_MASK;
     const uint32_t link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
-    uint32_t owed;
+    const bool ss_link = type == UDC_DWC3_DEVT_ULSTCHNG &&
+                 (evt & UDC_DWC3_DEVT_EVTINFO_SS) != 0U;
+    uint32_t owed = 0U;
 
     /*
-     * 4.1.10 is about U3, a SuperSpeed state. In HS/FS the same field encodes
-     * On/Sleep/Suspend (DSTS), so a non-SS event is never a U3 entry or exit.
+     * 4.1.10 bookkeeping, decided here and nowhere else. Only a SuperSpeed U3
+     * followed by U0 is the exit 4.1.10 describes: U3 exit passes through
+     * Recovery, whose entry is not reported. A U3 records the endpoints active
+     * "prior to the entry into U3" (a repeated U3 must not re-record); the U0
+     * after it hands that set over. Everything else cancels a pending exit: a
+     * non-SS event (On/Sleep/Suspend share the encoding, they are never U3), any
+     * other link state, USB reset, disconnect, and an event-buffer overflow,
+     * after which a later U0 may not be the exit from the U3 recorded here. A U0
+     * without a preceding U3 (Recovery, U1, U2 exit) never gets the command: "It
+     * should not to be used in any other scenario."
      */
-    if ((evt & UDC_DWC3_DEVT_EVTINFO_SS) == 0U) {
-        priv->link_in_u3 = false;
-        priv->u3_active_eps = 0U;
-        return;
-    }
-
-    /*
-     * U3 entry: record which endpoints are active NOW - "an active transfer
-     * on an endpoint prior to the entry into U3". A repeated U3 event must not
-     * re-record: anything started since was not active before the entry.
-     */
-    if (link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U3)) {
+    if (ss_link && link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK,
+                     UDC_DWC3_DSTS_USBLNKST_USB3_U3)) {
         if (!priv->link_in_u3) {
             priv->u3_active_eps = 0U;
             for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
@@ -5430,51 +5445,72 @@ static UDC_DWC3_COLD void udc_dwc3_on_link_state(const struct device *const dev,
             }
             priv->link_in_u3 = true;
         }
-        return;
-    }
-
-    /*
-     * Only U3 -> U0 is the exit 4.1.10 describes (U3 exit passes through
-     * Recovery, whose entry is not reported - 3.3.2). Any other state seen in
-     * between means the link left U3 some other way; a U0 without a preceding
-     * U3 is a Recovery, U1 or U2 exit. Neither gets the command: "It should not
-     * to be used in any other scenario."
-     */
-    if (link != FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK, UDC_DWC3_DSTS_USBLNKST_USB3_U0)) {
+    } else if (type == UDC_DWC3_DEVT_ULSTCHNG || type == UDC_DWC3_DEVT_USBRST ||
+           type == UDC_DWC3_DEVT_DISCONNEVT || type == UDC_DWC3_DEVT_EVNTOVERFLOW) {
+        if (ss_link && link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK,
+                         UDC_DWC3_DSTS_USBLNKST_USB3_U0) && priv->link_in_u3) {
+            owed = priv->u3_active_eps;
+        }
         priv->link_in_u3 = false;
         priv->u3_active_eps = 0U;
-        return;
     }
-    if (!priv->link_in_u3) {
-        return;
-    }
-    priv->link_in_u3 = false;
-    owed = priv->u3_active_eps;
-    priv->u3_active_eps = 0U;
 
-    /* "... and also detects that there are transfers still active on the endpoint". */
-    for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
-        k_spinlock_key_t key;
+    switch (type) {
+    case UDC_DWC3_DEVT_USBRST:
+        udc_dwc3_on_usb_reset(dev);
+        break;
+    case UDC_DWC3_DEVT_CONNECTDONE:
+        udc_dwc3_on_connect_done(dev);
+        break;
+    case UDC_DWC3_DEVT_DISCONNEVT:
+        /* Any Endpoint Command Complete still outstanding is not coming. */
+        udc_dwc3_bus_reset_state(dev);
+        udc_dwc3_dctl_link_request(base, UDC_DWC3_DCTL_ULSTCHNGREQ_RXDETECT);
+        break;
+    case UDC_DWC3_DEVT_ULSTCHNG:
+        /* "... and also detects that there are transfers still active on the endpoint". */
+        for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
+            k_spinlock_key_t key;
 
-        if ((owed & BIT(epn)) == 0U || !_EPN_IS_VALID(cfg, epn) ||
-            !udc_dwc3_ep_active_for_u3(priv, epn, _EP_DATA_FROM_EPN(cfg, epn))) {
-            continue;
+            if ((owed & BIT(epn)) == 0U || !_EPN_IS_VALID(cfg, epn) ||
+                !udc_dwc3_ep_active_for_u3(priv, epn, _EP_DATA_FROM_EPN(cfg, epn))) {
+                continue;
+            }
+
+            if (!udc_dwc3_dgcmd_wait_idle(base)) {
+                LOG_ERR_RATELIMIT("a generic command stayed active; Set Endpoint "
+                          "NRDY for physical endpoint %u not issued", epn);
+                continue;
+            }
+            key = k_spin_lock(&priv->dgcmd_lock);
+            sys_write32(epn & 0x1fU, base + UDC_DWC3_DGCMDPAR);
+            sys_write32(UDC_DWC3_DGCMD_SET_EP_NRDY | UDC_DWC3_DGCMD_ACT,
+                    base + UDC_DWC3_DGCMD);
+            k_spin_unlock(&priv->dgcmd_lock, key);
+            priv->u3_exit_nrdy++;
+            LOG_INF("U3 exit: Set Endpoint NRDY on physical endpoint %u (%u total)",
+                epn, priv->u3_exit_nrdy);
+            (void)udc_dwc3_dgcmd_wait_idle(base);
         }
-
-        if (!udc_dwc3_dgcmd_wait_idle(base)) {
-            LOG_ERR_RATELIMIT("a generic command stayed active; Set Endpoint "
-                      "NRDY for physical endpoint %u not issued", epn);
-            continue;
-        }
-        key = k_spin_lock(&priv->dgcmd_lock);
-        sys_write32(epn & 0x1fU, base + UDC_DWC3_DGCMDPAR);
-        sys_write32(UDC_DWC3_DGCMD_SET_EP_NRDY | UDC_DWC3_DGCMD_ACT,
-                base + UDC_DWC3_DGCMD);
-        k_spin_unlock(&priv->dgcmd_lock, key);
-        priv->u3_exit_nrdy++;
-        LOG_INF("U3 exit: Set Endpoint NRDY on physical endpoint %u (%u total)",
-            epn, priv->u3_exit_nrdy);
-        (void)udc_dwc3_dgcmd_wait_idle(base);
+        break;
+    case UDC_DWC3_DEVT_ERRTICERR:
+        /*
+         * On UTMI+: phy_rxvalid/phy_rxactive asserted for at least 2 ms; in SS
+         * the PIPE did not answer a PHY command. Rate-limited: nothing clears
+         * the fault before the reset. The reset sleeps, so the heartbeat runs it.
+         */
+        LOG_ERR_RATELIMIT("DEVT_ERRTICERR: PHY erratic error - resetting "
+            "the controller");
+        udc_submit_event(dev, UDC_EVT_ERROR, -EIO);
+        priv->erratic_reset_pending = true;
+        break;
+    case UDC_DWC3_DEVT_EVNTOVERFLOW:
+        /* The only line for this event: the generic banner is suppressed. */
+        LOG_ERR_RATELIMIT("evt ring ovfl");
+        break;
+    default:
+        /* WKUPEVT, SUSPEND: nothing owed. */
+        break;
     }
 }
 
@@ -6364,22 +6400,16 @@ static void udc_dwc3_dispatch_event(const struct device *const dev, const uint32
     case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_EPCMDCMPLT):
         udc_dwc3_on_ep_cmd_cmplt(dev, evt);
         break;
+    /* Link and bus events: udc_dwc3_link_event() owns all of them. */
     case UDC_DWC3_DEVT_USBRST:
-        udc_dwc3_on_usb_reset(dev);
-        break;
     case UDC_DWC3_DEVT_CONNECTDONE:
-        udc_dwc3_on_connect_done(dev);
-        break;
     case UDC_DWC3_DEVT_DISCONNEVT:
-        /*
-         * The link is gone, so any Endpoint Command Complete still
-         * outstanding is not coming.
-         */
-        udc_dwc3_bus_reset_state(dev);
-        priv->link_in_u3 = false;
-        priv->u3_active_eps = 0U;
-        /* SPEC 4.1.7: "it must set DCTL[8:5] to 5" (Rx.Detect). */
-        udc_dwc3_dctl_link_request(base, UDC_DWC3_DCTL_ULSTCHNGREQ_RXDETECT);
+    case UDC_DWC3_DEVT_ULSTCHNG:
+    case UDC_DWC3_DEVT_WKUPEVT:
+    case UDC_DWC3_DEVT_SUSPEND:
+    case UDC_DWC3_DEVT_ERRTICERR:
+    case UDC_DWC3_DEVT_EVNTOVERFLOW:
+        udc_dwc3_link_event(dev, evt);
         break;
     /*
      * XferNotReady on a NON-CONTROL endpoint. NOT ignored - this is the one
@@ -6390,46 +6420,9 @@ static void udc_dwc3_dispatch_event(const struct device *const dev, const uint32
     case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
         udc_dwc3_on_xfer_not_ready_nonctrl(dev, evt);
         break;
-    case UDC_DWC3_DEVT_ULSTCHNG:
-        udc_dwc3_on_link_state(dev, evt);
-        break;
-    case UDC_DWC3_DEVT_WKUPEVT:
-    case UDC_DWC3_DEVT_SUSPEND:
     case UDC_DWC3_DEVT_SOF:
     case UDC_DWC3_DEVT_CMDCMPLT:
     case UDC_DWC3_DEVT_VNDRDEVTSTRCVED:
-        break;
-    case UDC_DWC3_DEVT_ERRTICERR:
-        /*
-         * Erratic error: on UTMI+ this means phy_rxvalid/phy_rxactive
-         * stayed asserted for at least 2 ms. Rate-limited because nothing
-         * here clears the fault - the link does not come back on its own,
-         * so the controller is free to raise this again on every pass.
-         */
-        LOG_ERR_RATELIMIT("DEVT_ERRTICERR: PHY erratic error - resetting "
-            "the controller");
-        udc_submit_event(dev, UDC_EVT_ERROR, -EIO);
-        /*
-         * SPEC 3.3.2: "Software must reset the controller on receiving the
-         * erratic error" (SuperSpeed); in HS/FS only a soft disconnect
-         * recovers. The device-initiated disconnect, soft reset and reconnect
-         * covers both. It sleeps, so the heartbeat runs it, not this thread.
-         */
-        priv->erratic_reset_pending = true;
-        break;
-    case UDC_DWC3_DEVT_EVNTOVERFLOW:
-        /*
-         * The only line for this event now - the generic banner and
-         * "end" are suppressed above.
-         */
-        LOG_ERR_RATELIMIT("evt ring ovfl");
-        /*
-         * SPEC 3.3.2: device-specific events after this one may have been
-         * dropped (endpoint events are not). A U0 seen later may not be the
-         * exit from the U3 recorded here, so 4.1.10 cannot be applied to it.
-         */
-        priv->link_in_u3 = false;
-        priv->u3_active_eps = 0U;
         break;
     default:
         /* Skip the event, do not assume it cannot happen. */
@@ -6473,8 +6466,8 @@ static const char *udc_dwc3_drain_state_name(const uint32_t state)
     }
 }
 
-#ifdef UDC_DWC3_SETUP_STUCK_RESET
-static void udc_dwc3_setup_stuck_reset(const struct device *const dev,
+#ifdef UDC_DWC3_CONTROLLER_RECOVER
+static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const dev,
                        const char *const reason);
 #endif
 
@@ -7398,10 +7391,10 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     drain_stuck = (priv->hb_drain_stuck_beats * UDC_DWC3_HEARTBEAT_MS) >=
               UDC_DWC3_HB_DRAIN_STUCK_MS;
 
-#ifdef UDC_DWC3_SETUP_STUCK_RESET
+#ifdef UDC_DWC3_CONTROLLER_RECOVER
     if (priv->erratic_reset_pending) {
         priv->erratic_reset_pending = false;
-        udc_dwc3_setup_stuck_reset(dev, "PHY erratic error");
+        udc_dwc3_controller_recover(dev, "PHY erratic error");
         return;
     }
 
@@ -7424,7 +7417,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             "reconnecting (%u so far)",
             UDC_DWC3_HB_DRAIN_DEAD_MS, gc, priv->drain_dead_resets);
 
-        udc_dwc3_setup_stuck_reset(dev, "event ring not advancing");
+        udc_dwc3_controller_recover(dev, "event ring not advancing");
         return;
     }
 #endif
@@ -7647,11 +7640,16 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     /* No re-arm here on purpose: the periodic timer owns the cadence. */
 }
 
-#ifdef UDC_DWC3_SETUP_STUCK_RESET
+#ifdef UDC_DWC3_CONTROLLER_RECOVER
 /*
- * Last resort: device-initiated disconnect, core soft reset, reconnect.
+ * Controller recovery: device-initiated disconnect (SPEC 3.30b 4.1.8: End
+ * Transfer for every active transfer, then RunStop=0 and wait for DevCtrlHlt),
+ * core soft reset, and reconnect as after power-on (4.1.9 -> 4.1.1). The one
+ * path that resets the controller; run from the heartbeat (it sleeps) for an
+ * erratic error (3.3.2: "Software must reset the controller") and for an event
+ * ring that has stopped advancing.
  */
-static void udc_dwc3_setup_stuck_reset(const struct device *const dev,
+static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const dev,
                        const char *const reason)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
@@ -7775,7 +7773,7 @@ static void udc_dwc3_setup_stuck_reset(const struct device *const dev,
 
     udc_unlock_internal(dev);
 }
-#endif /* UDC_DWC3_SETUP_STUCK_RESET */
+#endif /* UDC_DWC3_CONTROLLER_RECOVER */
 
 /*
  * EP0 telemetry. NOT recovery.
