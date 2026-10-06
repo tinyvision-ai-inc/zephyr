@@ -290,6 +290,27 @@ __weak void trace_dump(void)
 #define UDC_DWC3_CONTROLLER_RECOVER
 
 /*
+ * 1: udc_dwc3_depcmd() polls every endpoint command until CmdAct clears and
+ * reports its outcome synchronously. 0: the two per-transfer commands are
+ * posted without that poll.
+ *   Start Transfer: its outcome always arrives - its Command Complete event
+ *   (CmdIOC), or, if that event is lost, the STARTING deadline resolver, both
+ *   reading DEPCMD or the value saved in cmd_record before a later command
+ *   overwrote it; a refusal goes to udc_dwc3_ep_start_refused() on every path.
+ *   Update Transfer: cannot be refused by a race - "the controller will detect
+ *   that the Update Transfer is unnecessary" for a transfer already completed
+ *   (3.2.2.6); its only error, an index never started, is a driver bug, still
+ *   logged by the next command's pre-poll.
+ * The configuration, stall and End Transfer commands are always polled: they
+ * are rare and their callers act on the outcome, and DEPSTARTCFG at power-on
+ * "must poll the CmdAct bit" (3.2.2.8). The pre-poll before every command is
+ * never skipped.
+ */
+#ifndef UDC_DWC3_DEPCMD_POST_POLL
+#define UDC_DWC3_DEPCMD_POST_POLL                           1
+#endif
+
+/*
  * How long a slot must stay empty before the event write is presumed lost
  * rather than late.
  */
@@ -335,6 +356,11 @@ __weak void trace_dump(void)
  * only, so every other caller sees the two values above and nothing else.
  */
 #define UDC_DWC3_DEPCMD_NOT_POSTED                          0xfffffffeU
+/*
+ * Returned by udc_dwc3_depcmd() for a Start or Update Transfer posted without
+ * the post-poll (UDC_DWC3_DEPCMD_POST_POLL == 0): written, outcome not yet known.
+ */
+#define UDC_DWC3_DEPCMD_POSTED                              0xfffffffdU
 /* DEPCFG Command and Parameters */
 /* Command type occupies bits 3:0 - DEPCFG(1) through DEPSTARTCFG(9). */
 #define UDC_DWC3_DEPCMD_CMDTYP_MASK                         GENMASK(3, 0)
@@ -1201,6 +1227,7 @@ struct udc_dwc3_diag {
     uint32_t                    evt_late_polls_max;
     uint32_t                    evt_late_us_max;
     uint32_t                    evt_midzero;        /* passes that stopped on an empty slot */
+    uint32_t                    post_fail_total;    /* completions posted to a full usbd queue */
     uint32_t                    drain_dead_resets;  /* reconnects issued for a dead ring */
     /* promotions to START_UNKNOWN / END_UNKNOWN */
     uint32_t                    ep_cmd_unknown;
@@ -1305,6 +1332,13 @@ struct udc_dwc3_data {
         /* one pass, copied out of the ring */
         uint32_t                copy[CONFIG_UDC_DWC3_EVENTS_NUM];
         uint32_t                handled;        /* events dispatched */
+        /*
+         * Completions this pass posted to a full usbd queue (-ENOMSG). Counted in
+         * udc_dwc3_drain_completed() and reported once by the pass, after the
+         * UDC mutex is released: a synchronous log line per failure would keep
+         * usbd off the CPU and make the next post fail too.
+         */
+        uint32_t                post_fail;
         /*
          * The drain pass's one GEVNTCOUNT read, shared with every other reader.
          * The controller updates it concurrently, so two reads never describe the
@@ -1925,23 +1959,20 @@ static inline void udc_dwc3_trb_fill(volatile struct udc_dwc3_trb *const trb,
 }
 
 /*
- * Snapshot a TRB the controller may have written back. ctrl is read first and
- * the status only if HWO reads clear, each once: the controller writes status
- * and clears HWO in its write-back, so a status read before an HWO=0 read can
- * be the stale, pre-write-back one. Returns false, with only out->ctrl valid,
- * while the controller still owns the TRB. Not for a poll: each check takes a
- * new snapshot.
+ * Snapshot a TRB the controller may have written back: ctrl, then status, each
+ * read once. The controller writes status and clears HWO in its write-back, so
+ * the status is the written-back one only if ctrl, read before it, has HWO
+ * clear. Returns that: true means out->status is the write-back; false means
+ * the controller still owns the TRB and out->status may be stale. Not for a
+ * poll: each check takes a new snapshot.
  */
 static inline bool udc_dwc3_trb_snapshot(const volatile struct udc_dwc3_trb *const t,
                      struct udc_dwc3_trb *const out)
 {
     out->ctrl = t->ctrl;
-    if ((out->ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
-        return false;
-    }
     out->status = t->status;
 
-    return true;
+    return (out->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U;
 }
 
 /* Record a transfer resource index. Defined below. */
@@ -2302,21 +2333,12 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
             (unsigned int)(ep->cmd.depcmd_last & UDC_DWC3_DEPCMD_CMDTYP_MASK));
     }
 
-    reg = sys_read32(base + UDC_DWC3_GUSB2PHYCFG);
-    if ((reg & (UDC_DWC3_GUSB2PHYCFG_SUSPHY |
-            UDC_DWC3_GUSB2PHYCFG_ENBLSLPM)) != 0) {
-        /*
-         * Clear them and leave them clear. The databook requires them clear
-         * for the whole execution, so restoring would need a second CmdAct
-         * poll; the rule is one poll per command.
-         */
-        sys_write32(reg & ~(UDC_DWC3_GUSB2PHYCFG_SUSPHY |
-                    UDC_DWC3_GUSB2PHYCFG_ENBLSLPM),
-                base + UDC_DWC3_GUSB2PHYCFG);
+    /*
+     * SusPHY and EnblSlpM must be clear before an endpoint command (GUSB2PHYCFG
+     * notes). This driver never sets them; udc_dwc3_on_soft_reset() clears them
+     * once, and the register survives a core soft reset.
+     */
 
-        LOG_WRN("GUSB2PHYCFG had SUSPHY/ENBLSLPM set (0x%08x) before an "
-            "endpoint command; cleared and left clear", reg);
-    }
 
     /*
      * The transfer resource index lives and dies with Start/End Transfer
@@ -2364,11 +2386,18 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     /*
      * Poll every command, not just Start Transfer: Update Transfer has CmdIOC=0
      * and raises no Command Complete, so its CmdStatus is read only here.
+     * Without the post-poll (UDC_DWC3_DEPCMD_POST_POLL), Start and Update
+     * return POSTED here; see the #define for where their outcome is learnt.
      */
     if (ep != NULL) {
         const uint32_t cmdtyp = cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK;
         uint32_t done = 0;
         bool finished;
+
+        if (!UDC_DWC3_DEPCMD_POST_POLL &&
+            (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER || cmdtyp == UDC_DWC3_DEPCMD_DEPUPDXFER)) {
+            return UDC_DWC3_DEPCMD_POSTED;
+        }
 
         finished = udc_dwc3_wait_cmdact_zero(dev, addr, &done);
 
@@ -2795,6 +2824,14 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     if (idx == UDC_DWC3_DEPCMD_NOT_POSTED) {
         udc_dwc3_ep_state_reset(ep_data);
         return false;
+    }
+
+    /*
+     * Posted without the post-poll: STARTING until its Command Complete, the
+     * next command's pre-poll or the resolver settles it.
+     */
+    if (idx == UDC_DWC3_DEPCMD_POSTED) {
+        return true;
     }
 
     /*
@@ -4712,6 +4749,19 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
      */
     sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG,
                UDC_DWC3_GUSB2PHYCFG_ULPIAUTORES);
+
+    /*
+     * Clear SusPHY and EnblSlpM, and leave them clear: "before issuing any
+     * device endpoint command when operating in 2.0 speeds, disable this bit"
+     * (GUSB2PHYCFG). The reset value may be 1. Nothing in this driver sets them
+     * again, so udc_dwc3_depcmd() does not re-check them per command.
+     */
+    reg = sys_read32(base + UDC_DWC3_GUSB2PHYCFG);
+    if ((reg & (UDC_DWC3_GUSB2PHYCFG_SUSPHY | UDC_DWC3_GUSB2PHYCFG_ENBLSLPM)) != 0U) {
+        LOG_WRN("GUSB2PHYCFG had SusPHY/EnblSlpM set (0x%08x): cleared", reg);
+        sys_write32(reg & ~(UDC_DWC3_GUSB2PHYCFG_SUSPHY | UDC_DWC3_GUSB2PHYCFG_ENBLSLPM),
+                base + UDC_DWC3_GUSB2PHYCFG);
+    }
     /*
      * Wait for the register file again here, not only in udc_dwc3_init(): this
      * function issues its own CSftRst after init() settled the core, and the FIFO
@@ -5218,9 +5268,7 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, struct udc_dwc3_ep_
      * A chained ZLP TRB still owned keeps the first TRB's TRBSTS (OK here),
      * which is also what its programmed status of 0 reads as.
      */
-    if (!udc_dwc3_trb_snapshot(&h->trb_buf[0], &t)) {
-        t.status = h->trb_buf[0].status;
-    }
+    (void)udc_dwc3_trb_snapshot(&h->trb_buf[0], &t);
     status = t.status;
     if ((t.ctrl & UDC_DWC3_TRB_CTRL_CHN) != 0U &&
         (status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) == UDC_DWC3_TRB_STATUS_TRBSTS_OK &&
@@ -5670,14 +5718,21 @@ static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
         ep_data->diag.n_retire++;
 
 
-        ret = udc_dwc3_buf_return(dev, buf, UDC_DWC3_BUF_DONE);
-        if (ret != 0) {
-            LOG_ERR("Failed to submit buffer %p: %d", buf, ret);
+        /*
+         * A failed post (usbd queue full) is counted, not logged here; the pass
+         * reports it once. The buffer is already on the stack's list, which usbd
+         * drains on every message it handles.
+         */
+        if (udc_dwc3_buf_return(dev, buf, UDC_DWC3_BUF_DONE) != 0) {
+            priv->evt.post_fail++;
         }
 
-        /* A ring slot is free: let the endpoint work queue more buffers. */
-        k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
         drained++;
+    }
+
+    /* Ring slots are free: one kick lets the endpoint work queue more buffers. */
+    if (drained > 0U) {
+        k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
     }
 
     return drained;
@@ -7878,6 +7933,14 @@ static bool udc_dwc3_event_drain_once(const struct device *const dev, const bool
             priv->diag.dispatch_evt = 0U;
         }
         udc_unlock_internal(dev);
+
+        /* One line per pass, outside the mutex: see evt.post_fail. */
+        if (priv->evt.post_fail != 0U) {
+            priv->diag.post_fail_total += priv->evt.post_fail;
+            LOG_ERR("Failed to submit %u buffers (%u total)",
+                priv->evt.post_fail, priv->diag.post_fail_total);
+            priv->evt.post_fail = 0U;
+        }
     }
 
     /* Retry: the interrupt stays masked, or the owed count would re-raise it at once. */
@@ -7926,7 +7989,6 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 {
     struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
     const struct udc_buf_info bi = *udc_get_buf_info(buf);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
     LOG_DBG("enq %p d=%p sz=%u ln=%u EP%02x %u:%u:%u",
         buf, buf->data, buf->size, buf->len, ep_cfg->addr, bi.setup, bi.data, bi.status);
@@ -7940,9 +8002,12 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
     if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
         udc_dwc3_ctrl_next(dev);
     } else {
-        /* Process this buffer along with other waiting */
-        if (sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP &&
-            ep_cfg->stat.enabled) {
+        /*
+         * Process this buffer along with other waiting. Whether a transfer may
+         * start (controller running, endpoint in DALEPENA) is the worker's
+         * check, made under the mutex from driver state.
+         */
+        if (ep_cfg->stat.enabled) {
             LOG_DBG("submitting to EP%02x", ep_cfg->addr);
             k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
         }
@@ -8568,8 +8633,8 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
     /*
      * No new transfer while the controller is stopping or stopped: 4.1.8 ends
      * every active transfer before RunStop is cleared, and after that the
-     * controller is halting, where commands are undefined. udc_dwc3_ep_enqueue()
-     * checks RunStop before scheduling this; buffers stay queued for the next enable.
+     * controller is halting, where commands are undefined. Buffers stay queued
+     * for the next enable (udc_dwc3_ep_enable() kicks this worker).
      * Driver state, no register read: RunStop is clear only before an enable or
      * after a disable (udc_dwc3_stack_enabled() false; both written under the mutex
      * here), during the controller recovery (STOPPING until its last step), or
