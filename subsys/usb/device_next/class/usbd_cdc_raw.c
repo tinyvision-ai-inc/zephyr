@@ -408,7 +408,8 @@ static struct cdc_acm_desc cdc_acm_desc_##n = {					\
 	.if1_ss_in_comp = {							\
 		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,						\
+		/* One packet. TxFIFO4 is 1.5 KiB and DEPCFG.BrstSiz matches. */ \
+		.bMaxBurst = 0,							\
 		.bmAttributes = 0,						\
 		.wBytesPerInterval = 0,						\
 	},									\

@@ -249,6 +249,10 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GSBUSCFG0_INCR4BRSTENA				BIT(1)
 #define UDC_DWC3_GSBUSCFG0_INCRBRSTENA				BIT(0)
 
+/* Global SoC Bus Configuration Register 1. PipeTransLimit is bits 11:8. */
+#define UDC_DWC3_GSBUSCFG1					0xc104
+#define UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK			GENMASK(11, 8)
+
 /* Global Tx Threshold Control Register */
 #define UDC_DWC3_GTXTHRCFG					0xc108
 #define UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL			BIT(29)
@@ -268,6 +272,7 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_GCTL_RAMCLKSEL_MASK				GENMASK(7, 6)
 #define UDC_DWC3_GCTL_SCALEDOWN_MASK				GENMASK(5, 4)
 #define UDC_DWC3_GCTL_DISSCRAMBLE				BIT(3)
+#define UDC_DWC3_GCTL_U2EXIT_LFPS				BIT(2)
 #define UDC_DWC3_GCTL_DSBLCLKGTNG				BIT(0)
 
 /* Global User Control Register 1 (Linux DWC3_GUCTL1) */
@@ -704,6 +709,9 @@ struct udc_dwc3_data {
 	void (*iebm_complete_cb)(const struct device *dev, uint8_t ep_addr, void *user);
 	void *iebm_complete_user;
 	uint8_t iebm_complete_ep;
+	/* Set by udc_dwc3_disable(): the next enable goes through
+	 * DCTL.CSFTRST and the boot-time init again (bulk IN wedge). */
+	bool core_reinit;
 };
 
 #if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
@@ -1074,6 +1082,7 @@ UDC_DWC3_XIP static void udc_dwc3_dbg_epinfo(const mm_reg_t base, uint32_t epn,
 }
 
 static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag);
+static void udc_dwc3_wedge_pump(const struct device *const dev);
 static void udc_dwc3_rateprobe_print(void);
 
 /* Force the TRB write onto the CPU→SRAM path before a mailbox DEPCMD. */
@@ -1679,6 +1688,60 @@ UDC_DWC3_XIP static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const 
 #endif
 #endif
 
+/* rtl/gen/flir_uab_engine_xm0w/debug_regs_def.h */
+#define UDC_DWC3_DBGPORT_USBPIPED_R		0xb4010210U
+#define UDC_DWC3_DBGPORT_USBPIPED_R_LAST	0xb4010214U
+#define UDC_DWC3_DBGPORT_USBPIPED_AR		0xb4010218U
+#define UDC_DWC3_DBGPORT_USBPIPED_W		0xb401021cU
+#define UDC_DWC3_DBGPORT_USBPIPED_W_LAST	0xb4010220U
+#define UDC_DWC3_DBGPORT_USBPIPED_AW		0xb4010224U
+#define UDC_DWC3_DBGPORT_USBPIPED_R_ERROR	0xb4010228U
+
+/*
+ * One line that splits a dead IN data stage in two.
+ * tx0 is words free in TxFIFO0 (EP0 IN; POR depth 0x42, so 66 means empty).
+ * lsp0 is GDBGLSP with GDBGLSPMUX cleared; lsp1 is GDBGLSP with
+ * EPSELECT = physical EP 1 (EP0 IN). The later "lsp=" field stays the
+ * sample taken after EPSELECT(11), so older logs still compare.
+ */
+UDC_DWC3_XIP static void udc_dwc3_wedge_pump(const struct device *const dev)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t ep0_0, ep0_1, lsp0, lsp1;
+	uint32_t tx0, tx2, tx5, rxreq, rxinfo, psq;
+
+	if (dev == NULL) {
+		return;
+	}
+
+	tx0 = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
+	tx2 = udc_dwc3_dbg_fifo_avail(base, 2U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
+	tx5 = udc_dwc3_dbg_fifo_avail(base, 5U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
+	rxreq = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXREQ);
+	rxinfo = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXINFO);
+	psq = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_PROTOCOL);
+	sys_write32(0U, base + UDC_DWC3_GDBGLSPMUX_DEV);
+	lsp0 = sys_read32(base + UDC_DWC3_GDBGLSP);
+	udc_dwc3_dbg_epinfo(base, 1U, &ep0_0, &ep0_1);
+	lsp1 = sys_read32(base + UDC_DWC3_GDBGLSP);
+	printk("PARK0 pump bmu=0x%08x tx0=%u tx2=%u tx5=%u rxreq=%u rxinfo=%u "
+	       "psq=%u ep0=0x%08x/0x%08x lsp0=0x%08x lsp1=0x%08x\n",
+	       sys_read32(base + UDC_DWC3_GDBGBMU),
+	       tx0, tx2, tx5, rxreq, rxinfo, psq, ep0_0, ep0_1, lsp0, lsp1);
+	/* Soft-IP debug port (TinyvisionTopLevel DebugPort, 0xb4010000, on
+	 * when withDebugRegisters is left at its default): usbPiped AXI
+	 * counters on the USB23 master. ar > r_last with both frozen means a
+	 * read burst left USB23 and never got its last beat back. */
+	printk("PARK0 axi ar=%u r_last=%u r=%u r_err=%u aw=%u w_last=%u w=%u\n",
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_AR),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_R_LAST),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_R),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_R_ERROR),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_AW),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_W_LAST),
+	       sys_read32(UDC_DWC3_DBGPORT_USBPIPED_W));
+}
+
 UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
@@ -1693,6 +1756,7 @@ UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device
 		return;
 	}
 
+	udc_dwc3_wedge_pump(dev);
 	udc_dwc3_dbg_epinfo(base, 5U, &i0_82, &i1_82);
 	udc_dwc3_dbg_epinfo(base, 11U, &i0_85, &i1_85);
 	tx2 = udc_dwc3_dbg_fifo_avail(base, 2U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
@@ -1705,6 +1769,12 @@ UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device
 	buserr = sys_read32(base + UDC_DWC3_GBUSERRADDR_LO);
 	cmd5 = sys_read32(base + UDC_DWC3_DEPCMD(5));
 	cmd11 = sys_read32(base + UDC_DWC3_DEPCMD(11));
+	/* LTSSM substate and PIPE status: is the link really in U0 and
+	 * is the PHY TX side idle while the TxFIFOs hold data. */
+	printk("PARK0 %s ltssm=0x%08x lsp=0x%08x pipectl=0x%08x\n", tag,
+	       sys_read32(base + UDC_DWC3_GDBGLTSSM),
+	       sys_read32(base + UDC_DWC3_GDBGLSP),
+	       sys_read32(base + UDC_DWC3_GUSB3PIPECTL));
 #if defined(CONFIG_UDC_DWC3_DEPCMD_MAILBOX)
 	mbx_n = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_CMD_COUNT);
 	rd_addr = sys_read32(UDC_DWC3_MBX_BASE + UDC_DWC3_MBX_RD_ADDR);
@@ -1915,6 +1985,12 @@ static bool udc_dwc3_ep_refuse_if_hw_owned(struct udc_dwc3_ep_data *const ep_dat
 
 static bool udc_dwc3_ep_is_hw_in(const struct udc_dwc3_ep_data *ep_data);
 
+/* Defined next to the TxFIFO depth table. */
+static uint8_t udc_dwc3_bulk_brstsiz(uint8_t addr);
+/* 1: keep the core reset GTXFIFOSIZ layout like the Lattice firmware
+ * (flat 0x205 words per FIFO). 0: write the dep[] rebalance below. */
+uint32_t udc_dwc3_txfifo_por = 1U;
+
 static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)
 {
@@ -1952,12 +2028,10 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
 	/*
-	 * Burst: bulk/int keep 0. SuperSpeed isoc: DEPCFG.BRSTSIZ must fit the
-	 * ~4KiB TX FIFO (dep≈517×8B ≈ 3×1024B packets). Companion still
-	 * advertises bMaxBurst=15 / Mult=1 (32KiB/SI) so the host budgets
-	 * bandwidth; the core sends multiple smaller bursts within the SI.
-	 * BRSTSIZ=15 previously stalled TX (never enough FIFO for one burst)
-	 * → host C Zi completions with 0-byte slots.
+	 * Burst: bulk BrstSiz equals the SS companion bMaxBurst
+	 * (udc_dwc3_bulk_burst, sized to the TxFIFO). Interrupt stays 0.
+	 * SuperSpeed isoc keeps 7: a BrstSiz of 15 stalled TX because one
+	 * burst did not fit the FIFO.
 	 */
 	if ((ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) == USB_EP_TYPE_ISO) {
 		/*
@@ -1973,6 +2047,10 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 7);
 		param1 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR1_DEPCFG_BINTERVAL_MASK,
 				     binterval_m1);
+	} else if ((ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) ==
+		   USB_EP_TYPE_BULK) {
+		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK,
+				     udc_dwc3_bulk_brstsiz(ep_data->cfg.addr));
 	} else {
 		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 0);
 	}
@@ -2432,10 +2510,10 @@ void lattice_usb23_isoc_disarm(const struct device *dev, uint8_t ep_addr)
 	if (ep_data != NULL && xfer_active && xferrscidx != 0U) {
 		(void)udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
 				      UDC_DWC3_DEPCMD_DEPENDXFER |
-					      UDC_DWC3_DEPCMD_HIPRI_FORCERM |
 					      FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
 							 xferrscidx));
-		DWC3_TRACE("dwc3: isoc EndXfer(ForceRM) ep=0x%02x idx=0x%x\n",
+		k_busy_wait(1000);
+		DWC3_TRACE("dwc3: isoc EndXfer ep=0x%02x idx=0x%x\n",
 		       ep_addr, xferrscidx);
 	}
 
@@ -2548,18 +2626,26 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 		ep_data->cfg.addr, addr, flags);
 }
 
-static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
-				     struct udc_dwc3_ep_data *const ep_data,
-				     uint32_t flags)
+UDC_DWC3_XIP static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
+						  struct udc_dwc3_ep_data *const ep_data,
+						  uint32_t flags)
 {
 	if (udc_dwc3_ep_refuse_if_hw_owned(ep_data, "EndXfer")) {
 		return;
 	}
 
+	/*
+	 * ForceRM=0. With ForceRM=1 the transfer was observed to stay active
+	 * after EndTransfer, and the next StartTransfer acted on that stale
+	 * state. CMDACT can clear before the teardown finishes, so wait 1 ms
+	 * before the caller touches TRBs. Lattice lsc_usb_stop_xfer.
+	 */
+	flags &= ~UDC_DWC3_DEPCMD_HIPRI_FORCERM;
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+	k_busy_wait(1000);
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 
@@ -3011,19 +3097,14 @@ void lattice_usb23_iebm_kick(const struct device *dev)
 
 /*
  * Push one IEBM page TRB. Interrupts locked by the caller (refill hook).
- * IOC on every page: the ISR consumes the DEPEVT and refills, which is the
- * Lattice-ref cadence.
- *
- * @p eof breaks the TRB chain, which is what puts a short packet on the wire
- * and ends the UVC payload. Everything else chains, so a page that is not a
- * multiple of MPS (IEBM flushes an 8 KiB+16 page mid-frame) has its remainder
- * packetized together with the next page instead of closing the frame early.
+ * IOC on every page and CHN clear: each page is a finished packet, the
+ * Lattice bulk IN template.
  */
 __ramfunc int lattice_usb23_iebm_fast_push(const struct device *dev, struct net_buf *buf,
 					   bool eof)
 {
 	struct udc_dwc3_ep_data *const ep_data = iebm_fast.ep;
-	uint32_t ctrl = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP |
+	uint32_t ctrl = UDC_DWC3_TRB_CTRL_HWO |
 			UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL | UDC_DWC3_TRB_CTRL_IOC;
 	uint32_t slot;
 
@@ -3043,9 +3124,7 @@ __ramfunc int lattice_usb23_iebm_fast_push(const struct device *dev, struct net_
 	}
 
 	ep_data->total += buf->len;
-	if (!eof) {
-		ctrl |= UDC_DWC3_TRB_CTRL_CHN;
-	} else {
+	if (eof) {
 		ep_data->total = 0;
 	}
 
@@ -3593,8 +3672,10 @@ static void udc_dwc3_in_vid_rel(uint8_t addr);
  * rs16c: every park that overlaps active video costs one frame whatever
  * its length (34 parks / 89 ms parked / 21.6 frames lost in a BULK_READ
  * interval), so the lever is the park count, not the duration.
+ * 0x000C: the arbiter holds the next DEPCMD until CMDACT clears, which is
+ * the gap this park was covering. Default off so that path is what runs.
  */
-uint32_t udc_dwc3_ring_park_mode = 1U;
+uint32_t udc_dwc3_ring_park_mode = 0U;
 /*
  * rs17d: synchronous release of the ring park. rs17c measured the ring
  * parks at 0.7 ms mean (rpark=55781us/80) with the ISR release in place:
@@ -3651,9 +3732,9 @@ static uint32_t udc_dwc3_acm_kick_aborted;
  * endpoint's own link-TRB ring at the CPU head slot and rings UpdateXfer
  * with the CPU's xferrscidx, the way one Linux dwc3 lock covers TRB write
  * plus doorbell. The CPU keeps head/tail/net_buf and the DEPEVT retire
- * path. A continuing IN buffer sets DESC_CTRL bit 8 and the ring
- * writes TRB CHN, so the 1024-byte SRP chunks stay on the ring with
- * the short tail. The CPU mailbox is StartXfer and abort only.
+ * path. A bulk IN post leaves CHN clear (Lattice: HWO|NORMAL|IOC on every
+ * chunk, including an exact MPS buffer). The CPU mailbox is StartXfer and
+ * abort only.
  *
  * -ENOTSUP: not an engine case, use the CPU TRB path.
  * -EBUSY: ring not ready, keep the buffer queued (worker retries on the
@@ -3674,15 +3755,10 @@ static int udc_dwc3_acm_ring_kick(const struct device *const dev,
 	    !ep_data->xfer_active || ep_data->xferrscidx == 0U) {
 		return -ENOTSUP;
 	}
-	/* Same rule as the CPU path: an exact MPS multiple continues an IN
-	 * transfer. OUT TRBs carry CSP and no LST, so the transfer already
-	 * stays open across them; no CHN there. IOC stays set so each TRB
-	 * produces an event and the one-deep ring can post the next buffer. */
-	if (USB_EP_DIR_IS_IN(addr) && !zlp && ep_data->cfg.mps != 0U &&
-	    ((ep_data->total + buf->len) % ep_data->cfg.mps) == 0U) {
-		post_ctrl |= USB_ENGINE_DESC_CTRL_CHN;
-	}
-
+	/* Lattice bulk IN TRBs are HWO|NORMAL|IOC with CHN clear, including
+	 * an exact MPS chunk. IOC stays set so each TRB produces an event
+	 * and the ring can post the next buffer. OUT keeps CSP and no CHN.
+	 */
 	if (!udc_dwc3_engine_ring_synced(addr)) {
 		ret = udc_dwc3_engine_ring_sync(addr,
 						(uint32_t)(uintptr_t)&ep_data->trb_buf[0],
@@ -3776,8 +3852,8 @@ void udc_dwc3_engine_slot_aborted(const struct device *dev, uint8_t addr,
 		trb->addr_lo = LO32((uintptr_t)buf->data);
 		trb->addr_hi = HI32((uintptr_t)buf->data);
 		trb->status = USB_EP_DIR_IS_IN(addr) ? buf->len : buf->size;
-		trb->ctrl = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP |
-			    UDC_DWC3_TRB_CTRL_IOC |
+		trb->ctrl = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_IOC |
+			    (USB_EP_DIR_IS_OUT(addr) ? UDC_DWC3_TRB_CTRL_CSP : 0U) |
 			    (udc_ep_buf_has_zlp(buf) ? UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP :
 						       UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL);
 		udc_dwc3_trb_fence(trb);
@@ -3796,7 +3872,12 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 			     struct udc_dwc3_ep_data *const ep_data,
 			     struct net_buf *const buf)
 {
-	uint32_t ctrl = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_CSP;
+	uint32_t ctrl = UDC_DWC3_TRB_CTRL_HWO;
+
+	/* CSP is an OUT flag. An IN short packet must end the TRB. */
+	if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
+		ctrl |= UDC_DWC3_TRB_CTRL_CSP;
+	}
 
 	LOG_DBG("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
 		ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
@@ -3838,21 +3919,20 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 	} else {
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL;
 		{
+			const uint8_t addr = ep_data->cfg.addr;
+			const bool bulk_in = (addr == 0x82U || addr == 0x84U || addr == 0x85U);
+
 			ep_data->total += buf->len;
 
-			if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+			/* 0x82/0x84/0x85 match Lattice: each bulk IN TRB is a
+			 * finished packet (IOC, no CHN), MPS multiple included.
+			 */
+			if (!bulk_in && USB_EP_DIR_IS_IN(addr) &&
 			    ep_data->total % ep_data->cfg.mps == 0) {
 				LOG_DBG("Buffer is a multiple of %d, continuing this transfer of %u bytes",
 					ep_data->cfg.mps, ep_data->total);
 				ctrl |= UDC_DWC3_TRB_CTRL_CHN;
-				/* 0x85: IOC on every 16 KiB page flooded the
-				 * event ring next to ACM and dropped completes.
-				 * HWO-poll retires CHN pages; IOC only on the
-				 * short last TRB.
-				 */
-				if (ep_data->cfg.addr != 0x85) {
-					ctrl |= UDC_DWC3_TRB_CTRL_IOC;
-				}
+				ctrl |= UDC_DWC3_TRB_CTRL_IOC;
 			} else {
 				LOG_DBG("End of USB transfer, %u bytes transferred", ep_data->total);
 				ep_data->total = 0;
@@ -4000,7 +4080,8 @@ static void udc_dwc3_next_ctrl_out(const struct device *const dev,
 	}
 }
 
-static void udc_dwc3_ep0_flush_pending(const struct device *const dev, const int err)
+/* Error path only; XIP so the reinit caller does not clone it into SRAM. */
+UDC_DWC3_XIP static void udc_dwc3_ep0_flush_pending(const struct device *const dev, const int err)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
 	struct net_buf *buf;
@@ -4160,6 +4241,139 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
  * with the hardware.
  */
 
+/*
+ * SS bulk burst, the same numbers as the endpoint companions and the
+ * TxFIFO depths below (8 B/word). BrstSiz must equal bMaxBurst, and an
+ * IN FIFO must hold one burst (maxburst * (1024 + 8) + 8).
+ *   0x82 ACM IN  bMaxBurst 0   FIFO2  384 words (3 KiB)
+ *   0x84 RAW IN  bMaxBurst 0   FIFO4  192 words (1.5 KiB)
+ *   0x85 UVC IN  bMaxBurst 15  FIFO5 1024 words (8 KiB; Lattice
+ *                        advertises 15 on a ~4 KiB FIFO)
+ *   0x01 ACM OUT bMaxBurst 15  RxFIFO
+ *   0x02 RAW OUT bMaxBurst 15  RxFIFO
+ * Any other bulk endpoint keeps BrstSiz 0.
+ */
+struct udc_dwc3_bulk_burst {
+	uint8_t addr;
+	uint8_t brstsiz;
+};
+
+static const struct udc_dwc3_bulk_burst udc_dwc3_bulk_burst[] = {
+	{ 0x82, 0 },
+	{ 0x84, 0 },
+	{ 0x85, 15 },
+	{ 0x01, 15 },
+	{ 0x02, 15 },
+};
+
+UDC_DWC3_XIP static uint8_t udc_dwc3_bulk_brstsiz(uint8_t addr)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(udc_dwc3_bulk_burst); i++) {
+		if (udc_dwc3_bulk_burst[i].addr == addr) {
+			return udc_dwc3_bulk_burst[i].brstsiz;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Lattice lsc_usb_hw_init, after DCTL.CSFTRST:
+ *   GSBUSCFG1[11:8] = 0 (one outstanding AXI request; the RAM bridge is
+ *   single-outstanding), GSBUSCFG0[0] = 0 (undefined-length INCR off),
+ *   GCTL scale-down / scramble-disable / U2-exit-LFPS cleared and
+ *   PRTCAPDIR = device. Bulk IN rings 0x84 and 0x82 drop CSP from the
+ *   TRB template (HWO|NORMAL|IOC). The OUT ring keeps the reset 0x819.
+ */
+UDC_DWC3_XIP static void udc_dwc3_lattice_core_cfg(const mm_reg_t base)
+{
+	uint32_t reg;
+	const uint32_t in_trb = UDC_DWC3_TRB_CTRL_HWO | UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL |
+				UDC_DWC3_TRB_CTRL_IOC;
+
+	reg = sys_read32(base + UDC_DWC3_GSBUSCFG1);
+	reg &= ~UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK;
+	sys_write32(reg, base + UDC_DWC3_GSBUSCFG1);
+	sys_clear_bits(base + UDC_DWC3_GSBUSCFG0, UDC_DWC3_GSBUSCFG0_INCRBRSTENA);
+
+	reg = sys_read32(base + UDC_DWC3_GCTL);
+	reg &= ~(UDC_DWC3_GCTL_SCALEDOWN_MASK | UDC_DWC3_GCTL_DISSCRAMBLE |
+		 UDC_DWC3_GCTL_U2EXIT_LFPS | UDC_DWC3_GCTL_PRTCAPDIR_MASK);
+	reg |= FIELD_PREP(UDC_DWC3_GCTL_PRTCAPDIR_MASK, 2U);
+	sys_write32(reg, base + UDC_DWC3_GCTL);
+
+	if ((sys_read32(USB_ENGINE_BASE + USB_ENGINE_ENG_ID) & 0xffffU) == USB_ENGINE_MAGIC) {
+		sys_write32(in_trb, USB_ENGINE_BASE + USB_ENGINE_RING_TRB_CTRL(0));
+		sys_write32(in_trb, USB_ENGINE_BASE + USB_ENGINE_RING_TRB_CTRL(1));
+	}
+
+	printk("dwc3: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GCTL=0x%08x trb=%08x/%08x\n",
+	       sys_read32(base + UDC_DWC3_GSBUSCFG0),
+	       sys_read32(base + UDC_DWC3_GSBUSCFG1),
+	       sys_read32(base + UDC_DWC3_GCTL),
+	       sys_read32(USB_ENGINE_BASE + USB_ENGINE_RING_TRB_CTRL(0)),
+	       sys_read32(USB_ENGINE_BASE + USB_ENGINE_RING_TRB_CTRL(1)));
+}
+
+/*
+ * Lattice lsc_usb_phy_reset, run right after DCTL.CSFTRST. Nothing in
+ * this tree or in the Soft-IP programmed the PHY before; it ran at its
+ * power-on defaults. Word offsets 0x4000..0x6002 are the USB3/USB2 PHY
+ * CSRs inside the USB23 LMMI window (bridge consumes address [16:0]).
+ * Values are the "PE & New Eval board, internal clock" set, the ones the
+ * licensed Lattice image used on this board.
+ */
+uint32_t udc_dwc3_lattice_phy = 1U;
+
+UDC_DWC3_XIP static void udc_dwc3_lattice_phy_init(const mm_reg_t base)
+{
+	static const struct {
+		uint32_t off;
+		uint32_t val;
+	} csr[] = {
+		{ 0x18008U, 0x00000100U }, /* 6002 USB2 PHY */
+		{ 0x14010U, 0x00000000U }, /* 5004 USB3 PHY */
+		{ 0x18004U, 0x83008B69U }, /* 6001 internal clock */
+		{ 0x18000U, 0x75440018U }, /* 6000 */
+		{ 0x100C8U, 0x00000040U }, /* 4032 */
+		{ 0x1008CU, 0x90940001U }, /* 4023 */
+		{ 0x10090U, 0x3f7a03d0U }, /* 4024 */
+		{ 0x10094U, 0x03d09000U }, /* 4025 */
+		{ 0x10040U, 0x7FE7C032U }, /* 4010 */
+		{ 0x10010U, 0x80003F25U }, /* 4004 RX EQ */
+	};
+
+	/* Core in reset: full write, as Lattice does (GCTL ends up 0). */
+	sys_write32(UDC_DWC3_GCTL_CORESOFTRESET, base + UDC_DWC3_GCTL);
+	sys_write32(UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST |
+		    UDC_DWC3_GUSB3PIPECTL_REQUEST_P1P2P3 |
+		    UDC_DWC3_GUSB3PIPECTL_DELAYP0TOP1P2P3 |
+		    BIT(19) | /* DELAYP1P2P3 = 1 */
+		    FIELD_PREP(UDC_DWC3_GUSB3PIPECTL_TXDEEMPHASIS_MASK, 1U),
+		    base + UDC_DWC3_GUSB3PIPECTL);
+	sys_write32(UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST |
+		    BIT(6) |          /* SUSPHY */
+		    (2U << 19) |      /* LSIPD 3 bit times */
+		    (9U << 10),       /* USBTRDTIM 8-bit UTMI */
+		    base + UDC_DWC3_GUSB2PHYCFG);
+	k_busy_wait(5000);
+
+	for (size_t i = 0; i < ARRAY_SIZE(csr); i++) {
+		sys_write32(csr[i].val, base + csr[i].off);
+	}
+
+	sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
+	sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
+	k_busy_wait(5000);
+	sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+
+	printk("dwc3: lattice phy GUSB3PIPECTL=0x%08x GUSB2PHYCFG=0x%08x GCTL=0x%08x rxeq=0x%08x\n",
+	       sys_read32(base + UDC_DWC3_GUSB3PIPECTL),
+	       sys_read32(base + UDC_DWC3_GUSB2PHYCFG),
+	       sys_read32(base + UDC_DWC3_GCTL),
+	       sys_read32(base + 0x10010U));
+}
+
 static void udc_dwc3_on_soft_reset(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -4179,6 +4393,10 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		}
 	}
 
+	if (udc_dwc3_lattice_phy != 0U) {
+		udc_dwc3_lattice_phy_init(base);
+	}
+
 	/* Enable AXI64 bursts for various sizes expected */
 	reg = UDC_DWC3_GSBUSCFG0_INCR256BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR128BRSTENA;
@@ -4188,6 +4406,7 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	reg |= UDC_DWC3_GSBUSCFG0_INCR8BRSTENA;
 	reg |= UDC_DWC3_GSBUSCFG0_INCR4BRSTENA;
 	sys_set_bits(base + UDC_DWC3_GSBUSCFG0, reg);
+	udc_dwc3_lattice_core_cfg(base);
 
 	/*
 	 * SS bulk "park mode" (GUCTL1[17]=0, the reset default) lets the
@@ -4207,13 +4426,21 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	       sys_read32(base + UDC_DWC3_GUCTL1));
 
 	/*
-	 * After TX FIFO rebalance, isoc FIFONUM3 is ~16KiB — allow up to 8
-	 * packet bursts (still below full Mult=16 so underruns stay rare).
+	 * TX thresholding. Lattice leaves GTXTHRCFG at reset (off): a packet
+	 * goes out as soon as it is in the FIFO. With PktCnt=4 the core
+	 * waits for four packets before it starts a burst; a CHN TRB of one
+	 * packet in a 4 KiB FIFO4 then never transmits (xm0w_m: every 0x84
+	 * bulk read stopped after its first TRB), and the databook wants
+	 * the FIFO to hold the whole threshold, which 3 KiB FIFO2 did not.
 	 */
-	reg = UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL;
-	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBTXPKTCNT_MASK, 4);
-	reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBMAXTXBURSTSIZE_MASK, 8);
-	sys_write32(reg, base + UDC_DWC3_GTXTHRCFG);
+	if (udc_dwc3_txfifo_por != 0U) {
+		sys_write32(0U, base + UDC_DWC3_GTXTHRCFG);
+	} else {
+		reg = UDC_DWC3_GTXTHRCFG_USBTXPKTCNTSEL;
+		reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBTXPKTCNT_MASK, 4);
+		reg |= FIELD_PREP(UDC_DWC3_GTXTHRCFG_USBMAXTXBURSTSIZE_MASK, 8);
+		sys_write32(reg, base + UDC_DWC3_GTXTHRCFG);
+	}
 
 	/* Read the chip identification */
 	reg = sys_read32(base + UDC_DWC3_GCOREID);
@@ -4272,7 +4499,12 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 		for (uint32_t i = 0; i < ARRAY_SIZE(dep); i++) {
 			sum += dep[i];
 		}
-		if (sum <= ram1) {
+		if (udc_dwc3_txfifo_por != 0U) {
+			/* Lattice: GTXFIFOSIZ left at the core reset layout
+			 * (FIFO0 0x42, FIFO1..5 0x205 each; GDBGFIFOSPACE
+			 * showed tx2=tx5=517 on xm0w_m). FIFO6/7 do not exist
+			 * on this core: reading them hangs the bus. */
+		} else if (sum <= ram1) {
 			for (uint32_t i = 0; i < ARRAY_SIZE(dep); i++) {
 				sys_write32(FIELD_PREP(UDC_DWC3_GTXFIFOSIZ_TXFSTADDR_MASK,
 						       addr) |
@@ -4315,8 +4547,6 @@ static void udc_dwc3_on_soft_reset(const struct device *const dev)
 	sys_write32(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t), base + UDC_DWC3_GEVNTSIZ(0));
 	LOG_INF("Event buffer size is %u bytes", sys_read32(base + UDC_DWC3_GEVNTSIZ(0)));
 	sys_write32(0, base + UDC_DWC3_GEVNTCOUNT(0));
-
-	/* Letting GCTL unchanged */
 
 	/* Set the USB device configuration, including max supported speed */
 	sys_write32(UDC_DWC3_DCFG_PERFRINT_90, base + UDC_DWC3_DCFG);
@@ -4729,8 +4959,9 @@ static void udc_dwc3_out_notready_recycle(const struct device *const dev,
 	const uint32_t tail = ep_data->tail;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
-			UDC_DWC3_DEPCMD_DEPENDXFER | UDC_DWC3_DEPCMD_HIPRI_FORCERM |
+			UDC_DWC3_DEPCMD_DEPENDXFER |
 			FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx));
+	k_busy_wait(1000);
 
 	udc_dwc3_depcmd_start_xfer_trb(dev, ep_data, &ep_data->trb_buf[tail]);
 }
@@ -5277,9 +5508,9 @@ static void udc_dwc3_in_park_retake(const struct device *const dev,
 	if (ep_data->xfer_active && ep_data->xferrscidx != 0U) {
 		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
 				UDC_DWC3_DEPCMD_DEPENDXFER |
-					UDC_DWC3_DEPCMD_HIPRI_FORCERM |
 					FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
 						   ep_data->xferrscidx));
+		k_busy_wait(1000);
 		ep_data->xfer_active = false;
 		ep_data->xferrscidx = 0;
 	}
@@ -6108,6 +6339,8 @@ UDC_DWC3_XIP static void udc_dwc3_in_vid_rel(uint8_t addr)
  * 2 ms event-thread tick. Cost ~20 ms of video per port open.
  */
 #define UDC_DWC3_OPEN_HOLD_MS 10U
+/* 0: DTR rise does not halt video. Same reason as ring_park_mode. */
+uint32_t udc_dwc3_open_hold_en = 0U;
 uint32_t udc_dwc3_open_hold_n;
 uint32_t udc_dwc3_open_hold_max_ms;
 uint32_t udc_dwc3_open_hold_sum_ms;
@@ -6119,6 +6352,11 @@ static bool udc_dwc3_open_hold_dtr_prev;
 UDC_DWC3_XIP static void udc_dwc3_open_hold_dtr(uint8_t dtr)
 {
 	const bool rise = (dtr != 0U) && !udc_dwc3_open_hold_dtr_prev;
+
+	if (udc_dwc3_open_hold_en == 0U) {
+		udc_dwc3_open_hold_dtr_prev = (dtr != 0U);
+		return;
+	}
 
 	udc_dwc3_open_hold_dtr_prev = (dtr != 0U);
 	if (!rise) {
@@ -6312,10 +6550,9 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_bulk(const struct device *const dev
 	irq_unlock(key);
 	reg = udc_dwc3_depcmd_reg(dev, UDC_DWC3_DEPCMD(ep->epn),
 				  FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, rsc) |
-				  UDC_DWC3_DEPCMD_HIPRI_FORCERM |
 				  UDC_DWC3_DEPCMD_DEPENDXFER,
 				  true);
-	k_busy_wait(200);
+	k_busy_wait(1000);
 	udc_dwc3_engine_poll(dev, NULL);
 	st = sys_read32(epb + USB_ENGINE_EP_STATE);
 	/* EVT_OWN is off, so the ring does not see this CPU EndXfer.
@@ -6422,6 +6659,67 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_bulk(const struct device *const dev
 #endif
 }
 
+/*
+ * Log a bulk IN that stays active on one slot. The host is left attached;
+ * a controller re-init is not started from here.
+ */
+#define UDC_DWC3_WEDGE_MS         2500U
+#define UDC_DWC3_WEDGE_HOLDOFF_MS 30000U
+
+static uint32_t udc_dwc3_wedge_since[2];
+static uint8_t udc_dwc3_wedge_slot[2];
+static uint32_t udc_dwc3_wedge_last_ms;
+static uint32_t udc_dwc3_wedge_pump_ms;
+uint32_t udc_dwc3_wedge_n;
+
+UDC_DWC3_XIP static void udc_dwc3_wedge_tick(const struct device *const dev, int idx)
+{
+	const uint8_t addr = (idx == 0) ? 0x84U : 0x82U;
+	struct udc_dwc3_ep_data *const ep =
+		(struct udc_dwc3_ep_data *)udc_get_ep_cfg(dev, addr);
+	const mm_reg_t epb = USB_ENGINE_BASE + USB_ENGINE_BULK_BASE +
+			     (uint32_t)idx * USB_ENGINE_BULK_WINDOW;
+	const uint32_t now = k_uptime_get_32();
+	uint32_t st;
+
+	if (ep == NULL || ep->trb_buf == NULL || !udc_dwc3_engine_enabled()) {
+		udc_dwc3_wedge_since[idx] = 0U;
+		return;
+	}
+	st = sys_read32(epb + USB_ENGINE_EP_STATE);
+	if ((st & USB_ENGINE_EP_STATE_ACTIVE) == 0U ||
+	    (ep->trb_buf[ep->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+		udc_dwc3_wedge_since[idx] = 0U;
+		return;
+	}
+	if (udc_dwc3_wedge_since[idx] == 0U || udc_dwc3_wedge_slot[idx] != ep->tail) {
+		/* First look, or the ring moved: restart the clock. */
+		udc_dwc3_wedge_since[idx] = now | 1U;
+		udc_dwc3_wedge_slot[idx] = ep->tail;
+		return;
+	}
+	if ((now - udc_dwc3_wedge_since[idx]) < UDC_DWC3_WEDGE_MS) {
+		return;
+	}
+	udc_dwc3_wedge_since[idx] = 0U;
+	if (udc_dwc3_wedge_n != 0U &&
+	    (now - udc_dwc3_wedge_last_ms) < UDC_DWC3_WEDGE_HOLDOFF_MS) {
+		printk("dwc3: WEDGE ep=0x%02x again within holdoff\n", addr);
+		/* The detector retriggers in the same millisecond once the
+		 * slot clock is cleared, so the pump line is gated here. */
+		if ((now - udc_dwc3_wedge_pump_ms) >= 2000U) {
+			udc_dwc3_wedge_pump_ms = now;
+			udc_dwc3_wedge_pump(dev);
+		}
+		return;
+	}
+	udc_dwc3_wedge_last_ms = now;
+	udc_dwc3_wedge_n++;
+	printk("dwc3: WEDGE ep=0x%02x slot=%u st=0x%08x trb=0x%08x #%u\n",
+	       addr, ep->tail, st, ep->trb_buf[ep->tail].ctrl, udc_dwc3_wedge_n);
+	udc_dwc3_park_snapshot(dev, "wedge");
+}
+
 UDC_DWC3_XIP static void udc_dwc3_in_restart_video(const struct device *const dev)
 {
 	static uint32_t seen;
@@ -6476,9 +6774,9 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_video(const struct device *const de
 	irq_unlock(key);
 	reg = udc_dwc3_depcmd_reg(dev, UDC_DWC3_DEPCMD(ep->epn),
 				  FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, rsc) |
-				  UDC_DWC3_DEPCMD_HIPRI_FORCERM |
 				  UDC_DWC3_DEPCMD_DEPENDXFER,
 				  true);
+	k_busy_wait(1000);
 	if (trb >= 0x80000000U) {
 		*(volatile uint32_t *)(uintptr_t)(trb + 12U) |= UDC_DWC3_TRB_CTRL_HWO;
 	}
@@ -6495,6 +6793,8 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_tick(const struct device *const dev
 	udc_dwc3_open_hold_tick();
 	udc_dwc3_in_restart_bulk(dev, 1);
 	udc_dwc3_in_restart_bulk(dev, 0);
+	udc_dwc3_wedge_tick(dev, 1);
+	udc_dwc3_wedge_tick(dev, 0);
 	udc_dwc3_in_restart_video(dev);
 }
 #endif /* CONFIG_UDC_DWC3_USB_ENGINE */
@@ -7012,9 +7312,47 @@ static enum udc_bus_speed udc_dwc3_device_speed(const struct device *const dev)
 	return 0;
 }
 
+static int udc_dwc3_ep_enable(const struct device *const dev,
+			      struct udc_ep_config *const ep_cfg);
+
+/*
+ * Re-init after udc_dwc3_disable() (bulk IN wedge). Same path as boot:
+ * DCTL.CSFTRST, global/FIFO/event-buffer/DCFG setup, DEPSTARTCFG(0),
+ * EP0 config. Runs under usbd_enable()'s k_sched_lock(), so the event
+ * thread cannot interleave with the ring reset. The USB stack returns
+ * the SETUP buffer on -ECONNRESET and enqueues it again after we return,
+ * i.e. after RUN_STOP is set, like the first enable.
+ */
+UDC_DWC3_XIP static void udc_dwc3_core_reinit(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+
+	printk("dwc3: REINIT DSTS=0x%08x DCTL=0x%08x evt_next=%u\n",
+	       sys_read32(base + UDC_DWC3_DSTS), sys_read32(base + UDC_DWC3_DCTL),
+	       priv->evt_next);
+
+	udc_dwc3_on_soft_reset(dev);
+	priv->evt_next = 0U;
+
+	priv->ep0_setup_pending = false;
+	priv->ep0_status_nrd = false;
+	priv->ep0_data_inflight = false;
+	priv->ep0_data_dir = 0U;
+	udc_dwc3_ep0_flush_pending(dev, -ECONNRESET);
+
+	(void)udc_dwc3_ep_enable(dev, &cfg->ep_data_out[0].cfg);
+	(void)udc_dwc3_ep_enable(dev, &cfg->ep_data_in[0].cfg);
+
+	printk("dwc3: REINIT done DSTS=0x%08x DALEPENA=0x%08x\n",
+	       sys_read32(base + UDC_DWC3_DSTS), sys_read32(base + UDC_DWC3_DALEPENA));
+}
+
 static int udc_dwc3_enable(const struct device *const dev)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	int ret;
 
@@ -7023,6 +7361,11 @@ static int udc_dwc3_enable(const struct device *const dev)
 	ret = udc_dwc3_quirk_enable(dev);
 	if (ret != 0) {
 		return ret;
+	}
+
+	if (priv->core_reinit) {
+		priv->core_reinit = false;
+		udc_dwc3_core_reinit(dev);
 	}
 
 	/* Enable the DWC3 events */
@@ -7059,14 +7402,43 @@ bool udc_dwc3_video_pipe_reset_pending(void)
 	return k_uptime_get() < udc_dwc3_video_grace_until;
 }
 
+/* Stop the RTL (same as a bus reset), RUN_STOP 1->0, then poll
+ * DSTS.DEVCTRLHLT as the databook asks. A wedged core may never halt;
+ * that is diagnostic only, the next enable resets the core regardless. */
+UDC_DWC3_XIP static void udc_dwc3_disable_quiesce(const struct device *const dev)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	uint32_t spins = 0U;
+
+	udc_dwc3_hw_owned_revoke_all(dev, "udc-disable");
+	udc_dwc3_engine_disable();
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	udc_dwc3_in_vid_rel(0x82U);
+	udc_dwc3_in_vid_rel(0x84U);
+#endif
+
+	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+
+	while ((sys_read32(base + UDC_DWC3_DSTS) & UDC_DWC3_DSTS_DEVCTRLHLT) == 0U) {
+		if (++spins > 200U) {
+			break;
+		}
+		k_sleep(K_MSEC(1));
+	}
+	printk("dwc3: DISABLE halted=%u after %u ms DSTS=0x%08x\n",
+	       (sys_read32(base + UDC_DWC3_DSTS) & UDC_DWC3_DSTS_DEVCTRLHLT) != 0U,
+	       spins, sys_read32(base + UDC_DWC3_DSTS));
+
+	priv->core_reinit = true;
+}
+
 static int udc_dwc3_disable(const struct device *const dev)
 {
-	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-
 	LOG_DBG("Disabling DWC3 driver");
 
 	udc_dwc3_evt_fast = false;
-	sys_clear_bits(base + UDC_DWC3_DCTL, UDC_DWC3_DCTL_RUNSTOP);
+	udc_dwc3_disable_quiesce(dev);
 
 	return 0;
 }

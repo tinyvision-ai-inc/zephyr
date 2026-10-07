@@ -2375,7 +2375,8 @@ static struct uvc_desc uvc_desc_##n = {						\
 	.if1_ep_ss_co = {							\
 		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,						\
+		/* 7 packets: 7*1032+8 fits the 8 KiB TxFIFO5. */		\
+		.bMaxBurst = 6,							\
 		.bmAttributes = 0x00,						\
 		.wBytesPerInterval = 0x00,					\
  	},									\

@@ -1451,7 +1451,8 @@ struct usbd_class_api usbd_cdc_acm_api = {
 	.if1_ss_in_ep_co = {							\
 		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
 		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
-		.bMaxBurst = 15,						\
+		/* One packet. TxFIFO2 is 3 KiB and DEPCFG.BrstSiz matches. */	\
+		.bMaxBurst = 0,							\
 		.bmAttributes = 0x00,						\
 		.wBytesPerInterval = 0x00,					\
 	},									\
