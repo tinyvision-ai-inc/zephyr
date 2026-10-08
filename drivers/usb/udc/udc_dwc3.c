@@ -3,6 +3,27 @@
  * SPDX-FileCopyrightText: Copyright tinyVision.ai Inc.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/*
+ * Synopsys DWC3 USB device controller driver.
+ *
+ * Sections, in file order:
+ * - Configuration: Kconfig defaults and driver limits.
+ * - Hardware definitions: TRB, event and register layouts.
+ * - Driver data: per-instance configuration and state.
+ * - Helpers: run state, DCTL, buffer return, event interrupt and lock.
+ * - Commands: endpoint commands and the endpoint state they drive.
+ * - Transfer Requests (TRB): the TRB rings.
+ * - Control buffers: arming the control transfer stages.
+ * - Endpoint and control recovery.
+ * - Core setup: soft reset and register set-up.
+ * - Events: the event handlers and dispatch.
+ * - Heartbeat and controller recovery.
+ * - Event drain: the thread that reads the event ring.
+ * - UDC API: the functions the Zephyr USB stack calls.
+ * - Driver instance: pre-init and the device definition.
+ * - Shell: debug commands.
+ */
 #define DT_DRV_COMPAT   snps_dwc3
 
 #include <string.h>
@@ -22,12 +43,10 @@
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 /*
- * trace_tag() and friends: empty stubs that keep this file a drop-in replacement
- * for the stock udc_dwc3.c. usbd_core.c, usbd_cdc_acm.c and usbd_ch9.c declare and
- * call them, so without these the driver cannot be swapped in alone.
- *
- * No trace buffer: the stock 128-entry array costs 2 KB of a 64 KB RAM and nothing
- * here reads it. Weak, so a tree can supply the real implementation.
+ * Empty trace_tag() stubs. usbd_core.c, usbd_cdc_acm.c and usbd_ch9.c call
+ * them, so these let this file replace the stock udc_dwc3.c on its own. There
+ * is no trace buffer, which saves 2 KB of RAM. They are weak, so a tree can
+ * supply the real ones.
  */
 __weak void trace_tag(const char *tag)
 {
@@ -45,73 +64,79 @@ __weak void trace_dump(void)
 #include "udc_common.h"
 
 /*
- * Kconfig knobs, defaulted here so this file builds on its own.
+ * Configuration
+ *
+ * Kconfig defaults and the driver's time and size limits.
  */
+
+/* Kconfig defaults, so this file builds on its own. */
 #ifndef CONFIG_UDC_DWC3_EVENTS_NUM
-/* 16 entries x 4 bytes = the 64-byte cap of this part (not the databook's); see BUILD_ASSERT. */
+/* 16 events x 4 bytes = 64 bytes, this part's limit (see BUILD_ASSERT). */
 #define CONFIG_UDC_DWC3_EVENTS_NUM  16
 #endif
 
 #ifndef CONFIG_UDC_DWC3_TRB_NUM
-/* Per non-control endpoint. Must be >= 2: the control paths index trb_buf[1]. */
+/* TRBs per endpoint, including the LINK TRB. EP0 uses trb_buf[1], so >= 2. */
 #define CONFIG_UDC_DWC3_TRB_NUM 4
 
 #endif
 
 /*
- * Event FIFO (a power of two: the indices run free and only the array index wraps,
- * which is continuous across the 2^32 wrap only if the size divides 2^32). Normally
- * emptied in the pass that fills it; events
- * stay only while dispatch is blocked by a reset/error post that did not fit in
- * the stack's queue, retried on the next pass (next interrupt, or the heartbeat's
- * kick). Full: the drain stops taking events from the ring.
+ * Size of the event FIFO between the ring and dispatch. It is a power of two
+ * because the indices run free and only the array index wraps.
  */
 #define UDC_DWC3_EVQ_NUM                                    64u
 
 /*
- * Wall-clock cap (ms) on one pass's busy-wait for a late head slot, alongside its
- * poll count (udc_dwc3_evt_wait_first()). Defined here because the SETUP report
- * threshold below is derived from it.
+ * Longest time (ms) one drain pass busy-waits for a late event write, see
+ * udc_dwc3_evt_wait_first(). The SETUP report time below is derived from it.
  */
 #define UDC_DWC3_EVT_ARRIVE_MAX_MS                          100u
 
 /*
- * Init, recovery, fault and log-only code goes out of line into one section. When
- * the board relocates this driver to RAM, its filter leaves .text.udc_dwc3_recov* in
- * flash, so only the per-event path is copied to RAM. Without relocation it has no
- * effect.
+ * Section for init, recovery, fault and log-only code. When the board copies
+ * this driver to RAM, its filter keeps this section in flash. So only the
+ * per-event path takes RAM. Without relocation it has no effect.
  */
 #define UDC_DWC3_COLD      __noinline __attribute__((cold, section(".text.udc_dwc3_recovery_cold")))
 
 /*
  * How long an armed SETUP may stay undelivered before
- * udc_dwc3_ctrl_setup_wd_check() reports it. Must outlast one full event-arrival
- * wait, or it reports a SETUP that was about to arrive; deriving it from that
- * wait keeps the two in step. Not in Kconfig, so the driver builds standalone.
+ * udc_dwc3_ctrl_setup_wd_check() reports it. It must be longer than one full
+ * event-arrival wait, or a SETUP that is about to arrive gets reported. So it
+ * is derived from that wait.
  */
 #define UDC_DWC3_SETUP_WD_REPORT_MS                         (2u * UDC_DWC3_EVT_ARRIVE_MAX_MS)
 
 
 /*
- * Event-drain thread stack. 512 B overflows: the dispatch goes handle_event ->
- * depcmd -> LOG_INF, and a synchronous log backend formats each message on this
- * stack. The heartbeat reports the remaining headroom in its own "evtstack" line.
+ * Event-drain thread stack. Dispatch can reach LOG_INF, and a synchronous log
+ * backend formats the message on this stack, so 512 B is too small. The
+ * heartbeat reports the free space in its "evtstack" line.
  */
 #define UDC_DWC3_EVT_STACK_SIZE                             1280
 /*
- * Event-drain thread priority. Cooperative, so preemptible work cannot split a
- * pass. Not higher: one step up and the drain runs the instant it is signalled,
- * reads slots the controller has not finished writing, and counts them as late.
+ * Event-drain thread priority. It is cooperative, so preemptible work cannot
+ * split a pass. A higher priority makes the drain run the moment it is
+ * signalled. It then reads slots the controller is still writing, and counts
+ * them as late.
  */
 #define UDC_DWC3_EVT_THREAD_PRIO                            K_PRIO_COOP(7)
 
+
+/*
+ * Hardware definitions
+ *
+ * TRB, event and register layouts from the databook, with the driver
+ * limits that go with them.
+ */
 
 /* TRB memory buffer fields */
 #define UDC_DWC3_TRB_STATUS_BUFSIZ_MASK                     GENMASK(23, 0)
 #define UDC_DWC3_TRB_STATUS_PCM1_MASK                       GENMASK(25, 24)
 /*
  * Short Packet Received, bit 26 of the status dword. On OUT write-back the
- * controller sets it on the last TRB used for the transfer descriptor.
+ * controller sets it on the last TRB of the transfer.
  */
 #define UDC_DWC3_TRB_STATUS_SPR                             BIT(26)
 #define UDC_DWC3_TRB_STATUS_PCM1_1PKT                       (0x0 << 24)
@@ -139,32 +164,27 @@ __weak void trace_dump(void)
 #define UDC_DWC3_TRB_CTRL_TRBCTL_LINK_TRB                   (0x8 << 4)
 #define UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP                 (0x9 << 4)
 
-/*
- * watchdog_type when no control stage is watched (no TRBCTL encoding is 0):
- * set when a stage completes, its endpoint is disabled, or transfer state is
- * dropped.
- */
+/* watchdog_type when no control stage is watched. No TRBCTL encoding is 0. */
 #define UDC_DWC3_WATCHDOG_TYPE_NONE                         0U
 
 #define UDC_DWC3_TRB_CTRL_ISP_IMI                           BIT(10)
 #define UDC_DWC3_TRB_CTRL_IOC                               BIT(11)
 /*
- * Stream ID / SOF Number. The control word holds only HWO, LST, CHN, CSP, TRBCTL,
- * ISP/IMI, IOC and this field; bits 13:12 and 31:30 are reserved. PCM1 and SPR
- * are in the status dword (Figure 3-1).
+ * Stream ID / SOF Number. Bits 13:12 and 31:30 of the control word are
+ * reserved. PCM1 and SPR are in the status dword (Figure 3-1).
  */
 #define UDC_DWC3_TRB_CTRL_SIDSOFN_MASK                      GENMASK(29, 14)
 
-/* Incomplete coverage of all fields, but suited for what this driver supports */
+/* Not every field is covered, only what this driver uses */
 #define UDC_DWC3_EVT_MASK                                   GENMASK(11, 0)
 #define UDC_DWC3_DEPEVT_EPN_MASK                            GENMASK(5, 1)
 #define UDC_DWC3_DEPEVT_KIND_MASK                           GENMASK(9, 6)
 #define UDC_DWC3_DEPEVT_RSVD_MASK                           GENMASK(11, 10)
-/* The kind field of a DEPEVT type, e.g. UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_XFERCOMPLETE(0)). */
+/* Kind field of a DEPEVT type, e.g. of UDC_DWC3_DEPEVT_XFERCOMPLETE(0). */
 #define UDC_DWC3_DEPEVT_KIND(depevt)                        (((depevt) & UDC_DWC3_DEPEVT_KIND_MASK) >> 6)
 /*
- * Fields the controller returns in an Endpoint Command Complete event.
- * Programming Guide 3.30b, Table 3-7 "Device Endpoint-n Events: DEPEVT":
+ * Fields of an Endpoint Command Complete event.
+ * Programming Guide 3.30b, Table 3-7 "Device Endpoint-n Events: DEPEVT".
  */
 #define UDC_DWC3_DEPEVT_CMDTYP_MASK                         GENMASK(27, 24)
 #define UDC_DWC3_DEPEVT_XFERRSCIDX_MASK                     GENMASK(22, 16)
@@ -177,16 +197,15 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEPEVT_RXTXFIFOEVT(epn)                    (((epn) << 1) | (0x04 << 6))
 #define UDC_DWC3_DEPEVT_STREAMEVT(epn)                      (((epn) << 1) | (0x06 << 6))
 #define UDC_DWC3_DEPEVT_EPCMDCMPLT(epn)                     (((epn) << 1) | (0x07 << 6))
-/* SPEC 3.30b DEPEVT 15:12 "Event Status" in an XferNotReady event (p.326): */
+/* XferNotReady "Event Status", DEPEVT 15:12 (SPEC 3.30b p.326). */
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK                 GENMASK(13, 12)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_SETUP                (0x0 << 12)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_DATA                 (0x1 << 12)
 #define UDC_DWC3_DEPEVT_STATUS_CONTROL_STATUS               (0x2 << 12)
 /*
- * Event Status (bits 15:12) means different things per event type. The decodes
- * below and the control-stage mask above all live in that field.
- */
-/* For XferComplete or XferInProgress: short packet received, or the last
+ * Event Status (bits 15:12) means different things per event type. The
+ * control-stage values above and the bits below are all in that field.
+ * SHORT, on XferComplete or XferInProgress: short packet received, or the last
  * packet of an isochronous interval.
  */
 #define UDC_DWC3_DEPEVT_STATUS_SHORT                        BIT(13)
@@ -194,11 +213,12 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEPEVT_STATUS_IOC                          BIT(14)
 /* For XferComplete: LST bit of the completed TRB */
 #define UDC_DWC3_DEPEVT_STATUS_LST                          BIT(15)
-/* For XferInProgress: the interval did not complete successfully. This shares
- * bit 15 with LST above - the event type is what tells the two apart.
+/*
+ * XferInProgress: the isochronous interval did not complete. This is the same
+ * bit as LST above. The event type tells them apart.
  */
 #define UDC_DWC3_DEPEVT_STATUS_MISSED_ISOC                  BIT(15)
-/* For StreamEvt: 4'h1 StreamFound, 4'h2 StreamNotFound, also in bits 15:12 */
+/* StreamEvt: 4'h1 StreamFound, 4'h2 StreamNotFound, also in bits 15:12 */
 #define UDC_DWC3_DEPEVT_STATUS_STREAMFOUND                  (0x1 << 12)
 #define UDC_DWC3_DEPEVT_STATUS_STREAMNOTFOUND               (0x2 << 12)
 #define UDC_DWC3_DEVT_DISCONNEVT                            (BIT(0) | (0x0 << 8))
@@ -212,124 +232,103 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEVT_CMDCMPLT                              (BIT(0) | (0xa << 8))
 #define UDC_DWC3_DEVT_EVNTOVERFLOW                          (BIT(0) | (0xb << 8))
 /*
- * Device-event payload, databook Table 3-8 field 24:16 (EvtInfo). For a USB/Link
- * State Change event: EvtInfo[4] is set for SuperSpeed, and EvtInfo[3:0] is the
- * link state at the time of the event, in the same encoding as DSTS.
+ * Device-event EvtInfo, bits 24:16 (databook Table 3-8). In a USB/Link State
+ * Change event, EvtInfo[4] is set for SuperSpeed. EvtInfo[3:0] is the link
+ * state, encoded as in DSTS.
  */
 #define UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK                GENMASK(19, 16)
 #define UDC_DWC3_DEVT_EVTINFO_SS                            BIT(20)
 /*
- * One line per this many repeats of the same link state; see
- * udc_dwc3_log_link_event(). Prime, so coprime with the event ring size (16): a
- * multiple of 16 would sample the same slot every time when the sampled thing
- * advances by a constant stride.
+ * Log one line per this many repeats of the same link state, see
+ * udc_dwc3_log_link_event(). It is prime, so it shares no factor with the
+ * 16-slot event ring. A multiple of 16 could sample the same slot every time.
  */
 #define UDC_DWC3_EVT_LINK_LOG_EVERY                         257u
-/* Heartbeat tick; bounds how long the event drain can sit unscheduled. */
+/* Heartbeat period. It bounds how long the event drain can go unscheduled. */
 #define UDC_DWC3_HEARTBEAT_MS                               200u
 /*
- * Heartbeats between event-ring statistics lines. A wall-clock period, so the
- * report keeps coming while the event ring is stalled.
+ * Heartbeats between event-ring statistics lines. The period is wall-clock,
+ * so the reports continue while the event ring is not moving.
  */
 #define UDC_DWC3_EVT_STATS_BEATS                            25u
 /*
- * Beats between forced statistics lines when nothing has changed; proves
- * liveness on a quiet run. The console is synchronous and a full line costs
- * ~35 ms, so an identical report every 5 s is not worth it.
+ * Heartbeats between statistics lines when nothing has changed (60 s). They
+ * show the driver is alive on a quiet run. A line costs ~35 ms on the
+ * synchronous console, so it is not printed more often. The core debug report
+ * uses the same period.
  */
 #define UDC_DWC3_EVT_STATS_FORCE_BEATS                      300u
 
-/*
- * Beats between CORE debug-register samples (25 x 200 ms = 5 s). Several of these
- * registers only mean something against a healthy baseline, which a wedge dump
- * is compared to. Costs ~0.2 lines/s.
- */
+/* Heartbeats between core debug-register samples (25 x 200 ms = 5 s). */
 #define UDC_DWC3_CORE_DBG_BEATS                             25u
 
 
 /*
- * Kick the drain if it has not completed a pass in this long while the controller
- * still reports events outstanding. A backstop for a drain that is not running,
- * not a request deadline. Must exceed a stats line's console cost (up to ~35 ms,
- * synchronous); 100 ms covers any real pass and is well inside the host's 5 s.
+ * Kick the drain if it has not finished a pass in this long while the
+ * controller still reports events. This is a backstop for a drain that is not
+ * running. It must be longer than one statistics line (up to ~35 ms on the
+ * synchronous console). 100 ms covers any real pass.
  */
 #define UDC_DWC3_EVT_IDLE_KICK_MS                           100u
 
 /*
- * How long the heartbeat must see GEVNTCOUNT > 0 with nothing handled before the
- * drain is treated as dead (not slow) and the controller recovery reconnects.
- * Well past the drain's own dead-slot skip (UDC_DWC3_EVT_DEAD_SLOT_MS), so a
- * single lost event never gets this far.
+ * How long the heartbeat must see GEVNTCOUNT > 0 with no event taken before
+ * the drain counts as dead, not slow. This is well past the drain's own
+ * dead-slot skip (UDC_DWC3_EVT_DEAD_SLOT_MS), so one lost event never gets
+ * this far.
  */
 #define UDC_DWC3_HB_DRAIN_DEAD_MS                           5000u
 
 /*
- * There is no endpoint inactivity timer, and none may be added. A non-control
- * endpoint holding a controller-owned TRB and retiring nothing is normally idle,
- * waiting for the host; elapsed time cannot tell that from a fault.
- */
-
-
-
-/*
- * Cumulative give-ups (looks that found the slot empty) that prove a slot dead
- * regardless of wall clock. The 1000 ms route needs an unbroken run, which
- * anything resetting drain.attempts can starve; this is a reset-proof second route.
+ * Give-ups on one slot (looks that found it empty) that also prove it dead.
+ * This is a second route besides UDC_DWC3_EVT_DEAD_SLOT_MS.
  */
 #define UDC_DWC3_EVT_DEAD_SLOT_GIVEUPS                      64u
 
 /*
- * Minimum age of a give-up run before any abort route may discard a slot.
+ * Minimum watch time before either timeout route may discard a slot. Watch
+ * time is the time actually spent looking at the empty slot (drain.watched_us),
+ * not wall-clock time.
  */
 #define UDC_DWC3_EVT_DEAD_SLOT_MIN_MS                       200u
 
+/* Watch time after which an empty slot is taken as dead. */
 #define UDC_DWC3_EVT_DEAD_SLOT_MS                           1000u
 
 /*
- * Minimum age before the drain may act on the look-ahead proof rather than on
- * the timeout above.
+ * Minimum watch time before the drain may discard a slot on the look-ahead
+ * proof (a written slot ahead of it).
  */
 #define UDC_DWC3_EVT_LOOKAHEAD_MIN_MS                       50u
 
-/*
- * Build in udc_dwc3_controller_recover(): device-initiated disconnect, core soft
- * reset and reconnect, run from the heartbeat for an erratic error or an event
- * ring that has stopped advancing.
- */
+/* Build in the controller recovery, udc_dwc3_controller_recover(). */
 #define UDC_DWC3_CONTROLLER_RECOVER
 
 /*
  * 1: udc_dwc3_depcmd() polls every endpoint command until CmdAct clears and
- * reports its outcome synchronously. 0: the two per-transfer commands are
- * posted without that poll.
- *   Start Transfer: its outcome always arrives - its Command Complete event
- *   (CmdIOC), or, if that event is lost, the STARTING deadline resolver, both
- *   reading DEPCMD or the value saved in cmd_record before a later command
- *   overwrote it; a refusal goes to udc_dwc3_ep_start_refused() on every path.
- *   Update Transfer: cannot be refused by a race - "the controller will detect
- *   that the Update Transfer is unnecessary" for a transfer already completed
- *   (3.2.2.6); its only error, an index never started, is a driver bug, still
- *   logged by the next command's pre-poll.
- * The configuration, stall and End Transfer commands are always polled: they
- * are rare and their callers act on the outcome, and DEPSTARTCFG at power-on
- * "must poll the CmdAct bit" (3.2.2.8). The pre-poll before every command is
- * never skipped.
+ * returns its outcome.
+ * 0: Start Transfer and Update Transfer are posted without that poll. Their
+ * outcomes are handled in udc_dwc3_depcmd_start_xfer() and
+ * udc_dwc3_depcmd_update_xfer().
+ * The configuration, stall and End Transfer commands are always polled. They
+ * are rare and their callers act on the outcome. DEPSTARTCFG at power-on "must
+ * poll the CmdAct bit" (3.2.2.8).
  */
 #ifndef UDC_DWC3_DEPCMD_POST_POLL
 #define UDC_DWC3_DEPCMD_POST_POLL                           0
 #endif
 
 /*
- * How long a slot must stay empty before the event write is presumed lost
- * rather than late.
+ * How long (wall clock) a slot may stay empty before the episode is counted
+ * as a lost event write rather than a late one.
  */
 #define UDC_DWC3_EVT_MISSED_MS                              1000u
 
 
 /*
- * Marker for a consumed (or not yet written) slot. 0xFFFFFFFF is never a real
- * event: bit 0 = 1 means device event, which requires bits 7:1 = 0, but here they
- * are 0x7f. Zero cannot be used: it decodes as a valid endpoint event.
+ * Marker for a consumed or not yet written slot. 0xFFFFFFFF is never a real
+ * event. Bit 0 set means a device event, which needs bits 7:1 clear. Zero is
+ * not usable because it decodes as a valid endpoint event.
  */
 #define UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE                   0xFFFFFFFFu
 #define UDC_DWC3_DISPATCH_STUCK_MS                          250u
@@ -343,10 +342,8 @@ __weak void trace_dump(void)
 /* Common fields to DEPCMD */
 #define UDC_DWC3_DEPCMD_HIPRI_FORCERM                       (1 << 11)
 /*
- * Command Interrupt On Completion: raise Endpoint Command Complete when the
- * command finishes. Required on End Transfer: CmdAct clearing only means the
- * command was accepted; the completion event is the only sign that DMA has
- * stopped, which a new Start Transfer must wait for.
+ * Command Interrupt On Completion: the controller raises Endpoint Command
+ * Complete when the command finishes.
  */
 #define UDC_DWC3_DEPCMD_CMDIOC                              BIT(8)
 #define UDC_DWC3_DEPCMD_STATUS_MASK                         GENMASK(15, 12)
@@ -354,25 +351,27 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEPCMD_STATUS_CMDERR                       (1 << 12)
 #define UDC_DWC3_DEPCMD_XFERRSCIDX_MASK                     GENMASK(22, 16)
 /*
- * "No transfer resource index": returned by udc_dwc3_depcmd() when a command
- * fails, and held in ep_data->xferrscidx while none is assigned. XferRscIdx is
- * 7 bits (DEPCMD/DEPEVT [22:16]), so no real index can equal it.
+ * "No transfer resource index". udc_dwc3_depcmd() returns it when a command
+ * fails, and ep_data->xferrscidx holds it while no index is assigned.
+ * XferRscIdx is 7 bits wide (DEPCMD/DEPEVT [22:16]), so no real index equals it.
  */
 #define UDC_DWC3_XFERRSCIDX_INVALID                         0xffffffffU
 /*
- * Returned by udc_dwc3_depcmd() instead of UDC_DWC3_XFERRSCIDX_INVALID for a
- * Start Transfer its pre-poll gave up on: nothing was written. Start Transfer
- * only, so every other caller sees the two values above and nothing else.
+ * Returned by udc_dwc3_depcmd() for a Start Transfer when the pre-poll gave
+ * up and nothing was written. Other commands return UDC_DWC3_XFERRSCIDX_INVALID
+ * in that case.
  */
 #define UDC_DWC3_DEPCMD_NOT_POSTED                          0xfffffffeU
 /*
  * Returned by udc_dwc3_depcmd() for a Start or Update Transfer posted without
- * the post-poll (UDC_DWC3_DEPCMD_POST_POLL == 0): written, outcome not yet known.
+ * the post-poll (UDC_DWC3_DEPCMD_POST_POLL == 0). The command is written, but
+ * its outcome is not known yet.
  */
 #define UDC_DWC3_DEPCMD_POSTED                              0xfffffffdU
-/* DEPCFG Command and Parameters */
-/* Command type occupies bits 3:0 - DEPCFG(1) through DEPSTARTCFG(9). */
+/* Command type, bits 3:0: DEPCFG (1) to DEPSTARTCFG (9). */
 #define UDC_DWC3_DEPCMD_CMDTYP_MASK                         GENMASK(3, 0)
+
+/* DEPCFG Command and Parameters */
 #define UDC_DWC3_DEPCMD_DEPCFG                              (1 << 0)
 #define UDC_DWC3_DEPCMDPAR0_DEPCFG_EPTYPE_MASK              GENMASK(2, 1)
 #define UDC_DWC3_DEPCMDPAR0_DEPCFG_EPTYPE_CTRL              (0x0 << 1)
@@ -412,9 +411,9 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEPCMD_DEPSTARTCFG                         (0x9 << 0)
 #define UDC_DWC3_DEPCMD_CMDACT                              BIT(10)
 /*
- * ep_data->cmd.depcmd_last before this endpoint's first command since boot or core
- * soft reset, while DEPCMD reads undefined (databook 1.3.12). CmdTyp 0 is
- * reserved, so no command the driver posts is equal to it.
+ * Value of ep_data->cmd.depcmd_last before the endpoint's first command since
+ * boot or core soft reset. Until then DEPCMD reads undefined (databook 1.3.12).
+ * CmdTyp 0 is reserved, so no real command equals it.
  */
 #define UDC_DWC3_DEPCMD_NONE                                0U
 
@@ -481,9 +480,9 @@ __weak void trace_dump(void)
 #define UDC_DWC3_GSBUSCFG0                                  0xc100
 #define UDC_DWC3_GSBUSCFG1                                  0xc104
 /*
- * AXI Pipelined Transfers Burst Request Limit, encoded N-1 (0x0 = 1 outstanding
- * request, 0xf = 16). At the limit the AXI master makes no more ARADDR/AWADDR
- * requests until the associated data phases complete.
+ * AXI pipelined transfer limit, encoded N-1 (0x0 = 1 outstanding request,
+ * 0xf = 16). At the limit the AXI master issues no new address requests until
+ * the earlier data phases complete.
  */
 #define UDC_DWC3_GSBUSCFG1_PIPETRANSLIMIT_MASK              GENMASK(11, 8)
 /* Break DMA transfers at the 1k page boundary instead of 4k. */
@@ -514,9 +513,9 @@ __weak void trace_dump(void)
 #define UDC_DWC3_GRXTHRCFG_USBRXPKTCNTSEL                   BIT(29)
 #define UDC_DWC3_GRXTHRCFG_USBRXPKTCNT_MASK                 GENMASK(27, 24)
 /*
- * Databook 1.2.4 erratum workaround: clear GRXTHRCFG.UsbRxPktCntSel so a fixed
- * NUMP is sent instead of one derived from the RX threshold. Citations are in
- * udc_dwc3_on_soft_reset().
+ * Databook 1.2.4 erratum workaround. Clear GRXTHRCFG.UsbRxPktCntSel so a fixed
+ * NUMP is sent instead of one derived from the RX threshold. The citations are
+ * in udc_dwc3_on_soft_reset().
  */
 #define UDC_DWC3_RX_THRESHOLD_WORKAROUND                    1
 
@@ -530,38 +529,33 @@ __weak void trace_dump(void)
 #define UDC_DWC3_GCTL_PRTCAPDIR_MASK                        GENMASK(13, 12)
 #define UDC_DWC3_GCTL_CORESOFTRESET                         BIT(11)
 /*
- * Fixed settle time after the core leaves reset, before any read. The release is
- * a posted write, so GHWPARAMS may briefly return its pre-reset value, pass a
- * poll, then read zero. Polling alone is not enough; this wait comes first.
+ * Fixed wait after the core leaves reset, before any register read. The
+ * release is a posted write. So GHWPARAMS may briefly show its old value, pass
+ * a poll, and then read zero. This wait therefore comes before the poll.
  */
 #define UDC_DWC3_CORE_SETTLE_MS                             50u
 /*
- * How long PHYSoftRst (GUSB2PHYCFG / GUSB3PIPECTL) is held, and then how long the
- * PHY clocks get to stabilise before GCTL.CoreSoftReset is released.
+ * How long PHYSoftRst (GUSB2PHYCFG / GUSB3PIPECTL) is held. The PHY clocks then
+ * get the same time to settle before GCTL.CoreSoftReset is released.
  */
 #define UDC_DWC3_PHY_RESET_MS                               100u
 /*
  * Polls of the core's register file after a soft reset, one per ms, after the
- * settle above. The PHY reset delay alone is far too short for the observed failure.
+ * settle time above.
  */
 #define UDC_DWC3_CORE_READY_POLLS                           100
 /*
- * How many times the reset sequence is retried if the register file does not come
- * back. init() is also re-entered by the reconnect escalation, and a core that
- * never leaves reset must not be configured.
+ * How many times the reset sequence is tried if the register file does not
+ * come back.
  */
 #define UDC_DWC3_CORE_RESET_ATTEMPTS                        3u
 
-/*
- * Wait for DSTS.DEVCTRLHLT after RunStop is cleared, yielding between polls. The
- * controller cannot halt until its written events are acknowledged, so the drain
- * thread must run meanwhile: the wait is done with the UDC mutex released.
- */
+/* Poll interval and number of polls for DSTS.DevCtrlHlt after RunStop is cleared. */
 #define UDC_DWC3_HALT_POLL_MS                               1u
 #define UDC_DWC3_HALT_POLLS                                 500u
 /*
- * Longest sleep between two DEPCMD settles in the controller recovery's quiesce
- * wait (udc_dwc3_quiesce_settle()), for when no event reports progress.
+ * Longest sleep between two DEPCMD settles in the controller recovery's
+ * quiesce wait (udc_dwc3_quiesce_settle()), used when no event reports progress.
  */
 #define UDC_DWC3_QUIESCE_SETTLE_MS                          20u
 #define UDC_DWC3_GCTL_DEBUGATTACH                           BIT(8)
@@ -619,7 +613,7 @@ __weak void trace_dump(void)
 
 /* USB Device Event Enable Register */
 #define UDC_DWC3_DEVTEN                                     0xc708
-/* Bits 10, 11 and 13 are RESERVED in this controller - do not write them. */
+/* Bits 10, 11 and 13 are reserved in this controller. Do not set them. */
 #define UDC_DWC3_DEVTEN_VNDRDEVTSTRCVEDEN                   BIT(12)
 #define UDC_DWC3_DEVTEN_ERRTICERREN                         BIT(9)
 #define UDC_DWC3_DEVTEN_SOFEN                               BIT(7)
@@ -630,8 +624,6 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEVTEN_CONNECTDONEEN                       BIT(2)
 #define UDC_DWC3_DEVTEN_USBRSTEN                            BIT(1)
 #define UDC_DWC3_DEVTEN_DISCONNEVTEN                        BIT(0)
-
-/* USB Device Event Register */
 
 /* Endpoint Global Event Buffer Address (64-bit) */
 #define UDC_DWC3_GEVNTADR(n)                                (0xc400 + 16 * (n))
@@ -645,18 +637,15 @@ __weak void trace_dump(void)
 /* Endpoint Global Event Buffer Count (of valid event) */
 #define UDC_DWC3_GEVNTCOUNT(n)                              (0xc40c + 16 * (n))
 /*
- * Programming Guide 3.30b 1.2.56, Table 1-68: bits 15:0 EVNTCOUNT, 30:16
- * reserved, 31 EVNT_HANDLER_BUSY. Read once per assertion, before processing: a
- * re-read after acknowledging may still count events already handed back, so
- * udc_dwc3_evt_drain() reads it exactly once.
+ * Programming Guide 3.30b 1.2.56, Table 1-68: bits 15:0 EVNTCOUNT, bits 30:16
+ * reserved, bit 31 EVNT_HANDLER_BUSY.
  */
 #define UDC_DWC3_GEVNTCOUNT_MASK                            GENMASK(15, 0)
 #define UDC_DWC3_GEVNTCOUNT_EVNT_HANDLER_BUSY               BIT(31)
 
 /*
- * DWC_usb3 Programming Guide 3.30b, section 1.3.13 DEV_IMOD[0], Table 1-90
- * (p.253): bits 15:0 DEVICE_IMODI (Interrupt Moderation Interval), bits 31:16
- * DEVICE_IMODC (down counter).
+ * DEV_IMOD[0], Programming Guide 3.30b 1.3.13, Table 1-90 (p.253): bits 15:0
+ * DEVICE_IMODI (moderation interval), bits 31:16 DEVICE_IMODC (down counter).
  */
 #define UDC_DWC3_DEV_IMOD(n)                                (0xca00 + 4 * (n))
 #define UDC_DWC3_DEV_IMOD_DEVICE_IMODI_MASK                 GENMASK(15, 0)
@@ -665,8 +654,10 @@ __weak void trace_dump(void)
 #define UDC_DWC3_DEV_IMOD_INTERVAL_1MS                      4000U
 
 /*
- * Return the event count in bytes from GEVNTCOUNT(0), fencing afterwards so no
- * later access is reordered ahead of the read.
+ * Return the event count in bytes from GEVNTCOUNT(0). The fence after the read
+ * keeps later accesses from moving ahead of it.
+ * Each drain pass reads it exactly once, before processing (1.2.56). A re-read
+ * after the acknowledgement may still count events already handed back.
  */
 static inline uint32_t udc_dwc3_gevntcount(const mm_reg_t base)
 {
@@ -682,10 +673,10 @@ static inline uint32_t udc_dwc3_gevntcount(const mm_reg_t base)
 }
 
 /*
- * Acknowledge `words` event words, writing EVNT_HANDLER_BUSY (bit 31) with the
- * count (Table 1-68). The only GEVNTCOUNT write once the ring is live; each drain
- * pass calls it exactly once. words == 0 is legal: credits nothing and clears
- * the handler-busy bit.
+ * Acknowledge `words` event words. The count is written with EVNT_HANDLER_BUSY
+ * (bit 31) set (Table 1-68). Each drain pass calls this exactly once. It is the
+ * only GEVNTCOUNT write while the ring is live. words == 0 is legal. It credits
+ * nothing and clears the handler-busy bit.
  */
 static inline void udc_dwc3_gevntcount_ack(const mm_reg_t base,
                        const uint32_t words)
@@ -696,9 +687,8 @@ static inline void udc_dwc3_gevntcount_ack(const mm_reg_t base,
 }
 
 /*
- * Initialise the count at event-buffer setup: write 0. Credits nothing and leaves
- * EVNT_HANDLER_BUSY untouched (bit 31 is write-1-to-clear, so only an
- * acknowledgement clears it).
+ * Initialise the count when the event buffer is set up, by writing 0. This
+ * credits nothing. EVNT_HANDLER_BUSY is write-1-to-clear, so it stays as is.
  */
 static inline void udc_dwc3_gevntcount_enable(const mm_reg_t base)
 {
@@ -717,7 +707,7 @@ static inline void udc_dwc3_gevntcount_enable(const mm_reg_t base)
 #define UDC_DWC3_GCOREID_CORE_MASK                          GENMASK(31, 16)
 #define UDC_DWC3_GCOREID_REL_MASK                           GENMASK(15, 0)
 
-/* USB Globa Status register */
+/* USB Global Status register */
 #define UDC_DWC3_GSTS                                       0xc118
 #define UDC_DWC3_GSTS_CBELT_MASK                            GENMASK(31, 20)
 #define UDC_DWC3_GSTS_SSIC_IP                               BIT(11)
@@ -756,10 +746,10 @@ static inline void udc_dwc3_gevntcount_enable(const mm_reg_t base)
 /* Physical endpoints this driver keeps its own per-endpoint state for. */
 #define UDC_DWC3_MAX_EPN                                    16U
 
-/* The video streaming endpoint: excluded from the per-arm TRB trace, for volume. */
+/* The video streaming endpoint. */
 #define UDC_DWC3_VIDEO_EP                                   0x85U
 
-/* Endpoint excluded from the per-arm TRB trace. */
+/* Endpoint left out of the per-arm TRB trace, because of its volume. */
 #define UDC_DWC3_TRBLOG_SKIP_EP                             UDC_DWC3_VIDEO_EP
 
 /* USB Global Debug Queue/FIFO Space Available register */
@@ -854,14 +844,14 @@ static inline void udc_dwc3_gevntcount_enable(const mm_reg_t base)
 #define UDC_DWC3_DGCMD_LINKFUNCTION                         (1 << 0)
 #define UDC_DWC3_DGCMD_WAKENOTIFNUM                         (3 << 0)
 #define UDC_DWC3_DGCMD_FIFOFLUSHONE                         (9 << 0)
-/* SPEC 3.30b DGCMD 0Ch: Parameter[4:0] = physical endpoint number. 4.1.10 only. */
+/* SPEC 3.30b DGCMD 0Ch: Parameter[4:0] = physical endpoint. For U3 exit (4.1.10). */
 #define UDC_DWC3_DGCMD_SET_EP_NRDY                          (0xc << 0)
 /* DGCMDPAR for 09h: [4:0] FIFO number, [5] 1 = TX FIFO, 0 = RX FIFO. */
 #define UDC_DWC3_DGCMD_FIFOFLUSH_NUM_MASK                   GENMASK(4, 0)
 #define UDC_DWC3_DGCMD_FIFOFLUSH_TX                         BIT(5)
 /*
- * Wedge guard on a generic command, counted in CSR reads rather than
- * microseconds; see udc_dwc3_dgcmd_wait_idle().
+ * Limit on polls of a generic command, counted in register reads rather than
+ * time. See udc_dwc3_dgcmd_wait_idle().
  */
 #define UDC_DWC3_DGCMD_POLL_MAX                             200u
 #define UDC_DWC3_DGCMD_FIFOFLUSHALL                         (10 << 0)
@@ -905,15 +895,21 @@ static inline void udc_dwc3_gevntcount_enable(const mm_reg_t base)
              : ((uint32_t)((epn) >> 1) < (cfg)->num_out_eps))
 #define _NUM_FIFO_SPACE 16
 /*
- * Queue types dumped by "dwc3 fifo". Bounds udc_dwc3_fifo_regs[] and
- * max_bytes_avail[][], so adding a queue type without raising it fails to compile
- * instead of overrunning.
+ * Queue types dumped by "dwc3 fifo". It sizes udc_dwc3_fifo_regs[] and
+ * max_bytes_avail[][], so adding a queue type without raising it fails to
+ * compile.
  */
 #define _NUM_FIFO_REGS  8
 
 /*
- * TRB: one DMA request from the CPU to the DWC3 core, layout fixed by the
- * databook. No cache flush needed: this SoC has no data cache.
+ * Driver data
+ *
+ * The TRB layout and the per-instance configuration and state.
+ */
+
+/*
+ * TRB: one DMA request from the CPU to the DWC3 core, in the databook layout.
+ * No cache flush is needed because this SoC has no data cache.
  */
 struct udc_dwc3_trb {
     uint32_t    addr_lo;
@@ -922,27 +918,22 @@ struct udc_dwc3_trb {
     uint32_t    ctrl;
 } __packed __aligned(16);
 
-/*
- * Controller configuration items that can remain in non-volatile memory
- */
+/* Controller configuration that can stay in non-volatile memory */
 struct udc_dwc3_config {
     DEVICE_MMIO_NAMED_ROM(base);
     /* USB endpoints data */
     struct udc_dwc3_ep_data *ep_data_in;
     struct udc_dwc3_ep_data *ep_data_out;
-    /* Pointer to the DMA-accessible buffer of TRBs and its size */
+    /* DMA-accessible TRB buffers */
     struct udc_dwc3_trb (*trb_buf_in)[CONFIG_UDC_DWC3_TRB_NUM];
     struct udc_dwc3_trb (*trb_buf_out)[CONFIG_UDC_DWC3_TRB_NUM];
     /* USB device configuration */
     int                     maximum_speed_idx;
-    /* Pointers to event buffer fetched by DWC3 with DMA */
+    /* Event buffer, written by the DWC3 with DMA */
     volatile uint32_t       *evt_buf;
     /*
      * Driver-owned SETUP buffer (SPEC 3.30b 4.4 step 1: "Setup a Control-Setup
-     * TRB"). The driver arms it on every return to the Setup phase; the stack's
-     * queue never does. NOCACHE, like every buffer the controller writes (TRBs,
-     * event ring, UDC pool heap via CONFIG_UDC_BUF_FORCE_NOCACHE).
-     * udc_setup_received() copies the 8 bytes into the stack's SETUP buffer.
+     * TRB"). It is NOCACHE, like every buffer the controller writes.
      */
     uint8_t                 *setup_buf;
     /* Data used by vendor-specific functions ("quirks") */
@@ -952,48 +943,48 @@ struct udc_dwc3_config {
     void (*irq_connect_func)(void);
     void (*irq_enable_func)(void);
     void (*irq_disable_func)(void);
-    /* Number of hardware endpoint set for input or output */
+    /* Number of IN and OUT hardware endpoints */
     uint8_t                 num_in_eps;
     uint8_t                 num_out_eps;
 };
 
 
 /*
- * Transfer state of one endpoint: one variable, one owner per transition. It
- * tells "no transfer running" apart from "index not known yet", which xferrscidx
- * alone cannot. That matters: a second Start on an endpoint that already holds a
- * transfer takes a fresh transfer resource that is never returned.
+ * Transfer state of one endpoint. Each transition has one owner. The state
+ * tells "no transfer running" apart from "index not known yet", which
+ * xferrscidx alone cannot. This matters because a second Start on an endpoint
+ * that already holds a transfer takes a new transfer resource that is never
+ * returned.
  *
- * Invariants (checkable from udc_dwc3_ep_state_set() and its callers):
+ * Rules (see udc_dwc3_ep_state_set() and its callers):
  *   - DEPSTRTXFER only from IDLE.
  *   - DEPUPDXFER and DEPENDXFER only from RUNNING, where xferrscidx is valid.
- *   - DEPSTARTCFG / DEPCFG / DEPXFERCFG belong to endpoint enable, only from IDLE.
- *   - Never DEPXFERCFG on a recovery path: each issue allocates another resource.
+ *   - DEPSTARTCFG, DEPCFG and DEPXFERCFG belong to endpoint enable, from IDLE.
+ *   - No DEPXFERCFG on a recovery path. Each one allocates another resource.
  * Each transition is written next to the command that causes it.
  *
- * cfg.stat.enabled is owned by udc_common.c, not folded in here. cfg.stat.halted
- * is written only by the two stall commands, so it always matches the controller.
+ * udc_common.c owns cfg.stat.enabled. Only the two stall commands write
+ * cfg.stat.halted, so it always matches the controller.
  */
 enum udc_dwc3_ep_state {
     UDC_DWC3_EP_IDLE = 0,     /* no transfer, no controller resource held   */
     UDC_DWC3_EP_STARTING,     /* DEPSTRTXFER posted, still executing        */
-    UDC_DWC3_EP_START_UNKNOWN,/* DEPSTRTXFER outcome undetermined past the
-                   * deadline: the controller may or may not hold
-                   * a transfer resource, so no Start may follow */
+    UDC_DWC3_EP_START_UNKNOWN,/* DEPSTRTXFER outcome unknown past the
+                   * deadline. The controller may hold a
+                   * transfer resource, so no Start follows */
     UDC_DWC3_EP_RUNNING,      /* transfer live, xferrscidx valid            */
     UDC_DWC3_EP_ENDING,   /* DEPENDXFER posted, awaiting completion     */
-    UDC_DWC3_EP_END_UNKNOWN,  /* DEPENDXFER outcome undetermined past the
-                   * deadline: the controller may still own the
-                   * ring, so nothing may be reclaimed          */
+    UDC_DWC3_EP_END_UNKNOWN,  /* DEPENDXFER outcome unknown past the
+                   * deadline. The controller may still own
+                   * the ring, so nothing is reclaimed          */
 };
 
 /*
- * Work owed to an endpoint once no command is open on it, carried out by
- * udc_dwc3_ep_recover(). A bitmask, since several can be owed at once (e.g. a
- * Clear Stall deferred for command ordering and a resume deferred for 3.2.2.7).
- * Kept across transfer-state resets. udc_dwc3_ep_disable() withdraws all but
- * the cancel; a core reset or controller disable (udc_dwc3_drop_xfer_state())
- * withdraws everything.
+ * Work owed to an endpoint, done by udc_dwc3_ep_recover() once no command is
+ * open on it. It is a bitmask because several can be owed at once, e.g. a
+ * deferred Clear Stall and a resume deferred for 3.2.2.7. The recovery bits
+ * survive transfer-state resets. udc_dwc3_ep_disable() keeps only the cancel.
+ * A core reset or controller disable (udc_dwc3_drop_xfer_state()) clears all.
  */
 enum udc_dwc3_ep_pending {
     UDC_DWC3_EP_PEND_NONE       = 0,
@@ -1001,25 +992,22 @@ enum udc_dwc3_ep_pending {
     UDC_DWC3_EP_PEND_RESUME     = BIT(1), /* re-establish the transfer       */
     UDC_DWC3_EP_PEND_DEQUEUE    = BIT(3), /* release the ring, cancel the buffers */
     /*
-     * An Update Transfer refused because the Start was still open. Not recovery
-     * work: udc_dwc3_ep_update_owed() issues it once the Start has an index.
+     * An Update Transfer refused because the Start was still open. This is not
+     * recovery work. udc_dwc3_ep_update_owed() issues it once the Start has an
+     * index.
      */
     UDC_DWC3_EP_PEND_UPDATE         = BIT(5),
 };
 
 
 /*
- * All data specific to one endpoint for use by the driver.
+ * Driver data for one endpoint. The vendor quirk API (udc_dwc3_lattice_usb23.h)
+ * reads epn, trb_buf and xferrscidx by name, so they stay at top level.
  */
 struct udc_dwc3_ep_data {
-    /* Allow to cast a pointer between ep_data and ep_cfg */
+    /* First member, so ep_data and ep_cfg pointers can be cast */
     struct udc_ep_config            cfg;
-    /*
-     * epn, trb_buf and xferrscidx are read by name by the vendor quirk API
-     * (udc_dwc3_lattice_usb23.h), so they stay at top level.
-     *
-     * Endpoint number (physical address): the logical address is on ep_cfg.
-     */
+    /* Physical endpoint number. The logical address is in cfg. */
     int                             epn;
     /*
      * The TRB ring. trb_buf[CONFIG_UDC_DWC3_TRB_NUM - 1] is the LINK TRB.
@@ -1027,23 +1015,26 @@ struct udc_dwc3_ep_data {
      */
     volatile struct udc_dwc3_trb    *trb_buf;
     /*
-     * Transfer resource index for endpoint commands, assigned by the controller.
-     * UDC_DWC3_XFERRSCIDX_INVALID until a Start Transfer reports one, and again
-     * after DEPSTARTCFG, which reassigns resources and invalidates all earlier
-     * indexes.
+     * Transfer resource index for endpoint commands, assigned by the
+     * controller. It is UDC_DWC3_XFERRSCIDX_INVALID while no transfer is
+     * active: until a Start Transfer reports one, and again once a Start or End
+     * is issued, the endpoint state is reset, or DEPSTARTCFG reassigns all
+     * resources.
      */
     uint32_t                        xferrscidx;
-    /* A work queue entry to process the buffers to submit on that endpoint */
+    /* Work item that submits the queued buffers of this endpoint */
     struct k_work                   work;
-    /* To re-queue cancelled buffers after an endpoint is disabled */
+    /* Cancelled buffers to re-queue after the endpoint is disabled */
     struct k_fifo                   requeue_fifo;
-    /* Point back to the device for work queues */
+    /* Back-pointer to the device, for the work items */
     const struct device             *dev;
     /*
-     * Software side of the TRB ring: the buffer armed in each slot of trb_buf,
-     * one slot less, as the LINK TRB never holds one. Slot i is occupied if and
-     * only if net_buf[i] != NULL: the ring is full when net_buf[head] != NULL
-     * and holds something when net_buf[tail] != NULL.
+     * Software side of the TRB ring: the buffer armed in each slot of trb_buf.
+     * The UDC mutex protects it, because udc_dwc3_push_trb() and
+     * udc_dwc3_pop_trb() may run on different threads.
+     * It has one slot less, because the LINK TRB never holds a buffer. Slot i
+     * is in use when net_buf[i] != NULL. The ring is full when net_buf[head] is
+     * set, and not empty when net_buf[tail] is set.
      */
     struct {
         struct net_buf  *net_buf[CONFIG_UDC_DWC3_TRB_NUM - 1];
@@ -1054,81 +1045,79 @@ struct udc_dwc3_ep_data {
     /* The transfer on this endpoint and the work owed to it. */
     struct {
         /*
-         * What this endpoint is doing; see enum udc_dwc3_ep_state for the
-         * rules. cfg.stat.busy is derived from this and the ring -
-         * udc_dwc3_ep_busy_sync().
+         * What this endpoint is doing. See enum udc_dwc3_ep_state for the
+         * rules. udc_dwc3_ep_busy_sync() derives cfg.stat.busy from this and
+         * the ring.
          */
         enum udc_dwc3_ep_state  state;
-        /* Work owed once no command is open - see enum udc_dwc3_ep_pending. */
+        /* Work owed once no command is open. See enum udc_dwc3_ep_pending. */
         uint8_t                 pending;
         /*
          * Index the outstanding End Transfer was posted against. Posting an
-         * End invalidates xferrscidx (a successful End frees the resource),
-         * but a refused End leaves the transfer holding it. The refusal may be
-         * learnt long after the posting call returned, in
-         * udc_dwc3_ep_resolve_cmd() from ENDING or END_UNKNOWN, so the index
-         * is kept here. Without it the endpoint returns to RUNNING with no
-         * index: Update Transfer is refused and no End can reclaim the
-         * resource. Valid only while an End is outstanding.
+         * End clears xferrscidx, because a successful End frees the resource.
+         * A refused End leaves the transfer holding it. The refusal may be seen
+         * much later, in udc_dwc3_ep_resolve_cmd(). With the index kept here,
+         * the endpoint returns to RUNNING with a valid index. Valid only while
+         * an End is outstanding.
          */
         uint32_t                end_idx;
     } xfer;
-    /* This endpoint's DEPCMD bookkeeping. */
+    /*
+     * This endpoint's DEPCMD bookkeeping. A core soft reset sets depcmd_last to
+     * NONE, and udc_dwc3_ep_state_reset() clears cmd_record.
+     */
     struct {
         /*
-         * The last command written (without CmdAct), or UDC_DWC3_DEPCMD_NONE
-         * while DEPCMD reads undefined.
+         * The last command written (without CmdAct). UDC_DWC3_DEPCMD_NONE while
+         * DEPCMD reads undefined.
          */
         uint32_t    depcmd_last;
         /*
-         * DEPCMD as read for this endpoint's open Start or End Transfer when
-         * another command was posted over it. If the Command Complete is lost,
-         * DEPCMD is the only record of how that command ended, and any later
-         * command (e.g. a stack Set Stall) overwrites it. udc_dwc3_depcmd()
-         * saves it from its pre-poll read; udc_dwc3_cmd_outcome() uses it once
-         * DEPCMD has moved on. 0 (no command type) when none; a new Start or
-         * End clears it.
+         * DEPCMD as read for this endpoint's open Start or End Transfer, saved
+         * when another command is posted over it. If the Command Complete event
+         * is lost, DEPCMD is the only record of how the command ended, and a
+         * later command overwrites it. udc_dwc3_depcmd() saves it from its
+         * pre-poll read. udc_dwc3_cmd_outcome() uses it once DEPCMD has moved
+         * on. It is 0 when empty. A new Start or End clears it.
          */
         uint32_t    cmd_record;
         /*
          * Cycle stamp of the last Start or End Transfer posted on this
          * endpoint. STARTING and ENDING last at most UDC_DWC3_CMD_UNKNOWN_MS
-         * from here; past that the endpoint moves to the matching UNKNOWN state.
+         * from here. Then the endpoint moves to the matching UNKNOWN state.
          */
         uint32_t    cmd_t0;
     } cmd;
     /*
-     * Pool generation (priv->epcfg.epoch) in which this endpoint took its
-     * transfer resource with DEPXFERCFG. Only DEPSTARTCFG frees resources, so
-     * DEPXFERCFG runs again only after one: equal values mean "already holds a
-     * resource".
+     * Pool generation (priv->epcfg.epoch) in which this endpoint got its
+     * transfer resource with DEPXFERCFG. Only DEPSTARTCFG frees resources. So
+     * equal values mean the endpoint already holds one, and DEPXFERCFG is not
+     * repeated.
      */
     uint32_t                        rsc_epoch;
-    /* Diagnostics only: nothing decides on these. */
+    /* Diagnostics only. Nothing decides on these. */
     struct {
         /*
-         * Arms and retires on this endpoint. A bulk endpoint that stops
-         * accepting host traffic shows up here and nowhere else device-side.
+         * Arms and retires on this endpoint. This is the only device-side sign
+         * of a bulk endpoint that stops accepting host traffic.
          */
         uint32_t    n_arm;
         uint32_t    n_retire;
-        /* The last command's error has already been logged. */
+        /* The last command's error is already logged. */
         bool        cmd_reported;
     } diag;
 };
 
-/*
- * What the event drain is doing right now.
- */
+/* What the event drain is doing right now. */
 enum udc_dwc3_drain_state {
     UDC_DWC3_DRAIN_IDLE = 0,    /* controller owes nothing */
     UDC_DWC3_DRAIN_RUNNING,     /* taking events */
-    UDC_DWC3_DRAIN_WAITING,     /* head slot owed but empty: a late-write episode */
+    UDC_DWC3_DRAIN_WAITING,     /* head slot owed but still empty (late write) */
 };
 
 /*
- * What one arrival wait concluded. The wait reports; the caller decides what
- * state that puts the drain in - see the dispatch in udc_dwc3_evt_drain().
+ * Result of one arrival wait. The caller decides the drain state from it, see
+ * udc_dwc3_evt_drain().
  */
 enum udc_dwc3_wait_result {
     UDC_DWC3_WAIT_ARRIVED,  /* the write landed inside the budget */
@@ -1136,39 +1125,41 @@ enum udc_dwc3_wait_result {
 };
 
 /*
- * Drain state. Written by the drain thread during a pass, without a lock, and
- * reset together with the event ring by udc_dwc3_on_soft_reset() only, while
- * the drain is shut out (udc_dwc3_evt_block()). A pass never sleeps or blocks
- * before its write-back, so no reset lands mid-pass. No field is wider than 32
- * bits, so the heartbeat's lockless reads never see a torn value. Do not widen
- * any field to 64 bits.
+ * Drain state. The drain thread writes it during a pass, without a lock.
+ * udc_dwc3_on_soft_reset() resets it together with the event ring. The
+ * heartbeat reads it without a lock, so every field is at most 32 bits wide to
+ * avoid torn reads.
  */
 struct udc_dwc3_drain {
     uint32_t    state;      /* enum udc_dwc3_drain_state */
     uint32_t    slot;       /* slot the episode is stuck on */
-    uint32_t    since;      /* cycle stamp the episode opened */
+    uint32_t    since;      /* cycle stamp when the episode opened */
     uint32_t    attempts;   /* consecutive give-ups on that slot */
     uint32_t    gc0;        /* GEVNTCOUNT when the episode opened */
     uint32_t    watched_us; /* time actually spent looking at the slot */
-    uint32_t    quiet;      /* nothing was printed inside this episode */
+    uint32_t    quiet;      /* nothing printed in this episode yet */
     uint32_t    counted;    /* this episode was already counted as missed */
     /*
-     * The slot held back by the last skip, and whether one is being watched.
-     * Armed only when a skip stepped over less than the controller owed, so
-     * the held slot lies inside the stuck group and no newly generated event
-     * can land in it - see udc_dwc3_evt_skip_dead_slot().
+     * The slot held back by the last skip, and whether it is being watched.
+     * Set only when a skip stepped over fewer events than the controller owed.
+     * The held slot then lies inside the stuck group, so no new event can land
+     * in it. See udc_dwc3_evt_skip_dead_slot().
      */
     uint32_t    skip_watch_slot;
     bool        skip_watch;
 };
 
-/* Reset the whole drain state as one act - see the enum above. */
+/* Reset the whole drain state at once. */
 static inline void udc_dwc3_drain_reset(struct udc_dwc3_drain *const d)
 {
     *d = (struct udc_dwc3_drain){ .state = UDC_DWC3_DRAIN_IDLE };
 }
 
-/* One snapshot of the core debug registers (LTSSM, BMU, LNMCC, LSP, EPINFO). */
+/*
+ * One snapshot of the core debug registers (LTSSM, BMU, LNMCC, LSP, EPINFO).
+ * Some of them only make sense next to a healthy baseline, so they are sampled
+ * periodically and a fault dump is compared with the last sample.
+ */
 struct udc_dwc3_core_dbg {
     uint32_t    ltssm;
     uint32_t    bmu;
@@ -1179,85 +1170,89 @@ struct udc_dwc3_core_dbg {
 };
 
 /*
- * Diagnostics: counters, maxima, timestamps and report state for the heartbeat,
- * the dumps and the shell. None of it changes what the driver does to the
- * controller; driver behaviour lives in struct udc_dwc3_data.
+ * Diagnostics: counters, maxima, timestamps and report state for the
+ * heartbeat, the dumps and the shell. None of it changes what the driver does
+ * to the controller.
  */
 struct udc_dwc3_diag {
     uint32_t                    evt_stack_free;     /* smallest observed headroom, bytes */
-    /* DEVCTRLHLT never seen after RunStop cleared */
+    /* Times DEVCTRLHLT was not seen after RunStop was cleared */
     uint32_t                    halt_timeouts;
 #if CONFIG_UDC_DWC3_SHELL
     /* FIFO space initial values */
     uint16_t                    max_bytes_avail[_NUM_FIFO_SPACE][_NUM_FIFO_REGS];
-    /* Direction of the last control stage armed (shell fake-XferComplete). */
+    /* Direction of the last control stage armed (shell fake XferComplete). */
     uint8_t                     last_xfer_dir;
 #endif
     /*
-     * Event-buffer posted-write race: events not yet written on first read,
-     * give-ups, and events handled.
+     * Late event writes: events not yet written when first read, and give-ups
+     * waiting for them.
      */
     uint32_t                    evt_late;
     uint32_t                    evt_gaveup;
-    /* worst announced-but-unread backlog, bytes */
+    /* largest backlog the controller reported, bytes */
     uint32_t                    evt_gevntcount_hwm;
-    /* completions the heartbeat sweep returned */
+    /* completions returned by the heartbeat sweep */
     uint32_t                    evt_sweep_rescued;
     uint32_t                    evt_sweep_runs;     /* sweeps that found something to drain */
-    /* stalls ended early by the look-ahead proof */
+    /* slots declared dead early by the look-ahead proof */
     uint32_t                    evt_lookahead_short;
-    uint32_t                    evt_gaveup_us_max;  /* worst uninstrumented fill latency, us */
+    uint32_t                    evt_gaveup_us_max;  /* worst time a slot stayed empty, us */
     uint32_t                    evt_missed;         /* give-up runs presumed a lost write */
     uint32_t                    evt_missed_frozen;  /* of those, with GEVNTCOUNT not moving */
-    uint32_t                    evt_gaveup_multi;   /* runs opened owed MORE than one event */
+    uint32_t                    evt_gaveup_multi;   /* runs opened owing more than one event */
     /* counter signature at the last stats line */
     uint32_t                    stats_sig_last;
-    /* beats since that line, for the forced floor */
+    /* beats since that line, for the forced line */
     uint32_t                    stats_quiet_beats;
-    /* heartbeat had to restart a stopped drain */
+    /* times the heartbeat restarted a stopped drain */
     uint32_t                    evt_kick;
     /* Interrupts taken versus worker passes entered. */
     uint32_t                    evt_isr;            /* interrupt handler invocations */
     uint32_t                    evt_worker_runs;    /* event worker passes entered */
-    uint32_t                    evt_skipped;        /* events discarded to free a full ring */
+    uint32_t                    evt_skipped;        /* event slots skipped as dead */
     /*
-     * Skips later proved wrong: the slot after a skip filled, and the controller
-     * writes in order, so the skipped slots were late, not lost. Zero means
-     * skipping only ever discarded events that never arrived.
+     * Skips later proved wrong. The slot after a skip filled, and the
+     * controller writes in order, so the skipped slots were late, not lost.
+     * Zero means every skip discarded only events that never arrived.
      */
     uint32_t                    evt_skip_refuted;
     uint32_t                    evt_link_total;     /* USB/Link State Change events seen */
-    /* consecutive events reporting the same state */
+    /* consecutive events with the same state */
     uint32_t                    evt_link_run;
     uint32_t                    evt_link_last;      /* that state, EvtInfo[3:0] */
     uint32_t                    dispatch_evt;       /* event being dispatched now, 0 = none */
-    uint32_t                    dispatch_t0;        /* cycle stamp when that drain pass began */
-    /* Worst late-but-arrived wait: polls is the lower bound, us the upper. */
+    uint32_t                    dispatch_t0;        /* cycle stamp when that dispatch began */
+    /* Worst wait for a late event that arrived: polls (lower bound), us (upper). */
     uint32_t                    evt_late_polls_max;
     uint32_t                    evt_late_us_max;
     uint32_t                    evt_midzero;        /* passes that stopped on an empty slot */
-    /* Completions posted to a full usbd queue: counted, never logged (the buffer is not lost). */
+    /* Completions posted to a full usbd queue. No buffer is lost. Printed as pf. */
     uint32_t                    post_fail_total;
     uint32_t                    drain_dead_resets;  /* reconnects issued for a dead ring */
     /* promotions to START_UNKNOWN / END_UNKNOWN */
     uint32_t                    ep_cmd_unknown;
     uint32_t                    xnrdy_acted;        /* non-control XferNotReady with TRBs armed */
     uint32_t                    core_dbg_beats;     /* beats since the last CORE debug sample */
-    /* Last sample reported, so an unchanged core is not re-printed. */
+    /* Last sample reported, so an unchanged core is not printed again. */
     struct udc_dwc3_core_dbg    core_dbg_last;
-    /* beats since that report, for the forced floor */
+    /* beats since that report, for the forced report */
     uint32_t                    core_dbg_quiet;
     uint32_t                    ctrl_start_fail;    /* Start Transfer commands rejected */
     /* Stage buffers of abandoned transfers returned in the Setup phase. */
     uint32_t                    ctrl_stale_returned;
-    /* The control endpoint and stage the watchdog is guarding. */
+    /*
+     * The control endpoint and stage the watchdog is guarding. watchdog_type
+     * returns to UDC_DWC3_WATCHDOG_TYPE_NONE when the stage completes, its
+     * endpoint is disabled, or the transfer state is dropped.
+     */
     struct udc_dwc3_ep_data     *watchdog_ep;
     uint32_t                    watchdog_type;
     /*
-     * SETUP watchdog ageing (heartbeat):
-     *   wd_gen            armed SETUPs
-     *   wd_seen/wd_beats  how long the current one has stood
-     *   wd_reported       suppresses a second report for the same SETUP
+     * SETUP watchdog state (heartbeat):
+     *   wd_gen            SETUPs armed
+     *   wd_seen/wd_beats  how long the current one has been waiting
+     *   wd_reported       stops a second report for the same SETUP
      */
     uint32_t                    ctrl_setup_wd_gen;
     uint32_t                    ctrl_setup_wd_seen;
@@ -1285,12 +1280,11 @@ struct udc_dwc3_diag {
     bool                        buscfg_logged;
     /* Descriptors overwritten while the controller still owned them. */
     uint32_t                    trb_stomp;
-    /* Reclaims completed, so the ring was cleared and the TxFIFO flushed. */
+    /* Reclaims completed (ring cleared, TxFIFO flushed). */
     uint32_t                    ctrl_reclaim_done;
     uint32_t                    ctrl_status_done;   /* status stages retired (IN and OUT) */
     /*
-     * Device-wide command counts. Per-endpoint bookkeeping (cmd.depcmd_last,
-     * diag.cmd_reported) lives on the endpoint.
+     * Device-wide command counts. The per-endpoint ones are on the endpoint.
      */
     uint32_t                    depcmd_n_err;       /* completion seen, CmdStatus != OK     */
     uint32_t                    depcmd_n_timeout;   /* fast poll expired, status unknown    */
@@ -1302,18 +1296,17 @@ struct udc_dwc3_diag {
     uint32_t                    hb_submit_t;
     uint32_t                    hb_q_ms_max;
     /*
-     * A periodic k_timer stays on the UDC_DWC3_HEARTBEAT_MS grid under any
-     * load; only the work run can be lost. These count expiries and work
-     * runs coalesced.
+     * The periodic k_timer stays on the UDC_DWC3_HEARTBEAT_MS grid under any
+     * load. Only the work run can be late or merged. These count timer
+     * expiries and merged work runs.
      */
     uint32_t                    hb_expiries;
     uint32_t                    hb_coalesced;
 };
 
 /*
- * Per-instance driver state, read and written at run time: udc_get_private(dev).
- * Only what the driver acts on lives here, by concern; counters and report state
- * are in diag.
+ * Per-instance run-time state, from udc_get_private(dev). It holds what the
+ * driver acts on, grouped by concern. Counters and report state are in diag.
  */
 struct udc_dwc3_data {
     DEVICE_MMIO_NAMED_RAM(base);
@@ -1324,15 +1317,15 @@ struct udc_dwc3_data {
     k_thread_stack_t        *evt_stack;
     struct k_thread         *evt_thread;
     /*
-     * Liveness: a periodic k_timer submits heartbeat_work, so no beat depends on
-     * a work item re-arming itself.
+     * Liveness. A periodic k_timer submits heartbeat_work, so no beat depends
+     * on a work item re-arming itself.
      */
     struct k_timer          heartbeat_timer;
     struct k_work           heartbeat_work;
-    /* Runs udc_dwc3_evt_force(): one DGCMD to make the controller emit. */
+    /* Runs udc_dwc3_evt_force(), one DGCMD that makes the controller emit an event. */
     struct k_work           nudge_work;
     /*
-     * Held by udc_dwc3_dgcmd(), the only DGCMDPAR/DGCMD writer; its callers run
+     * Held by udc_dwc3_dgcmd(), the only DGCMDPAR/DGCMD writer. Its callers run
      * on the drain thread and the UDC work queue.
      */
     struct k_spinlock       dgcmd_lock;
@@ -1341,28 +1334,35 @@ struct udc_dwc3_data {
     struct {
         uint32_t                next;           /* ring slot the drain reads next */
         /*
-         * Events copied out of the ring, not yet dispatched (event thread only,
-         * no lock). Free-running indices: tail - head is the occupancy (0 to
-         * UDC_DWC3_EVQ_NUM, never reduced modulo the size: full would read as
-         * empty); index modulo the size. Zeroed with the ring (on_soft_reset()).
+         * Events copied out of the ring but not yet dispatched. It is normally
+         * emptied in the pass that fills it. Events stay in it only when a reset
+         * or error post did not fit in the stack's queue. They are retried on
+         * the next pass. When it is full, the drain stops taking events from the
+         * ring. Only the event thread uses it, so there is no lock. The indices
+         * run free.
+         * tail - head is the occupancy, from 0 to UDC_DWC3_EVQ_NUM. It is never
+         * reduced modulo the size, or a full FIFO would read as empty. Only the
+         * array index is taken modulo the size. Zeroed with the ring in
+         * on_soft_reset().
          */
         uint32_t                q[UDC_DWC3_EVQ_NUM];
         uint32_t                q_head;
         uint32_t                q_tail;
         uint32_t                handled;        /* events dispatched */
         /*
-         * The drain pass's one GEVNTCOUNT read, shared with every other reader.
-         * The controller updates it concurrently, so two reads never describe the
-         * same instant. Read only in udc_dwc3_evt_drain() and
-         * udc_dwc3_drain_helper(); everything else uses this copy.
+         * GEVNTCOUNT from the pass's single read, shared with every other
+         * reader. The controller changes the register all the time, so two
+         * reads never agree. Only udc_dwc3_evt_drain() and
+         * udc_dwc3_drain_helper() read it. The rest of the driver uses this
+         * copy.
          */
         uint32_t                gc_last;
-        struct udc_dwc3_drain   drain;          /* drain state - see the enum above */
+        struct udc_dwc3_drain   drain;          /* see struct udc_dwc3_drain */
         uint32_t                force_t0;       /* cycle stamp of the last forced command */
         uint32_t                worker_exit_t0; /* cycle stamp when the drain last exited */
         /*
-         * Drain-dead detection: events taken from the ring (handled + FIFO
-         * occupancy) at the last beat, and beats with none since.
+         * Dead-drain detection: events taken from the ring (handled + FIFO
+         * occupancy) at the last beat, and beats with none taken since.
          */
         uint32_t                hb_last_taken;
         uint32_t                hb_stuck_beats;
@@ -1371,21 +1371,21 @@ struct udc_dwc3_data {
     /* Control transfer (EP0/EP1). */
     struct {
         /*
-         * Control transfer progress, as one value rather than flags: a request
-         * that ends without a status stage must not leave a stale "data done"
+         * Control transfer progress, as one value rather than flags. A request
+         * that ends without a status stage then leaves no stale "data done"
          * flag for the next request's first XferNotReady(Data).
          */
         enum udc_dwc3_ctrl_state {
-            UDC_DWC3_CTRL_IDLE = 0,     /* Setup phase: the Setup TRB is (to be) armed */
+            UDC_DWC3_CTRL_IDLE = 0,     /* Setup phase: the Setup TRB is armed or about to be */
             UDC_DWC3_CTRL_SETUP_DONE,   /* SETUP taken; data or status not yet armed */
-            UDC_DWC3_CTRL_DATA_DONE,    /* data stage retired; waiting XferNotReady(Status) */
+            UDC_DWC3_CTRL_DATA_DONE,    /* data stage retired; waiting for XferNotReady(Status) */
             UDC_DWC3_CTRL_STATUS_READY, /* XferNotReady(Status) taken; status not yet armed */
             UDC_DWC3_CTRL_STATUS_ARMED, /* status TRB armed */
             UDC_DWC3_CTRL_DATA_ARMED,   /* data TRB armed */
             /*
-             * udc_dwc3_ctrl_ep_recover() in progress: back to Step 1, ending both
-             * halves. _STALL ends it with Set Stall. No other state is entered until
-             * the recovery finishes (the stage handlers all defer to it).
+             * udc_dwc3_ctrl_ep_recover() is running. _STALL means it ends with
+             * Set Stall. The stage handlers defer to it, so no other state is
+             * entered until it finishes.
              */
             UDC_DWC3_CTRL_RECOVERING,
             UDC_DWC3_CTRL_RECOVERING_STALL,
@@ -1393,9 +1393,9 @@ struct udc_dwc3_data {
         /* Copy of the current SETUP packet, taken before the stack can react. */
         struct usb_setup_packet setup;
         /*
-         * The data stage completed with SetupPending: the host abandoned this
-         * transfer. Per 4.4.2 steps 4 and 6 / Figure 4-2 the flow still reaches
-         * XferNotReady(Status); that is where we Set Stall and return to Step 1.
+         * The data stage completed with SetupPending, so the host abandoned
+         * this transfer. Handled at XferNotReady(Status), in
+         * udc_dwc3_on_ctrl_xnr().
          */
         bool                    setup_pending;
     } ctrl;
@@ -1405,29 +1405,26 @@ struct udc_dwc3_data {
         uint8_t     first_ep;   /* first endpoint configured */
         /*
          * DEPSTARTCFG has been tried for this configuration. Cleared on bus
-         * reset. It reassigns the transfer-resource pool and resets every
-         * endpoint, so re-running it on a SET_INTERFACE that touches first_ep
-         * would tear down streaming endpoints. Set even when it was skipped or
-         * refused: the pool keeps its assignment and the next bus reset tries
-         * again (udc_dwc3_on_set_config_or_interface()).
+         * reset. Set even when DEPSTARTCFG was skipped or refused.
          */
         bool        pool_assigned;
         /*
-         * Transfer-resource pool generation; bumped by DEPSTARTCFG, the only
-         * command that frees resources. Compared with each ep_data->rsc_epoch.
+         * Transfer-resource pool generation. DEPSTARTCFG, the only command that
+         * frees resources, bumps it. Compared with each ep_data->rsc_epoch.
          */
         uint32_t    epoch;
         /*
-         * DALEPENA as last written: udc_dwc3_dalepena_set() writes both, and the
-         * core reset in udc_dwc3_init() zeroes both. Read instead of the
-         * register on the arm paths (endpoint worker, udc_dwc3_trb_bulk()).
+         * DALEPENA as last written. udc_dwc3_dalepena_set() writes both, and
+         * the core reset in udc_dwc3_init() zeroes both. The arm paths
+         * (endpoint worker, udc_dwc3_trb_bulk()) read this copy, not the
+         * register.
          */
         uint32_t    dalepena;
     } epcfg;
 
     /*
-     * SPEC 4.1.10: the link is in U3 (entered, not yet left), and the physical
-     * endpoints that had an active transfer on entry.
+     * SPEC 4.1.10: whether the link is in U3, and which physical endpoints had
+     * an active transfer when it entered U3.
      */
     struct {
         bool        in_u3;
@@ -1437,19 +1434,22 @@ struct udc_dwc3_data {
     /*
      * Controller run/recover state. Written by udc_dwc3_enable(),
      * udc_dwc3_disable(), the ErrticErr event and udc_dwc3_controller_recover().
-     * While recovery waits in UDC_DWC3_RUN_STOPPING, quiesce_sem wakes it on each
-     * transfer/control state change.
      */
     struct {
         enum udc_dwc3_run_state {
             UDC_DWC3_RUN = 0,       /* normal operation */
             UDC_DWC3_RUN_RESET_OWED,    /* SPEC 3.3.2 ErrticErr: the heartbeat resets */
-            UDC_DWC3_RUN_STOPPING,      /* SPEC 4.1.8: transfers ending before RunStop=0;
-                             * no new transfer may start */
-            UDC_DWC3_RUN_RESETTING,     /* the event ring and drain state are being
-                             * re-initialised (udc_dwc3_evt_block()):
-                             * no drain pass, no new transfer */
+            UDC_DWC3_RUN_STOPPING,      /* SPEC 4.1.8: transfers end before
+                             * RunStop=0. No new transfer starts */
+            UDC_DWC3_RUN_RESETTING,     /* the event ring and drain state are
+                             * being re-initialised
+                             * (udc_dwc3_evt_block()). No drain pass,
+                             * no new transfer */
         } state;
+        /*
+         * Given on each transfer or control state change while the controller
+         * recovery waits in UDC_DWC3_RUN_STOPPING.
+         */
         struct k_sem quiesce_sem;
     } run;
 
@@ -1458,26 +1458,21 @@ struct udc_dwc3_data {
 };
 
 
-/*
- * Indexes matching the "device-speed" devicetree property values.
- */
+/* Indexes matching the "device-speed" devicetree property values. */
 enum {
     UDC_DWC3_SPEED_IDX_FULL_SPEED = 1,
     UDC_DWC3_SPEED_IDX_HIGH_SPEED = 2,
     UDC_DWC3_SPEED_IDX_SUPER_SPEED = 3,
 };
 
-/*
- * Vendor quirks: vendor-specific hooks, overridable per SoC.
- */
-
+/* Vendor quirks: vendor-specific hooks, overridable per SoC. */
 struct udc_dwc3_vendor_quirks {
     int (*preinit)(const struct device *const dev);
     int (*init)(const struct device *const dev);
     int (*enable)(const struct device *const dev);
 };
 
-/* Helper for accessing vendor quirks */
+/* Helpers for accessing vendor quirks */
 #define UDC_DWC3_QUIRK_CFG(dev)     (((const struct udc_dwc3_config *)(dev->config))->quirk_config)
 #define UDC_DWC3_QUIRK_DATA(dev)    (((const struct udc_dwc3_config *)(dev->config))->quirk_data)
 
@@ -1485,7 +1480,7 @@ struct udc_dwc3_vendor_quirks {
 #include "udc_dwc3_lattice_usb23.h"
 #endif
 
-/* Wrapper functions that fallback to returning 0 if no quirk is needed */
+/* Wrappers that return 0 when no quirk is set */
 #define UDC_DWC3_QUIRK_FUNC_DEFINE(fn)                      \
     static inline int udc_dwc3_quirk_##fn(const struct device *const dev)   \
     {                                   \
@@ -1499,6 +1494,13 @@ struct udc_dwc3_vendor_quirks {
 UDC_DWC3_QUIRK_FUNC_DEFINE(preinit);
 UDC_DWC3_QUIRK_FUNC_DEFINE(init);
 UDC_DWC3_QUIRK_FUNC_DEFINE(enable);
+
+/*
+ * Helpers
+ *
+ * Small functions used throughout: run state, DCTL writes, buffer return,
+ * event interrupt masking and the UDC lock.
+ */
 
 #define DEV_CFG(dev)    ((const struct udc_dwc3_config *)(dev->config))
 
@@ -1514,15 +1516,16 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 static void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t fifo);
 
 /*
- * Enable or disable an endpoint in DALEPENA, and in priv->epcfg.dalepena, its
- * copy. The only DALEPENA writer; a core reset clears both (udc_dwc3_init()).
+ * Enable or disable an endpoint in DALEPENA and in its copy,
+ * priv->epcfg.dalepena. This is the only DALEPENA writer. A core reset clears
+ * both (udc_dwc3_init()).
  */
 static UDC_DWC3_COLD void udc_dwc3_dalepena_set(const struct device *const dev,
                         const int epn, const bool on)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const uint32_t bit = UDC_DWC3_DALEPENA_USBACTEP(epn);
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const uint32_t              bit = UDC_DWC3_DALEPENA_USBACTEP(epn);
 
     if (on) {
         priv->epcfg.dalepena |= bit;
@@ -1534,10 +1537,10 @@ static UDC_DWC3_COLD void udc_dwc3_dalepena_set(const struct device *const dev,
 }
 
 /*
- * udc_is_enabled(), as one load: atomic_test_bit() is an out-of-line atomic_get()
- * with CONFIG_ATOMIC_OPERATIONS_C. Exact for a caller holding the UDC mutex:
- * udc_enable() and udc_disable() change the bit only under it, and an aligned
- * word load cannot tear.
+ * udc_is_enabled() as a plain load. atomic_test_bit() is an out-of-line call
+ * with CONFIG_ATOMIC_OPERATIONS_C. The result is exact when the caller holds the
+ * UDC mutex, because udc_enable() and udc_disable() change the bit only under it.
+ * An aligned word load cannot tear.
  */
 static inline bool udc_dwc3_stack_enabled(const struct device *const dev)
 {
@@ -1554,8 +1557,8 @@ static inline bool udc_dwc3_ep_in_dalepena(const struct udc_dwc3_data *const pri
 }
 
 /*
- * A transfer or control state changed: wake the controller recovery if it is
- * waiting for the device to quiesce.
+ * Called when a transfer or control state changes. Wakes a controller recovery
+ * that is waiting for the device to go quiet.
  */
 static inline void udc_dwc3_quiesce_progress(struct udc_dwc3_data *const priv)
 {
@@ -1565,8 +1568,8 @@ static inline void udc_dwc3_quiesce_progress(struct udc_dwc3_data *const priv)
 }
 
 /*
- * No transfer may start: the transfers are being ended (4.1.8) or the core is
- * being re-initialised.
+ * True while the transfers are being ended (4.1.8) or the core is being
+ * re-initialised. No new transfer may start then.
  */
 static inline bool udc_dwc3_run_halting(const struct udc_dwc3_data *const priv)
 {
@@ -1575,8 +1578,8 @@ static inline bool udc_dwc3_run_halting(const struct udc_dwc3_data *const priv)
 }
 
 /*
- * The only writer of ctrl.state; wakes a controller recovery waiting for the
- * control endpoint to return to Setup.
+ * The only writer of ctrl.state. It also wakes a controller recovery that waits
+ * for the control endpoint to return to Setup.
  */
 static void udc_dwc3_ctrl_state_set(const struct device *const dev,
                     const enum udc_dwc3_ctrl_state next)
@@ -1592,9 +1595,9 @@ static void udc_dwc3_init_fifo_space(const struct device *dev);
 #endif
 
 /*
- * Shut down the controller completely. A control endpoint already disabled is
- * done, not a failure: a controller recovery that failed after its own shutdown
- * leaves them so, and refusing here would fail every later shutdown.
+ * Shut down the controller. A control endpoint that is already disabled counts
+ * as done. A failed controller recovery can leave them disabled, and every later
+ * shutdown must still succeed.
  */
 static int udc_dwc3_shutdown(const struct device *const dev)
 {
@@ -1613,10 +1616,10 @@ static int udc_dwc3_shutdown(const struct device *const dev)
 
 
 /*
- * Write DCTL with ULSTCHNGREQ = 0. Every DCTL write except the link request in
- * udc_dwc3_dctl_link_request() goes through here, because any value in that
- * write-only field is a link state request; the databook requires 0 when not
- * requesting a link change (DCTL, 3.30b).
+ * Write DCTL with ULSTCHNGREQ = 0. Any value in that write-only field is a link
+ * state request, and the databook requires 0 when no link change is wanted (DCTL,
+ * 3.30b). Every DCTL write goes through here, except the link request in
+ * udc_dwc3_dctl_link_request().
  */
 static UDC_DWC3_COLD void udc_dwc3_dctl_write(const mm_reg_t base, const uint32_t value)
 {
@@ -1630,8 +1633,8 @@ static UDC_DWC3_COLD void udc_dwc3_dctl_update(const mm_reg_t base, const uint32
 }
 
 /*
- * Issue a link state request. Writes 0 first, then the request: the databook
- * requires a 0 between back-to-back identical requests.
+ * Issue a link state request. It writes 0 first, because the databook requires a
+ * 0 between two identical requests.
  */
 static UDC_DWC3_COLD void udc_dwc3_dctl_link_request(const mm_reg_t base, const uint32_t req)
 {
@@ -1643,16 +1646,16 @@ static UDC_DWC3_COLD void udc_dwc3_dctl_link_request(const mm_reg_t base, const 
 
 
 /*
- * Why a buffer goes back to the stack, and its status (Zephyr's udc_common.c
- * convention):
+ * Why a buffer goes back to the stack, and the status it carries. The values
+ * follow Zephyr's udc_common.c:
  *   DONE       0             the transfer completed
- *   ABANDONED  -ECONNRESET   a control data/status stage made obsolete by the host
- *                            starting a new SETUP (as udc_setup_received())
- *   CANCELLED  -ECONNABORTED a queued request taken back by the driver - dequeue,
- *                            disable, reset, recovery (as udc_ep_cancel_queued())
+ *   ABANDONED  -ECONNRESET   a control data/status stage dropped because the host
+ *                            sent a new SETUP (as udc_setup_received())
+ *   CANCELLED  -ECONNABORTED a queued request taken back by the driver on dequeue,
+ *                            disable, reset or recovery (as udc_ep_cancel_queued())
  *   REFUSED    -EINVAL       a buffer this driver cannot use
- * Classes act on the difference: a cancelled request is dropped quietly, any
- * other error is reported as a failed transfer.
+ * Classes drop a cancelled request quietly. They report any other error as a
+ * failed transfer.
  */
 enum udc_dwc3_buf_end {
     UDC_DWC3_BUF_DONE,
@@ -1676,8 +1679,8 @@ static inline int udc_dwc3_buf_return(const struct device *const dev, struct net
 
 
 /*
- * Negotiated speed: the only decode of DSTS.ConnectSpd. Valid from Connect Done
- * on (4.1.3).
+ * Negotiated speed. This is the only place DSTS.ConnectSpd is decoded. It is
+ * valid from Connect Done on (4.1.3).
  */
 static inline enum udc_bus_speed udc_dwc3_connect_speed(const mm_reg_t base)
 {
@@ -1695,16 +1698,17 @@ static inline enum udc_bus_speed udc_dwc3_connect_speed(const mm_reg_t base)
 
 
 /*
- * Turn the event interrupt on/off: GEVNTSIZ.EvntIntMask plus the CPU line.
- * Masked, the controller still writes events but stops interrupting.
- * The ISR turns it off until the drain has consumed the ring; the drain, enable
- * and disable set it. IRQ-locked because the ISR writes the same register.
+ * Turn the event interrupt on or off, both GEVNTSIZ.EvntIntMask and the CPU line.
+ * While masked, the controller still writes events but does not interrupt. The
+ * ISR turns it off until the drain has emptied the ring. The drain and enable
+ * turn it on, and disable turns it off. Interrupts are locked because the ISR
+ * writes the same register.
  */
 static inline void udc_dwc3_evt_irq(const struct device *const dev, const bool on)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const unsigned int key = irq_lock();
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const unsigned int                  key = irq_lock();
 
     if (on) {
         sys_clear_bits(base + UDC_DWC3_GEVNTSIZ(0), UDC_DWC3_GEVNTSIZ_EVNTINTRPTMASK);
@@ -1721,19 +1725,18 @@ static inline void udc_dwc3_evt_irq(const struct device *const dev, const bool o
 }
 
 /*
- * Shut the event drain out before the event ring and the drain state are
- * re-initialised (udc_dwc3_on_soft_reset(), one act). RESETTING first: a drain
- * pass checks it on entry, which covers a drain thread already woken but not yet
- * run (in the cooperative builds it runs only when the caller next sleeps). Then
- * every source of a new pass is removed: the event interrupt, the heartbeat's
- * kick, a queued nudge and a pending wake. No pass can be suspended inside the
- * ring code: a pass never sleeps or blocks before its write-back. Returns the
- * state to restore; the event interrupt and the heartbeat come back with
- * udc_dwc3_enable().
+ * Stop the event drain before the event ring and drain state are re-initialised
+ * in udc_dwc3_on_soft_reset(). It sets RESETTING first. Every drain pass checks
+ * it on entry, which also stops a drain thread that is woken but has not run yet.
+ * Then it removes every source of a new pass: the event interrupt, the heartbeat
+ * timer, a queued nudge and a pending wake. A pass never sleeps before its
+ * write-back, so none can be caught half-way through the ring. Returns the
+ * previous run state. udc_dwc3_enable() turns the event interrupt and the
+ * heartbeat back on.
  */
 static UDC_DWC3_COLD enum udc_dwc3_run_state udc_dwc3_evt_block(const struct device *const dev)
 {
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const   priv = udc_get_private(dev);
     const enum udc_dwc3_run_state prev = priv->run.state;
 
     priv->run.state = UDC_DWC3_RUN_RESETTING;
@@ -1745,7 +1748,7 @@ static UDC_DWC3_COLD enum udc_dwc3_run_state udc_dwc3_evt_block(const struct dev
     return prev;
 }
 
-/* UDC API lock/unlock: thin wrappers over the framework mutex. */
+/* UDC API lock: a thin wrapper over the framework mutex. */
 static void udc_dwc3_lock(const struct device *const dev)
 {
     udc_lock_internal(dev, K_FOREVER);
@@ -1760,38 +1763,34 @@ static void udc_dwc3_unlock(const struct device *const dev)
 /*
  * Commands
  *
- * DEPCMD takes a command number plus parameters; the controller clears CMDACT
+ * Endpoint commands (DEPCMD) and the endpoint transfer state they drive.
+ * DEPCMD takes a command number and parameters. The controller clears CmdAct
  * when the command completes.
  */
 
 /*
- * CSftRst completion wait: bounded CSR reads, then sleeping ticks.
- * udc_dwc3_on_soft_reset() runs on the work queue under the mutex, so it must
- * not busy-wait for the whole budget.
+ * CSftRst completion wait: a few fast register reads, then sleeping ticks.
+ * udc_dwc3_on_soft_reset() runs on the work queue under the mutex, so it must not
+ * busy-wait for the whole time.
  */
 #define UDC_DWC3_CSFTRST_FAST_READS 256u
 #define UDC_DWC3_CSFTRST_SLOW_TICKS 10u
-/*
- * Endpoint-command wait: number of CSR reads watching CmdAct clear. CmdAct still
- * set means the command is still executing, not that it failed.
- */
+/* Endpoint-command wait, in register reads, for CmdAct to clear. */
 #define UDC_DWC3_CMD_FAST_POLLS     32u
 
 /*
- * How long a posted command may keep CmdAct set before its outcome is
- * undetermined (STARTING -> START_UNKNOWN, ENDING -> END_UNKNOWN). A slow
- * command retires well inside this. The heartbeat checks it from cmd_t0;
- * nothing waits on it.
+ * How long a posted Start or End may keep CmdAct set before its outcome counts as
+ * unknown (STARTING -> START_UNKNOWN, ENDING -> END_UNKNOWN). A slow command
+ * finishes well inside this. The heartbeat checks it against cmd_t0.
  */
 #define UDC_DWC3_CMD_UNKNOWN_MS     100u
 
-/* Defined with the other event-name decoders; used here for timeout diagnostics. */
+/* Defined with the other event-name decoders. Used here in timeout logs. */
 static const char *udc_dwc3_get_devt_ulstchng_name(const uint32_t dsts);
 
 /*
- * Physical endpoint number for a DEPCMD register address (inverse of
- * UDC_DWC3_DEPCMD(n)). Returns UDC_DWC3_MAX_EPN if addr is not a DEPCMD
- * register; the depcmd_last bookkeeping tests for that.
+ * Physical endpoint number for a DEPCMD register address (the inverse of
+ * UDC_DWC3_DEPCMD(n)). Returns UDC_DWC3_MAX_EPN if addr is not a DEPCMD register.
  */
 static inline uint32_t udc_dwc3_depcmd_epn(const uint32_t addr)
 {
@@ -1807,20 +1806,20 @@ static inline uint32_t udc_dwc3_depcmd_epn(const uint32_t addr)
 /*
  * Wait for the register file to come back after a reset.
  *
- * GHWPARAMS0.MDWIDTH and GHWPARAMS7.RAM1_DEPTH are fixed at synthesis, so zero
- * in either means the reset is not finished. Both feed the FIFO map; building it
- * from zeros gives every FIFO zero depth and silently kills the controller.
+ * GHWPARAMS0.MDWIDTH and GHWPARAMS7.RAM1_DEPTH are fixed at synthesis. Zero in
+ * either means the reset has not finished, and the core must not be configured
+ * yet.
  *
- * Needs two consecutive non-zero reads (one can catch a mid-transition value).
- * Returns false if the budget expires with either still zero.
+ * Two non-zero reads in a row are needed, since one read can catch a value in
+ * transition. Returns false if either still reads zero when the time runs out.
  */
 static bool udc_dwc3_wait_regfile_ready(const struct device *const dev)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 
     /*
-     * Always settle first: a reset that has not started yet still reads the
-     * previous (non-zero) values, which would pass every test below.
+     * Always settle first. A reset that has not started yet still reads the old,
+     * non-zero values, which would pass every test below.
      */
     k_sleep(K_MSEC(UDC_DWC3_CORE_SETTLE_MS));
 
@@ -1853,21 +1852,21 @@ static bool udc_dwc3_wait_regfile_ready(const struct device *const dev)
 }
 
 /*
- * Poll DEPCMD.CmdAct until it clears. Returns false if still set when the budget
- * expires. *reg_out (required) gets the last value read.
+ * Poll DEPCMD.CmdAct until it clears. Returns false if it is still set when the
+ * poll count runs out. That means the command is still executing, not that it
+ * failed. *reg_out (required) gets the last value read.
  */
 static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
                       const uint32_t addr, uint32_t *const reg_out)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg = 0;
+    uint32_t       reg = 0;
 
     /*
-     * Bounded read loop, no yield. k_yield() does not help: on the drain thread
-     * (UDC_DWC3_EVT_THREAD_PRIO) it returns at once and the loop still spins
-     * with the UDC mutex held; on the work queue it hands the CPU to the drain
-     * thread, which needs this mutex. Every caller handles false, so giving up
-     * after a few dozen reads is cheap.
+     * A short read loop with no yield, because a yield does not help. On the drain
+     * thread (cooperative priority) k_yield() returns at once. On the work queue it
+     * hands the CPU to the drain thread, which needs the mutex held here. Every
+     * caller handles false, so giving up after a few dozen reads is cheap.
      */
     for (uint32_t i = 0; i < UDC_DWC3_CMD_FAST_POLLS; i++) {
         reg = sys_read32(base + addr);
@@ -1878,9 +1877,9 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
     }
 
     /*
-     * No sleep fallback. Every DEPCMD is issued with the UDC mutex held, and
-     * udc_dwc3_handle_event() takes that mutex for every event, so sleeping here
-     * would stall the event drain and recovery on a core that stopped answering.
+     * No sleeping fallback either. Every DEPCMD is issued with the UDC mutex held,
+     * and udc_dwc3_handle_event() takes that mutex for every event. Sleeping here
+     * would stall event handling and recovery when the core stops answering.
      */
     *reg_out = reg;
 
@@ -1894,7 +1893,7 @@ static bool udc_dwc3_wait_cmdact_zero(const struct device *const dev,
  */
 static inline void udc_dwc3_trb_sync(volatile uint32_t *const last_word)
 {
-    /* The fence below is the ordering; no read-back is needed. */
+    /* The fence alone orders the writes. No read-back is needed. */
     ARG_UNUSED(last_word);
 
 #if defined(CONFIG_RISCV)
@@ -1907,11 +1906,12 @@ static inline void udc_dwc3_trb_sync(volatile uint32_t *const last_word)
 /* Log only the first few stomps; this can fire in a tight loop. */
 #define UDC_DWC3_TRB_STOMP_LOG_FIRST    8u
 
-/* F6: single controller instance, asserted. */
+/* One controller instance only, because udc_dwc3_stomp_priv is file-scope. */
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) <= 1,
          "udc_dwc3 is single-instance: udc_dwc3_stomp_priv is file-scope and "
          "the last initialised controller would own every stomp report");
 
+/* The controller instance that udc_dwc3_trb_stomp_report() reports into. */
 static struct udc_dwc3_data *udc_dwc3_stomp_priv;
 
 /*
@@ -1936,11 +1936,11 @@ static inline void udc_dwc3_trb_stomp_report(const uint32_t ctrl, const uint32_t
 }
 
 /*
- * The only writer of TRB words. The values are prepared by the caller; the
- * words go out in a fixed order with ctrl (HWO) last, then the fence. A 16-byte
- * TRB cannot be stored in one access on this CPU, and a struct assignment to a
- * volatile TRB leaves the word order to the compiler, so this order is what
- * keeps the controller from seeing HWO before the rest of the TRB.
+ * The only writer of TRB words. The words go out in a fixed order, with ctrl
+ * (which holds HWO) last, then the fence. This CPU cannot store a 16-byte TRB in
+ * one access, and a struct assignment would leave the order to the compiler.
+ * Writing ctrl last keeps the controller from seeing HWO before the rest of the
+ * TRB.
  */
 static inline void udc_dwc3_trb_write(volatile struct udc_dwc3_trb *const trb,
                       const uintptr_t addr, const uint32_t status,
@@ -1955,9 +1955,10 @@ static inline void udc_dwc3_trb_write(volatile struct udc_dwc3_trb *const trb,
 }
 
 /*
- * Arm a TRB: udc_dwc3_trb_write(), reporting (not preventing) an overwrite of a
- * TRB the controller still owns. For clearing a TRB the controller has already
- * released, which may still read HWO=1, use udc_dwc3_trb_write() directly.
+ * Arm a TRB with udc_dwc3_trb_write(). It reports, but does not prevent, an
+ * overwrite of a TRB the controller still owns. To clear a TRB the controller has
+ * already released, which may still read HWO=1, call udc_dwc3_trb_write()
+ * directly.
  */
 static inline void udc_dwc3_trb_fill(volatile struct udc_dwc3_trb *const trb,
                      const uintptr_t addr, const uint32_t status,
@@ -1973,12 +1974,11 @@ static inline void udc_dwc3_trb_fill(volatile struct udc_dwc3_trb *const trb,
 }
 
 /*
- * Snapshot a TRB the controller may have written back: ctrl, then status, each
- * read once. The controller writes status and clears HWO in its write-back, so
- * the status is the written-back one only if ctrl, read before it, has HWO
- * clear. Returns that: true means out->status is the write-back; false means
- * the controller still owns the TRB and out->status may be stale. Not for a
- * poll: each check takes a new snapshot.
+ * Snapshot a TRB the controller may have written back. It reads ctrl, then
+ * status, once each. The controller writes status and clears HWO in the same
+ * write-back. So status is the written-back value only if ctrl, read first, has
+ * HWO clear. Returns true in that case. False means the controller still owns the
+ * TRB and out->status may be stale. To poll, take a new snapshot each time.
  */
 static inline bool udc_dwc3_trb_snapshot(const volatile struct udc_dwc3_trb *const t,
                      struct udc_dwc3_trb *const out)
@@ -2010,13 +2010,12 @@ static UDC_DWC3_COLD const char *udc_dwc3_ep_state_name(const enum udc_dwc3_ep_s
 
 
 /*
- * Recompute cfg.stat.busy (what udc_ep_is_busy() reports):
+ * Recompute cfg.stat.busy, which udc_ep_is_busy() reports.
  *   - EP0 halves: busy while a transfer is in progress (xfer.state != IDLE).
  *   - Other endpoints: busy while the ring holds TRBs not yet retired.
- * Called only where those facts change: the xfer.state writers
- * (udc_dwc3_ep_state_set()/_reset()) and the ring writers (udc_dwc3_push_trb(),
- * udc_dwc3_pop_trb(), udc_dwc3_ep_ring_release()). Written only when it changes:
- * on a streaming ring most arms and retires leave it set.
+ * It is called only where those facts change: the xfer.state writers and the ring
+ * writers (push, pop and ring release). The flag is written only when it changes,
+ * since most arms and retires on a streaming ring leave it set.
  */
 static inline void udc_dwc3_ep_busy_sync(struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2030,8 +2029,8 @@ static inline void udc_dwc3_ep_busy_sync(struct udc_dwc3_ep_data *const ep_data)
 }
 
 /*
- * After an xfer.state change (both writers): update cfg.stat.busy and wake a
- * controller recovery waiting for transfers to end.
+ * Run after every xfer.state change. Updates cfg.stat.busy and wakes a controller
+ * recovery waiting for transfers to end.
  */
 static inline void udc_dwc3_ep_state_derive(struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2040,10 +2039,9 @@ static inline void udc_dwc3_ep_state_derive(struct udc_dwc3_ep_data *const ep_da
 }
 
 /*
- * Change xfer.state along a legal transition. Returns false (and logs) for an
- * illegal one. The only other writer is udc_dwc3_ep_state_reset(), which
- * returns to IDLE from anywhere; every return to IDLE goes through it, so the
- * table has no row ending in IDLE.
+ * Change xfer.state along a legal transition. Returns false and logs for an
+ * illegal one. Every return to IDLE goes through udc_dwc3_ep_state_reset(), so
+ * the table has no row that ends in IDLE.
  */
 static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
                   const enum udc_dwc3_ep_state next)
@@ -2052,29 +2050,27 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
         { UDC_DWC3_EP_IDLE,     UDC_DWC3_EP_STARTING },
         { UDC_DWC3_EP_STARTING,     UDC_DWC3_EP_RUNNING },
         /*
-         * Deadline passed with the command still executing: outcome
-         * undetermined, neither success nor rejection.
+         * The deadline passed with the command still executing. The outcome is
+         * unknown.
          */
         { UDC_DWC3_EP_STARTING,     UDC_DWC3_EP_START_UNKNOWN },
         { UDC_DWC3_EP_ENDING,       UDC_DWC3_EP_END_UNKNOWN },
         /*
-         * UNKNOWN is left only on proof: DEPCMD (or cmd_record, if a later
-         * command overwrote it) shows the same command type with CmdAct
-         * clear. The Start/End refusals guarantee no second Start or End
-         * replaces it. Without proof, and for a Start proven refused or an
-         * End proven complete, the exit is udc_dwc3_ep_state_reset().
+         * UNKNOWN is left only on proof. DEPCMD (or cmd_record, if a later
+         * command overwrote it) must show the same command type with CmdAct
+         * clear. The Start and End refusals make sure no second Start or End
+         * replaces it. In all other cases the exit is udc_dwc3_ep_state_reset().
          */
         { UDC_DWC3_EP_START_UNKNOWN,    UDC_DWC3_EP_RUNNING },
         /*
-         * Same proof, showing the End was refused: the transfer still runs
-         * and owns its resource. udc_dwc3_ep_end_refused() restores the
-         * index first.
+         * The same proof shows the End was refused. The transfer still runs and
+         * owns its resource. udc_dwc3_ep_end_refused() restores the index first.
          */
         { UDC_DWC3_EP_END_UNKNOWN,  UDC_DWC3_EP_RUNNING },
         { UDC_DWC3_EP_RUNNING,      UDC_DWC3_EP_ENDING },
         /*
-         * The End Transfer did not end the transfer: either never issued
-         * (pre-poll gave up on a still-active command) or refused.
+         * The End Transfer did not end the transfer. Either it was never issued
+         * (the pre-poll gave up on a still-active command) or it was refused.
          */
         { UDC_DWC3_EP_ENDING,       UDC_DWC3_EP_RUNNING },
     };
@@ -2104,8 +2100,8 @@ static bool udc_dwc3_ep_state_set(struct udc_dwc3_ep_data *const ep_data,
 
 
 /*
- * An End Transfer is outstanding (executing or outcome unknown). Either way the
- * controller may still own the ring.
+ * An End Transfer is outstanding, either executing or with an unknown outcome.
+ * The controller may still own the ring.
  */
 static inline bool udc_dwc3_ep_is_ending(const struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2122,7 +2118,7 @@ static inline bool udc_dwc3_ep_is_unknown(const struct udc_dwc3_ep_data *const e
 
 /*
  * A command posted on this endpoint has not resolved, so nothing else may act on
- * it. xfer.state alone decides this.
+ * it. Only xfer.state decides this.
  */
 static inline bool udc_dwc3_ep_cmd_busy(const struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2132,10 +2128,10 @@ static inline bool udc_dwc3_ep_cmd_busy(const struct udc_dwc3_ep_data *const ep_
 }
 
 /*
- * Return to IDLE from any state, for paths that know the controller holds no
- * transfer on this endpoint: teardown (bus reset, disconnect, disable,
- * DEPSTARTCFG, controller recovery), a completed stage or ring, a concluded End,
- * and a Start proven refused. So this bypasses the transition table.
+ * Return to IDLE from any state, bypassing the transition table. It is used where
+ * the controller holds no transfer on this endpoint: teardown (bus reset,
+ * disconnect, disable, DEPSTARTCFG, controller recovery), a completed stage or
+ * ring, a concluded End, and a Start proven refused.
  */
 static void udc_dwc3_ep_state_reset(struct udc_dwc3_ep_data *const ep_data)
 {
@@ -2151,11 +2147,10 @@ static void udc_dwc3_ep_state_reset(struct udc_dwc3_ep_data *const ep_data)
     ep_data->cmd.cmd_record = 0U;
 
     /*
-     * An owed Update belongs to the transfer and ends with it. The other
-     * pending bits are owed to the stack or the host, not to a command, and
-     * survive: udc_dwc3_ep_recover() carries them out once the endpoint is
-     * idle. Teardown withdraws them explicitly (udc_dwc3_ep_disable(),
-     * udc_dwc3_drop_xfer_state()).
+     * An owed Update belongs to the transfer and ends with it. The other pending
+     * bits are owed to the stack or the host, not to a command, so they stay.
+     * udc_dwc3_ep_recover() carries them out once the endpoint is idle. Teardown
+     * clears them itself (udc_dwc3_ep_disable(), udc_dwc3_drop_xfer_state()).
      */
     ep_data->xfer.pending &= (uint8_t)~UDC_DWC3_EP_PEND_UPDATE;
 }
@@ -2169,15 +2164,15 @@ static void udc_dwc3_adopt_xferrscidx(const struct device *const dev,
 static void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data);
 
-/* The End Transfer has concluded; run what it owed. Defined below. */
+/* The End Transfer has concluded. Run what it owed. Defined below. */
 static void udc_dwc3_ep_end_completed(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data);
 
 /*
- * Result of a posted endpoint command. Three outcomes: CmdAct still set means
- * still executing, which is neither success nor rejection; treating it as either
- * can leak a transfer resource the controller really took.
- * CMD_OTHER is not an outcome: DEPCMD holds a different command.
+ * Result of a posted endpoint command. CmdAct still set means still executing,
+ * which is neither success nor rejection. Treating it as either can leak a
+ * transfer resource the controller really took. CMD_OTHER is not an outcome. It
+ * means DEPCMD holds a different command.
  */
 enum udc_dwc3_cmd_outcome {
     UDC_DWC3_CMD_UNKNOWN = 0,   /* CmdAct set: still executing          */
@@ -2187,19 +2182,18 @@ enum udc_dwc3_cmd_outcome {
 };
 
 /*
- * Classify DEPCMD as the outcome of this endpoint's command of type cmdtyp.
- * The only place this rule is written. *reg_out (optional) gets the value used.
+ * Classify DEPCMD as the outcome of this endpoint's command of type cmdtyp. This
+ * is the only place the rule is written. *reg_out (optional) gets the value used.
  *
- * - CmdAct clear means finished, not failed; CmdStatus says which. Testing
- *   CmdAct alone reads a late success as a refusal.
- * - CmdStatus needs the command type too: DEPCMD holds the last command posted,
- *   which may be a later one (e.g. a Set Stall) or an earlier one (our
- *   pre-poll gave up without posting). Reading its status as ours can, e.g.,
- *   release a ring under a live transfer after a refused End Transfer.
+ * - CmdAct clear means finished, not failed. CmdStatus says which.
+ * - The command type must match too. DEPCMD holds the last command posted, which
+ *   may be a later one (such as a Set Stall) or an earlier one (when the pre-poll
+ *   gave up without posting). Reading its status as ours could, for example,
+ *   release a ring under a live transfer after a refused End.
  * - If a later command overwrote ours, udc_dwc3_depcmd() saved the old value in
- *   cmd_record, which answers instead.
- * - CMD_OTHER: neither holds it. Right after posting, it means the pre-poll gave
- *   up and nothing was posted.
+ *   cmd_record, and that answers instead.
+ * - CMD_OTHER means neither holds it. Right after posting, it means the pre-poll
+ *   gave up and nothing was posted.
  */
 static enum udc_dwc3_cmd_outcome
 udc_dwc3_cmd_outcome(const struct device *const dev,
@@ -2208,11 +2202,11 @@ udc_dwc3_cmd_outcome(const struct device *const dev,
              uint32_t *const reg_out)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg = sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
+    uint32_t       reg = sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn));
 
     /*
-     * Overwritten: answer from cmd_record if it holds the command asked
-     * after. The record is only taken with CmdAct clear.
+     * DEPCMD holds another command. Answer from cmd_record if it holds the
+     * command asked about. The record is saved only with CmdAct clear.
      */
     if ((reg & UDC_DWC3_DEPCMD_CMDTYP_MASK) != cmdtyp) {
         if ((ep_data->cmd.cmd_record & UDC_DWC3_DEPCMD_CMDTYP_MASK) != cmdtyp) {
@@ -2239,14 +2233,13 @@ udc_dwc3_cmd_outcome(const struct device *const dev,
 /*
  * Operands (DEPCMDPAR0/1/2) of one endpoint command.
  *
- * The databook does not say they are latched when CmdAct is written, so they
- * are live while CmdAct is set: never write them over a command still executing
- * on this endpoint. That is why they are passed to udc_dwc3_depcmd() and written
- * after its pre-poll, just before CmdAct; a call-site write would land on the
- * previous, still-running command.
+ * The databook does not say they are latched when CmdAct is written. So they must
+ * not change while a command on this endpoint is still executing.
+ * udc_dwc3_depcmd() writes them after its pre-poll, just before CmdAct. A write at
+ * the call site could land on the previous, still-running command.
  *
- * A command with operands writes all three, unused ones zero (as the reference
- * driver does). A command without operands passes NULL.
+ * A command with operands writes all three, with unused ones zero, as the
+ * reference driver does. A command without operands passes NULL.
  */
 struct udc_dwc3_depcmd_par {
     uint32_t    par0;
@@ -2258,24 +2251,22 @@ struct udc_dwc3_depcmd_par {
  * Issue one endpoint command and collect its result. par holds the operands, or
  * NULL if the command has none.
  *
- * Returns 0 on completion with status OK, else UDC_DWC3_XFERRSCIDX_INVALID
- * (rejected, not issued, or still executing when the poll expired). Callers that
- * must tell these apart use udc_dwc3_cmd_outcome(). A Start Transfer that is not
- * issued returns UDC_DWC3_DEPCMD_NOT_POSTED instead, so its caller knows for
- * certain that nothing was posted.
+ * Returns 0 when the command completed with status OK. Otherwise it returns
+ * UDC_DWC3_XFERRSCIDX_INVALID: rejected, not issued, or still executing when the
+ * poll ran out. Callers that must tell these apart use udc_dwc3_cmd_outcome().
+ * Two more values exist. A Start Transfer that is not issued returns
+ * UDC_DWC3_DEPCMD_NOT_POSTED, so its caller knows nothing was posted. A Start or
+ * Update Transfer posted without the post-poll returns UDC_DWC3_DEPCMD_POSTED.
  */
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
                 const uint32_t addr, const uint32_t cmd,
                 const struct udc_dwc3_depcmd_par *const par)
 {
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
     const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const uint32_t epn = udc_dwc3_depcmd_epn(addr);
-    /*
-     * Target endpoint, or NULL if addr is not an endpoint command register.
-     * Command bookkeeping lives on the endpoint, so an endpoint reset clears it.
-     */
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const uint32_t                      epn = udc_dwc3_depcmd_epn(addr);
+    /* Target endpoint, or NULL if addr is not an endpoint command register. */
     struct udc_dwc3_ep_data *const ep = _EPN_IS_VALID(cfg, epn)
                          ? _EP_DATA_FROM_EPN(cfg, epn) : NULL;
     const bool first_on_ep = (ep == NULL) || ep->cmd.depcmd_last == UDC_DWC3_DEPCMD_NONE;
@@ -2284,11 +2275,11 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
                 UDC_DWC3_DEPCMD_DEPSTRTXFER) ||
                ((cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK) ==
                 UDC_DWC3_DEPCMD_DEPENDXFER);
-    uint32_t reg = 0;
+    uint32_t   reg = 0;
 
     /*
-     * A new Start or End clears the saved record before the pre-poll: if the
-     * pre-poll gives up, the caller's outcome read must not find an older
+     * A new Start or End clears the saved record before the pre-poll. If the
+     * pre-poll gives up, the caller's outcome check then cannot find an older
      * command of the same type.
      */
     if (ep != NULL && opens) {
@@ -2296,10 +2287,10 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     }
 
     /*
-     * Never write a command over one still running: CmdAct is R/W1S and the
-     * result is undefined (dropped, doubled, or using the previous operands).
-     * Exception: the first command on an endpoint, where DEPCMD reads undefined
-     * and CmdAct may read set (1.3.12), so issuing is safe.
+     * Never write a command over one still running. CmdAct is R/W1S, and the result
+     * is undefined: dropped, doubled, or run with the old operands. The first
+     * command on an endpoint is the exception. DEPCMD reads undefined then and CmdAct
+     * may read set (1.3.12), so it is issued without the check.
      */
     if (!first_on_ep && !udc_dwc3_wait_cmdact_zero(dev, addr, &reg)) {
         LOG_ERR("previous command still active on addr 0x%x (0x%08x) after the "
@@ -2314,10 +2305,9 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     }
 
     /*
-     * DEPCMD is about to be overwritten: if it holds the outcome of the
-     * endpoint's open Start or End, save it in cmd_record (the resolver would
-     * otherwise find this new command). Checked before the adoption below,
-     * which may close the Start.
+     * DEPCMD is about to be overwritten. If it holds the outcome of this endpoint's
+     * open Start or End, save it in cmd_record so the resolver can still find it.
+     * This runs before the adoption below, which may close the Start.
      */
     if (!first_on_ep && !opens && udc_dwc3_ep_cmd_busy(ep)) {
         const uint32_t typ = reg & UDC_DWC3_DEPCMD_CMDTYP_MASK;
@@ -2329,10 +2319,10 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     }
 
     /*
-     * The pre-poll value may complete this endpoint's open Start. Not for a
-     * Start or End being posted: the caller has already set STARTING or ENDING,
-     * and DEPCMD holds an earlier command, so a Start found there belongs to a
-     * previous transfer and its index is not this one's.
+     * The pre-poll value may complete this endpoint's open Start. This is skipped
+     * when posting a Start or End. The caller has already set STARTING or ENDING,
+     * and a Start found in DEPCMD then belongs to an earlier transfer, with a
+     * different index.
      */
     if (!first_on_ep && !opens) {
         udc_dwc3_adopt_xferrscidx(dev, ep, reg);
@@ -2347,17 +2337,10 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
             (unsigned int)(ep->cmd.depcmd_last & UDC_DWC3_DEPCMD_CMDTYP_MASK));
     }
 
-    /*
-     * SusPHY and EnblSlpM must be clear before an endpoint command (GUSB2PHYCFG
-     * notes). This driver never sets them; udc_dwc3_on_soft_reset() clears them
-     * once, and the register survives a core soft reset.
-     */
-
 
     /*
-     * The transfer resource index lives and dies with Start/End Transfer
-     * (3.2.2.2), so it is invalidated here, where every command is issued,
-     * rather than at the call sites.
+     * The transfer resource index lives and dies with Start and End Transfer
+     * (3.2.2.2). So it is invalidated here, where every command is issued.
      */
     {
         const uint32_t cmdtyp = cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK;
@@ -2370,8 +2353,9 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     }
 
     /*
-     * Operands, then the command, both after the pre-poll, so operands never
-     * land on a still-executing command. The give-up path above touches nothing.
+     * Write the operands, then the command, both after the pre-poll. So operands
+     * never land on a command still executing. The give-up path above writes
+     * nothing.
      */
     if (par != NULL && epn < UDC_DWC3_MAX_EPN) {
         sys_write32(par->par0, base + UDC_DWC3_DEPCMDPAR0(epn));
@@ -2382,15 +2366,15 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 
     /*
-     * DEPCMD is now written, so its read value is defined and the next command
-     * on this endpoint may pre-poll it.
+     * DEPCMD has now been written, so its value is defined and the next command on
+     * this endpoint can pre-poll it.
      */
     if (ep != NULL) {
         ep->cmd.depcmd_last = cmd;
         ep->diag.cmd_reported = false;
         /*
-         * Start of the UDC_DWC3_CMD_UNKNOWN_MS deadline, which only a Start or
-         * End has: a later Set Stall or DEPCFG must not extend it.
+         * Start the UDC_DWC3_CMD_UNKNOWN_MS deadline. Only a Start or End has one,
+         * so a later Set Stall or DEPCFG does not extend it.
          */
         if (opens) {
             ep->cmd.cmd_t0 = k_cycle_get_32();
@@ -2398,15 +2382,15 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
     }
 
     /*
-     * Poll every command, not just Start Transfer: Update Transfer has CmdIOC=0
-     * and raises no Command Complete, so its CmdStatus is read only here.
-     * Without the post-poll (UDC_DWC3_DEPCMD_POST_POLL), Start and Update
-     * return POSTED here; see the #define for where their outcome is learnt.
+     * Poll for the result. Update Transfer has CmdIOC=0 and raises no Command
+     * Complete, so its CmdStatus can only be read here. Without the post-poll
+     * (UDC_DWC3_DEPCMD_POST_POLL), Start and Update return POSTED instead. The
+     * #define explains how their outcome is learnt then.
      */
     if (ep != NULL) {
         const uint32_t cmdtyp = cmd & UDC_DWC3_DEPCMD_CMDTYP_MASK;
-        uint32_t done = 0;
-        bool finished;
+        uint32_t       done = 0;
+        bool           finished;
 
         if (!UDC_DWC3_DEPCMD_POST_POLL &&
             (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER || cmdtyp == UDC_DWC3_DEPCMD_DEPUPDXFER)) {
@@ -2416,12 +2400,11 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
         finished = udc_dwc3_wait_cmdact_zero(dev, addr, &done);
 
         /*
-         * Read once more before reporting. The LOG_WRN below takes ~11 ms
-         * under CONFIG_LOG_MODE_MINIMAL (~130 chars at ~87 us/char, mutex
-         * held). A command retiring in that window would make the caller's
-         * CmdAct re-read see clear and treat a success as a rejection,
-         * resetting the endpoint and orphaning its transfer resource.
-         * CmdStatus is valid as soon as CmdAct clears.
+         * Read once more before reporting. The LOG_WRN below is slow (about 11 ms
+         * with CONFIG_LOG_MODE_MINIMAL, with the mutex held). If the command
+         * finished in that time, the caller's re-read would see CmdAct clear and
+         * take a success for a rejection. It would then reset the endpoint and
+         * orphan its transfer resource. CmdStatus is valid as soon as CmdAct clears.
          */
         if (!finished) {
             done = sys_read32(base + addr);
@@ -2430,7 +2413,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 
         if (!finished) {
             priv->diag.depcmd_n_timeout++;
-            /* Not success yet: callers resolve it with udc_dwc3_cmd_outcome(). */
+            /* Not a success yet. Callers resolve it with udc_dwc3_cmd_outcome(). */
             LOG_WRN("EP%02x command 0x%x on addr 0x%x still executing past the "
                 "poll (0x%08x), outcome pending (%u so far)",
                 ep->cfg.addr, cmd, addr, done, priv->diag.depcmd_n_timeout);
@@ -2438,8 +2421,8 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
         }
 
         /*
-         * Only Start Transfer assigns a transfer resource; adopt checks the
-         * value before trusting it.
+         * Only Start Transfer assigns a transfer resource. The adopt function
+         * checks the value before trusting it.
          */
         if (cmdtyp == UDC_DWC3_DEPCMD_DEPSTRTXFER) {
             udc_dwc3_adopt_xferrscidx(dev, ep, done);
@@ -2476,13 +2459,13 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_config(const struct device *const d
                       const bool modify)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t param0 = 0;
-    uint32_t param1 = 0;
+    uint32_t       param0 = 0;
+    uint32_t       param1 = 0;
 
     LOG_INF("Configuring endpoint 0x%02x with wMaxPacketSize=%u",
         ep_data->cfg.addr, ep_data->cfg.mps);
 
-    /* Init or Modify is passed in, not inferred from cfg.stat.enabled. */
+    /* The caller says whether this is Init or Modify. */
     if (modify) {
         LOG_DBG("UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_MODIFY");
         param0 |= UDC_DWC3_DEPCMDPAR0_DEPCFG_ACTION_MODIFY;
@@ -2508,22 +2491,24 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_config(const struct device *const d
         CODE_UNREACHABLE;
     }
 
-    /* Max Packet Size according to the USB descriptor configuration */
+    /* Max packet size from the USB descriptor. */
     param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_MPS_MASK, ep_data->cfg.mps);
 
     /*
-     * BrstSiz = packets per burst - 1. Control endpoints do not burst: 0 for
-     * EP0 (Table 4-1).
+     * BrstSiz is packets per burst minus 1. Control endpoints do not burst, so it is
+     * 0 for EP0 (Table 4-1).
      */
     if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
         param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 0);
     } else {
-        /* Burst of 4, matching bMaxBurst=3 in the class descriptors and
-         * DCFG.NUMP=4, as the controller vendor specified. */
+        /*
+         * Burst of 4, matching bMaxBurst=3 in the class descriptors and
+         * DCFG.NUMP=4, as the controller vendor specified.
+         */
         param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_BRSTSIZ_MASK, 3);
     }
 
-    /* Set the FIFO number, must be 0 for all OUT EPs */
+    /* FIFO number. It must be 0 for every OUT endpoint. */
     if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
         param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_FIFONUM_MASK,
                      ep_data->cfg.addr & 0x7f);
@@ -2534,26 +2519,24 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_config(const struct device *const d
     param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
 
     /*
-     * XferNotReady on every endpoint except video:
-     *   - EP0: mandatory, an integral part of control transfer handling (4.2.4);
-     *   - other non-control endpoints: the signal that the host is asking while
-     *     the controller has no TRB it will fetch (udc_dwc3_on_xfer_not_ready_nonctrl());
-     *   - not video: between frames of the bulk-IN stream it is the normal state,
-     *     and would only add events.
+     * XferNotReady is enabled on every endpoint except video.
+     *   - EP0 needs it for control transfer handling (4.2.4).
+     *   - Other endpoints use it to see the host asking while the controller has no
+     *     TRB to fetch (udc_dwc3_on_xfer_not_ready_nonctrl()).
+     *   - On the video bulk-IN stream that is the normal state between frames, so it
+     *     would only add events.
      */
     if (ep_data->cfg.addr != UDC_DWC3_VIDEO_EP) {
         param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
     }
 
-    /* USB endpoint number field; our physical endpoint number uses the same
-     * encoding.
-     */
+    /* USB endpoint number. The physical endpoint number uses the same encoding. */
     param1 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR1_DEPCFG_EPNUMBER_MASK, ep_data->epn);
 
     /*
-     * bInterval_m1: bInterval - 1, and 0 at Full-Speed (DEPCFG field
-     * description). Mandatory for isochronous endpoints (4.3.3); same meaning
-     * for interrupt ones.
+     * bInterval_m1 is bInterval - 1, and 0 at Full-Speed (DEPCFG field description).
+     * It is required for isochronous endpoints (4.3.3) and means the same for
+     * interrupt ones.
      */
     switch (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) {
     case USB_EP_TYPE_ISO:
@@ -2596,8 +2579,8 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_config(const struct device *const d
 }
 
 /*
- * DEPXFERCFG: allocate this endpoint's transfer resource. Endpoint enable only:
- * re-issuing it leaks a resource.
+ * DEPXFERCFG: allocate this endpoint's transfer resource. Issue it only on
+ * endpoint enable. Issuing it again leaks a resource.
  */
 static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
                        struct udc_dwc3_ep_data *const ep_data)
@@ -2615,8 +2598,9 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_ep_xfer_config(const struct device *co
 }
 
 /*
- * After udc_dwc3_depcmd() failed: was the command posted and not refused, i.e.
- * still executing (it completes; R2) or completed late with status OK?
+ * After udc_dwc3_depcmd() failed, check whether the command was posted and not
+ * refused. That is, it is still executing (and will complete), or it completed
+ * late with status OK.
  */
 static bool udc_dwc3_cmd_posted_ok(const struct device *const dev,
                    const struct udc_dwc3_ep_data *const ep_data,
@@ -2630,7 +2614,7 @@ static bool udc_dwc3_cmd_posted_ok(const struct device *const dev,
 
 /*
  * DEPSETSTALL. Returns whether the controller took the command (accepted, or
- * still executing past the poll).
+ * still executing past the poll). When it did, cfg.stat.halted is set.
  */
 static UDC_DWC3_COLD bool udc_dwc3_depcmd_set_stall(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data)
@@ -2638,8 +2622,8 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_set_stall(const struct device *const d
     LOG_DBG("DepSetStall: EP%02x", ep_data->cfg.addr);
 
     /*
-     * udc_dwc3_depcmd() fails both for a refusal and for a command still
-     * executing past its poll; the latter was posted and takes effect.
+     * udc_dwc3_depcmd() fails both for a refusal and for a command still executing
+     * past its poll. The second one was posted and takes effect.
      */
     if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
                 UDC_DWC3_DEPCMD_DEPSETSTALL, NULL) != 0U &&
@@ -2673,28 +2657,24 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_clear_stall(const struct device *const
 
     /*
      * Cleared only here, once the controller has taken the command.
-     * udc_dwc3_ep_resume() also un-stalls every non-control endpoint it restores.
-     * If the flag were cleared anywhere else, a recovery through resume could leave
-     * the hardware un-halted with halted still true, and udc_dwc3_ep_worker() would
-     * then refuse every buffer.
+     * udc_dwc3_ep_resume() also un-stalls the endpoints it restores, through this
+     * function. Clearing the flag anywhere else could leave the hardware un-halted
+     * with halted still true. udc_dwc3_ep_worker() would then refuse every buffer.
      */
     ep_data->cfg.stat.halted = false;
 
     return true;
 }
 
-/*
- * Defined below; needed here to release a transfer resource that a rejected
- * Start Transfer could not obtain.
- */
+/* Defined below. */
 static bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data,
                      uint32_t flags);
 
-/* Defined below; udc_dwc3_ep_update_owed() needs it. */
+/* Defined below. udc_dwc3_depcmd_start_xfer() and udc_dwc3_ep_update_owed() use it. */
 static bool udc_dwc3_ep_ring_outstanding(const struct udc_dwc3_ep_data *const ep_data);
 
-/* Defined below; udc_dwc3_depcmd_start_xfer() needs it for a refusal at post time. */
+/* Defined below. Used for a Start refusal seen at post time. */
 static void udc_dwc3_ep_start_refused(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data,
                       const char *const src, const uint32_t val,
@@ -2710,7 +2690,7 @@ static void udc_dwc3_store_xferrscidx(const struct device *const dev,
 {
     if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
         const struct udc_dwc3_config *const cfg = DEV_CFG(dev);
-        const struct udc_dwc3_ep_data *clash = NULL;
+        const struct udc_dwc3_ep_data      *clash = NULL;
 
         for (uint8_t i = 0; i < cfg->num_in_eps && clash == NULL; i++) {
             if (&cfg->ep_data_in[i] != ep_data &&
@@ -2738,33 +2718,29 @@ static void udc_dwc3_store_xferrscidx(const struct device *const dev,
 
 
 /*
- * Returns true when the transfer is running.
+ * Post Start Transfer. Returns true when the Start was posted and not refused.
+ * The transfer is then running, or STARTING until its outcome arrives.
+ *
+ * The caller writes the TRB first. The controller fetches it as soon as it
+ * sees the command.
+ * No link-state request is made. In U1/U2 the controller serves the Start after
+ * it leaves the low-power state itself. In U3 (host suspended the device) it
+ * waits for the host to resume. Writing ULSTCHNGREQ=Resume here would turn
+ * every arm in U3 into an unrequested remote wake.
  */
 static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
                        struct udc_dwc3_ep_data *const ep_data)
 {
-    /* Filled in below; issued with the command, not before it. */
+    /* Filled in below and written with the command, not before it. */
     struct udc_dwc3_depcmd_par par;
-    uint32_t idx;
-    uint32_t cmd;
-
-    /*
-     * The controller fetches the TRB as soon as it sees the command, so the TRB
-     * must be in memory before the command is posted.
-     */
-
-    /*
-     * No link-state request here. In U1/U2 the controller serves the Start after
-     * its own exit; in U3 (host suspended the device) it waits for the host's
-     * resume. Writing ULSTCHNGREQ=Resume here would make every arm in U3 an
-     * unsolicited remote wake.
-     */
+    uint32_t                   idx;
+    uint32_t                   cmd;
 
     /*
      * Resolve an open Start first, so the checks below see the controller's real
-     * state. Start side only: resolving an End here runs
-     * udc_dwc3_ep_end_completed(), which resumes the endpoint and re-enters this
-     * function.
+     * state. Only the Start side is resolved here. Resolving an End runs
+     * udc_dwc3_ep_end_completed(), which resumes the endpoint and would re-enter
+     * this function.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_STARTING ||
         ep_data->xfer.state == UDC_DWC3_EP_START_UNKNOWN) {
@@ -2772,10 +2748,10 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * Never post a second Start while the first one's outcome is open. The
-     * controller may already hold a transfer resource for it, and a second Start
-     * would take another that the driver cannot address or End. Control endpoints
-     * are not exempt from this rule.
+     * Never post a second Start while the first one's outcome is open. This applies
+     * to control endpoints too. The controller may already hold a transfer resource
+     * for the first Start. A second Start would take another one that the driver
+     * cannot address or end.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_STARTING ||
         udc_dwc3_ep_is_unknown(ep_data)) {
@@ -2786,9 +2762,9 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * INVARIANT 1: Start Transfer only from IDLE - on every endpoint; EP0 starts
-     * each control stage as a new transfer. This also enforces 3.2.2.7: no Start
-     * while an End Transfer is still completing on this endpoint.
+     * INVARIANT 1: Start Transfer only from IDLE, on every endpoint. EP0 starts each
+     * control stage as a new transfer. This also enforces 3.2.2.7: no Start while an
+     * End Transfer is still completing on this endpoint.
      */
     if (ep_data->xfer.state != UDC_DWC3_EP_IDLE) {
         LOG_ERR("EP%02x Start Transfer refused: endpoint is %s, not idle",
@@ -2798,13 +2774,13 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * PAR0/PAR1 = address of this transfer's first TRB, trb_buf[tail], not the
-     * ring base. After a wrap the base slot has HWO clear, so starting there makes
-     * the controller take the transfer resource and never move. EP0 has no ring
-     * and always uses slot 0.
+     * PAR0/PAR1 hold the address of this transfer's first TRB, trb_buf[tail], not the
+     * ring base. After a wrap the base slot has HWO clear. Starting there would make
+     * the controller take the transfer resource and never move. EP0 has no ring and
+     * always uses slot 0.
      */
     {
-        const uint32_t first = (USB_EP_GET_IDX(ep_data->cfg.addr) == 0U)
+        const uint32_t  first = (USB_EP_GET_IDX(ep_data->cfg.addr) == 0U)
                            ? 0U : ep_data->ring.tail;
         const uintptr_t trb0 = (uintptr_t)&ep_data->trb_buf[first];
 
@@ -2814,30 +2790,29 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * The databook returns the transfer resource index "in the DEPCMDn register
-     * and in the Command Complete event". CMDIOC (below) requests that event, so
-     * the index is not waited for here.
+     * The databook returns the transfer resource index "in the DEPCMDn register and
+     * in the Command Complete event".
      */
     cmd = UDC_DWC3_DEPCMD_DEPSTRTXFER;
 
     /*
-     * Without CMDIOC the only way to observe the Start is the synchronous poll
-     * in udc_dwc3_depcmd(). If that misses, the outcome is unknown and the
-     * endpoint stays STARTING until another command runs on it.
+     * CMDIOC requests that event. It lets the driver learn the outcome and the index
+     * even when the poll in udc_dwc3_depcmd() does not see the command finish.
      */
     cmd |= UDC_DWC3_DEPCMD_CMDIOC;
 
-    /* Set STARTING before posting, for the same reason End Transfer sets ENDING first. */
+    /*
+     * Set STARTING before posting. Whoever sees the result first (post-poll,
+     * pre-poll or Command Complete) then finds the endpoint waiting for it.
+     */
     (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_STARTING);
 
     idx = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), cmd, &par);
 
     /*
-     * Not posted: the previous command was still executing when the pre-poll
-     * gave up (logged there). Told apart from a posted Start still executing,
-     * whose outcome DEPCMD would then report as that older command's. Back to
-     * IDLE, as before the call: IDLE holds no index, end_idx, cmd_record or owed
-     * Update, so the reset restores exactly that.
+     * Not posted: the pre-poll gave up because the previous command was still
+     * executing (logged there). Go back to IDLE, as before the call. IDLE holds no
+     * index, end_idx, cmd_record or owed Update, so the reset restores exactly that.
      */
     if (idx == UDC_DWC3_DEPCMD_NOT_POSTED) {
         udc_dwc3_ep_state_reset(ep_data);
@@ -2845,27 +2820,27 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * Posted without the post-poll: STARTING until its Command Complete, the
-     * next command's pre-poll or the resolver settles it.
+     * Posted without the post-poll. It stays STARTING until its Command Complete,
+     * the next command's pre-poll or the resolver settles it.
      */
     if (idx == UDC_DWC3_DEPCMD_POSTED) {
         return true;
     }
 
     /*
-     * The Start was posted, so failure means still executing past the poll,
-     * completed late, or refused.
+     * The Start was posted, so the failure means it is still executing past the
+     * poll, completed late, or was refused.
      */
     if (idx == UDC_DWC3_XFERRSCIDX_INVALID) {
         struct udc_dwc3_data *const priv = udc_get_private(dev);
-        uint32_t done = 0U;
+        uint32_t                        done = 0U;
         const enum udc_dwc3_cmd_outcome out =
             udc_dwc3_cmd_outcome(dev, ep_data, UDC_DWC3_DEPCMD_DEPSTRTXFER,
                          &done);
 
         /*
-         * Still executing is neither success nor refusal: leave it STARTING for
-         * its Command Complete (or the resolver).
+         * Still executing is neither success nor refusal. Leave it STARTING for its
+         * Command Complete or the resolver.
          */
         if (out == UDC_DWC3_CMD_UNKNOWN) {
             LOG_WRN("EP%02x Start Transfer still executing past the poll "
@@ -2876,10 +2851,10 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
         }
 
         /*
-         * The command completed after the poll expired (e.g. during the ~11 ms
-         * synchronous log line in udc_dwc3_depcmd()). Adopt the index: resetting
-         * to IDLE would abandon a resource the controller just assigned, with no
-         * index left to End it.
+         * The command completed after the poll ran out, for example during the slow
+         * log line in udc_dwc3_depcmd(). Adopt the index. Resetting to IDLE would
+         * abandon a resource the controller just assigned, with no index left to end
+         * it.
          */
         if (out == UDC_DWC3_CMD_OK) {
             udc_dwc3_adopt_xferrscidx(dev, ep_data, done);
@@ -2887,17 +2862,17 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
         }
 
         /*
-         * Refused (CMD_OTHER, DEPCMD not holding a Start, cannot follow a posted
-         * Start and is handled the same way). No resource was assigned. CmdStatus
+         * Refused. CMD_OTHER (DEPCMD not holding a Start) cannot follow a posted
+         * Start and is handled the same way. No resource was assigned. CmdStatus
          * 4'h1 on Start Transfer means "no transfer resource available on the
-         * endpoint"; 3.2.2.2 describes how to get one back. No retry.
+         * endpoint", and 3.2.2.2 describes how to get one back. There is no retry.
          *
-         * A non-control endpoint with buffers armed is taken out of service as
-         * when the refusal is learnt later (udc_dwc3_ep_start_refused()), so
-         * nothing re-issues this Start for an armed ring on an IDLE endpoint.
-         * Otherwise (EP0, whose callers recover the control transfer, or an empty
-         * ring being built for an enable) the endpoint returns to IDLE and false
-         * lets the caller act.
+         * A non-control endpoint with buffers armed is taken out of service, the
+         * same as when the refusal is learnt later (udc_dwc3_ep_start_refused()).
+         * This stops anything from re-issuing the Start for an armed ring on an IDLE
+         * endpoint. In the other cases (EP0, whose callers recover the control
+         * transfer, or an empty ring set up during enable) the endpoint returns to
+         * IDLE and the caller acts on false.
          */
         if (USB_EP_GET_IDX(ep_data->cfg.addr) != 0U &&
             udc_dwc3_ep_ring_outstanding(ep_data)) {
@@ -2915,19 +2890,18 @@ static bool udc_dwc3_depcmd_start_xfer(const struct device *const dev,
     }
 
     /*
-     * udc_dwc3_depcmd() has already invalidated the index. It arrives with the
-     * Command Complete event, or the next command's pre-poll reads it back if it
-     * is needed before that event is drained.
+     * Reached only with the post-poll on and the Start completed with status OK.
+     * udc_dwc3_depcmd() has already adopted the index and set RUNNING.
      */
-    LOG_DBG("start EP%02x issued, transfer resource index pending",
+    LOG_DBG("start EP%02x completed, transfer resource index adopted",
         ep_data->cfg.addr);
 
     return true;
 }
 
 /*
- * Adopt the transfer resource index out of a DEPCMD value, if that value is a
- * completed, successful Start Transfer for this endpoint.
+ * Take the transfer resource index from a DEPCMD value. This is done only if
+ * the value is a finished, successful Start Transfer.
  */
 static void udc_dwc3_adopt_xferrscidx(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data,
@@ -2938,10 +2912,8 @@ static void udc_dwc3_adopt_xferrscidx(const struct device *const dev,
     }
 
     /*
-     * Only STARTING and START_UNKNOWN wait for an index. In any other state DEPCMD
-     * holds a stale result from a transfer since reset (DEPSTARTCFG, disable or
-     * bus reset); adopting it would give a valid xferrscidx to an endpoint with
-     * no transfer.
+     * Only a Start still in progress waits for an index. In any other state the
+     * value in DEPCMD belongs to an older transfer and is ignored.
      */
     if (ep_data->xfer.state != UDC_DWC3_EP_STARTING &&
         ep_data->xfer.state != UDC_DWC3_EP_START_UNKNOWN) {
@@ -2964,9 +2936,9 @@ static void udc_dwc3_adopt_xferrscidx(const struct device *const dev,
                   FIELD_GET(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, reg));
 
     /*
-     * The index completes STARTING -> RUNNING. Whichever observer gets here first
-     * (post-poll, next command's pre-poll, Command Complete handler) makes the
-     * same transition; it is idempotent.
+     * With the index known, the Start is done and the endpoint is RUNNING.
+     * Several code paths can get here first. The transition is the same for
+     * all of them.
      */
     (void)udc_dwc3_ep_state_set(ep_data, UDC_DWC3_EP_RUNNING);
 }
@@ -2979,9 +2951,8 @@ static void udc_dwc3_adopt_xferrscidx_evt(const struct device *const dev,
                       const uint32_t idx)
 {
     /*
-     * The open Start, still executing or past its deadline, when DEPCMD keeps
-     * no record of it (udc_dwc3_on_ep_cmd_cmplt() asks DEPCMD first): the
-     * event resolves it.
+     * A Start is still open and DEPCMD no longer holds its result. The event
+     * completes it. (udc_dwc3_on_ep_cmd_cmplt() checks DEPCMD first.)
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_STARTING ||
         ep_data->xfer.state == UDC_DWC3_EP_START_UNKNOWN) {
@@ -2991,25 +2962,23 @@ static void udc_dwc3_adopt_xferrscidx_evt(const struct device *const dev,
     }
 
     /*
-     * Already RUNNING on the same index is the normal case, not a fault. The
-     * post-poll in udc_dwc3_depcmd() usually sees CmdAct clear before this event
-     * is drained, and udc_dwc3_adopt_xferrscidx() has already taken the index and
-     * moved STARTING -> RUNNING.
+     * RUNNING on the same index is normal. Another path has already read the
+     * index from DEPCMD before this event was handled.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_RUNNING) {
         if (ep_data->xferrscidx == idx) {
             return;
         }
 
-        /* RUNNING with no index: adopt it; this event is the only place it exists. */
+        /* RUNNING with no index. This event is the only source, so take it. */
         if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
             udc_dwc3_store_xferrscidx(dev, ep_data, idx);
             return;
         }
 
         /*
-         * A DIFFERENT valid index on a running endpoint. Do not silently
-         * replace a working resource with another one.
+         * A different index on a running endpoint. Keep the one in use and
+         * log the mismatch.
          */
         LOG_WRN_RATELIMIT("EP%02x Start Transfer completion carries index %u "
                   "but the endpoint is running on index %u: NOT adopted",
@@ -3018,9 +2987,8 @@ static void udc_dwc3_adopt_xferrscidx_evt(const struct device *const dev,
     }
 
     /*
-     * Anything else is a completion for a transfer the state says does not
-     * exist: IDLE after a teardown or a refusal, or ENDING / END_UNKNOWN while
-     * an End is outstanding.
+     * In any other state (IDLE, or an End in progress) there is no Start this
+     * completion could belong to. It is ignored.
      */
     LOG_WRN_RATELIMIT("EP%02x Start Transfer completion for index %u arrived "
               "while the endpoint is %s holding index %u: NOT adopted",
@@ -3029,9 +2997,7 @@ static void udc_dwc3_adopt_xferrscidx_evt(const struct device *const dev,
               ep_data->xferrscidx);
 }
 
-/*
- * Recover a transfer resource index from DEPCMD if one is already there.
- */
+/* Take the transfer resource index from DEPCMD if it is already there. */
 static void udc_dwc3_peek_xferrscidx(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data)
 {
@@ -3041,7 +3007,7 @@ static void udc_dwc3_peek_xferrscidx(const struct device *const dev,
         return;
     }
 
-    /* Undefined until this endpoint has been commanded at least once. */
+    /* DEPCMD is undefined until the first command on this endpoint. */
     if (ep_data->cmd.depcmd_last == UDC_DWC3_DEPCMD_NONE) {
         return;
     }
@@ -3050,7 +3016,15 @@ static void udc_dwc3_peek_xferrscidx(const struct device *const dev,
                   sys_read32(base + UDC_DWC3_DEPCMD(ep_data->epn)));
 }
 
-/* Returns true when the command was issued. */
+/*
+ * Issue Update Transfer. Returns true when the command was issued.
+ * A race cannot refuse it. For a transfer already completed, "the controller
+ * will detect that the Update Transfer is unnecessary" (3.2.2.6). Its only
+ * error, an index never started, is a driver bug. The next command's pre-poll
+ * logs it.
+ * The caller writes the TRB first, as for Start Transfer. This runs once per
+ * buffer on every bulk and interrupt endpoint.
+ */
 static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data)
 {
@@ -3058,11 +3032,11 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 
     udc_dwc3_peek_xferrscidx(dev, ep_data);
 
-    /* Refuse: without a resource index there is nothing for Update Transfer to address. */
+    /* Update Transfer needs a resource index to address. */
     if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
         if (ep_data->xfer.state == UDC_DWC3_EP_STARTING ||
             ep_data->xfer.state == UDC_DWC3_EP_START_UNKNOWN) {
-            /* Not a fault: the Start is still executing. Owe it. */
+            /* The Start is still running. Issue the Update when it ends. */
             ep_data->xfer.pending |= UDC_DWC3_EP_PEND_UPDATE;
             LOG_DBG("Update Transfer on EP%02x owed: Start still open",
                 ep_data->cfg.addr);
@@ -3074,10 +3048,9 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
     }
 
     /*
-     * INVARIANT 2: Update Transfer only from RUNNING. In STARTING, ENDING or IDLE
-     * there is no running transfer to address. Should be unreachable (the peek
-     * above promotes STARTING to RUNNING; End Transfer invalidates the index), so
-     * a hit is a real state error, worth one compare on the per-buffer path.
+     * INVARIANT 2: Update Transfer only from RUNNING. Other states hold no
+     * running transfer. With a valid index this should not happen, so a hit
+     * is a real state error.
      */
     if (ep_data->xfer.state != UDC_DWC3_EP_RUNNING) {
         LOG_ERR("Update Transfer on EP%02x refused: endpoint is %s, not "
@@ -3087,23 +3060,16 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
         return false;
     }
 
-    /*
-     * Same ordering requirement as Start Transfer. This is the hot path: it runs
-     * per buffer on every bulk and interrupt endpoint.
-     */
     flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
     flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 
-    /*
-     * Checked but not re-logged: udc_dwc3_depcmd() has already logged the
-     * endpoint, command and reason, and this is the hot path.
-     */
+    /* A failure is already logged by udc_dwc3_depcmd(). */
     if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, NULL) ==
         UDC_DWC3_XFERRSCIDX_INVALID) {
         return false;
     }
 
-    /* DBG: this fires once per buffer from udc_dwc3_trb_bulk(). */
+    /* Debug level, because this runs once per buffer. */
     LOG_DBG("DepUpdateXfer done EP%02x, addr 0x%08x, data 0x%08x, xferrscidx 0x%x",
         ep_data->cfg.addr, UDC_DWC3_DEPCMD(ep_data->epn), flags, ep_data->xferrscidx);
 
@@ -3111,11 +3077,10 @@ static bool udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 }
 
 /*
- * Issue the Update Transfer owed by a buffer armed while the Start was still open
- * (UDC_DWC3_EP_PEND_UPDATE), once the Start has its index. Called where a late
- * Start outcome is learnt: its Command Complete, and the sweep (which settles it
- * from DEPCMD when that event is lost). Without it the controller may never fetch
- * that descriptor: it caches the ring at Start time.
+ * Issue the Update Transfer owed by a buffer armed while the Start was still
+ * open (UDC_DWC3_EP_PEND_UPDATE). Called once the Start has its index: from its
+ * Command Complete, or from the sweep when that event is lost. The Update is
+ * needed because the controller may not fetch a TRB added after the Start.
  */
 static void udc_dwc3_ep_update_owed(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data)
@@ -3136,10 +3101,9 @@ static void udc_dwc3_ep_update_owed(const struct device *const dev,
 }
 
 /*
- * The End Transfer did not end the transfer (refused, or never posted), so
- * the transfer still runs and owns its resource. Restore the index and return
- * to RUNNING. Shared by both places that learn this: udc_dwc3_depcmd_end_xfer()
- * at post time, and udc_dwc3_ep_resolve_cmd() later, from ENDING or END_UNKNOWN.
+ * The End Transfer was refused or never posted. The transfer still runs and
+ * owns its resource, so restore the index and go back to RUNNING. Called from
+ * udc_dwc3_depcmd_end_xfer() and udc_dwc3_ep_resolve_cmd().
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_end_refused(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data)
@@ -3154,8 +3118,8 @@ static UDC_DWC3_COLD void udc_dwc3_ep_end_refused(const struct device *const dev
 }
 
 /*
- * Issue End Transfer. Returns true only when the command was issued and will
- * raise an Endpoint Command Complete event, i.e. when the caller may wait for it.
+ * Issue End Transfer. Returns true only when a Command Complete event will
+ * follow, so the caller can wait for it.
  */
 static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data,
@@ -3165,12 +3129,10 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
 
     if (ep_data->xferrscidx == UDC_DWC3_XFERRSCIDX_INVALID) {
         /*
-         * Not a fault: no stored index means no running transfer to end - IDLE
-         * after a teardown (Linux dwc3 makes the same decision on
-         * DWC3_EP_TRANSFER_STARTED), or a command outcome still open (STARTING,
-         * ENDING or UNKNOWN, which all hold no index). An End over an open Start
-         * could target a transfer that does not exist; the state is left as is
-         * for that command's completion or udc_dwc3_ep_resolve_cmd().
+         * No index means no running transfer to end. The endpoint is IDLE, or
+         * a Start or End is still in progress. Linux dwc3 makes the same check.
+         * The state is left for that command's completion or for
+         * udc_dwc3_ep_resolve_cmd() to settle.
          */
         LOG_DBG("End Transfer on EP%02x not issued: no started transfer",
             ep_data->cfg.addr);
@@ -3181,8 +3143,10 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
     flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
     /*
-     * Ask for a completion event so the conclusion of bus traffic for this
-     * transfer is observable - see UDC_DWC3_DEPCMD_CMDIOC.
+     * Ask for a completion event. CmdAct clearing only means the command was
+     * accepted. The completion event is the only sign that bus traffic for this
+     * transfer has stopped, and a new Start Transfer must wait for it. Only
+     * while RunStop is set.
      */
     if ((sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0) {
         flags |= UDC_DWC3_DEPCMD_CMDIOC;
@@ -3193,29 +3157,19 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
         }
     }
 
-    /*
-     * Save the index in end_idx across the command. udc_dwc3_depcmd() invalidates
-     * xferrscidx before posting End Transfer, since a successful End returns the
-     * resource. A rejected End does not: the transfer still runs and owns the
-     * resource, and the endpoint goes back to RUNNING. RUNNING with no index is a
-     * dead end (Update is refused, and no second End can reclaim it). Stored on
-     * the endpoint because the refusal can be learnt after this returns.
-     */
+    /* Keep the index in end_idx, so a refused End can restore it (see xfer.end_idx). */
     ep_data->xfer.end_idx = ep_data->xferrscidx;
 
     /*
-     * A failed return means the command was never issued: the previous command
-     * on this endpoint was still active when the pre-poll gave up.
+     * A failure here means the End was not issued, was refused, is still
+     * running, or completed after the poll expired.
      */
     if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags, NULL) ==
         UDC_DWC3_XFERRSCIDX_INVALID) {
         /*
-         * Still active is not "not issued", but udc_dwc3_depcmd() returns
-         * XFERRSCIDX_INVALID for both. udc_dwc3_cmd_outcome() tells them apart from
-         * DEPCMD: first the command type (a pre-poll that gave up leaves the previous
-         * command there, active and not ours), then CmdAct. Taking that command's
-         * CmdAct as our End's would leave ENDING waiting for a completion that never
-         * comes.
+         * udc_dwc3_cmd_outcome() tells these cases apart. It checks the command
+         * type in DEPCMD first. If the End was not issued, DEPCMD still holds the
+         * previous command, and its CmdAct says nothing about our End.
          */
         const enum udc_dwc3_cmd_outcome out =
             udc_dwc3_cmd_outcome(dev, ep_data, UDC_DWC3_DEPCMD_DEPENDXFER,
@@ -3230,9 +3184,9 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
         }
 
         /*
-         * Still executing. With RunStop set the endpoint stays ENDING for its
-         * Command Complete; with RunStop clear no CMDIOC was asked for, so no
-         * completion is coming and the caller treats the controller as stopped.
+         * Still executing. With RunStop set, the endpoint stays ENDING until its
+         * Command Complete. With RunStop clear, no event was requested, so the
+         * caller treats the controller as stopped.
          */
         if (out == UDC_DWC3_CMD_UNKNOWN) {
             LOG_WRN("EP%02x End Transfer still executing past the poll "
@@ -3243,15 +3197,15 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
         }
 
         /*
-         * The End completed after the poll expired, so the resource did come back.
-         * Do not restore end_idx: RUNNING with an index the controller has reassigned
-         * makes the next Update Transfer address another endpoint's transfer.
+         * The End completed after the poll expired, so the resource is released.
+         * end_idx is not restored, because the controller may give that index to
+         * another endpoint.
          */
         if (out == UDC_DWC3_CMD_OK) {
             return (flags & UDC_DWC3_DEPCMD_CMDIOC) != 0;
         }
 
-        /* Refused, so the resource never came back (see end_idx above). */
+        /* Refused. The transfer still owns its resource (see end_idx above). */
         udc_dwc3_ep_end_refused(dev, ep_data);
         LOG_ERR("End Transfer REJECTED on EP%02x (CmdAct clear, so the "
             "controller refused it rather than still running it)",
@@ -3261,25 +3215,24 @@ static UDC_DWC3_COLD bool udc_dwc3_depcmd_end_xfer(const struct device *const de
 
     LOG_DBG("DepEndXfer done EP%02x", ep_data->cfg.addr);
 
-    /* True only when a completion event is genuinely expected. */
+    /* True only when a completion event will follow. */
     return (flags & UDC_DWC3_DEPCMD_CMDIOC) != 0;
 }
 
-/*
- * DEPSTARTCFG: (re)allocate the controller's transfer resource pool.
- */
+/* DEPSTARTCFG: set up the controller's pool of transfer resources. */
 static UDC_DWC3_COLD void udc_dwc3_depcmd_start_config(const struct device *const dev,
                      bool is_control)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    /* XferRscIdx 2 keeps resources 0 and 1, the EP0 halves'. */
+    /* Non-control: the reset loops below skip index 0, the EP0 halves. */
     const uint8_t first = is_control ? 0U : 1U;
-    uint32_t flags = 0;
+    uint32_t      flags = 0;
 
+    /* XferRscIdx 2 keeps resources 0 and 1, which the two EP0 halves use. */
     flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
     flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
-    /* Not posted, or refused: the pool is unchanged, and so is every index. */
+    /* Not posted or refused. The pool and every index stay unchanged. */
     if (udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(0), flags, NULL) != 0U &&
         !udc_dwc3_cmd_posted_ok(dev, &cfg->ep_data_out[0],
                     UDC_DWC3_DEPCMD_DEPSTARTCFG)) {
@@ -3289,10 +3242,9 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_start_config(const struct device *cons
     }
 
     /*
-     * DEPSTARTCFG reassigns the transfer resources it covers, so every earlier
-     * index there, and every transfer running, starting or ending on one, is
-     * void. Callers issue it with every covered endpoint idle; work owed to the
-     * stack or host (pending) is kept.
+     * DEPSTARTCFG reassigns the resources it covers, so every index and transfer
+     * state on those endpoints is now invalid. Reset them. Callers issue it with
+     * those endpoints idle. Pending work owed to the stack or host is kept.
      */
     for (uint8_t i = first; i < cfg->num_in_eps; i++) {
         udc_dwc3_ep_state_reset(&cfg->ep_data_in[i]);
@@ -3302,8 +3254,8 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_start_config(const struct device *cons
     }
 
     /*
-     * New pool generation: every endpoint must issue DEPXFERCFG again, exactly
-     * once (see udc_dwc3_ep_resume()).
+     * A new pool generation. Each endpoint issues DEPXFERCFG again, exactly once
+     * (see udc_dwc3_ep_resume()).
      */
     ((struct udc_dwc3_data *)udc_get_private(dev))->epcfg.epoch++;
 
@@ -3317,14 +3269,11 @@ static UDC_DWC3_COLD void udc_dwc3_depcmd_start_config(const struct device *cons
  * submitted with each Start or Update Transfer command.
  */
 
-
-
 /*
  * Report a non-control OUT buffer whose size is not a whole number of packets.
- * BUFSIZ must be (databook 4.2.3.3), so the TRB is programmed with the size
- * rounded up (udc_dwc3_trb_programmed_len()), which reaches past the buffer: a
- * full last packet writes up to MPS - 1 bytes beyond it. The class, not the
- * driver, sizes the buffer; the report names the overrun risk.
+ * BUFSIZ must be a multiple of MPS (databook 4.2.3.3), so the TRB is programmed
+ * with the size rounded up. A full last packet can then write up to MPS - 1
+ * bytes past the buffer. The class sizes the buffer, so the driver only reports.
  */
 static void udc_dwc3_out_size_check(const struct device *const dev,
                     const struct udc_dwc3_ep_data *const ep_data,
@@ -3332,7 +3281,7 @@ static void udc_dwc3_out_size_check(const struct device *const dev,
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-    /* Silent when the caller already supplied whole packets - the normal case. */
+    /* The normal case: the buffer is already whole packets. */
     if (trb_size == in_size) {
         return;
     }
@@ -3349,9 +3298,8 @@ static void udc_dwc3_out_size_check(const struct device *const dev,
  * Bytes programmed into the TRB for this buffer:
  *   - OUT: buf->size rounded up to whole packets (databook 4.2.3.3).
  *   - IN: buf->len.
- * Derived from the buffer because the controller overwrites BUFSIZ with the
- * bytes not transferred. The single definition for the arm and retire paths,
- * so they always agree.
+ * The controller overwrites BUFSIZ with the bytes left over, so the value is
+ * computed from the buffer. Arm and retire both use this function.
  */
 static uint32_t udc_dwc3_trb_programmed_len(const struct udc_dwc3_ep_data *const ep_data,
                         const struct net_buf *const buf)
@@ -3369,39 +3317,27 @@ static uint32_t udc_dwc3_trb_programmed_len(const struct udc_dwc3_ep_data *const
     return (mps != 0U) ? ROUND_UP(buf->size, mps) : buf->size;
 }
 
-/*
- * Arm one buffer in the endpoint's TRB ring and advance head.
- */
+/* Arm one buffer in the endpoint's TRB ring and advance head. */
 static void udc_dwc3_push_trb(const struct device *const dev,
                   struct udc_dwc3_ep_data *const ep_data,
                   struct net_buf *const buf, const uint32_t ctrl)
 {
     volatile struct udc_dwc3_trb *const trb = &ep_data->trb_buf[ep_data->ring.head];
-    const uint32_t out_size = udc_dwc3_trb_programmed_len(ep_data, buf);
+    const uint32_t                      out_size = udc_dwc3_trb_programmed_len(ep_data, buf);
 
     if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
         udc_dwc3_out_size_check(dev, ep_data, buf->size, out_size);
     }
 
     /*
-     * The UDC mutex protects this ring, not the work queue: head, tail and
-     * net_buf[] are shared with udc_dwc3_pop_trb(), and the dispatch thread is
-     * not udc_get_work_q().
-     */
-
-    /*
-     * The ring must not be full (next TRB still owned by the hardware); callers
-     * retry later when a TRB frees up.
+     * The slot must be free. Callers check this and retry later when the ring
+     * is full.
      */
     __ASSERT_NO_MSG(ep_data->ring.net_buf[ep_data->ring.head] == NULL);
 
-    /* Associate an active buffer and a TRB together */
+    /* Link the buffer to its TRB slot. */
     ep_data->ring.net_buf[ep_data->ring.head] = buf;
 
-    /*
-     * OUT size is rounded up to whole packets (S4.2.3.3); see
-     * udc_dwc3_trb_programmed_len().
-     */
     ep_data->diag.n_arm++;
 
     udc_dwc3_trb_fill(trb, (uintptr_t)buf->data, out_size, ctrl);
@@ -3410,8 +3346,8 @@ static void udc_dwc3_push_trb(const struct device *const dev,
         ep_data->ring.head, (void *)buf, (void *)buf->data, buf->size, out_size);
 
     /*
-     * Per-arm trace for non-control endpoints. Debug only: it fires once per
-     * buffer and the console is synchronous.
+     * Per-arm trace, skipped on the video endpoint. Debug level, because it runs
+     * once per buffer.
      */
     if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
         LOG_DBG("EP%02x: ARM s%u len=%u n=%u", ep_data->cfg.addr,
@@ -3423,7 +3359,7 @@ static void udc_dwc3_push_trb(const struct device *const dev,
     udc_dwc3_ep_busy_sync(ep_data);
 }
 
-/* True if the controller (HWO set) or software (net_buf held) still owns any slot. */
+/* True if any slot is still owned by the controller (HWO) or holds a buffer. */
 static bool udc_dwc3_ep_ring_outstanding(const struct udc_dwc3_ep_data *const ep_data)
 {
     for (uint32_t i = 0U; i < (CONFIG_UDC_DWC3_TRB_NUM - 1U); i++) {
@@ -3439,12 +3375,11 @@ static bool udc_dwc3_ep_ring_outstanding(const struct udc_dwc3_ep_data *const ep
 }
 
 /*
- * Retire the oldest completed TRB. Returns -EBUSY while the controller still owns
- * it and -ENOBUFS when the slot holds no buffer.
+ * Retire the oldest completed TRB. Returns -EBUSY while the controller still
+ * owns it and -ENOBUFS when the slot holds no buffer.
  *
- * HWO is read first, and the rest of the TRB only once it reads clear (volatile
- * accesses, in program order), so the written-back BUFSIZ is never read ahead of
- * the HWO=0 that says the controller is done with the TRB.
+ * HWO is read first. The rest of the TRB is read only after HWO reads clear,
+ * so the written-back BUFSIZ is always final.
  */
 static int udc_dwc3_pop_trb(struct udc_dwc3_ep_data *const ep_data,
                 struct net_buf **buf, struct udc_dwc3_trb *trb)
@@ -3465,24 +3400,24 @@ static int udc_dwc3_pop_trb(struct udc_dwc3_ep_data *const ep_data,
     trb->addr_lo = t->addr_lo;
     trb->addr_hi = t->addr_hi;
 
-    /* Clear the last TRB */
+    /* Free the slot. */
     ep_data->ring.net_buf[ep_data->ring.tail] = NULL;
 
     LOG_DBG("POP %u EP%02x, buf %p, data %p",
         ep_data->ring.tail, ep_data->cfg.addr, (void *)*buf, (void *)(*buf)->data);
 
-    /* Retire side of the arm trace: together they give arm -> retire time per slot. */
+    /* Retire trace. With the arm trace it shows each slot's arm-to-retire time. */
     if (ep_data->cfg.addr != UDC_DWC3_TRBLOG_SKIP_EP) {
         LOG_DBG("EP%02x: RET s%u sts=%x n=%u", ep_data->cfg.addr,
             ep_data->ring.tail, trb->status, ep_data->diag.n_retire);
     }
 
-    /* -1 for link trb */
+    /* The last slot is the link TRB. */
     ep_data->ring.tail = (ep_data->ring.tail + 1) % (CONFIG_UDC_DWC3_TRB_NUM - 1);
 
     udc_dwc3_ep_busy_sync(ep_data);
 
-    /* Received length = PROGRAMMED size minus residual BUFSIZ, not buf->size minus it. */
+    /* Received length is the programmed size minus the residual BUFSIZ. */
     if (USB_EP_DIR_IS_OUT(ep_data->cfg.addr)) {
         const uint32_t programmed =
             udc_dwc3_trb_programmed_len(ep_data, *buf);
@@ -3497,26 +3432,24 @@ static int udc_dwc3_pop_trb(struct udc_dwc3_ep_data *const ep_data,
     return 0;
 }
 
-/*
- * Build a non-control endpoint's ring and start its transfer.
- */
+/* Build a non-control endpoint's ring and start its transfer. */
 static int udc_dwc3_trb_nonctrl_init(const struct device *const dev,
                    struct udc_dwc3_ep_data *const ep_data)
 {
     volatile struct udc_dwc3_trb *trb = ep_data->trb_buf;
-    const uint32_t i = CONFIG_UDC_DWC3_TRB_NUM - 1;
+    const uint32_t                i = CONFIG_UDC_DWC3_TRB_NUM - 1;
 
     LOG_DBG("Initializing normal TRB");
 
-    /* HWO=0 on the first TRB will prevent the transfers to start until configured */
+    /* All TRBs start with HWO clear, so nothing moves until a buffer is armed. */
     memset((void *)trb, 0x00, sizeof(*trb) * CONFIG_UDC_DWC3_TRB_NUM);
 
-    /* TRB LINK that loops the ring buffer back to the beginning */
+    /* The last TRB is a link back to the start of the ring. */
     udc_dwc3_trb_fill(&trb[i], (uintptr_t)ep_data->trb_buf, 0U,
               UDC_DWC3_TRB_CTRL_TRBCTL_LINK_TRB | UDC_DWC3_TRB_CTRL_HWO);
 
 
-    /* Start the transfer now, update it later */
+    /* Start the transfer now. Buffers are added later with Update Transfer. */
     if (!udc_dwc3_depcmd_start_xfer(dev, ep_data)) {
         LOG_ERR("EP%02x ring primed but Start Transfer failed; not enabling",
             ep_data->cfg.addr);
@@ -3528,26 +3461,25 @@ static int udc_dwc3_trb_nonctrl_init(const struct device *const dev,
 
 /*
  * Fill and start one control OUT stage TRB (data or status) on EP0-OUT. The
- * caller, udc_dwc3_ctrl_try(), has checked that the stage is due and the half
- * holds no transfer, which makes writing the TRB safe.
+ * caller, udc_dwc3_ctrl_try(), has checked that the stage is due and that the
+ * half holds no transfer.
  */
 static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf *const buf,
                   const uint32_t ctrl)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[0];
+    struct udc_dwc3_ep_data *const      ep_data = &cfg->ep_data_out[0];
     volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
-    uint32_t size;
+    uint32_t                            size;
 
 #ifdef CONFIG_UDC_DWC3_SHELL
     ((struct udc_dwc3_data *)udc_get_private(dev))->diag.last_xfer_dir = USB_EP_DIR_OUT;
 #endif
 
     /*
-     * A Status TRB has BUFSIZ 0 (Programming Guide 3.30b, Status TRB: "a Buffer
-     * Size of zero. There is no data buffer associated with a Status TRB";
-     * Table 4-14 step 9: "zero-bytes"). The general OUT rule (BUFSIZ a multiple of
-     * MPS) does not apply to it.
+     * A Status TRB has BUFSIZ 0 (Programming Guide 3.30b: "There is no data
+     * buffer associated with a Status TRB"). The OUT multiple-of-MPS rule does
+     * not apply to it.
      */
     if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2 ||
         ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3) {
@@ -3558,8 +3490,7 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 
     /*
      * A control OUT data TRB's BUFSIZ must be a multiple of wMaxPacketSize
-     * (4.4.2 step 5a), or a host ending an exact-multiple stage with a ZLP has
-     * nowhere to put it.
+     * (4.4.2 step 5a). Otherwise a ZLP from the host has nowhere to go.
      */
     if (ctrl == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA) {
         const uint32_t mps = USB_MPS_EP_SIZE(ep_data->cfg.mps);
@@ -3577,16 +3508,16 @@ static bool udc_dwc3_trb_ctrl_out(const struct device *const dev, struct net_buf
 
 
 /*
- * Fill and start one control IN stage TRB (data or status) on EP0-IN, with a
- * chained zero-length TRB when the data stage needs a ZLP. Same contract as
- * udc_dwc3_trb_ctrl_out().
+ * Fill and start one control IN stage TRB (data or status) on EP0-IN. A chained
+ * zero-length TRB is added when the data stage needs a ZLP. The caller checks
+ * as for udc_dwc3_trb_ctrl_out().
  */
 static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
                  struct net_buf *const buf,
                  const uint32_t ctrl)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_in[0];
+    struct udc_dwc3_ep_data *const      ep_data = &cfg->ep_data_in[0];
     volatile struct udc_dwc3_trb *const trb = ep_data->trb_buf;
 
 #ifdef CONFIG_UDC_DWC3_SHELL
@@ -3610,9 +3541,10 @@ static bool udc_dwc3_trb_ctrl_in(const struct device *const dev,
 }
 
 /*
- * Arm one bulk/interrupt buffer and tell the controller about it. Returns -EBUSY
- * if the ring is full, or -EIO while a refused Start keeps the endpoint out of
- * service; in both cases nothing was armed and the caller keeps the buffer.
+ * Arm one bulk or interrupt buffer and tell the controller about it. Returns
+ * -EBUSY if the ring is full. Returns -EIO if the endpoint is out of service
+ * after a refused Start. In both cases nothing is armed and the caller keeps
+ * the buffer.
  */
 static int udc_dwc3_trb_bulk(const struct device *const dev,
                  struct udc_dwc3_ep_data *const ep_data,
@@ -3621,18 +3553,15 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
     uint32_t ctrl = UDC_DWC3_TRB_CTRL_IOC | UDC_DWC3_TRB_CTRL_HWO;
 
     /*
-     * CSP (Continue on Short Packet) is set for OUT only. For IN, XferComplete
-     * needs LST=1 (Table 4-8), which this driver never sets, and XferComplete and
-     * XferInProgress go to the same handler anyway (udc_dwc3_on_xfer_done_nonctrl()).
+     * CSP (Continue on Short Packet) is for OUT only. LST is never set, so IN
+     * gets XferInProgress, not XferComplete (Table 4-8). Both events use the
+     * same handler (udc_dwc3_on_xfer_done_nonctrl()).
      */
     if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
         ctrl |= UDC_DWC3_TRB_CTRL_CSP;
     }
 
-    /*
-     * DBG, like the control stages: a log line per transfer on a data endpoint
-     * capped control traffic at ~41/s.
-     */
+    /* Debug level, because a log line per transfer slows all traffic. */
     LOG_DBG("TRB_BULK_EP_0x%02x, buf %p, data %p, size %u, len %u",
         ep_data->cfg.addr, (void *)buf, (void *)buf->data, buf->size, buf->len);
 
@@ -3641,11 +3570,9 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
     }
 
     /*
-     * Out of service after a refused Start: IDLE and out of DALEPENA
-     * (udc_dwc3_ep_start_refused()). Nothing more is armed until an enable
-     * puts the endpoint back in DALEPENA. Also stops the caller's loop after a
-     * refusal inside this very call. Checked only while IDLE, from the driver's
-     * copy of DALEPENA.
+     * After a refused Start the endpoint is IDLE and removed from DALEPENA
+     * (udc_dwc3_ep_start_refused()). Nothing is armed until an enable adds it
+     * back. This also stops the caller's loop after a refusal in this call.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_IDLE &&
         !udc_dwc3_ep_in_dalepena(udc_get_private(dev), ep_data)) {
@@ -3662,16 +3589,14 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
     udc_dwc3_push_trb(dev, ep_data, buf, ctrl);
 
     /*
-     * Start or Update, decided only here, from xfer.state. IDLE means the
-     * controller has released the transfer resource (XferComplete and every reset
-     * path leave it IDLE), so there is nothing to Update and the arm needs a Start.
+     * IDLE means no transfer holds a resource, so the buffer needs a Start.
+     * Otherwise an Update adds it to the running transfer.
      *
-     * A failure is not unwound: the TRB is already armed with HWO set, and the
-     * buffer stays owned by net_buf[]. Returning an error after
-     * udc_dwc3_push_trb() would leave it in both net_buf[] and the stack's queue,
-     * and the double free panics the device. An Update refused while the Start is
-     * still open is owed and issued once the index is known
-     * (udc_dwc3_ep_update_owed()); any other refusal is logged where it happens.
+     * A failure is not undone. The TRB is armed and net_buf[] owns the buffer.
+     * Returning an error would leave the buffer in both net_buf[] and the
+     * stack's queue, and it would be freed twice. An Update that must wait for
+     * an open Start is issued later by udc_dwc3_ep_update_owed(). Other failures
+     * are logged where they happen.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_IDLE) {
         (void)udc_dwc3_depcmd_start_xfer(dev, ep_data);
@@ -3684,54 +3609,50 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 
 /*
  * Control buffers
+ *
+ * Arming the control endpoint stages: SETUP, data and status. Figure 4-2 says
+ * which stage is due next.
  */
-
-
-
 
 /*
  * Record the control endpoint and stage just armed, for the SETUP watchdog
- * report (udc_dwc3_ctrl_setup_wd_check()), which only reports.
+ * report (udc_dwc3_ctrl_setup_wd_check()).
  */
 static void udc_dwc3_ctrl_arm_watchdog(const struct device *const dev,
                        const bool is_in, const uint32_t type)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
     priv->diag.watchdog_ep = is_in ? &cfg->ep_data_in[0] : &cfg->ep_data_out[0];
     priv->diag.watchdog_type = type;
 
     /*
-     * Snapshot the traffic counters, so the SETUP watchdog can tell "nothing has
-     * moved since this SETUP was armed" from "the bus is busy and the shared
-     * RxFIFO holds someone else's data".
+     * Save the traffic counters. The watchdog uses them to tell an idle bus from
+     * a busy one where the shared RxFIFO holds other endpoints' data.
      */
     if (type == UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
         priv->diag.ctrl_setup_wd_snap_setup = priv->diag.ctrl_setup_done;
         priv->diag.ctrl_setup_wd_snap_nonctrl = priv->diag.nonctrl_done;
 
         /*
-         * Telemetry only, SETUP only (see udc_dwc3_ctrl_setup_wd_check()); DATA and
-         * STATUS stages are driven by XferNotReady and SetupPending. No timer: the
-         * heartbeat ages the armed SETUP, so the hot path pays one increment instead
-         * of a timeout insert and removal per stage.
+         * Watched for SETUP only. The heartbeat checks how long the SETUP has
+         * been armed, so no timer is needed here.
          */
         priv->diag.ctrl_setup_wd_gen++;
     }
 }
 
 /*
- * Arm the data or status stage this buffer describes on EP0-IN (the caller,
- * udc_dwc3_ctrl_try(), passes only those). Returns false if the Start Transfer
- * was not taken; the buffer stays queued.
+ * Arm the data or status stage this buffer describes on EP0-IN. Returns false
+ * if the Start Transfer was not taken. The buffer then stays queued.
  */
 static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
                   struct net_buf *const buf)
 {
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const          priv = udc_get_private(dev);
     const struct usb_setup_packet *const setup = &priv->ctrl.setup;
-    const struct udc_buf_info bi = *udc_get_buf_info(buf);
+    const struct udc_buf_info            bi = *udc_get_buf_info(buf);
 
     if (bi.data) {
         LOG_DBG("trb IN_DATA ln=%d d=%p", buf->len, (void *)buf->data);
@@ -3751,7 +3672,7 @@ static bool udc_dwc3_ctrl_next_in(const struct device *const dev,
         }
         udc_dwc3_ctrl_arm_watchdog(dev, true, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_2);
     } else {
-        /* Same as the two-stage case: buf->len is what reaches the TRB. */
+        /* Also a ZLP: buf->len is what reaches the TRB. */
         buf->size = 0;
         buf->len = 0;
         LOG_DBG("trb IN_STATUS_3 ln=%d d=%p", buf->len, (void *)buf->data);
@@ -3779,10 +3700,7 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
         }
         udc_dwc3_ctrl_arm_watchdog(dev, false, UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_DATA);
     } else {
-        /*
-         * buf->size is left as allocated (bMaxPacketSize0, by udc_ctrl_status_alloc());
-         * udc_dwc3_trb_ctrl_out() programs BUFSIZ 0 for a status TRB regardless.
-         */
+        /* udc_dwc3_trb_ctrl_out() programs BUFSIZ 0 for a status TRB. */
         LOG_DBG("trb OUT_STATUS_3 sz=%d d=%p", buf->size, (void *)buf->data);
         if (!udc_dwc3_trb_ctrl_out(dev, buf,
                        UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_STATUS_3)) {
@@ -3795,16 +3713,14 @@ static bool udc_dwc3_ctrl_next_out(const struct device *const dev,
 }
 
 /*
- * EP0 follows the control transfer programming model of SPEC 3.30b 4.4 /
- * Figure 4-2, and nothing else. The hardware "automatically recovers from these
- * scenarios as long as software follows this single control transfer
- * programming model".
+ * EP0 follows the control transfer model of SPEC 3.30b 4.4 / Figure 4-2. The
+ * hardware "automatically recovers from these scenarios as long as software
+ * follows this single control transfer programming model".
  *
- * ctrl.state is the current node of Figure 4-2. Each EP0/EP1 event is either an
- * edge from that node (advance), not one (ignore), or one of the databook's
- * error cases (udc_dwc3_ctrl_ep_recover()). No per-scenario handling: the
- * controller absorbs aborts, suspend/resume and resets while the flow is
- * followed.
+ * ctrl.state is the current node of Figure 4-2. An event on physical endpoint
+ * 0 or 1 either moves to the next node, is ignored, or is an error case that
+ * udc_dwc3_ctrl_ep_recover() handles. The controller itself handles aborts,
+ * suspend/resume and resets.
  *
  * Stage endpoints (4.4):
  *   - control read: SETUP EP0, data EP1, status EP0
@@ -3814,14 +3730,14 @@ static void udc_dwc3_ctrl_next(const struct device *const dev);
 static void udc_dwc3_ctrl_ep_recover(const struct device *const dev);
 
 /*
- * Return every buffer queued on this control endpoint that belongs to the
- * transfer being abandoned, stopping at a SETUP. Returns how many.
+ * Return the queued buffers of an abandoned transfer on this control endpoint.
+ * Stops at a SETUP buffer. Returns how many were returned.
  */
 static UDC_DWC3_COLD uint32_t udc_dwc3_ctrl_drain_abandoned(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data)
 {
     struct net_buf *buf;
-    uint32_t n = 0U;
+    uint32_t        n = 0U;
 
     while ((buf = udc_buf_peek(&ep_data->cfg)) != NULL) {
         if (udc_get_buf_info(buf)->setup) {
@@ -3841,9 +3757,8 @@ static UDC_DWC3_COLD uint32_t udc_dwc3_ctrl_drain_abandoned(const struct device 
 }
 
 /*
- * Is this control endpoint busy only because a SETUP TRB is armed on it?
- * Read from the TRB (HWO set, TRBCTL = SETUP), not from saved state, so it
- * stays correct across abandon and re-arm.
+ * True if a SETUP TRB is armed on this control endpoint. Read from the TRB
+ * itself, so it stays correct across abandon and re-arm.
  */
 static bool udc_dwc3_ctrl_armed_setup(struct udc_dwc3_ep_data *const ep_data)
 {
@@ -3855,19 +3770,19 @@ static bool udc_dwc3_ctrl_armed_setup(struct udc_dwc3_ep_data *const ep_data)
                UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP;
 }
 
-/* From the SETUP of the request in progress (4.4): data stage is device-to-host. */
+/* The current request's data stage is device-to-host (4.4). */
 static inline bool udc_dwc3_ctrl_dir_in(const struct udc_dwc3_data *const priv)
 {
     return priv->ctrl.setup.RequestType.direction == USB_REQTYPE_DIR_TO_HOST;
 }
 
-/* From the SETUP of the request in progress: it has a data stage (wLength != 0). */
+/* The current request has a data stage (wLength != 0). */
 static inline bool udc_dwc3_ctrl_three_stage(const struct udc_dwc3_data *const priv)
 {
     return sys_le16_to_cpu(priv->ctrl.setup.wLength) != 0U;
 }
 
-/* The status stage's direction for the request in progress (4.4). */
+/* True if the current request's status stage is IN (4.4). */
 static inline bool udc_dwc3_ctrl_status_is_in(const struct udc_dwc3_data *const priv)
 {
     return !(udc_dwc3_ctrl_three_stage(priv) && udc_dwc3_ctrl_dir_in(priv));
@@ -3882,17 +3797,15 @@ static inline bool udc_dwc3_ctrl_recovering(const struct udc_dwc3_data *const pr
 
 /*
  * Arm EP0-OUT for the next SETUP (4.4.1/4.4.2 step 1: "Software sets up a Setup
- * TRB and issues Start Transfer on EP0 pointing to the Setup TRB").
- * Uses the driver's own buffer, so the arm never waits behind anything the stack
- * has queued. Runs only in the Setup phase with no transfer on EP0-OUT; otherwise
- * (a stage being ended, or this SETUP already armed) the release re-enters
- * udc_dwc3_ctrl_next() and arms it then.
+ * TRB and issues Start Transfer on EP0 pointing to the Setup TRB"). The TRB
+ * uses the driver's own buffer. This runs only in the Setup phase with EP0-OUT
+ * idle. Otherwise udc_dwc3_ctrl_next() calls it again when EP0-OUT is free.
  */
 static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct udc_dwc3_ep_data *const out0 = &cfg->ep_data_out[0];
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    struct udc_dwc3_ep_data *const      out0 = &cfg->ep_data_out[0];
 
     if (priv->ctrl.state != UDC_DWC3_CTRL_IDLE ||
         out0->xfer.state != UDC_DWC3_EP_IDLE) {
@@ -3900,14 +3813,10 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
     }
 
     /*
-     * In the Setup phase no transfer is live, so a stage buffer at the head of
-     * either EP0 queue belongs to an abandoned transfer (the state leaves IDLE
-     * before a SETUP reaches the stack, and the stack queues a request's stage
-     * buffers before its next SETUP buffer). The stack can still queue them after
-     * the driver went back to Step 1, as its thread may be preempted between
-     * enqueues. Left in place they would block the gate below forever, so return
-     * them; Figure 4-2 goes straight back to the Setup TRB after an abandoned
-     * transfer.
+     * In the Setup phase no transfer is live. A stage buffer at the head of
+     * either EP0 queue therefore belongs to an abandoned transfer. The stack can
+     * queue such buffers late, after the driver has gone back to Step 1. Left in
+     * place they would block the check below, so return them.
      */
     {
         struct udc_dwc3_ep_data *const in0 = &cfg->ep_data_in[0];
@@ -3921,11 +3830,9 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
     }
 
     /*
-     * Arm the SETUP only while the stack's SETUP buffer is queued on EP0-OUT, so a
-     * SETUP never arrives before the stack is ready. Otherwise udc_setup_received()
-     * caches it (setup_pending) and udc_ep_enqueue() completes the buffer later; if
-     * the stack's message queue is full then, the stack reads -ENOMSG as "not
-     * queued" and drops a reference to a buffer that is still queued.
+     * Arm the SETUP only while the stack's SETUP buffer is queued on EP0-OUT, so
+     * a SETUP never arrives before the stack is ready. An early SETUP takes a
+     * path in the stack that can drop a reference to a still-queued buffer.
      * udc_dwc3_ep_enqueue() calls back here when the stack queues the buffer.
      */
     {
@@ -3945,9 +3852,8 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
 #endif
 
     /*
-     * Not taken (not posted, or refused): the controller does not own the TRB, so
-     * clear it. Left with HWO set it would read as an armed SETUP
-     * (udc_dwc3_ctrl_armed_setup()) and nothing would arm one again.
+     * Not taken, so the controller does not own the TRB. Clear it. With HWO set
+     * it would look like an armed SETUP and no new SETUP would be armed.
      */
     if (!udc_dwc3_depcmd_start_xfer(dev, out0)) {
         udc_dwc3_trb_write(&out0->trb_buf[0], 0U, 0U, 0U);
@@ -3958,22 +3864,22 @@ static void udc_dwc3_ctrl_arm_setup(const struct device *const dev)
 }
 
 /*
- * Arm the stage buffer queued on this half only if Figure 4-2 says that stage is
- * due now, on this endpoint, and the half holds no transfer. Otherwise the buffer
- * waits; the event that makes it due (XferNotReady(Status), or the SETUP's
- * XferComplete) calls back here.
+ * Arm the stage buffer queued on this half if Figure 4-2 says that stage is due
+ * now on this endpoint and the half is idle. Otherwise the buffer waits. The
+ * event that makes it due (XferNotReady(Status) or the SETUP's XferComplete)
+ * calls back here.
  *
- * Never arms the stack's SETUP buffer: the driver owns the SETUP stage
- * (udc_dwc3_ctrl_arm_setup()) and udc_setup_received() fills that buffer.
+ * The stack's SETUP buffer is not armed here. The driver arms the SETUP stage
+ * itself (udc_dwc3_ctrl_arm_setup()).
  */
 static void udc_dwc3_ctrl_try(const struct device *const dev,
                   struct udc_dwc3_ep_data *const ep_data)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const bool is_in = USB_EP_DIR_IS_IN(ep_data->cfg.addr);
-    struct net_buf *const buf = udc_buf_peek(&ep_data->cfg);
-    const struct udc_buf_info *bi;
-    bool armed = false;
+    const bool                  is_in = USB_EP_DIR_IS_IN(ep_data->cfg.addr);
+    struct net_buf *const       buf = udc_buf_peek(&ep_data->cfg);
+    const struct udc_buf_info  *bi;
+    bool                        armed = false;
 
     if (buf == NULL || udc_dwc3_ctrl_recovering(priv) ||
         ep_data->xfer.state != UDC_DWC3_EP_IDLE) {
@@ -4012,8 +3918,8 @@ static void udc_dwc3_ctrl_try(const struct device *const dev,
     }
 
     /*
-     * The stage's Start Transfer was not taken: no event will move this transfer
-     * on, so take it back to Step 1 (Set Stall, fresh SETUP).
+     * The stage's Start Transfer was not taken, so no event will move this
+     * transfer on. Recover back to Step 1 (Set Stall, then a new SETUP).
      */
     if (!armed) {
         udc_dwc3_ctrl_ep_recover(dev);
@@ -4038,18 +3944,13 @@ static int udc_dwc3_enable(const struct device *const dev);
 static int udc_dwc3_init(const struct device *const dev);
 static int udc_dwc3_ep_enable(const struct device *const dev, struct udc_ep_config *const ep_cfg);
 
-/*
- * Second half of a control-endpoint recovery.
- */
-
-/* Read the core debug registers - the ones worth comparing healthy vs wedged - into *s. */
+/* Read the core debug registers into *s, to compare a healthy and a stuck core. */
 static void udc_dwc3_core_dbg_read(const mm_reg_t base,
                    struct udc_dwc3_core_dbg *const s)
 {
     /*
-     * GDBGLSP is a muxed window: select the source before reading it. Do not
-     * decode GDBGLSP until the device-mode selector encoding is confirmed
-     * against the databook.
+     * GDBGLSP shows the source selected by its mux, so select it first. GDBGLSP
+     * is logged raw, because the device-mode selector encoding is not confirmed.
      */
     sys_write32(0U, base + UDC_DWC3_GDBGLSPMUX_DEV);
 
@@ -4073,11 +3974,11 @@ static void udc_dwc3_core_dbg_log(const char *const tag,
 /* Dump the controller's own view of itself (passive register reads only). */
 static void udc_dwc3_core_state_dump(const struct device *const dev)
 {
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const mm_reg_t           base = DEVICE_MMIO_NAMED_GET(dev, base);
     struct udc_dwc3_core_dbg dbg;
     static const struct {
         const char *name;
-        uint32_t sel;
+        uint32_t    sel;
     } queues[] = {
         { "TXQ",      UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TXQ },
         { "RXQ",      UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_RXQ },
@@ -4105,14 +4006,13 @@ static void udc_dwc3_core_state_dump(const struct device *const dev)
 }
 
 /*
- * Reclaim one control half's TRBs once the controller holds no transfer on it:
- * clear both TRBs and, on an IN half, flush the TxFIFO (it may still hold data
- * for a stage that never went out).
+ * Reclaim one control half's TRBs. Clear both TRBs. On an IN half, also flush
+ * the TxFIFO, which may hold data for a stage that never went out.
  *
  * SPEC 3.30b Programming Guide Table 4-14 step 8: "Software has to reclaim the
- * TRBs with HWO=1 in the skipped TRBs and flush the TxFIFO." Safe only when no
- * transfer owns the half, i.e. after its XferComplete (3.2.2.2) or End Transfer
- * completion; every caller guarantees this.
+ * TRBs with HWO=1 in the skipped TRBs and flush the TxFIFO." Callers do this
+ * only when no transfer owns the half, after its XferComplete (3.2.2.2) or End
+ * Transfer completion.
  */
 static UDC_DWC3_COLD void udc_dwc3_ctrl_reclaim_half(const struct device *const dev,
                        struct udc_dwc3_ep_data *const h)
@@ -4142,26 +4042,25 @@ static UDC_DWC3_COLD int udc_dwc3_recover(const struct device *dev)
 #endif /* CONFIG_UDC_DWC3_SHELL */
 
 /*
- * Events
+ * Endpoint and control recovery
  *
- * Events are fetched from an event ring shared with the hardware; the interrupt
- * only signals that one is available.
+ * Recovery of one endpoint or of the control endpoint, and the teardown of all
+ * transfers on a disconnect.
  */
 
-/* Defined below; teardown needs it to move armed buffers off the ring. */
+/* Defined below. Teardown uses it to move armed buffers off the ring. */
 static void udc_dwc3_ep_ring_release(struct udc_dwc3_ep_data *const ep_data);
 
-/* Defined below; the endpoint recovery retires written-back TRBs before a restart. */
+/* Defined below. Endpoint recovery uses it to retire completed TRBs first. */
 static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data);
 
 /*
- * Return every buffer parked on requeue_fifo to the stack; returns the count.
+ * Return every buffer parked on requeue_fifo to the stack. Returns the count.
  *
- * udc_dwc3_ep_ring_release() moves armed buffers onto that fifo, and only
- * udc_dwc3_ep_resume() consumes it. On teardown nothing resumes the endpoint, so
- * without this the buffers are never unref'd or reported, are invisible to
- * udc_ep_cancel_queued(), and leak from a fixed pool.
+ * udc_dwc3_ep_ring_release() parks armed buffers there, and normally
+ * udc_dwc3_ep_resume() takes them back. On teardown the endpoint is not
+ * resumed, so this returns them instead. Otherwise they would leak.
  */
 static UDC_DWC3_COLD uint32_t udc_dwc3_ep_return_parked(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data,
@@ -4183,62 +4082,61 @@ static UDC_DWC3_COLD uint32_t udc_dwc3_ep_return_parked(const struct device *con
 }
 
 /*
- * The single non-control endpoint recovery: takes the endpoint back to a known
- * state. Used by USB reset and disconnect, SetConfiguration/SetInterface,
- * ClearFeature(ENDPOINT_HALT), dequeue and disable. The End Transfer completion,
- * the Start Transfer completion and the heartbeat sweep call it again to continue
- * an unfinished recovery. Callers cite no spec; the databook basis is here.
+ * Recover a non-control endpoint: bring it back to a known state.
+ * USB reset, disconnect, SetConfiguration, ClearFeature(ENDPOINT_HALT), dequeue,
+ * disable and XferNotReady all use it. The End Transfer and Start Transfer
+ * completions and the heartbeat sweep call it again to finish a recovery that
+ * had to wait.
  *
- * The action depends only on the endpoint state:
+ * What it does depends only on the endpoint state:
  *
- *   1. A command outcome is open (STARTING / ENDING / *_UNKNOWN): issue nothing
- *      on the endpoint. Its Command Complete, or the resolver reading DEPCMD,
- *      re-enters here.
+ *   1. A command outcome is still open (STARTING, ENDING, *_UNKNOWN).
+ *      Do nothing. The Command Complete, or the resolver reading DEPCMD,
+ *      calls back here.
  *
- *   2. A transfer holds a resource (xferrscidx valid): End Transfer with ForceRM=1
- *      and CmdIOC set, so a Command Complete reports the end (SPEC 3.2.2.7).
- *      Required on USB reset (4.1.2, 4.2.5), SetConfiguration (4.1.5, all but
- *      EP0), after ClearFeature(STALL) (4.2.7), and before buffers are given back
- *      (dequeue/disable). End Transfer raises no XferComplete and does not update
- *      TRB status (3.2.2.7); the resource is released when it completes (4.2.5).
- *      Until then the ring is the controller's: posted is not completed.
+ *   2. A transfer holds a resource (xferrscidx valid).
+ *      Issue End Transfer with ForceRM and CmdIOC, so a Command Complete
+ *      reports the end (SPEC 3.2.2.7). The databook requires this on USB reset
+ *      (4.1.2, 4.2.5), on SetConfiguration (4.1.5), after ClearFeature(STALL)
+ *      (4.2.7) and before buffers are given back. End Transfer raises no
+ *      XferComplete and does not update TRB status (3.2.2.7). The controller
+ *      owns the ring until the End completes (4.2.5).
  *
- *   3. No transfer: the ring is the driver's again. In order:
- *      - Buffers: returned as cancelled (-ECONNABORTED, as udc_ep_cancel_queued()
- *        does) after a dequeue, disable or USB reset; parked for re-enable if a
- *        refused Start took the endpoint out of DALEPENA; otherwise left in place.
+ *   3. No transfer. The ring belongs to the driver again. In order:
+ *      - Buffers. After a dequeue, disable or USB reset they are returned as
+ *        cancelled (-ECONNABORTED, like udc_ep_cancel_queued()). If a refused
+ *        Start took the endpoint out of DALEPENA, they are parked for
+ *        re-enable. Otherwise they stay on the ring.
  *      - Clear Stall, if owed. 4.2.7: End Transfer first, then Clear Stall.
- *        4.1.2: clear any stalled endpoint on USB reset. 3.2.2.4: software owns
- *        STALL on non-control endpoints, so it is owed only on those two
- *        requests, never on a recovery of its own.
- *      - Start Transfer again if enabled (4.2.7): either the resume deferred
- *        behind the End (3.2.2.7: no Start until the End has reported), or a
- *        Start here for buffers still armed on the ring, then the endpoint worker
- *        for whatever the stack has queued since.
+ *        4.1.2: clear stalled endpoints on USB reset. Software owns STALL on
+ *        non-control endpoints (3.2.2.4), so only those two requests owe it.
+ *      - Start Transfer again if enabled (4.2.7). This is either a resume that
+ *        waited for the End (3.2.2.7: no Start until the End has reported), or
+ *        a Start for buffers still armed on the ring. Then the endpoint worker
+ *        runs for anything the stack queued since.
  *
- * The only inputs that are not controller state are requests recorded in
- * ep_data->xfer.pending by the path that received them: a Clear Stall owed
- * (ClearFeature(ENDPOINT_HALT), USB reset), a cancel owed (dequeue, disable, USB
- * reset), and a resume deferred by udc_dwc3_ep_resume().
+ * The only inputs besides controller state are the requests recorded in
+ * ep_data->xfer.pending: Clear Stall owed, cancel owed, and a resume deferred
+ * by udc_dwc3_ep_resume().
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
                 struct udc_dwc3_ep_data *const ep_data)
 {
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const mm_reg_t                    base = DEVICE_MMIO_NAMED_GET(dev, base);
     const struct udc_dwc3_data *const priv = udc_get_private(dev);
-    uint32_t returned;
-    uint8_t owed;
+    uint32_t                          returned;
+    uint8_t                           owed;
 
     if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0U) {
         return;
     }
 
-    /* 1. An outcome is open: its completion or the resolver carries on. */
+    /* 1. A command outcome is open. Its completion calls back here. */
     if (udc_dwc3_ep_cmd_busy(ep_data)) {
         return;
     }
 
-    /* 2. A transfer holds a resource: end it, and wait for the report. */
+    /* 2. A transfer holds a resource. End it and wait for the report. */
     if (ep_data->xferrscidx != UDC_DWC3_XFERRSCIDX_INVALID) {
         if (udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM)) {
             LOG_INF("EP%02x recovery: End Transfer (owed 0x%02x)",
@@ -4249,28 +4147,28 @@ static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
             return;
         }
         if ((sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0U) {
-            /* Refused on a running controller: it still owns the ring. */
+            /* Refused while running. The controller still owns the ring. */
             LOG_ERR_RATELIMIT("EP%02x recovery: End Transfer refused, transfer "
                       "left active (owed 0x%02x)", ep_data->cfg.addr,
                       ep_data->xfer.pending);
             return;
         }
-        /* RunStop clear: the controller is stopped, no completion is coming. */
+        /* The controller is stopped, so no completion will come. */
         udc_dwc3_ep_state_reset(ep_data);
     }
 
-    /* 3. No transfer: carry out what is owed, in the databook's order. */
+    /* 3. No transfer. Do what is owed, in the databook's order. */
     owed = ep_data->xfer.pending;
     ep_data->xfer.pending = UDC_DWC3_EP_PEND_NONE;
     returned = 0U;
 
     if ((owed & UDC_DWC3_EP_PEND_DEQUEUE) != 0U) {
-        /* Cancelled, as udc_ep_cancel_queued() returns them. */
+        /* Return the buffers as cancelled. */
         udc_dwc3_ep_ring_release(ep_data);
         returned = udc_dwc3_ep_return_parked(dev, ep_data, UDC_DWC3_BUF_CANCELLED);
     } else if ((sys_read32(base + UDC_DWC3_DALEPENA) &
             UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn)) == 0U) {
-        /* Not in DALEPENA (a refused Start took it out): park for the next resume. */
+        /* A refused Start took it out of DALEPENA. Park for the next resume. */
         udc_dwc3_ep_ring_release(ep_data);
     }
 
@@ -4281,8 +4179,8 @@ static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
     }
 
     /*
-     * Only when something was done: a USB reset or disconnect recovers every
-     * endpoint, and most have nothing armed and nothing owed but the cancel.
+     * Log only when something was done. A USB reset or disconnect recovers
+     * every endpoint, and most of them have nothing to report.
      */
     if (returned != 0U || (owed & (uint8_t)~UDC_DWC3_EP_PEND_DEQUEUE) != 0U) {
         LOG_INF("EP%02x recovery: done (owed 0x%02x, returned %u%s%s)",
@@ -4294,9 +4192,9 @@ static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
 
     if ((owed & UDC_DWC3_EP_PEND_RESUME) != 0U && udc_dwc3_run_halting(priv)) {
         /*
-         * A resume starts a transfer, which 4.1.8 rules out once the transfers
-         * are being ended: it stays owed. The controller reset that follows
-         * forgets it (udc_dwc3_drop_xfer_state()).
+         * A resume starts a transfer, and 4.1.8 forbids that while transfers
+         * are being ended. Keep it owed. The controller reset that follows
+         * clears it (udc_dwc3_drop_xfer_state()).
          */
         ep_data->xfer.pending |= UDC_DWC3_EP_PEND_RESUME;
     } else if ((owed & UDC_DWC3_EP_PEND_RESUME) != 0U) {
@@ -4308,11 +4206,10 @@ static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
         }
     } else if (ep_data->cfg.stat.enabled) {
         /*
-         * Buffers still armed (enabled in DALEPENA, nothing cancelled) need a
-         * Start of their own: the worker arms only what the stack queues, so with
-         * nothing new queued the ring would sit idle. Same gates as the worker.
-         * Written-back TRBs are retired first, so the Start (at tail) points at a
-         * TRB the controller still owns.
+         * Buffers still armed on the ring need their own Start. The worker only
+         * arms what the stack queues, so without new buffers the ring would sit
+         * idle. The gates match the worker. Completed TRBs are retired first, so
+         * the Start points at a TRB the controller still owns.
          */
         if (!udc_dwc3_run_halting(priv) &&
             (sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0U &&
@@ -4328,8 +4225,8 @@ static UDC_DWC3_COLD void udc_dwc3_ep_recover(const struct device *const dev,
 }
 
 /*
- * Does this endpoint still owe a recovery? Either a request is recorded, or it
- * is disabled in DALEPENA while a transfer or an armed ring is still there.
+ * Does this endpoint still owe a recovery? Yes if a request other than Update is
+ * recorded, or if it is out of DALEPENA but still has a transfer or an armed ring.
  */
 static bool udc_dwc3_ep_recovery_owed(const struct device *const dev,
                       const struct udc_dwc3_ep_data *const ep_data)
@@ -4350,31 +4247,31 @@ static bool udc_dwc3_ep_recovery_owed(const struct device *const dev,
 
 /*
  * One pass of the control-endpoint recovery (see udc_dwc3_ctrl_ep_recover()).
- * Each half is handled from the controller's handle on it, never from the stage
- * or the host scenario that led here:
+ * Each half (EP0 OUT and EP0 IN) is handled by what the controller holds for
+ * it, not by the control stage:
  *
- *   command outcome open    -> wait; its completion (or the resolver) re-enters.
- *   transfer resource valid -> End Transfer (ForceRM); its completion re-enters
- *                              (refused: the heartbeat re-enters and retries).
- *   nothing live            -> return the half's queued stage buffers. The drain
- *                              stops at the stack's SETUP buffer, which stays.
+ *   command outcome open    -> wait. Its completion calls back here.
+ *   transfer resource valid -> End Transfer (ForceRM). Its completion calls
+ *                              back here. If refused, the heartbeat retries.
+ *   nothing live            -> return the half's queued stage buffers. The
+ *                              stack's SETUP buffer stays.
  *
- * Once both halves hold nothing: Set Stall if the case calls for one (after the
- * End, per 4.4.2 step 3a), then enter the Setup phase and arm it.
+ * When both halves are idle, Set Stall if needed (after the End, per 4.4.2
+ * step 3a). Then enter the Setup phase and arm it.
  *
- * "xferrscidx valid" means "a transfer is live" only because every EP0/EP1
- * completion releases the half (udc_dwc3_ctrl_release()); the controller frees
- * the resource when it generates XferComplete (3.2.2.2).
+ * A valid xferrscidx means a live transfer because every EP0/EP1 completion
+ * releases the half (udc_dwc3_ctrl_release()). This matches the controller,
+ * which frees the resource at XferComplete (3.2.2.2).
  */
 static UDC_DWC3_COLD void udc_dwc3_ctrl_recover_continue(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    struct udc_dwc3_ep_data *const halves[2] = {
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    struct udc_dwc3_ep_data *const      halves[2] = {
         &cfg->ep_data_out[0], &cfg->ep_data_in[0],
     };
-    bool waiting = false;
+    bool                                waiting = false;
 
     if (!udc_dwc3_ctrl_recovering(priv)) {
         return;
@@ -4395,15 +4292,15 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_recover_continue(const struct device *co
                 continue;
             }
             /*
-             * Refused (or not posted) on a running controller: the transfer still
-             * runs and owns its TRBs. Wait; the heartbeat's
-             * udc_dwc3_recover_all() comes back here and ends it again.
+             * Refused or not posted while running. The transfer still owns its
+             * TRBs. Wait. The heartbeat's udc_dwc3_recover_all() calls back here
+             * and retries the End.
              */
             if ((sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0U) {
                 waiting = true;
                 continue;
             }
-            /* RunStop clear: the controller is stopped, no completion is coming. */
+            /* The controller is stopped, so no completion will come. */
             udc_dwc3_ep_state_reset(h);
         }
 
@@ -4414,7 +4311,7 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_recover_continue(const struct device *co
         return;
     }
 
-    /* Neither half holds a transfer: both descriptors and TxFIFO 0 are the driver's. */
+    /* Neither half holds a transfer. The TRBs and TxFIFO 0 belong to the driver. */
     for (size_t i = 0; i < ARRAY_SIZE(halves); i++) {
         udc_dwc3_ctrl_reclaim_half(dev, halves[i]);
     }
@@ -4429,35 +4326,34 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_recover_continue(const struct device *co
 }
 
 /*
- * The single control-endpoint recovery: back to Step 1.
+ * Recover the control endpoint: go back to Step 1 (wait for a SETUP).
  *
  * Every databook case ends there:
- *   - 4.4.1/4.4.2 "go back to Step 1": bad setup bytes; a stage XferNotReady
- *     before the SETUP's XferComplete; a data stage on a two-stage request or in
- *     the wrong direction; more data than wLength; a failed data stage at
- *     XferNotReady(Status).
- *   - 4.1.2 USB reset, 4.1.8 device-initiated disconnect: "complete it and get
- *     the controller into the Setup TRB / Start Transfer state".
- * The reference driver does the same (dwc3_ep0_end_control_data +
- * dwc3_ep0_stall_and_restart, from both the XferNotReady handler and the reset
- * interrupt).
+ *   - 4.4.1/4.4.2 "go back to Step 1": bad setup bytes, a stage XferNotReady
+ *     before the SETUP's XferComplete, a data stage on a two-stage request or
+ *     in the wrong direction, more data than wLength, or a failed data stage
+ *     at XferNotReady(Status).
+ *   - 4.1.2 USB reset and 4.1.8 device-initiated disconnect: "complete it and
+ *     get the controller into the Setup TRB / Start Transfer state".
+ * Linux dwc3 does the same (dwc3_ep0_end_control_data and
+ * dwc3_ep0_stall_and_restart).
  *
- * Whether it ends in Set Stall comes from the state, not from the caller.
+ * The state, not the caller, decides whether it ends with Set Stall.
  */
 static UDC_DWC3_COLD void udc_dwc3_ctrl_ep_recover(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct udc_dwc3_ep_data *const out0 = &cfg->ep_data_out[0];
-    struct udc_dwc3_ep_data *const in0 = &cfg->ep_data_in[0];
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    struct udc_dwc3_ep_data *const      out0 = &cfg->ep_data_out[0];
+    struct udc_dwc3_ep_data *const      in0 = &cfg->ep_data_in[0];
     /*
      * Set Stall answers a control transfer in progress that cannot complete
-     * (4.4.1/4.4.2 steps 2, 3, 3a, 5b, 6); a USB reset's "complete it" (4.1.2)
-     * reaches it the same way. In progress = past the Setup phase (a recovery
-     * already running froze the state it started from into _STALL or not), or a
-     * stage live on either half. Once _STALL, a re-entry keeps it.
+     * (4.4.1/4.4.2 steps 2, 3, 3a, 5b, 6). A USB reset (4.1.2) is handled the
+     * same way. In progress means past the Setup phase, or a stage live on
+     * either half. A running recovery keeps the choice it started with, and
+     * once RECOVERING_STALL is chosen it stays.
      */
-    const bool in_progress =
+    const bool                     in_progress =
         (priv->ctrl.state != UDC_DWC3_CTRL_IDLE && !udc_dwc3_ctrl_recovering(priv)) ||
         priv->ctrl.state == UDC_DWC3_CTRL_RECOVERING_STALL ||
         out0->xferrscidx != UDC_DWC3_XFERRSCIDX_INVALID ||
@@ -4473,23 +4369,23 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_ep_recover(const struct device *const de
 }
 
 /*
- * An open Start Transfer (STARTING / START_UNKNOWN) proven refused: by its
- * Command Complete, by DEPCMD when that event is lost (udc_dwc3_ep_resolve_cmd()),
- * or at post time (udc_dwc3_depcmd_start_xfer(), non-control with buffers armed
- * only). The one handler for all three. No transfer started and no resource was
- * taken, so the ring is the driver's again. src and val name the evidence for
- * the log.
+ * Handle a Start Transfer (STARTING / START_UNKNOWN) that is proven refused.
+ * The proof comes from its Command Complete, from DEPCMD when that event is
+ * lost (udc_dwc3_ep_resolve_cmd()), or at post time
+ * (udc_dwc3_depcmd_start_xfer(), non-control endpoints with buffers armed only).
+ * No transfer started and no resource was taken, so the ring belongs to the
+ * driver again. src and val describe the evidence for the log.
  *
- *   EP0 half: nothing is armed and no event will move the control transfer on:
- *             back to Step 1, or on with the recovery already doing so.
- *   other:    no new Start: CmdStatus 4'h1 means no transfer resource for the
- *             endpoint, which another Start does not cure. The endpoint leaves
- *             DALEPENA with its buffers parked, as a disable leaves them, and the
- *             stack is told. Work owed to the stack or host (pending) still runs.
- *             at_post: the ring is left armed for the heartbeat sweep's
- *             udc_dwc3_ep_recover() to park (DALEPENA clear with an armed ring is
- *             recovery owed): the poster may still hold a buffer linked in the
- *             stack's queue, and parking would link it into requeue_fifo too.
+ *   EP0 half: nothing is armed and no event will move the control transfer
+ *             on. Go back to Step 1, or let a running recovery continue.
+ *   other:    no new Start. CmdStatus 4'h1 means no transfer resource for the
+ *             endpoint, and another Start will not fix that. The endpoint
+ *             leaves DALEPENA with its buffers parked, as a disable leaves
+ *             them, and the stack is told. Owed work (pending) still runs.
+ *             With at_post, the ring stays armed, and the heartbeat sweep's
+ *             udc_dwc3_ep_recover() parks it later. The caller may still hold
+ *             a buffer linked in the stack's queue, and parking it now would
+ *             also link it into requeue_fifo.
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_start_refused(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data,
@@ -4497,10 +4393,10 @@ static UDC_DWC3_COLD void udc_dwc3_ep_start_refused(const struct device *const d
                     const bool at_post)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const bool is_ctrl = USB_EP_GET_IDX(ep_data->cfg.addr) == 0U;
+    const bool                  is_ctrl = USB_EP_GET_IDX(ep_data->cfg.addr) == 0U;
 
     priv->diag.ctrl_start_fail++;
-    /* Reported here, so udc_dwc3_depcmd()'s late CMDERR line stays quiet. */
+    /* Logged here, so udc_dwc3_depcmd() skips its own CMDERR line. */
     ep_data->diag.cmd_reported = true;
 
     LOG_ERR("EP%02x Start Transfer refused (%s 0x%08x), %s (%u so far)",
@@ -4522,7 +4418,7 @@ static UDC_DWC3_COLD void udc_dwc3_ep_start_refused(const struct device *const d
 
     udc_dwc3_dalepena_set(dev, ep_data->epn, false);
 
-    /* The stack still counts the endpoint enabled: its enable had succeeded. */
+    /* Tell the stack. It still counts the endpoint as enabled. */
     udc_submit_event(dev, UDC_EVT_ERROR, -EIO);
 
     if (at_post) {
@@ -4537,16 +4433,16 @@ static UDC_DWC3_COLD void udc_dwc3_ep_start_refused(const struct device *const d
 }
 
 /*
- * Forget every endpoint's transfer state. Only for a core soft reset or a
- * controller disable, after which the controller holds nothing: no transfer to
- * end, no Setup state to return to. Not for a USB reset or disconnect: there the
- * controller is live and keeps its transfers (use udc_dwc3_end_all_transfers()).
+ * Forget every endpoint's transfer state. Use this only after a core soft reset
+ * or a controller disable, when the controller holds nothing. A USB reset or
+ * disconnect uses udc_dwc3_end_all_transfers() instead, because the controller
+ * still holds its transfers then.
  */
 static UDC_DWC3_COLD void udc_dwc3_drop_xfer_state(const struct device *const dev,
                      const char *const reason)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
     LOG_DBG("dropping all transfer state (%s)", reason);
 
@@ -4554,20 +4450,19 @@ static UDC_DWC3_COLD void udc_dwc3_drop_xfer_state(const struct device *const de
     priv->diag.watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
     priv->ctrl.setup_pending = false;
     udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_IDLE);
-    /* A U3 of the old session has no exit owed in the next (4.1.10). */
+    /* A U3 from the old session owes no U3-exit work in the new one (4.1.10). */
     priv->link.in_u3 = false;
     priv->link.u3_active_eps = 0U;
 
     /*
-     * pending is forgotten too: the buffers are cancelled here, and a Clear Stall
-     * or resume owed to the old session has no endpoint configuration left to
-     * act on.
+     * Clear pending too. The buffers are cancelled here, and an owed Clear Stall
+     * or resume has no endpoint configuration left to act on.
      */
     for (int i = 0; i < cfg->num_in_eps; i++) {
         udc_dwc3_ep_state_reset(&cfg->ep_data_in[i]);
         cfg->ep_data_in[i].xfer.pending = UDC_DWC3_EP_PEND_NONE;
         if (i > 0) {
-            /* Release then return - the buffers were parked by the release. */
+            /* The release parks the buffers, then they are returned. */
             udc_dwc3_ep_ring_release(&cfg->ep_data_in[i]);
             udc_dwc3_ep_return_parked(dev, &cfg->ep_data_in[i], UDC_DWC3_BUF_CANCELLED);
         }
@@ -4583,27 +4478,26 @@ static UDC_DWC3_COLD void udc_dwc3_drop_xfer_state(const struct device *const de
 }
 
 /*
- * End every transfer and take EP0 back to its Setup stage: the common first step
- * of a USB reset and a device-initiated disconnect (SPEC 3.30b):
+ * End every transfer and take EP0 back to its Setup stage. This is the common
+ * first step of a USB reset and a disconnect (SPEC 3.30b):
  *
  *   4.1.2 Table 4-2 / 4.1.8 Table 4-7:
  *     "If a control transfer is still in progress, complete it and get the
  *     controller into the 'Setup a Control-Setup TRB / Start Transfer' state"
  *     "Issue a DEPENDXFER command for any active transfers (except for the
  *     default control endpoint 0)"
- *   4.1.2 only:
+ *   4.1.2 only (the clear_stall argument):
  *     "Issue a DEPCSTALL (ClearStall) command for any endpoint in STALL mode
- *     prior to the USB Reset (excluding control endpoints)"   -> clear_stall
+ *     prior to the USB Reset (excluding control endpoints)"
  *
- * Each non-control endpoint goes through udc_dwc3_ep_recover(): End Transfer
- * (ForceRM) if a transfer holds a resource, then buffers returned as cancelled
- * and Clear Stall when owed.
+ * Each non-control endpoint goes through udc_dwc3_ep_recover(). It ends any
+ * transfer, returns the buffers as cancelled, and clears a stall when owed.
  */
 static UDC_DWC3_COLD void udc_dwc3_end_all_transfers(const struct device *const dev,
                              const bool clear_stall)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
     for (uint32_t epn = 2U; epn < UDC_DWC3_MAX_EPN; epn++) {
         struct udc_dwc3_ep_data *ep_data;
@@ -4627,31 +4521,35 @@ static UDC_DWC3_COLD void udc_dwc3_end_all_transfers(const struct device *const 
 }
 
 /*
- * Core soft reset (DCTL.CSFTRST) and full event-ring reinitialisation.
+ * Core setup
+ *
+ * The core soft reset and the register set-up that follows it.
+ */
+
+/*
+ * Core soft reset (DCTL.CSFTRST), then set up the controller and event ring.
  */
 static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    uint32_t                            reg;
 
     /*
-     * Configure and reset the Device Controller.
-     * TODO confirm that DWC_USB3_EN_LPM_ERRATA == 1.
+     * Reset the device controller.
+     * TODO: confirm that DWC_USB3_EN_LPM_ERRATA == 1.
      */
     reg = UDC_DWC3_DCTL_CSFTRST;
     reg |= FIELD_PREP(UDC_DWC3_DCTL_LPM_NYET_THRES_MASK, 15);
     udc_dwc3_dctl_write(base, reg);
 
     /*
-     * Wait for CSftRst to clear, bounded so a core that never clears it cannot
-     * hang the driver.
-     *   Phase 1: reads with no delay; the core normally clears it here.
-     *   Phase 2: sleep a tick per read. This also runs at runtime
-     *   (udc_dwc3_controller_recover() -> init() -> here) on the work queue with
-     *   the UDC mutex held, where a busy spin starves every thread, including
-     *   the drain.
+     * Wait for CSftRst to clear, with a bound so a stuck core cannot hang the
+     * driver. First poll with no delay. The core normally clears it here.
+     * Then sleep one tick per read. This code also runs at runtime, from
+     * udc_dwc3_controller_recover() on the work queue with the mutex held.
+     * A busy spin there would starve every thread, including the drain.
      */
     for (uint32_t i = 0; i < UDC_DWC3_CSFTRST_FAST_READS; i++) {
         if ((sys_read32(base + UDC_DWC3_DCTL) &
@@ -4675,13 +4573,12 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
             UDC_DWC3_CSFTRST_FAST_READS, UDC_DWC3_CSFTRST_SLOW_TICKS);
     }
 
-    /* The core was just reset: no earlier command can still report completion. */
+    /* The core was reset, so no earlier command can still complete. */
     udc_dwc3_drop_xfer_state(dev, "soft reset");
 
     /*
-     * DEPCMD registers read as undefined again and no earlier command is active,
-     * so the next command on each endpoint must skip the pre-poll. (The transfer
-     * state, indices included, was dropped above.)
+     * The DEPCMD registers read as undefined again and no command is active, so
+     * the next command on each endpoint skips the pre-poll.
      */
     for (uint8_t i = 0; i < DEV_CFG(dev)->num_in_eps; i++) {
         DEV_CFG(dev)->ep_data_in[i].cmd.depcmd_last = UDC_DWC3_DEPCMD_NONE;
@@ -4690,19 +4587,14 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
         DEV_CFG(dev)->ep_data_out[i].cmd.depcmd_last = UDC_DWC3_DEPCMD_NONE;
     }
 
-    /*
-     * SoC bus configuration. Register hygiene, not a fix: the bitfile's power-on
-     * combination is undefined by the databook, and two independent vendor trees
-     * ship the same GSBUSCFG0 for this controller.
-     */
+    /* Log the bus configuration at reset. */
     LOG_INF("BUSCFG at reset: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
         sys_read32(base + UDC_DWC3_GSBUSCFG0),
         sys_read32(base + UDC_DWC3_GSBUSCFG1));
 
     /*
-     * Log the three registers the driver leaves at their power-on values. The
-     * databook's CSftRst exception list names them among the registers a core
-     * soft reset does not clear.
+     * Log three registers that a core soft reset does not clear (the databook's
+     * CSftRst exception list). The driver does not fully program them.
      */
     LOG_INF("POR unpinned: GUSB2PHYCFG=0x%08x GUSB3PIPECTL=0x%08x GTXTHRCFG=0x%08x",
         sys_read32(base + UDC_DWC3_GUSB2PHYCFG),
@@ -4710,10 +4602,10 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
         sys_read32(base + UDC_DWC3_GTXTHRCFG));
 
     /*
-     * Log the build parameters behind the U3/P3 settings the guide leaves to the
-     * integration:
-     *   GHWPARAMS0[1:0]    mode: 0 device, 1 host, 2 DRD (for DRD the
-     *                      application sets GUSB3PIPECTL.SuspendEnable after init)
+     * Log the build parameters behind the U3/P3 settings that the guide leaves
+     * to the integrator:
+     *   GHWPARAMS0[1:0]    mode: 0 device, 1 host, 2 DRD (for DRD, software
+     *                      sets GUSB3PIPECTL.SuspendEnable after init)
      *   GHWPARAMS1[25:24]  power options (2 = hibernation)
      *   GCTL               PwrDnScale (suspend_clk periods per 16 kHz tick)
      */
@@ -4726,18 +4618,26 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
             sys_read32(base + UDC_DWC3_GCTL));
     }
 
+    /*
+     * Set the SoC bus configuration to a known value. The databook does not
+     * define the power-on value, and two independent vendor trees use the same
+     * GSBUSCFG0 for this controller.
+     */
     sys_write32(UDC_DWC3_GSBUSCFG0_INCR16BRSTENA |
             UDC_DWC3_GSBUSCFG0_INCR8BRSTENA |
             UDC_DWC3_GSBUSCFG0_INCR4BRSTENA,
             base + UDC_DWC3_GSBUSCFG0);
 
-    /* GSBUSCFG1 is not written: PipeTransLimit stays at power-on (3 on this part). */
+    /* GSBUSCFG1 keeps its power-on value (PipeTransLimit is 3 on this part). */
 
     LOG_INF("BUSCFG programmed: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x",
         sys_read32(base + UDC_DWC3_GSBUSCFG0),
         sys_read32(base + UDC_DWC3_GSBUSCFG1));
 
-    /* Disable multi-packet RX thresholding (GRXTHRCFG; databook 1.2.4 erratum). */
+    /*
+     * Log GRXTHRCFG. When the workaround is built in, clear UsbRxPktCntSel to
+     * disable multi-packet RX thresholding (databook 1.2.4 erratum).
+     */
     reg = sys_read32(base + UDC_DWC3_GRXTHRCFG);
     LOG_INF("GRXTHRCFG=0x%08x at reset (UsbRxPktCntSel=%u, UsbRxPktCnt=%u)", reg,
         (reg & UDC_DWC3_GRXTHRCFG_USBRXPKTCNTSEL) ? 1U : 0U,
@@ -4751,7 +4651,7 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
     }
 #endif
 
-    /* GTXTHRCFG left unchanged: the erratum above is RX-only. */
+    /* GTXTHRCFG keeps its value. The erratum above affects RX only. */
 
     /* Read the chip identification */
     reg = sys_read32(base + UDC_DWC3_GCOREID);
@@ -4761,18 +4661,17 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
     __ASSERT_NO_MSG(FIELD_GET(UDC_DWC3_GCOREID_CORE_MASK, reg) == 0x5533);
 
     /*
-     * Clear GUSB2PHYCFG[15] (ULPIAutoRes): the PHY must not auto-resume in device
-     * mode, and the reset value may be 1 (databook Table 4-1, Power-On or Soft
-     * Reset Register Initialization).
+     * Clear GUSB2PHYCFG[15] (ULPIAutoRes). The PHY must not auto-resume in device
+     * mode, and the reset value may be 1 (databook Table 4-1).
      */
     sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG,
                UDC_DWC3_GUSB2PHYCFG_ULPIAUTORES);
 
     /*
-     * Clear SusPHY and EnblSlpM, and leave them clear: "before issuing any
-     * device endpoint command when operating in 2.0 speeds, disable this bit"
-     * (GUSB2PHYCFG). The reset value may be 1. Nothing in this driver sets them
-     * again, so udc_dwc3_depcmd() does not re-check them per command.
+     * Clear SusPHY and EnblSlpM. The databook (GUSB2PHYCFG) says: "before issuing
+     * any device endpoint command when operating in 2.0 speeds, disable this
+     * bit". The reset value may be 1. The driver never sets them again, so
+     * udc_dwc3_depcmd() does not check them per command.
      */
     reg = sys_read32(base + UDC_DWC3_GUSB2PHYCFG);
     if ((reg & (UDC_DWC3_GUSB2PHYCFG_SUSPHY | UDC_DWC3_GUSB2PHYCFG_ENBLSLPM)) != 0U) {
@@ -4781,39 +4680,35 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
                 base + UDC_DWC3_GUSB2PHYCFG);
     }
     /*
-     * Wait for the register file again here, not only in udc_dwc3_init(): this
-     * function issues its own CSftRst after init() settled the core, and the FIFO
-     * map below is the first GHWPARAMS read after it. Read too soon after CSftRst
-     * clears, it can return RAM1_DEPTH=0 and mdwidth=0 and program every FIFO
-     * to zero depth.
+     * Wait for the register file again, as udc_dwc3_init() does. This function
+     * issued its own CSftRst, and the FIFO map below is the first GHWPARAMS read
+     * after it. Read too soon after CSftRst clears, GHWPARAMS can return
+     * RAM1_DEPTH=0 and mdwidth=0, which means the core is still in reset.
      */
     if (!udc_dwc3_wait_regfile_ready(dev)) {
-        LOG_ERR("the register file is not out of reset after CSftRst, so every "
-            "FIFO would be programmed to zero depth and the controller "
-            "would stop moving data for good: abandoning the "
-            "configuration rather than completing it");
+        LOG_ERR("the register file is not out of reset after CSftRst: "
+            "abandoning the configuration");
         return -EIO;
     }
 
     /*
-     * One-shot FIFO map. GRXFIFOSIZ0 and GTXFIFOSIZn partition a pool whose
-     * total is fixed at synthesis (GHWPARAMS7.RAM1_DEPTH).
+     * Log the FIFO map. The TX FIFOs (GTXFIFOSIZn) share RAM1, whose size is
+     * fixed at synthesis (GHWPARAMS7.RAM1_DEPTH). RX FIFO 0 is in RAM2.
      */
     {
         const uint32_t hp7 = sys_read32(base + UDC_DWC3_GHWPARAMS7);
         const uint32_t ram1 = FIELD_GET(UDC_DWC3_GHWPARAMS7_RAM1_DEPTH_MASK, hp7);
         const uint32_t rx = sys_read32(base + UDC_DWC3_GRXFIFOSIZ(0));
         const uint32_t mdw = (sys_read32(base + UDC_DWC3_GHWPARAMS0) >> 8) & 0xFFU;
-        uint32_t used = 0;
+        uint32_t       used = 0;
 
         /*
-         * Refuse. The wait above should make this unreachable; if reached, the
-         * core is still in reset, so abandon the configuration as the wait does.
+         * The wait above should make this unreachable. If it happens, the core
+         * is still in reset, so stop here as the wait does.
          */
         if (ram1 == 0U || mdw == 0U) {
             LOG_ERR("FIFOMAP REFUSED: core reports RAM1_DEPTH=%u "
-                "mdwidth=%u - the register file is not out of reset "
-                "and every FIFO would be programmed to zero depth",
+                "mdwidth=%u - the register file is not out of reset",
                 ram1, mdw);
             return -EIO;
         }
@@ -4831,8 +4726,8 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
             (uint32_t)FIELD_GET(UDC_DWC3_GRXFIFOSIZ_RXFDEP_MASK, rx) * mdw /
                 BITS_PER_BYTE);
         /*
-         * Count TX only. RX0 lives in RAM2, a separate address space, so counting
-         * it against the TX budget would understate the spare by the RX depth.
+         * Count TX only. RX0 is in RAM2, a separate memory, so it does not use
+         * the TX budget.
          */
         used = 0U;
 
@@ -4858,16 +4753,16 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
             (uint32_t)FIELD_GET(UDC_DWC3_GHWPARAMS7_RAM2_DEPTH_MASK, hp7));
     }
 
-    /* Letting GRXFIFOSIZ unchanged */
+    /* GRXFIFOSIZ keeps its value. */
 
-    /* Setup the event buffer address, size and start event reception */
+    /* Set up the event buffer and start event reception. */
     memset((void *)cfg->evt_buf, 0, CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t));
 
-    /* Reset the read pointer together with the memset above; never separate them. */
+    /* Reset the read pointer together with the buffer, so they stay in step. */
     priv->evt.next = 0;
     udc_dwc3_drain_reset(&priv->evt.drain);
     priv->evt.q_head = priv->evt.q_tail = 0U;
-    /* Both stamps are valid from here, so no "is it meaningful yet" flags. */
+    /* Start both timestamps now, so they are always valid. */
     priv->evt.worker_exit_t0 = k_cycle_get_32();
     priv->evt.force_t0 = k_cycle_get_32();
     /* Prime every slot as consumed. */
@@ -4913,7 +4808,7 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
         LOG_INF("Event buffer at %p, size-aligned", (void *)cfg->evt_buf);
     }
 
-    /* Last setup step, after GEVNTADR/GEVNTSIZ: the count starts at 0. */
+    /* Enable the event count after GEVNTADR and GEVNTSIZ. It starts at 0. */
     udc_dwc3_gevntcount_enable(base);
 
     reg = sys_read32(base + UDC_DWC3_GUCTL2);
@@ -4945,21 +4840,20 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
     reg |= FIELD_PREP(UDC_DWC3_DCFG_NUMP_MASK, 4);
     sys_write32(reg, base + UDC_DWC3_DCFG);
 
-    /* Enable reception of all USB events this controller actually defines. */
+    /*
+     * Choose which device events the controller reports. These stay off:
+     *   - VNDRDEVTSTRCVED: the driver ignores it, and the databook advises
+     *     against the feature.
+     *   - HibernationReqEvtEn: the driver has no hibernation support, and this
+     *     event requires software "to start the hibernation process" (3.3.2).
+     * EvntOverflowEn, CmdCmpltEn and InactTimeoutRcvedEn do not exist in this
+     * controller's DEVTEN.
+     */
     reg = 0;
-    /*
-     * Not enabled: VNDRDEVTSTRCVED (the driver ignores it and the databook says
-     * not to use the feature). EvntOverflowEn, CmdCmpltEn and InactTimeoutRcvedEn
-     * do not exist in this controller's DEVTEN.
-     */
     reg |= UDC_DWC3_DEVTEN_ERRTICERREN;
-    /*
-     * HibernationReqEvtEn stays off: this driver implements no hibernation, and
-     * the event obliges software "to start the hibernation process" (3.3.2).
-     */
     reg |= UDC_DWC3_DEVTEN_WKUPEVTEN;
     /*
-     * Link state change, USB Reset and Connection Done: the controller vendor's
+     * Link state change, USB Reset and Connection Done are the vendor's
      * recommended minimum DEVTEN set.
      */
     reg |= UDC_DWC3_DEVTEN_ULSTCNGEN;
@@ -4975,6 +4869,13 @@ static UDC_DWC3_COLD int udc_dwc3_on_soft_reset(const struct device *const dev)
 }
 
 /*
+ * Events
+ *
+ * Handlers for device and endpoint events, and the dispatch that sends each
+ * event to its handler.
+ */
+
+/*
  * USBRST handler: return the device to the default state.
  */
 static UDC_DWC3_COLD void udc_dwc3_on_usb_reset(const struct device *const dev)
@@ -4984,14 +4885,14 @@ static UDC_DWC3_COLD void udc_dwc3_on_usb_reset(const struct device *const dev)
     LOG_DBG("Going through DWC3 reset logic");
 
     /*
-     * A bus reset starts a new configuration: let the next endpoint enable
-     * reassign the transfer-resource pool, and reset epcfg.first_ep, since a later
+     * A bus reset starts a new configuration. Let the next endpoint enable
+     * reassign the transfer-resource pool. Reset first_ep too, because the next
      * session may enable a different endpoint first.
      */
     priv->epcfg.pool_assigned = false;
     priv->epcfg.first_ep = 0U;
 
-    /* SPEC 3.30b 4.1.2, with the same primitives every other path uses. */
+    /* End all transfers and clear stalls (SPEC 3.30b 4.1.2). */
     udc_dwc3_end_all_transfers(dev, true);
 
     /* "Set DevAddr to 0". */
@@ -5000,15 +4901,15 @@ static UDC_DWC3_COLD void udc_dwc3_on_usb_reset(const struct device *const dev)
 
 /*
  * CONNECTDONE handler: adopt the negotiated speed and resize EP0. Returns false
- * if the reset did not fit in the stack's queue.
+ * if the reset event did not fit in the stack's queue.
  */
 static UDC_DWC3_COLD bool udc_dwc3_on_connect_done(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    int mps = 0;
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    int                                 mps = 0;
 
-    /* Adjust parameters against the connection speed */
+    /* EP0 max packet size for the connection speed. */
     switch (udc_dwc3_connect_speed(base)) {
     case UDC_BUS_SPEED_FS:
     case UDC_BUS_SPEED_HS:
@@ -5022,27 +4923,27 @@ static UDC_DWC3_COLD bool udc_dwc3_on_connect_done(const struct device *const de
     }
     __ASSERT_NO_MSG(mps != 0);
 
-    /* Reconfigure control endpoints connection speed */
+    /* Reconfigure the control endpoints with the new size. */
     udc_get_ep_cfg(dev, USB_CONTROL_EP_OUT)->mps = mps;
     udc_get_ep_cfg(dev, USB_CONTROL_EP_IN)->mps = mps;
     udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0], true);
     udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_out[0], true);
 
-    /* GTXFIFOSIZn is left alone; the databook states this is the normal case. */
+    /* GTXFIFOSIZn keeps its value. The databook says this is the normal case. */
 
     /*
-     * Report the reset here, not at USB_RESET: the speed-related registers are
-     * only valid after CONNECT_DONE.
+     * Report the reset here, not at USB_RESET. The speed registers are valid
+     * only after CONNECT_DONE.
      */
     return udc_submit_event(dev, UDC_EVT_RESET, 0) == 0;
 }
 
 /*
- * New transfer-resource pool generation (Table 4-5 SetConfiguration), run by
- * udc_dwc3_ep_enable() once per bus reset, on the first non-control endpoint
- * enabled: recover every non-control endpoint, re-initialise physical EP1's TX
- * FIFO allocation (DEPCFG Modify), and reassign the non-control transfer
- * resources (DEPSTARTCFG).
+ * Start a new transfer-resource pool (Table 4-5, SetConfiguration).
+ * udc_dwc3_ep_enable() runs this once per bus reset, when the first non-control
+ * endpoint is enabled. It recovers every non-control endpoint, re-initialises
+ * the TX FIFO allocation with DEPCFG Modify on physical EP1, and reassigns the
+ * non-control transfer resources (DEPSTARTCFG).
  */
 static UDC_DWC3_COLD void udc_dwc3_on_set_config_or_interface(const struct device *const dev)
 {
@@ -5060,11 +4961,11 @@ static UDC_DWC3_COLD void udc_dwc3_on_set_config_or_interface(const struct devic
     udc_dwc3_depcmd_ep_config(dev, &cfg->ep_data_in[0], true);
 
     /*
-     * DEPSTARTCFG reassigns the resources of every transfer the recovery may
-     * have left open (an End still executing, a refused End, a Start for an
-     * armed ring), and its reset would orphan that command's outcome. Skip it
-     * then: the pool keeps its current assignment, which INVARIANT 4 never
-     * over-allocates, and the next bus reset tries again.
+     * DEPSTARTCFG would reassign the resources of any transfer the recovery
+     * left open (an End still running, a refused End, or a Start for an armed
+     * ring). That command's outcome would then be lost. So skip it while any
+     * endpoint is busy. The pool keeps its current assignment, which never
+     * over-allocates (INVARIANT 4), and the next bus reset tries again.
      */
     for (uint32_t epn = 2U; epn < UDC_DWC3_MAX_EPN; epn++) {
         if (_EPN_IS_VALID(cfg, epn) &&
@@ -5080,11 +4981,11 @@ static UDC_DWC3_COLD void udc_dwc3_on_set_config_or_interface(const struct devic
 }
 
 /*
- * Release the half whose stage just completed, to match the controller, which
- * freed the transfer resource when it generated XferComplete (3.2.2.2). This
- * keeps the invariant udc_dwc3_ctrl_ep_recover() relies on: on EP0/EP1,
- * "xferrscidx valid" means "a transfer is live". A half with an End Transfer
- * outstanding is left for that End's completion.
+ * Release the half whose stage just completed. This matches the controller,
+ * which freed the transfer resource at XferComplete (3.2.2.2). It keeps the
+ * rule udc_dwc3_ctrl_ep_recover() relies on: on EP0/EP1, a valid xferrscidx
+ * means a transfer is live. A half with an End Transfer outstanding is left
+ * for that End's completion.
  */
 static void udc_dwc3_ctrl_release(struct udc_dwc3_ep_data *const h)
 {
@@ -5093,19 +4994,19 @@ static void udc_dwc3_ctrl_release(struct udc_dwc3_ep_data *const h)
     }
 }
 
-/* 4.4.1/4.4.2 step 2: the SETUP has arrived in the driver's buffer. */
+/* 4.4.1/4.4.2 step 2. The SETUP has arrived in the driver's buffer. */
 static void udc_dwc3_ctrl_setup_done(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
     memcpy(&priv->ctrl.setup, cfg->setup_buf, sizeof(priv->ctrl.setup));
     udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_SETUP_DONE);
     priv->diag.ctrl_setup_done++;
 
     /*
-     * Write SET_ADDRESS to DCFG at the SETUP, not the status stage: the controller
-     * applies the new address itself after the status stage.
+     * Write the SET_ADDRESS value to DCFG at the SETUP, not at the status stage.
+     * The controller applies the new address itself after the status stage.
      */
     if (priv->ctrl.setup.bmRequestType == USB_REQTYPE_TYPE_STANDARD &&
         priv->ctrl.setup.bRequest == USB_SREQ_SET_ADDRESS) {
@@ -5114,20 +5015,20 @@ static void udc_dwc3_ctrl_setup_done(const struct device *const dev)
 
     /*
      * Hand the 8 bytes to the stack. This returns any stage buffers still queued
-     * on either half for an earlier transfer, and copies the SETUP into the
-     * stack's SETUP buffer, or caches it until the stack queues one.
+     * from an earlier transfer. It copies the SETUP into the stack's SETUP
+     * buffer, or keeps it until the stack queues one.
      */
     udc_setup_received(dev, &priv->ctrl.setup);
     udc_dwc3_ctrl_next(dev);
 }
 
-/* 4.4.2 step 4: the data stage has retired on its endpoint. */
+/* 4.4.2 step 4. The data stage has completed on its endpoint. */
 static void udc_dwc3_ctrl_data_done(const struct device *const dev,
                     struct udc_dwc3_ep_data *const h,
                     const uint32_t sts, const uint32_t residual)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct net_buf *const buf = udc_buf_get(&h->cfg);
+    struct net_buf *const       buf = udc_buf_get(&h->cfg);
 
 
     if (buf == NULL || !udc_get_buf_info(buf)->data) {
@@ -5141,8 +5042,8 @@ static void udc_dwc3_ctrl_data_done(const struct device *const dev,
     }
 
     /*
-     * SetupPending: "this control transfer was aborted on the USB bus and the
-     * host did not complete the data stage." The flow still continues to
+     * SetupPending means "this control transfer was aborted on the USB bus and
+     * the host did not complete the data stage." The flow still goes on to
      * XferNotReady(Status) (Figure 4-2), where the failed data stage gets
      * Set Stall (step 6).
      */
@@ -5150,10 +5051,10 @@ static void udc_dwc3_ctrl_data_done(const struct device *const dev,
         priv->diag.ctrl_setup_pending++;
         priv->ctrl.setup_pending = true;
         /*
-         * Table 4-14 step 8: if a new SETUP arrives before the data goes out, the
-         * controller skips the data TRBs; software must reclaim them (HWO=1) and
-         * flush the TxFIFO. XferComplete released the transfer resource, so both
-         * TRBs are the driver's again.
+         * Table 4-14 step 8. If a new SETUP arrives before the IN data goes out,
+         * the controller skips the data TRBs. Software reclaims them (HWO=1) and
+         * flushes the TxFIFO. XferComplete released the transfer resource, so
+         * both TRBs belong to the driver again.
          */
         if (USB_EP_DIR_IS_IN(h->cfg.addr)) {
             udc_dwc3_ctrl_reclaim_half(dev, h);
@@ -5164,7 +5065,7 @@ static void udc_dwc3_ctrl_data_done(const struct device *const dev,
     }
 
     if (!USB_EP_DIR_IS_IN(h->cfg.addr)) {
-        /* What the hardware actually received, not what the host declared. */
+        /* Use the length actually received, not what the host declared. */
         const uint32_t mps = USB_MPS_EP_SIZE(h->cfg.mps);
         const uint32_t programmed = (mps != 0U) ? ROUND_UP(buf->size, mps) : buf->size;
         const uint32_t received = (programmed > residual) ? (programmed - residual) : 0U;
@@ -5179,22 +5080,22 @@ static void udc_dwc3_ctrl_data_done(const struct device *const dev,
 }
 
 /*
- * Update the DCTL U1/U2 bits from the request whose status stage just completed.
- * Called only once the stack has accepted the request (status stage completed
- * normally); SuperSpeed standard device requests only.
- *   - AcceptU1/U2Ena: set after SetConfiguration.
+ * Update the DCTL U1/U2 bits after a request's status stage completes normally.
+ * Only SuperSpeed standard device requests count.
+ *   - AcceptU1/U2Ena: set on SetConfiguration(non-zero). SetConfiguration(0)
+ *     clears all four bits.
  *   - InitU1/U2Ena: set on SetFeature(U1/U2_ENABLE), cleared on
  *     ClearFeature(U1/U2_ENABLE).
- * Hardware clears all four on USB reset; a disconnect clears them too.
+ * Hardware clears all four on USB reset. The disconnect handler clears them too.
  */
 static UDC_DWC3_COLD void udc_dwc3_ctrl_apply_link_pm(const struct device *const dev)
 {
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    struct udc_dwc3_data *const          priv = udc_get_private(dev);
+    const mm_reg_t                       base = DEVICE_MMIO_NAMED_GET(dev, base);
     const struct usb_setup_packet *const setup = &priv->ctrl.setup;
-    const uint16_t value = sys_le16_to_cpu(setup->wValue);
-    const bool ss = udc_dwc3_connect_speed(base) == UDC_BUS_SPEED_SS;
-    uint32_t bit;
+    const uint16_t                       value = sys_le16_to_cpu(setup->wValue);
+    const bool                           ss = udc_dwc3_connect_speed(base) == UDC_BUS_SPEED_SS;
+    uint32_t                             bit;
 
     if (!ss || setup->RequestType.type != USB_REQTYPE_TYPE_STANDARD ||
         setup->RequestType.recipient != USB_REQTYPE_RECIPIENT_DEVICE) {
@@ -5232,17 +5133,17 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_apply_link_pm(const struct device *const
 }
 
 /*
- * 4.4.1 step 5 / 4.4.2 step 8: the status stage has retired (SetupPending or
- * not); go back to Step 1. The status buffer is returned as completed either way,
- * as the reference driver does: the request was served, only the host's ACK is
- * in doubt.
+ * 4.4.1 step 5 / 4.4.2 step 8. The status stage has completed, so go back to
+ * Step 1. The status buffer is returned as completed even with SetupPending,
+ * as Linux dwc3 does. The request was served, and only the host's ACK is in
+ * doubt.
  */
 static void udc_dwc3_ctrl_status_done(const struct device *const dev,
                       struct udc_dwc3_ep_data *const h,
                       const uint32_t sts)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct net_buf *const buf = udc_buf_get(&h->cfg);
+    struct net_buf *const       buf = udc_buf_get(&h->cfg);
 
     if (buf != NULL) {
         buf->len = 0;
@@ -5257,36 +5158,37 @@ static void udc_dwc3_ctrl_status_done(const struct device *const dev,
 }
 
 /*
- * XferComplete on EP0 or EP1. Attributed by where Figure 4-2 says the transfer
- * is, never by what the driver remembers arming:
- *   Setup node -> the SETUP; data node -> the data stage (on bmRequestType's
- *   endpoint); status node -> the status stage.
+ * XferComplete on EP0 or EP1. The stage is taken from where Figure 4-2 says the
+ * transfer is, not from what the driver remembers arming:
+ *   Setup node  -> the SETUP.
+ *   Data node   -> the data stage, on the endpoint bmRequestType names.
+ *   Status node -> the status stage.
  */
 static void udc_dwc3_on_ctrl(const struct device *const dev, struct udc_dwc3_ep_data *const h,
                  const bool is_in)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const bool ending = udc_dwc3_ep_is_ending(h);
-    struct udc_dwc3_trb t;
-    uint32_t status;
+    const bool                  ending = udc_dwc3_ep_is_ending(h);
+    struct udc_dwc3_trb         t;
+    uint32_t                    status;
 
     if (priv->diag.watchdog_ep == h) {
         priv->diag.watchdog_ep = NULL;
         priv->diag.watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
     }
 
-    /* Nothing live on this half: a late or repeated event for a transfer already over. */
+    /* Nothing live on this half. This is a late or repeated event. */
     if (h->xfer.state == UDC_DWC3_EP_IDLE) {
         LOG_DBG("EP%02x XferComplete with no transfer live: ignored", h->cfg.addr);
         return;
     }
 
     /*
-     * Read the write-back before anything can rearm this half's ring, ctrl
-     * before status. HWO still set at XferComplete means the write-back is not
-     * visible: the status is read anyway, after ctrl, and used as it reads.
-     * A chained ZLP TRB still owned keeps the first TRB's TRBSTS (OK here),
-     * which is also what its programmed status of 0 reads as.
+     * Read the TRB write-back before anything can rearm this half's ring. Read
+     * ctrl before status. If HWO is still set at XferComplete, the write-back is
+     * not visible yet, and the status is used as read. If a chained ZLP TRB is
+     * still owned, the first TRB's TRBSTS (OK here) is kept. Its programmed
+     * status of 0 would read as OK too.
      */
     (void)udc_dwc3_trb_snapshot(&h->trb_buf[0], &t);
     status = t.status;
@@ -5300,7 +5202,7 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, struct udc_dwc3_ep_
     udc_dwc3_ctrl_release(h);
     priv->ctrl.setup_pending = false;
 
-    /* A stage of the transfer being taken back to Step 1: the recovery owns it. */
+    /* A recovery owns this transfer. Let it continue. */
     if (udc_dwc3_ctrl_recovering(priv) || ending) {
         udc_dwc3_ctrl_recover_continue(dev);
         return;
@@ -5332,9 +5234,9 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, struct udc_dwc3_ep_
     }
 
     /*
-     * A transfer was live on this half but not the one Figure 4-2 says is in
-     * progress: driver and controller disagree on where the control transfer is.
-     * Back to Step 1.
+     * A transfer was live on this half, but not the stage Figure 4-2 expects.
+     * The driver and controller disagree on where the control transfer is,
+     * so go back to Step 1.
      */
     LOG_WRN_RATELIMIT("EP%02x XferComplete (TRB status 0x%08x) in control state %u: "
               "back to Setup", h->cfg.addr, status, (unsigned int)priv->ctrl.state);
@@ -5343,19 +5245,18 @@ static void udc_dwc3_on_ctrl(const struct device *const dev, struct udc_dwc3_ep_
 
 /*
  * Wait, bounded, for DGCMD.CmdAct to clear. Returns false if it is still set.
- * SPEC 3.30b DGCMD bit 10 CMDACT: software sets it to start a generic command;
- * the controller clears it once the command has executed.
+ * SPEC 3.30b DGCMD bit 10 CMDACT: software sets it to start a generic command,
+ * and the controller clears it when the command has executed.
  */
 static UDC_DWC3_COLD bool udc_dwc3_dgcmd_wait_idle(const mm_reg_t base)
 {
     uint32_t polls = 0;
 
     /*
-     * Reads only, no delay: callers run on the drain thread or the UDC work
-     * queue, mostly with the UDC mutex held, where a delayed poll would stall
-     * every other UDC path. A generic command retires in microseconds; one
-     * still active after UDC_DWC3_DGCMD_POLL_MAX reads is reported, not waited
-     * on.
+     * Poll with no delay. Callers run on the drain thread or the UDC work queue,
+     * often with the mutex held, so a sleeping poll would stall other UDC paths.
+     * A generic command takes microseconds. One still active after
+     * UDC_DWC3_DGCMD_POLL_MAX reads is reported, not waited on.
      */
     while ((sys_read32(base + UDC_DWC3_DGCMD) & UDC_DWC3_DGCMD_ACT) != 0U) {
         if (++polls >= UDC_DWC3_DGCMD_POLL_MAX) {
@@ -5367,23 +5268,24 @@ static UDC_DWC3_COLD bool udc_dwc3_dgcmd_wait_idle(const mm_reg_t base)
 }
 
 /*
- * Issue one device generic command (SPEC 3.30b 3.2.1, Table 3-2). The only place
- * DGCMDPAR and DGCMD are written.
+ * Issue one device generic command (SPEC 3.30b 3.2.1, Table 3-2). This is the
+ * only place that writes DGCMDPAR and DGCMD.
  *
- * Parameter and command are written together under dgcmd_lock, since both the
- * drain thread and the work queue issue generic commands. A new command is never
- * written over one still executing (CmdAct set): bounded wait outside the lock,
- * then re-check under it. With wait, CmdAct is polled again after issuing.
+ * Both the drain thread and the work queue issue generic commands, so the
+ * parameter and command are written together under dgcmd_lock. A new command
+ * is never written over one still running (CmdAct set). The function waits
+ * outside the lock, then checks again under it. With wait set, it also polls
+ * CmdAct after issuing.
  *
- * Returns 0, -EBUSY (previous command never cleared; nothing issued), or
- * -ETIMEDOUT (issued, still executing after the bounded wait).
+ * Returns 0, -EBUSY (previous command still running, nothing issued), or
+ * -ETIMEDOUT (issued, but still running after the bounded wait).
  */
 static UDC_DWC3_COLD int udc_dwc3_dgcmd(const struct device *const dev, const uint32_t cmd,
                     const uint32_t param, const bool wait)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    k_spinlock_key_t key;
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
+    k_spinlock_key_t            key;
 
     if (!udc_dwc3_dgcmd_wait_idle(base)) {
         return -EBUSY;
@@ -5408,16 +5310,16 @@ static UDC_DWC3_COLD int udc_dwc3_dgcmd(const struct device *const dev, const ui
 /*
  * Flush one endpoint's TxFIFO (DGCMD 09h "Selected FIFO Flush", Table 3-2).
  *
- * Required after an aborted control IN transfer (4.4.2 step 8: on a SETUP
+ * Needed after an aborted control IN transfer (4.4.2 step 8: on a SETUP
  * mid-transfer, "reclaim the TRBs with HWO=1 ... and flush the TxFIFO").
- * Reclaiming alone leaves bytes already staged for the skipped IN stage in the
- * FIFO, and they would go out at the head of the next one.
+ * Without the flush, bytes already staged for the skipped IN stage would go
+ * out at the start of the next one.
  */
 static UDC_DWC3_COLD void udc_dwc3_fifo_flush_tx(const struct device *const dev, const uint8_t fifo)
 {
     /*
-     * Wait for completion: the next control stage is armed right after this
-     * returns, and must not race the bytes being discarded.
+     * Wait for the flush to finish. The next control stage is armed right after
+     * this returns.
      */
     const int ret = udc_dwc3_dgcmd(dev, UDC_DWC3_DGCMD_FIFOFLUSHONE,
                        UDC_DWC3_DGCMD_FIFOFLUSH_TX |
@@ -5434,10 +5336,10 @@ static UDC_DWC3_COLD void udc_dwc3_fifo_flush_tx(const struct device *const dev,
 }
 
 /*
- * True if the endpoint has an "active transfer" in the 4.1.10 sense: it holds a
- * transfer resource (RUNNING, or a Start whose outcome is still open). On EP0
- * only a data or status stage counts: a Setup TRB does not make it active (4.9.1)
- * and a SETUP is never flow-controlled, so no ERDY is owed for it.
+ * True if the endpoint has an "active transfer" in the 4.1.10 sense. That means
+ * it holds a transfer resource (RUNNING, or a Start whose outcome is open).
+ * On EP0 only a data or status stage counts. A Setup TRB does not make it
+ * active (4.9.1), and a SETUP is never flow-controlled, so it needs no ERDY.
  */
 static UDC_DWC3_COLD bool udc_dwc3_ep_active_for_u3(const struct udc_dwc3_data *const priv,
                       const uint32_t epn,
@@ -5449,56 +5351,54 @@ static UDC_DWC3_COLD bool udc_dwc3_ep_active_for_u3(const struct udc_dwc3_data *
         return false;
     }
 
-    /* EP0 only in a data/status stage; not while a recovery is ending it. */
+    /* EP0 counts only in a data or status stage, and not during a recovery. */
     return epn >= 2U ||
            (priv->ctrl.state != UDC_DWC3_CTRL_IDLE && !udc_dwc3_ctrl_recovering(priv));
 }
 
 /*
- * Link and bus events - the only place the driver reacts to link state
+ * Link and bus events. This is the only place the driver reacts to link state
  * (SPEC 3.30b):
  *
  *   USB Reset        4.1.2  back to the default state, DevAddr 0
  *   Connect Done     4.1.3  adopt the speed, resize EP0
  *   Disconnect       4.1.7  clear the U1/U2 enables, set DCTL[8:5] to 5
  *                           (Rx.Detect)
- *   Link State Chg   3.3.2  SS only; not raised on exit from HOT_RESET/POLL or
- *                           entry to RECOVERY, so a U0 event also ends every
- *                           Recovery
- *   Erratic error    3.3.2  SS: controller reset required; HS/FS: only a soft
- *                           disconnect recovers. Both via
- *                           udc_dwc3_controller_recover()
- *   Buffer overflow  3.3.2  device events after it may be lost; endpoint events
- *                           are not
+ *   Link State Chg   3.3.2  SS only. Not raised on exit from HOT_RESET or POLL,
+ *                           or on entry to RECOVERY, so a U0 event also ends
+ *                           every Recovery.
+ *   Erratic error    3.3.2  SS needs a controller reset. HS/FS needs a soft
+ *                           disconnect. Both go through
+ *                           udc_dwc3_controller_recover().
+ *   Buffer overflow  3.3.2  device events after it may be lost. Endpoint
+ *                           events are not.
  *   Wakeup, Suspend         nothing to do (no remote wakeup, no hibernation)
  *
- * SPEC 3.30b 4.1.10, Initialization after U3 Exit: on U3 -> U0, issue
- * "Set Endpoint NRDY" on every endpoint that had an active transfer before U3
- * entry and still has one, so it sends ERDY. Why: an ERDY sent as the host's
- * LGO_U3 arrived is lost on the host, the device keeps no record of it, and the
- * transfer would wait forever. Use only for U3 exit.
+ * It also handles the exit from U3 (SPEC 3.30b 4.1.10).
  */
 static UDC_DWC3_COLD bool udc_dwc3_link_event(const struct device *const dev, const uint32_t evt)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const uint32_t type = evt & UDC_DWC3_EVT_MASK;
-    const uint32_t link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
-    const bool ss_link = type == UDC_DWC3_DEVT_ULSTCHNG &&
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const uint32_t                      type = evt & UDC_DWC3_EVT_MASK;
+    const uint32_t                      link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
+    const bool                          ss_link = type == UDC_DWC3_DEVT_ULSTCHNG &&
                  (evt & UDC_DWC3_DEVT_EVTINFO_SS) != 0U;
-    uint32_t owed = 0U;
+    uint32_t                            owed = 0U;
 
     /*
-     * 4.1.10 bookkeeping, done only here. The exit is an SS U3 followed by U0
-     * (Recovery in between is not reported).
-     *   - SS U3: record the endpoints active now; a repeated U3 does not
+     * Record U3 entry and exit for SPEC 3.30b 4.1.10. This is done only here.
+     * A U3 exit is an SS U3 event followed by U0. Recovery in between is not
+     * reported.
+     *   - SS U3: record the endpoints active now. A repeated U3 does not
      *     re-record.
      *   - SS U0 after a recorded U3: those endpoints are owed Set Endpoint NRDY.
-     *   - Anything else cancels a pending exit: non-SS events (On/Sleep/Suspend
-     *     share the encoding but are never U3), other link states, USB reset,
-     *     disconnect, and event overflow (a later U0 may not be this U3's exit).
-     * A U0 without a preceding U3 (Recovery, U1/U2 exit) never gets the command.
+     *   - Anything else cancels a pending exit. This covers non-SS events
+     *     (On/Sleep/Suspend share the encoding but are never U3), other link
+     *     states, USB reset, disconnect and event overflow (after an overflow,
+     *     a later U0 may not be this U3's exit).
+     * A U0 without a recorded U3 (Recovery, U1/U2 exit) never gets the command.
      */
     if (ss_link && link == FIELD_GET(UDC_DWC3_DSTS_USBLNKST_MASK,
                      UDC_DWC3_DSTS_USBLNKST_USB3_U3)) {
@@ -5529,20 +5429,25 @@ static UDC_DWC3_COLD bool udc_dwc3_link_event(const struct device *const dev, co
     case UDC_DWC3_DEVT_CONNECTDONE:
         return udc_dwc3_on_connect_done(dev);
     case UDC_DWC3_DEVT_DISCONNEVT:
-        /* Any Endpoint Command Complete still outstanding is not coming. */
+        /* End every transfer and take EP0 back to its Setup stage (4.1.7). */
         udc_dwc3_end_all_transfers(dev, true);
         /*
-         * The device is no longer configured: drop the U1/U2 permissions, as
-         * a USB reset clears them in hardware (DCTL) and SetConfiguration(0)
-         * does in udc_dwc3_ctrl_apply_link_pm(). A new link must not enter or
-         * accept U1/U2 before the host enables them again.
+         * The device is no longer configured, so clear the U1/U2 enables. A new
+         * link must not enter or accept U1/U2 until the host enables them again.
          */
         udc_dwc3_dctl_update(base, UDC_DWC3_DCTL_ACCEPTU1ENA | UDC_DWC3_DCTL_INITU1ENA |
                        UDC_DWC3_DCTL_ACCEPTU2ENA | UDC_DWC3_DCTL_INITU2ENA, 0U);
         udc_dwc3_dctl_link_request(base, UDC_DWC3_DCTL_ULSTCHNGREQ_RXDETECT);
         break;
     case UDC_DWC3_DEVT_ULSTCHNG:
-        /* Only endpoints recorded at U3 that are still active now. */
+        /*
+         * SPEC 3.30b 4.1.10, Initialization after U3 Exit. On U3 -> U0, issue
+         * "Set Endpoint NRDY" on every endpoint that was active at U3 entry and
+         * is still active now, so that it sends ERDY. An ERDY sent just as the
+         * host's LGO_U3 arrived is lost on the host. The device keeps no record
+         * of it, so the transfer would wait forever. This command is for U3 exit
+         * only.
+         */
         for (uint32_t epn = 0U; epn < UDC_DWC3_MAX_EPN; epn++) {
             if ((owed & BIT(epn)) == 0U || !_EPN_IS_VALID(cfg, epn) ||
                 !udc_dwc3_ep_active_for_u3(priv, epn, _EP_DATA_FROM_EPN(cfg, epn))) {
@@ -5563,9 +5468,10 @@ static UDC_DWC3_COLD bool udc_dwc3_link_event(const struct device *const dev, co
         break;
     case UDC_DWC3_DEVT_ERRTICERR:
         /*
-         * UTMI+: phy_rxvalid/phy_rxactive asserted for >= 2 ms; SS: the PIPE did
-         * not answer a PHY command. Rate-limited, since it repeats until the
-         * reset. The reset sleeps, so the heartbeat runs it.
+         * UTMI+: phy_rxvalid or phy_rxactive was asserted for 2 ms or more.
+         * SS: the PIPE did not answer a PHY command. The log is rate-limited
+         * because the event repeats until the reset. The reset sleeps, so the
+         * heartbeat runs it.
          */
         LOG_ERR_RATELIMIT("DEVT_ERRTICERR: PHY erratic error - resetting "
             "the controller");
@@ -5573,16 +5479,16 @@ static UDC_DWC3_COLD bool udc_dwc3_link_event(const struct device *const dev, co
             return false;
         }
         if (priv->run.state == UDC_DWC3_RUN) {
-            /* A recovery already under way is the reset this asks for. */
+            /* If a recovery is already running, it provides the reset. */
             priv->run.state = UDC_DWC3_RUN_RESET_OWED;
         }
         break;
     case UDC_DWC3_DEVT_EVNTOVERFLOW:
-        /* The only line for this event: the generic banner is suppressed. */
+        /* The only log line for this event. The generic event log skips it. */
         LOG_ERR_RATELIMIT("evt ring ovfl");
         break;
     default:
-        /* WKUPEVT, SUSPEND: nothing owed. */
+        /* WKUPEVT, SUSPEND: nothing to do. */
         break;
     }
 
@@ -5590,20 +5496,20 @@ static UDC_DWC3_COLD bool udc_dwc3_link_event(const struct device *const dev, co
 }
 
 /*
- * XferNotReady on EP0 or EP1: the host asks for a control stage. Implements the
- * transitions of SPEC 3.30b 4.4.1/4.4.2 (Figure 4-2). Each event is either:
- *   - the expected edge: advance;
- *   - not an edge from the current state: ignore (hardware discards unexpected
- *     data/status stages when no SETUP was received);
- *   - a databook error case: back to Step 1 via udc_dwc3_ctrl_ep_recover().
+ * XferNotReady on either half of EP0. The host is asking for a control stage.
+ * This follows SPEC 3.30b 4.4.1/4.4.2 (Figure 4-2).
+ *   - An expected event advances the state.
+ *   - An event that does not fit the current state is ignored. The hardware
+ *     discards data and status stages that come without a SETUP.
+ *   - A databook error case goes back to Step 1 via udc_dwc3_ctrl_ep_recover().
  */
 static void udc_dwc3_on_ctrl_xnr(const struct device *const dev, const uint32_t evt,
                  const bool is_in)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const uint32_t stage = evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK;
-    struct udc_dwc3_ep_data *const out0 = &cfg->ep_data_out[0];
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const uint32_t                      stage = evt & UDC_DWC3_DEPEVT_STATUS_CONTROL_MASK;
+    struct udc_dwc3_ep_data *const      out0 = &cfg->ep_data_out[0];
 
 
     if (udc_dwc3_ctrl_recovering(priv) ||
@@ -5613,11 +5519,11 @@ static void udc_dwc3_on_ctrl_xnr(const struct device *const dev, const uint32_t 
     }
 
     /*
-     * Step 2: XferNotReady (Data/Status) before the Setup XferComplete -> Set
-     * Stall. The Setup TRB is already armed, so nothing else; state stays at
-     * Setup. "Before the XferComplete" is read from the hardware (Setup TRB
-     * still HWO), not from drain order: once that TRB has retired, the SETUP's
-     * XferComplete is behind this event, and a stall would hit the new request.
+     * Step 2: a data or status request before the SETUP completed. Set Stall.
+     * The Setup TRB is already armed, so the state stays at Setup.
+     * "Before the SETUP completed" means the Setup TRB still has HWO set.
+     * If that TRB has already retired, its XferComplete is still on the way.
+     * A stall then would hit the new request, so nothing is done.
      */
     if (priv->ctrl.state == UDC_DWC3_CTRL_IDLE) {
         if (out0->xfer.state == UDC_DWC3_EP_RUNNING &&
@@ -5638,15 +5544,16 @@ static void udc_dwc3_on_ctrl_xnr(const struct device *const dev, const uint32_t 
         }
 
         /*
-         * Step 6: if the data stage failed, Set Stall and go back to Step 1.
+         * Step 6: the data stage failed, so Set Stall and go back to Step 1.
          * A data stage the host abandoned (SetupPending) counts as failed.
+         * So does a status request in the wrong direction.
          */
         if (priv->ctrl.setup_pending || is_in != udc_dwc3_ctrl_status_is_in(priv)) {
             udc_dwc3_ctrl_ep_recover(dev);
             return;
         }
 
-        /* Steps 4 / 7: the status stage is due; arm it when the stack's buffer is there. */
+        /* Steps 4 and 7: the status stage is due. Arm it when the buffer is here. */
         udc_dwc3_ctrl_state_set(dev, UDC_DWC3_CTRL_STATUS_READY);
         udc_dwc3_ctrl_next(dev);
         return;
@@ -5656,25 +5563,26 @@ static void udc_dwc3_on_ctrl_xnr(const struct device *const dev, const uint32_t 
     switch (priv->ctrl.state) {
     case UDC_DWC3_CTRL_SETUP_DONE:
         /*
-         * Error: a data stage on a request without one (4.4.1 step 3), or in
-         * the wrong direction for bmRequestType (4.4.2 step 3a). Otherwise the
-         * host is just early; the stack's buffer arms the stage.
+         * A data request on a request with no data stage is an error (4.4.1
+         * step 3). So is a data request in the wrong direction (4.4.2 step 3a).
+         * Otherwise the host is just early. The stack's buffer arms the stage.
          */
         if (!udc_dwc3_ctrl_three_stage(priv) || is_in != udc_dwc3_ctrl_dir_in(priv)) {
             udc_dwc3_ctrl_ep_recover(dev);
         }
         return;
     case UDC_DWC3_CTRL_DATA_ARMED:
-        /* 3a: wrong direction - End the started data stage, Set Stall. 3b: ignore. */
+        /* 3a: wrong direction, so recover. 3b: right direction, so ignore. */
         if (is_in != udc_dwc3_ctrl_dir_in(priv)) {
             udc_dwc3_ctrl_ep_recover(dev);
         }
         return;
     case UDC_DWC3_CTRL_DATA_DONE:
         /*
-         * Step 5b: the host sent more data than wLength. (5a, the closing ZLP,
-         * never gets here: OUT data TRB BUFSIZ is rounded up to wMaxPacketSize
-         * in udc_dwc3_trb_ctrl_out(), so the ZLP lands in it.)
+         * Step 5b: the host sent more data than wLength.
+         * Step 5a (a closing ZLP) does not come here. The OUT data TRB is
+         * rounded up to wMaxPacketSize in udc_dwc3_trb_ctrl_out(), so the ZLP
+         * lands in it.
          */
         udc_dwc3_ctrl_ep_recover(dev);
         return;
@@ -5683,9 +5591,7 @@ static void udc_dwc3_on_ctrl_xnr(const struct device *const dev, const uint32_t 
     }
 }
 
-/*
- * Decode the completion status of a retired TRB.
- */
+/* Check the completion status of a retired TRB and log any error. */
 static void udc_dwc3_on_xfer_done(const struct udc_dwc3_trb *const trb)
 {
     switch (trb->status & UDC_DWC3_TRB_STATUS_TRBSTS_MASK) {
@@ -5718,14 +5624,14 @@ static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct net_buf *buf;
-    uint32_t drained = 0U;
-    int ret;
+    struct net_buf             *buf;
+    uint32_t                    drained = 0U;
+    int                         ret;
 
     while (true) {
         struct udc_dwc3_trb trb;
 
-        /* -EBUSY (controller still owns it) or -ENOBUFS (empty slot): done. */
+        /* Stop at a TRB the controller still owns, or at an empty slot. */
         ret = udc_dwc3_pop_trb(ep_data, &buf, &trb);
         if (ret != 0) {
             break;
@@ -5736,12 +5642,11 @@ static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
 
         udc_dwc3_on_xfer_done(&trb);
 
-        /* Liveness proxy for the SETUP watchdog - see nonctrl_done. */
         priv->diag.nonctrl_done++;
         ep_data->diag.n_retire++;
 
 
-        /* A failed post (usbd queue full) is counted only: the buffer is on the stack's list. */
+        /* A failed post (usbd queue full) is only counted. */
         if (udc_dwc3_buf_return(dev, buf, UDC_DWC3_BUF_DONE) != 0) {
             priv->diag.post_fail_total++;
         }
@@ -5749,7 +5654,7 @@ static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
         drained++;
     }
 
-    /* Ring slots are free: one kick lets the endpoint work queue more buffers. */
+    /* Ring slots are free, so let the endpoint work queue more buffers. */
     if (drained > 0U) {
         k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
     }
@@ -5757,9 +5662,7 @@ static uint32_t udc_dwc3_drain_completed(const struct device *const dev,
     return drained;
 }
 
-/*
- * Transfer completion on a non-control endpoint.
- */
+/* Transfer completion on a non-control endpoint. */
 static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data,
                       const bool complete)
@@ -5767,18 +5670,17 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev,
     (void)udc_dwc3_drain_completed(dev, ep_data);
 
     /*
-     * XferComplete and XferInProgress mean opposite things about the transfer
-     * resource (databook 3.2.2.2): only XferComplete means the controller
-     * released it.
+     * Only XferComplete means the controller released the transfer resource.
+     * XferInProgress means the transfer goes on (databook 3.2.2.2).
      */
     if (complete) {
         /*
-         * Reset to idle only from RUNNING with nothing still armed. A skipped
-         * event slot can be filled by a late write and read one ring wrap later,
-         * for a transfer that ended long ago; the event word has no sequence
-         * field to tell it from a fresh one. With a Start or End open (R2) its
-         * own completion or the resolver settles the endpoint; IDLE here would
-         * let a Start follow an End still executing (3.2.2.7).
+         * Go to idle only from RUNNING with nothing still armed.
+         * A late event can belong to a transfer that ended long ago. The event
+         * word has no sequence number to tell it from a fresh one.
+         * With a Start or End open, that command's completion settles the
+         * endpoint. Going IDLE here would let a Start follow an End that is
+         * still executing (3.2.2.7).
          */
         if (ep_data->xfer.state != UDC_DWC3_EP_RUNNING) {
             LOG_WRN_RATELIMIT("EP%02x XferComplete ignored: endpoint is %s",
@@ -5798,9 +5700,7 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev,
     }
 }
 
-/*
- * Name of a link state, for logging.
- */
+/* Name of a link state, for logging. */
 static const char *udc_dwc3_get_devt_ulstchng_name(const uint32_t dsts)
 {
     switch (dsts & UDC_DWC3_DSTS_CONNECTSPD_MASK) {
@@ -5864,9 +5764,7 @@ static const char *udc_dwc3_get_devt_ulstchng_name(const uint32_t dsts)
 
 #define _NORMAL_EP(n, fn)   fn(n + 2)
 
-/*
- * Name of an event word, for logging.
- */
+/* Name of an event word, for logging. */
 static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t dsts)
 {
     switch (evt & UDC_DWC3_EVT_MASK) {
@@ -5882,7 +5780,6 @@ static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t ds
         return "DEPEVT_XFERNOTREADY(0)";
     case UDC_DWC3_DEPEVT_XFERNOTREADY(1):
         return "DEPEVT_XFERNOTREADY(1)";
-    /* Without these, command completions would log as "unknown event". */
     case UDC_DWC3_DEPEVT_EPCMDCMPLT(0):
         return "DEPEVT_EPCMDCMPLT(0)";
     case UDC_DWC3_DEPEVT_EPCMDCMPLT(1):
@@ -5897,8 +5794,8 @@ static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t ds
         return "DEVT_CONNECTDONE";
     case UDC_DWC3_DEVT_ULSTCHNG:
         /*
-         * Link state from the event, speed from DSTS: the speed is fixed within
-         * a session, so reading it late is harmless; the link state is not.
+         * The link state comes from the event, because DSTS may have moved on.
+         * The speed comes from DSTS. It does not change within a session.
          */
         return udc_dwc3_get_devt_ulstchng_name(
             (dsts & ~UDC_DWC3_DSTS_USBLNKST_MASK) |
@@ -5926,15 +5823,16 @@ static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t ds
 }
 
 /*
- * Park every armed buffer on an endpoint back on its requeue FIFO and reset the
- * TRB ring to the empty state.
+ * Move every armed buffer on an endpoint to its requeue FIFO and empty the
+ * TRB ring.
  */
 static void udc_dwc3_ep_ring_release(struct udc_dwc3_ep_data *const ep_data)
 {
-    /* TRB_NUM - 1: the last TRB is the LINK TRB (udc_dwc3_trb_nonctrl_init),
-     * which stays armed to keep the ring intact; only payload slots are cleared.
+    /*
+     * The last TRB is the LINK TRB (udc_dwc3_trb_nonctrl_init()). It stays
+     * armed to keep the ring closed. Only the data slots are cleared.
      */
-    const int slots = CONFIG_UDC_DWC3_TRB_NUM - 1;
+    const int       slots = CONFIG_UDC_DWC3_TRB_NUM - 1;
     struct net_buf *buf;
 
     for (int n = 0; n < slots; n++) {
@@ -5952,7 +5850,7 @@ static void udc_dwc3_ep_ring_release(struct udc_dwc3_ep_data *const ep_data)
         }
     }
 
-    /* Reset the buffers */
+    /* Clear the data TRBs and the buffer slots. */
     for (uint32_t i = 0U; i < (CONFIG_UDC_DWC3_TRB_NUM - 1U); i++) {
         udc_dwc3_trb_write(&ep_data->trb_buf[i], 0U, 0U, 0U);
     }
@@ -5964,15 +5862,15 @@ static void udc_dwc3_ep_ring_release(struct udc_dwc3_ep_data *const ep_data)
 
 /*
  * The End Transfer on this endpoint has completed and the resource is free.
- * Continues whatever recovery was waiting for it.
+ * Continue the recovery that was waiting for it.
  *
- * Called from both places that detect the completion: the EpCmdCmplt event, and
- * udc_dwc3_ep_resolve_cmd() reading DEPCMD when that event never arrives.
+ * Called on the EpCmdCmplt event. Also called by udc_dwc3_ep_resolve_cmd()
+ * when DEPCMD shows the End completed but its event never arrived.
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_end_completed(const struct device *const dev,
                       struct udc_dwc3_ep_data *const ep_data)
 {
-    /* Keeps the work owed to the stack or host; drops an owed Update. */
+    /* The End completed, so the endpoint holds no transfer. Return it to IDLE. */
     udc_dwc3_ep_state_reset(ep_data);
 
     LOG_DBG("EpCmdCmplt: DMA stopped for EP%02x", ep_data->cfg.addr);
@@ -5982,22 +5880,17 @@ static UDC_DWC3_COLD void udc_dwc3_ep_end_completed(const struct device *const d
         return;
     }
 
-    /*
-     * Control half: only the control recovery ends an EP0 transfer, and it stays
-     * RECOVERING until both halves are idle; it reclaims the TRBs itself.
-     */
+    /* EP0: only the control recovery ends an EP0 transfer, so continue it. */
     udc_dwc3_ctrl_recover_continue(dev);
 }
 
-/*
- * Endpoint Command Complete.
- */
+/* Endpoint Command Complete. */
 static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
                      struct udc_dwc3_ep_data *const ep_data, const uint32_t evt)
 {
     /*
-     * A Start Transfer completion: the index every later Update and End needs,
-     * or the Start's refusal.
+     * A Start Transfer completion. It carries the resource index that later
+     * Update and End commands need, or it reports the Start was refused.
      */
     if (FIELD_GET(UDC_DWC3_DEPEVT_CMDTYP_MASK, evt) ==
         FIELD_GET(UDC_DWC3_DEPCMD_CMDTYP_MASK, UDC_DWC3_DEPCMD_DEPSTRTXFER)) {
@@ -6010,11 +5903,10 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
             uint32_t reg = 0U;
 
             /*
-             * The event names no command instance: a late-written completion of
-             * an earlier Start (event-ring holes) can arrive while this one is
-             * open. DEPCMD, or cmd_record once overwritten, holds the open
-             * Start's own outcome, so it decides; the event only when neither
-             * holds it.
+             * The event does not say which Start it belongs to. A late event
+             * from an earlier Start can arrive while this one is open.
+             * So DEPCMD (or cmd_record, if DEPCMD was overwritten) decides.
+             * The event decides only when neither holds this Start.
              */
             switch (udc_dwc3_cmd_outcome(dev, ep_data, UDC_DWC3_DEPCMD_DEPSTRTXFER,
                              &reg)) {
@@ -6041,9 +5933,10 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
             }
         } else if (!ok) {
             /*
-             * No Start open: an earlier Start's refusal, already handled when
-             * udc_dwc3_depcmd_start_xfer() saw it. Acting on it would tear down
-             * whatever runs now.
+             * No Start is open, so this is an earlier Start's refusal. It was
+             * handled when that Start was settled: by the post-poll, the next
+             * pre-poll or udc_dwc3_ep_resolve_cmd(). Acting on it again would
+             * tear down the transfer that runs now.
              */
             LOG_WRN_RATELIMIT("EP%02x Start Transfer refusal 0x%08x while the "
                       "endpoint is %s: an earlier Start's, discarded",
@@ -6054,10 +5947,10 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
             udc_dwc3_adopt_xferrscidx_evt(dev, ep_data, idx);
         }
 
-        /* Buffers armed while the Start was open: their Update is owed now. */
+        /* Buffers armed while the Start was open need an Update now. */
         udc_dwc3_ep_update_owed(dev, ep_data);
 
-        /* A recovery waiting on this Start's outcome goes on. */
+        /* Continue any recovery that was waiting for this Start. */
         if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0U) {
             udc_dwc3_ctrl_recover_continue(dev);
         } else if (udc_dwc3_ep_recovery_owed(dev, ep_data)) {
@@ -6068,14 +5961,13 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
 
     if (!udc_dwc3_ep_is_ending(ep_data)) {
         /*
-         * Stale: discard. CMDIOC is set only on Start and End Transfer, so this
-         * is an End Transfer completion for an endpoint that is not ending. The
-         * endpoint was torn down and re-enabled since (e.g. an alt-setting
-         * switch), so it belongs to a previous incarnation.
+         * A stale event, so discard it. CMDIOC is set only on Start and End
+         * Transfer, so this is an End completion on an endpoint that is not
+         * ending. It belongs to an earlier use of the endpoint, before it was
+         * disabled and enabled again (e.g. an alt-setting switch).
          *
-         * Handling it would reset the new transfer to IDLE and drop its fresh
-         * resource index; Update Transfer would then be refused and recovery
-         * would take a second transfer resource for the same endpoint.
+         * Handling it would reset the new transfer to IDLE and lose its
+         * resource index. Then Update Transfer would be refused.
          */
         LOG_WRN_RATELIMIT("EpCmdCmplt on EP%02x with no End Transfer "
                   "outstanding (%s): discarded",
@@ -6088,17 +5980,17 @@ static void udc_dwc3_on_ep_cmd_cmplt(const struct device *const dev,
 }
 
 /*
- * Log a Link State Change event, rate-limited by repetition.
+ * Log a Link State Change event.
  *
- * A state different from the last one always prints. Repeats of the same state
- * print once per UDC_DWC3_EVT_LINK_LOG_EVERY, with the run length. The raw event
+ * A new state always prints. A repeated state prints once every
+ * UDC_DWC3_EVT_LINK_LOG_EVERY times, with the repeat count. The raw event
  * word is logged so the decode can be checked against the databook.
  */
 static UDC_DWC3_COLD void udc_dwc3_log_link_event(const struct device *const dev,
                     const uint32_t evt, const uint32_t dsts)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const uint32_t link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
+    const uint32_t              link = FIELD_GET(UDC_DWC3_DEVT_EVTINFO_LINKSTATE_MASK, evt);
 
     priv->diag.evt_link_total++;
 
@@ -6120,9 +6012,7 @@ static UDC_DWC3_COLD void udc_dwc3_log_link_event(const struct device *const dev
     }
 }
 
-/*
- * An event the dispatch has no handler for: skipped, never assumed impossible.
- */
+/* Log and skip an event that has no handler. */
 static UDC_DWC3_COLD void udc_dwc3_evt_unknown(const struct device *const dev,
                            const uint32_t evt)
 {
@@ -6135,27 +6025,28 @@ static UDC_DWC3_COLD void udc_dwc3_evt_unknown(const struct device *const dev,
 }
 
 /*
- * XferNotReady on a non-control, non-video endpoint (DEPCFG enables it nowhere
- * else): the host asked and the controller answered NRDY.
+ * XferNotReady on a non-control, non-video endpoint. The host asked for data
+ * and the controller answered NRDY. DEPCFG enables this event on no other
+ * non-control endpoint.
  *
- * Nothing armed: the normal case, ignored. TRBs armed: the controller and the
- * driver disagree about the ring, and the event's Transfer Active bit says how:
- *   active = 1  a transfer runs, but the controller found no TRB it owns.
- *               Update Transfer makes it fetch the armed TRB again. It needs a
- *               RUNNING transfer's resource index.
- *   active = 0  no transfer runs: recover the endpoint. udc_dwc3_ep_recover()
- *               ends the transfer the driver still believes in (the controller
- *               wins; once the End is posted, repeats are ignored), or, with
- *               none, retires written-back TRBs and starts at the tail.
- * A command still unresolved on the endpoint: wait. The host retries, so the
- * event repeats.
+ * With nothing armed, this is normal and is ignored. With TRBs armed, the
+ * controller and the driver disagree about the ring. The Transfer Active bit
+ * says how.
+ *   active = 1  A transfer runs, but the controller found no TRB it owns.
+ *               Update Transfer makes it fetch the armed TRBs again. This
+ *               needs a RUNNING transfer's resource index.
+ *   active = 0  No transfer runs, so recover the endpoint.
+ *               udc_dwc3_ep_recover() ends the transfer the driver still
+ *               has, or else retires finished TRBs and starts a new transfer.
+ * If a command is still open on the endpoint, wait. The host retries, so the
+ * event comes again.
  */
 static void udc_dwc3_on_xfer_not_ready_nonctrl(const struct device *const dev,
                            struct udc_dwc3_ep_data *const ep_data,
                            const uint32_t evt)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const bool active = (evt & UDC_DWC3_DEPEVT_STATUS_XFER_ACTIVE) != 0U;
+    const bool                  active = (evt & UDC_DWC3_DEPEVT_STATUS_XFER_ACTIVE) != 0U;
 
     if (!udc_dwc3_ep_ring_outstanding(ep_data) || udc_dwc3_ep_cmd_busy(ep_data)) {
         return;
@@ -6178,19 +6069,22 @@ static void udc_dwc3_on_xfer_not_ready_nonctrl(const struct device *const dev,
 }
 
 /*
- * Endpoint event (DEPEVT, bit 0 = 0): bits 5:1 the physical endpoint, bits 9:6
- * the kind. Both are decoded and the endpoint validated and looked up once here;
- * the handlers take the results. Endpoint events are never logged: every
- * healthy transfer raises them, and a log line costs a synchronous UART write in
- * this thread. Physical endpoints 0 and 1 are the two halves of EP0 (control
- * state machine); the others take the generic ring handler.
+ * Endpoint event (DEPEVT, bit 0 = 0). Bits 5:1 are the physical endpoint and
+ * bits 9:6 the event kind. Both are decoded here once, and the handlers get
+ * the results.
+ *
+ * Endpoint events are not logged here. Every healthy transfer raises them,
+ * and a log line costs a synchronous UART write in this thread.
+ *
+ * Physical endpoints 0 and 1 are the two halves of EP0 and go to the control
+ * state machine. The others go to the ring handlers.
  */
 static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uint32_t evt)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    const uint32_t epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
-    const uint32_t kind = FIELD_GET(UDC_DWC3_DEPEVT_KIND_MASK, evt);
-    struct udc_dwc3_ep_data *ep_data;
+    const uint32_t                      epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+    const uint32_t                      kind = FIELD_GET(UDC_DWC3_DEPEVT_KIND_MASK, evt);
+    struct udc_dwc3_ep_data            *ep_data;
 
     if ((evt & UDC_DWC3_DEPEVT_RSVD_MASK) != 0U) {
         udc_dwc3_evt_unknown(dev, evt);
@@ -6207,7 +6101,7 @@ static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uin
 
     ep_data = _EP_DATA_FROM_EPN(cfg, epn);
 
-    /* Command completion: one handler for every endpoint, EP0 included. */
+    /* Command completion: one handler for every endpoint, including EP0. */
     if (kind == UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_EPCMDCMPLT(0))) {
         udc_dwc3_on_ep_cmd_cmplt(dev, ep_data, evt);
         return;
@@ -6224,7 +6118,7 @@ static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uin
         case UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_XFERNOTREADY(0)):
             udc_dwc3_on_ctrl_xnr(dev, evt, is_in);
             break;
-        /* EP0 uses no TRB that raises XferInProgress. */
+        /* EP0 TRBs never raise XferInProgress. */
         default:
             udc_dwc3_evt_unknown(dev, evt);
             break;
@@ -6234,8 +6128,8 @@ static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uin
 
     switch (kind) {
     /*
-     * Both completion events retire TRBs and mean success; which one the
-     * controller raises depends only on the TRB control bits (Table 4-8).
+     * Both completion events retire TRBs. Which one the controller raises
+     * depends on the TRB control bits (Table 4-8).
      */
     case UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_XFERCOMPLETE(0)):
         udc_dwc3_on_xfer_done_nonctrl(dev, ep_data, true);
@@ -6243,7 +6137,6 @@ static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uin
     case UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_XFERINPROGRESS(0)):
         udc_dwc3_on_xfer_done_nonctrl(dev, ep_data, false);
         break;
-    /* Enabled on every non-control endpoint except video (DEPCFG). */
     case UDC_DWC3_DEPEVT_KIND(UDC_DWC3_DEPEVT_XFERNOTREADY(0)):
         udc_dwc3_on_xfer_not_ready_nonctrl(dev, ep_data, evt);
         break;
@@ -6254,8 +6147,8 @@ static void udc_dwc3_dispatch_ep_event(const struct device *const dev, const uin
 }
 
 /*
- * Device event (bit 0 = 1): rare, so the logging decision lives here. Returns
- * false if a reset/error did not fit in the stack's queue.
+ * Device event (bit 0 = 1). These are rare, so they are logged here.
+ * Returns false if a reset or error event did not fit in the stack's queue.
  */
 static UDC_DWC3_COLD bool udc_dwc3_dispatch_dev_event(const struct device *const dev,
                               const uint32_t evt)
@@ -6265,9 +6158,8 @@ static UDC_DWC3_COLD bool udc_dwc3_dispatch_dev_event(const struct device *const
 
     /*
      * Link changes have their own rate-limited log. Overflow and generic
-     * command completions can arrive faster than the console prints, and a
-     * failing endpoint command is logged by udc_dwc3_on_ep_cmd_cmplt(). DSTS
-     * only names the event in a log line, so it is read only for one.
+     * command completions are not logged, because they can arrive faster than
+     * the console prints. DSTS is read only when a line is printed.
      */
     if (evt_type == UDC_DWC3_DEVT_ULSTCHNG) {
         udc_dwc3_log_link_event(dev, evt, sys_read32(base + UDC_DWC3_DSTS));
@@ -6277,7 +6169,7 @@ static UDC_DWC3_COLD bool udc_dwc3_dispatch_dev_event(const struct device *const
     }
 
     switch (evt_type) {
-    /* Link and bus events: udc_dwc3_link_event() owns all of them. */
+    /* udc_dwc3_link_event() handles all link and bus events. */
     case UDC_DWC3_DEVT_USBRST:
     case UDC_DWC3_DEVT_CONNECTDONE:
     case UDC_DWC3_DEVT_DISCONNEVT:
@@ -6300,20 +6192,19 @@ static UDC_DWC3_COLD bool udc_dwc3_dispatch_dev_event(const struct device *const
 }
 
 /*
- * Dispatch one event word: bit 0 separates endpoint from device events, and
- * each kind is decoded once below. Caller holds the UDC mutex (the drain takes
- * it once per pass, not per event; the event thread is cooperative anyway) and
- * clears priv->diag.dispatch_evt when its dispatching is over.
+ * Dispatch one event word. Bit 0 tells endpoint events from device events.
+ * The caller holds the UDC mutex. It clears priv->diag.dispatch_evt when it
+ * has finished dispatching.
  *
- * Returns false only if a reset/error did not fit in the stack's queue: the
- * event is dispatched again. An endpoint event always succeeds (a completion
- * that does not fit is already on the stack's list).
+ * Returns false only if a reset or error event did not fit in the stack's
+ * queue. The event is then dispatched again. An endpoint event always
+ * returns true.
  */
 static bool udc_dwc3_dispatch_event(const struct device *const dev, const uint32_t evt)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-    /* Published for udc_dwc3_heartbeat_worker(), which runs on another thread. */
+    /* Lets udc_dwc3_heartbeat_worker() see a dispatch that gets stuck. */
     priv->diag.dispatch_evt = evt;
 
     if ((evt & BIT(0)) == 0U) {
@@ -6324,9 +6215,7 @@ static bool udc_dwc3_dispatch_event(const struct device *const dev, const uint32
     return udc_dwc3_dispatch_dev_event(dev, evt);
 }
 
-/*
- * Dispatch one event word outside a drain pass, taking the UDC mutex.
- */
+/* Dispatch one event word outside a drain pass, taking the UDC mutex. */
 static __maybe_unused void udc_dwc3_handle_event(const struct device *const dev,
                            const uint32_t evt)
 {
@@ -6340,7 +6229,7 @@ static __maybe_unused void udc_dwc3_handle_event(const struct device *const dev,
 }
 
 #ifdef CONFIG_UDC_DWC3_SHELL
-/* Shell only (dwc3 events). */
+/* Used by the "dwc3 events" shell command. */
 static const char *udc_dwc3_drain_state_name(const uint32_t state)
 {
     switch (state) {
@@ -6353,16 +6242,23 @@ static const char *udc_dwc3_drain_state_name(const uint32_t state)
 #endif /* CONFIG_UDC_DWC3_SHELL */
 
 /*
- * Check readiness for RunStop=0 (SPEC 4.1.8 Table 4-7): EP0 in its Setup stage
- * (no control transfer, no control recovery, no End Transfer on either half) and
- * no transfer on any other endpoint.
- * Returns -1 when ready, else the first physical endpoint still busy (0 for
- * either EP0 half).
+ * Heartbeat and controller recovery
+ *
+ * A periodic heartbeat checks the event ring and the endpoints. It runs the
+ * controller recovery when the controller needs a reset.
+ */
+
+/*
+ * Check that the controller is ready for RunStop=0 (SPEC 4.1.8 Table 4-7).
+ * EP0 must be idle with no End Transfer on either half. Every other endpoint
+ * must be idle.
+ * Returns -1 when ready. Otherwise returns the first busy physical endpoint
+ * (0 for either EP0 half).
  */
 static UDC_DWC3_COLD int udc_dwc3_stop_blocker(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    const struct udc_dwc3_data *const priv = udc_get_private(dev);
+    const struct udc_dwc3_data *const   priv = udc_get_private(dev);
 
     if (priv->ctrl.state != UDC_DWC3_CTRL_IDLE ||
         udc_dwc3_ep_is_ending(&cfg->ep_data_out[0]) ||
@@ -6387,29 +6283,29 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
 static void udc_dwc3_drain_helper(const struct device *const dev);
 
 /*
- * Heartbeat timer callback: kicks the drain and submits the heartbeat worker.
+ * Heartbeat timer callback. It kicks the drain and submits the heartbeat
+ * worker.
  *
- * ISR context: only cheap, ISR-safe work (MMIO read, arithmetic,
- * k_work_submit_to_queue()). No mutex, no logging (LOG_MODE_MINIMAL busy-waits
- * on the UART for milliseconds with interrupts off), no recovery; those belong
- * in udc_dwc3_heartbeat_worker().
+ * This runs in ISR context, so it does only cheap work. Locking, logging and
+ * recovery are done in udc_dwc3_heartbeat_worker(). Logging is kept out
+ * because LOG_MODE_MINIMAL busy-waits on the UART.
  */
 static UDC_DWC3_COLD void udc_dwc3_heartbeat_expiry(struct k_timer *const timer)
 {
     struct udc_dwc3_data *const priv =
         CONTAINER_OF(timer, struct udc_dwc3_data, heartbeat_timer);
-    const struct device *const dev = priv->dev;
+    const struct device *const  dev = priv->dev;
 
     udc_dwc3_drain_helper(dev);
 
     priv->diag.hb_expiries++;
 
-    /* Submit time; the worker reads it on entry to measure the queue wait. */
+    /* Submit time. The worker uses it to measure the queue delay. */
     if (priv->diag.hb_submit_t == 0U) {
         priv->diag.hb_submit_t = k_cycle_get_32();
     }
 
-    /* 0 = already pending: the previous beat has not run, so drop this one. */
+    /* 0 means the previous beat has not run yet, so this one is dropped. */
     if (k_work_submit_to_queue(udc_get_work_q(),
                    &priv->heartbeat_work) == 0) {
         priv->diag.hb_coalesced++;
@@ -6418,14 +6314,16 @@ static UDC_DWC3_COLD void udc_dwc3_heartbeat_expiry(struct k_timer *const timer)
 
 
 /*
- * Is the empty slot at evt.next provably lost rather than merely late?
+ * Returns true if the empty slot at evt.next is surely lost, not just late.
+ * It is lost if a later slot is already written, because the controller
+ * fills the ring in order.
  */
 static UDC_DWC3_COLD bool udc_dwc3_evt_lookahead_lost(const struct device *const dev,
                     const uint32_t gc)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    uint32_t owed = gc / sizeof(uint32_t);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    uint32_t                            owed = gc / sizeof(uint32_t);
 
     if (owed > (CONFIG_UDC_DWC3_EVENTS_NUM - 1u)) {
         owed = CONFIG_UDC_DWC3_EVENTS_NUM - 1u;
@@ -6442,25 +6340,25 @@ static UDC_DWC3_COLD bool udc_dwc3_evt_lookahead_lost(const struct device *const
     return false;
 }
 
-/* Defined below; udc_dwc3_drain_slot_is_dead() decides, this performs it. */
+/* Skips a dead slot. udc_dwc3_drain_slot_is_dead() decides when. */
 static uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
                     const uint32_t gc, const bool frozen,
                     const uint32_t gaveup_ms);
 
 
 /*
- * Resolve an endpoint with a command outstanding by asking the controller
- * directly, and promote it to the matching UNKNOWN state once the command has
- * been executing past UDC_DWC3_CMD_UNKNOWN_MS.
+ * Settle an open Start or End command by reading its outcome from DEPCMD.
+ * If it is still executing after UDC_DWC3_CMD_UNKNOWN_MS, mark the endpoint
+ * START_UNKNOWN or END_UNKNOWN.
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev,
                     struct udc_dwc3_ep_data *const ep_data)
 {
-    const bool starting = (ep_data->xfer.state == UDC_DWC3_EP_STARTING) ||
+    const bool                starting = (ep_data->xfer.state == UDC_DWC3_EP_STARTING) ||
                   (ep_data->xfer.state == UDC_DWC3_EP_START_UNKNOWN);
-    const bool ending = (ep_data->xfer.state == UDC_DWC3_EP_ENDING) ||
+    const bool                ending = (ep_data->xfer.state == UDC_DWC3_EP_ENDING) ||
                 (ep_data->xfer.state == UDC_DWC3_EP_END_UNKNOWN);
-    uint32_t reg = 0U;
+    uint32_t                  reg = 0U;
     enum udc_dwc3_cmd_outcome out;
 
     if (!starting && !ending) {
@@ -6475,22 +6373,19 @@ static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev
     switch (out) {
     case UDC_DWC3_CMD_OTHER:
         /*
-         * DEPCMD was overwritten with no record kept (see
-         * udc_dwc3_cmd_outcome()), so our command's outcome is unknown. Not
-         * expected: every overwrite goes through udc_dwc3_depcmd()'s
-         * pre-poll, which keeps the record, except the first command on an
-         * endpoint. Treat it as still executing: the CMDIOC Command Complete
-         * still resolves it, and past the deadline the endpoint goes UNKNOWN
-         * for the quiescence door.
+         * DEPCMD was overwritten and no record holds our command, so its
+         * outcome is unknown. This is not expected, because udc_dwc3_depcmd()
+         * keeps a record before it overwrites DEPCMD.
+         * Treat the command as still executing. Its Command Complete event
+         * can still settle it. After the deadline the endpoint goes UNKNOWN.
          */
         __fallthrough;
 
     case UDC_DWC3_CMD_UNKNOWN:
         /*
-         * Still executing is not UNKNOWN until the deadline passes; after
-         * it, mark the endpoint UNKNOWN explicitly. UNKNOWN refuses every
-         * further Start and End, so this command's outcome (in DEPCMD, or
-         * in cmd_record once overwritten) stays readable.
+         * The command is still executing. After the deadline, mark the
+         * endpoint UNKNOWN. An UNKNOWN endpoint gets no further Start or End,
+         * so this command's outcome stays readable in DEPCMD or cmd_record.
          */
         if (udc_dwc3_ep_is_unknown(ep_data) ||
             k_cyc_to_ms_near32(k_cycle_get_32() - ep_data->cmd.cmd_t0) <
@@ -6515,8 +6410,8 @@ static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev
     case UDC_DWC3_CMD_ERROR:
         if (ending) {
             /*
-             * End refused: the transfer still runs and owns its
-             * resource. Restore its index, or RUNNING is a dead end.
+             * The End was refused, so the transfer still runs and owns
+             * its resource. Restore its resource index.
              */
             LOG_WRN("EP%02x End Transfer had failed unobserved "
                 "(0x%08x); the transfer is still running",
@@ -6524,7 +6419,7 @@ static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev
             udc_dwc3_ep_end_refused(dev, ep_data);
             return;
         }
-        /* Start refused, its Command Complete lost: as if it had arrived. */
+        /* The Start was refused and its event was lost. Handle it now. */
         udc_dwc3_ep_start_refused(dev, ep_data, "DEPCMD", reg, false);
         return;
 
@@ -6532,10 +6427,9 @@ static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev
     default:
         if (ending) {
             /*
-             * Proven, not timed out: DEPCMD (or the record kept when
-             * it was overwritten) shows our End Transfer completed
-             * successfully. The type is checked, and the Start/End
-             * refusals guarantee it is ours, so the resource is free.
+             * DEPCMD (or cmd_record) shows our End Transfer completed
+             * successfully, so the resource is free. The command type
+             * was checked, so this result is our End's.
              */
             if (ep_data->xfer.state == UDC_DWC3_EP_END_UNKNOWN) {
                 LOG_WRN("EP%02x End Transfer resolved late: the "
@@ -6552,19 +6446,21 @@ static UDC_DWC3_COLD void udc_dwc3_ep_resolve_cmd(const struct device *const dev
 
 
 /*
- * Per-endpoint sweep: one pass per heartbeat, two rules, no policy, no timer.
+ * Per-endpoint sweep, run once per heartbeat.
  *
- * The event ring on this part loses writes, so nothing here relies on events.
- * Each question has an answer that a lost event cannot affect:
+ * Events can be lost on this part, so the sweep reads state that a lost event
+ * cannot hide:
  *
  *   what a command did          -> DEPCMD: CmdAct, CmdStatus, XferRscIdx
  *   what a transfer did         -> the TRB: HWO, and BUFSIZ written back
  *
- * Whether the host is starved is not observable here: non-control endpoints get
- * no XferNotReady (it is enabled on EP0 only), and no timer may stand in for it.
+ * A host waiting for data is not detected here. That is the job of
+ * XferNotReady (udc_dwc3_on_xfer_not_ready_nonctrl()). There is no inactivity
+ * timeout either. An OUT endpoint with an armed TRB and no completions is
+ * waiting for the host, and a timer cannot tell that from a fault.
  *
- * Control endpoints are not swept: EP0 is a stage machine, not a ring, recovered
- * by Set Stall and a fresh SETUP arm in udc_dwc3_ctrl_ep_recover().
+ * EP0 is not swept. It is a stage machine, not a ring, and
+ * udc_dwc3_ctrl_ep_recover() handles it.
  */
 static UDC_DWC3_COLD void udc_dwc3_ep_sweep(const struct device *const dev,
                   struct udc_dwc3_ep_data *const ep_data)
@@ -6575,30 +6471,26 @@ static UDC_DWC3_COLD void udc_dwc3_ep_sweep(const struct device *const dev,
         return;
     }
 
-    /*
-     * RULE 1: settle any command whose Command Complete never arrived, by
-     * reading DEPCMD. Also promotes an unresolvable command to
-     * START_UNKNOWN / END_UNKNOWN.
-     */
+    /* Rule 1: settle a command whose Command Complete never arrived. */
     udc_dwc3_ep_resolve_cmd(dev, ep_data);
 
-    /* A command still owns this endpoint (this includes both UNKNOWN states): leave it. */
+    /* A command is still open (or UNKNOWN), so leave the endpoint alone. */
     if (udc_dwc3_ep_cmd_busy(ep_data)) {
         return;
     }
 
-    /* A recovery left owing work - e.g. a Start settled by the resolver - goes on. */
+    /* Continue a recovery that still has work to do. */
     if (udc_dwc3_ep_recovery_owed(dev, ep_data)) {
         udc_dwc3_ep_recover(dev, ep_data);
         return;
     }
 
-    /* A Start settled by the resolver (its Command Complete lost) may owe an Update. */
+    /* A Start settled above may still owe an Update. */
     udc_dwc3_ep_update_owed(dev, ep_data);
 
     /*
-     * RULE 2: retire every completion already written back. udc_dwc3_pop_trb()
-     * checks HWO and BUFSIZ in memory, so this recovers a lost XferComplete.
+     * Rule 2: retire every TRB the controller has finished. This reads the
+     * TRBs in memory, so it covers a lost XferComplete.
      */
     {
         const uint32_t got = udc_dwc3_drain_completed(dev, ep_data);
@@ -6610,9 +6502,8 @@ static UDC_DWC3_COLD void udc_dwc3_ep_sweep(const struct device *const dev,
     }
 
     /*
-     * A live ring on an IDLE endpoint means no transfer was started: a reset
-     * path cleared the state while buffers stayed armed. The arm path starts
-     * from IDLE, so this only catches teardown orphans. Start the transfer.
+     * Armed TRBs on an IDLE endpoint mean a reset path cleared the state
+     * while buffers stayed armed. Start the transfer for them.
      */
     if (ep_data->xfer.state == UDC_DWC3_EP_IDLE &&
         udc_dwc3_ep_ring_outstanding(ep_data)) {
@@ -6620,13 +6511,6 @@ static UDC_DWC3_COLD void udc_dwc3_ep_sweep(const struct device *const dev,
             "starting it", ep_data->cfg.addr);
         (void)udc_dwc3_depcmd_start_xfer(dev, ep_data);
     }
-
-    /*
-     * No rule 3 (inactivity timer), deliberately. A non-control OUT endpoint
-     * holding a controller-owned TRB and retiring nothing is the normal idle
-     * state: it waits for the host. No timeout can tell that from a fault; a
-     * timer here tore down healthy transfers on quiet endpoints.
-     */
 }
 
 /* Called only from udc_dwc3_heartbeat_worker(), with the UDC mutex held. */
@@ -6635,15 +6519,14 @@ static UDC_DWC3_COLD void udc_dwc3_recover_all(const struct device *const dev)
     const struct udc_dwc3_config *const cfg = dev->config;
 
     /*
-     * EP0: only settle an open command outcome from DEPCMD; the control stages
-     * are event-driven. Without this, a control half whose End Transfer
-     * Command Complete is lost stays ENDING forever (there is no EP0
-     * watchdog). Passive: reads DEPCMD and acts only on proof.
+     * EP0: only settle open commands from DEPCMD. The control stages are
+     * driven by events. Without this, an EP0 half whose End Transfer event
+     * was lost would stay ENDING.
      */
     udc_dwc3_ep_resolve_cmd(dev, &cfg->ep_data_out[0]);
     udc_dwc3_ep_resolve_cmd(dev, &cfg->ep_data_in[0]);
 
-    /* A control-endpoint recovery waiting on one of those outcomes goes on. */
+    /* Continue a control recovery that was waiting for one of them. */
     udc_dwc3_ctrl_recover_continue(dev);
 
     for (int i = 1; i < cfg->num_in_eps; i++) {
@@ -6654,32 +6537,28 @@ static UDC_DWC3_COLD void udc_dwc3_recover_all(const struct device *const dev)
     }
 }
 
-/*
- * Periodic liveness work: observe the drain, run recovery, report.
- *
- * Driven by a timer, not an event count, so it keeps reporting during event
- * loss. Runs off the drain thread: ~700 characters at ~87 us each under
- * CONFIG_LOG_MODE_MINIMAL is ~60 ms of synchronous console with the ring undrained.
- */
 static void udc_dwc3_ctrl_setup_wd_check(const struct device *const dev);
 
+/*
+ * Periodic health work: check the drain, run recovery, and report.
+ *
+ * A timer drives it, so it keeps running when events are lost. It runs on the
+ * work queue, not the drain thread, because its log lines are slow to print.
+ */
 static void udc_dwc3_heartbeat_worker(struct k_work *work)
 {
 
-    struct udc_dwc3_data *const priv =
+    struct udc_dwc3_data *const         priv =
         CONTAINER_OF(work, struct udc_dwc3_data, heartbeat_work);
-    const struct device *const dev = priv->dev;
+    const struct device *const          dev = priv->dev;
     const struct udc_dwc3_config *const cfg = dev->config;
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const uint32_t d_evt = priv->diag.dispatch_evt;
-    /*
-     * No register read here: udc_dwc3_drain_helper() made this beat's single
-     * read; use the published value.
-     */
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const uint32_t                      d_evt = priv->diag.dispatch_evt;
+    /* GEVNTCOUNT as read by udc_dwc3_drain_helper() on this beat. */
     const uint32_t gc = priv->evt.gc_last;
     const uint32_t hb_now = k_cycle_get_32();
 
-    /* Every run counts itself before anything here can block or return. */
+    /* Count this beat first, before anything can block or return. */
     if (priv->diag.hb_beats != 0U) {
         const uint32_t gap = k_cyc_to_ms_near32(hb_now - priv->diag.hb_last_t);
 
@@ -6691,9 +6570,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     priv->diag.hb_beats++;
 
     /*
-     * Sum of the fault counters. If unchanged, the stats line would only
-     * repeat, yet still cost the drain thread ~35 ms; skip it (until the force
-     * interval).
+     * Sum of the fault counters. If it has not changed, the stats line is
+     * skipped until the force interval. Printing it takes a long time.
      */
     const uint32_t stats_sig = priv->diag.evt_late + priv->diag.evt_gaveup +
                    priv->diag.evt_missed +
@@ -6709,9 +6587,9 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
         priv->diag.stats_sig_last = stats_sig;
         priv->diag.stats_quiet_beats = 0U;
         /*
-         * Drain-thread stack headroom: the smallest never-used span seen so
-         * far. A synchronous log backend formats on that stack, so this shows
-         * whether UDC_DWC3_EVT_STACK_SIZE is enough. Printed only when measured.
+         * Lowest free stack seen so far on the event thread. It shows whether
+         * UDC_DWC3_EVT_STACK_SIZE is enough. Printed only when it can be
+         * measured.
          */
         if (IS_ENABLED(CONFIG_INIT_STACKS) &&
             IS_ENABLED(CONFIG_THREAD_STACK_INFO) &&
@@ -6728,14 +6606,14 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
         }
 
         /*
-         * Print only non-zero counters: the full ~400-character line cost
-         * ~35 ms of synchronous console (ring undrained) even when all were zero.
+         * Print only non-zero counters, to keep the line short.
          * Abbreviations: lt late, gu gaveup, sk skipped/refuted, ms missed/frozen,
          * mz midzero, sf startfail, swd setup-watchdog, kk drain kicks,
          * sp setup-pending, sr stale control buffers returned, st control stalls,
          * eh endpoint halts, sm TRB stomps, rc control reclaims, om unaligned OUT,
          * mu multi-word give-ups, la look-ahead skips, dr drain-dead reconnects,
-         * cu commands left UNKNOWN, oN/iN endpoint arms/retires.
+         * cu commands left UNKNOWN, xn XferNotReady acted on,
+         * pf failed posts (not in stats_sig), oN/iN endpoint arms/retires.
          */
         {
             char b[248];
@@ -6774,22 +6652,15 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             _P(priv->diag.ctrl_reclaim_done, " rc%u", priv->diag.ctrl_reclaim_done);
             _P(priv->diag.out_unaligned, " om%u", priv->diag.out_unaligned);
             _P(priv->diag.evt_gaveup_multi, " mu%u", priv->diag.evt_gaveup_multi);
-            /* la: skips proven by the 50 ms look-ahead, not the 1 s budget. */
             _P(priv->diag.evt_lookahead_short, " la%u", priv->diag.evt_lookahead_short);
-            /* dr: reconnects issued because the ring stopped advancing. */
             _P(priv->diag.drain_dead_resets, " dr%u", priv->diag.drain_dead_resets);
-            /* cu: Start/End outcomes promoted to UNKNOWN by the resolver. */
             _P(priv->diag.ep_cmd_unknown, " cu%u", priv->diag.ep_cmd_unknown);
-            /* xn: non-control XferNotReady acted on (TRBs armed). */
             _P(priv->diag.xnrdy_acted, " xn%u", priv->diag.xnrdy_acted);
-            /* pf: completions posted to a full usbd queue (not a trigger for this line). */
             _P(priv->diag.post_fail_total, " pf%u", priv->diag.post_fail_total);
 
             /*
-             * Per-endpoint arm/retire counts, both directions, for every
-             * non-control endpoint ever armed: an endpoint that stops shows as
-             * a number that stops. This was once the only evidence of a CDC
-             * bulk endpoint frozen while every other counter read clean.
+             * Arm and retire counts for every non-control endpoint that was
+             * ever armed. An endpoint that stops shows as a count that stops.
              */
             for (uint8_t _i = 1U; _i < cfg->num_out_eps; _i++) {
                 _P(cfg->ep_data_out[_i].diag.n_arm, " o%u:%u/%u", _i,
@@ -6823,8 +6694,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     }
 
     /*
-     * Settle what a lost event left open, from what the controller shows
-     * without events (DEPCMD, TRB write-back): udc_dwc3_recover_all().
+     * Settle what a lost event left open. This reads DEPCMD and the TRBs,
+     * not events.
      */
     udc_lock_internal(dev, K_FOREVER);
     udc_dwc3_recover_all(dev);
@@ -6834,7 +6705,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
         k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt.worker_exit_t0);
     /* Nothing taken from the ring since the previous beat. */
     const uint32_t taken = priv->evt.handled + (priv->evt.q_tail - priv->evt.q_head);
-    const bool none_taken = (taken == priv->evt.hb_last_taken);
+    const bool     none_taken = (taken == priv->evt.hb_last_taken);
 
     if (gc > 0U && none_taken) {
         priv->evt.hb_stuck_beats++;
@@ -6850,10 +6721,10 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     }
 
     /*
-     * Drain dead: events are owed, none taken for UDC_DWC3_HB_DRAIN_DEAD_MS,
-     * and kicking the semaphore has not helped. Reconnect through the
-     * controller recovery; it is the only path back onto the bus. Clear the
-     * beat count first so a failed reconnect does not re-enter on the next beat.
+     * The drain is dead. Events are pending but none were taken for
+     * UDC_DWC3_HB_DRAIN_DEAD_MS, even after kicks. Reconnect through
+     * the controller recovery. The beat count is cleared first, so a failed
+     * reconnect does not retry on the very next beat.
      */
     if ((priv->evt.hb_stuck_beats * UDC_DWC3_HEARTBEAT_MS) >= UDC_DWC3_HB_DRAIN_DEAD_MS) {
         priv->evt.hb_stuck_beats = 0U;
@@ -6868,10 +6739,7 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     }
 #endif
 
-    /*
-     * Report the bus/DMA configuration once, from here rather than from
-     * udc_dwc3_init().
-     */
+    /* Report the bus and DMA configuration once. */
     if (!priv->diag.buscfg_logged) {
         priv->diag.buscfg_logged = true;
         LOG_INF("BUSCFG: GSBUSCFG0=0x%08x GSBUSCFG1=0x%08x GUCTL=0x%08x "
@@ -6883,23 +6751,20 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             sys_read32(base + UDC_DWC3_GCTL));
     }
 
-    /* CORE debug baseline. */
+    /* Periodic core debug registers. */
     if (++priv->diag.core_dbg_beats >= UDC_DWC3_CORE_DBG_BEATS) {
         struct udc_dwc3_core_dbg dbg;
-        bool changed;
+        bool                     changed;
 
         priv->diag.core_dbg_beats = 0U;
         priv->diag.core_dbg_quiet += UDC_DWC3_CORE_DBG_BEATS;
         udc_dwc3_core_dbg_read(base, &dbg);
 
         /*
-         * Log only on change (or after the force interval): an unchanged line
-         * costs the drain thread ~17 ms of synchronous console. A real
-         * transition, e.g. LTSSM dropping to zero when the core dies, is
-         * reported at once.
+         * Log only on change, or after the force interval. A real change,
+         * such as LTSSM dropping to zero when the core dies, shows at once.
          *
-         * Never return from here: the drain report and the SETUP telemetry
-         * below still run, and logging must not decide whether they do.
+         * Do not return from here. The checks below must still run.
          */
         changed = memcmp(&dbg, &priv->diag.core_dbg_last, sizeof(dbg)) != 0;
         if (changed || priv->diag.core_dbg_quiet >= UDC_DWC3_EVT_STATS_FORCE_BEATS) {
@@ -6908,8 +6773,8 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             udc_dwc3_core_dbg_log(" hb", &dbg);
 
             /*
-             * Beats run/timer expiries since boot, beats coalesced, and the
-             * worst timer gap and work-queue delay so far.
+             * Beats run and timer expiries since boot, beats dropped, and the
+             * worst beat gap and work-queue delay so far.
              */
             LOG_INF("  HB: beats %u/%u drop %u gapmax %u ms qmax %u ms "
                 "(nominal %u)",
@@ -6932,11 +6797,9 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
     } else if (gc > 0U && priv->evt.drain.state != UDC_DWC3_DRAIN_WAITING && none_taken &&
            priv->evt.q_tail - priv->evt.q_head < UDC_DWC3_EVQ_NUM) {
         /*
-         * Events owed, none taken since the last beat, the drain is not in a
-         * late-write episode (a slot it waits on is the drain's own business:
-         * udc_dwc3_drain_slot_is_dead()), and the FIFO is not full (then it stops
-         * taking on purpose). The drain has not run.
-         * Print idle_ms, not a threshold, so the real idle time shows.
+         * Events are pending and none were taken since the last beat. The
+         * drain is not waiting on a late slot, and the FIFO is not full.
+         * So the drain has not run. Log the real idle time.
          */
         LOG_ERR_RATELIMIT("%u B pending, drain IDLE %u ms with no stall "
             "run: slot %u holds 0x%08x, DSTS=0x%08x",
@@ -6944,25 +6807,24 @@ static void udc_dwc3_heartbeat_worker(struct k_work *work)
             cfg->evt_buf[priv->evt.next],
             sys_read32(base + UDC_DWC3_DSTS));
 
-        /* Retry here rather than spinning in the drain loop. */
+        /* Wake the drain thread. */
         k_sem_give(&priv->evt_sem);
     }
 
     udc_dwc3_ctrl_setup_wd_check(dev);
 
-    /* No re-arm here on purpose: the periodic timer owns the cadence. */
+    /* No re-arm here. The timer is periodic. */
 }
 
 /*
- * One settle of a quiesce wait (the controller recovery's, udc_dwc3_disable()'s),
- * with the UDC mutex held. The End Transfer completions the wait depends on come
- * as events, which the event ring may have lost or the mutex may hold back, so
- * read the outcomes from DEPCMD instead (udc_dwc3_ep_resolve_cmd(): acts only on
- * proof, and does what the lost event would have done). A Start settled
- * successfully leaves a running transfer, which gets its End Transfer here
- * (4.1.8). EP0 goes on with its return to Setup. No other Start and no Update:
- * STOPPING refuses them (the worker, udc_dwc3_ep_recover()'s restart and
- * udc_dwc3_ep_resume()).
+ * One step of a quiesce wait, used by the controller recovery and by
+ * udc_dwc3_disable(). The caller holds the UDC mutex.
+ *
+ * The wait needs the End Transfer completions. Their events may be lost, or held
+ * back by the mutex, so the outcomes are read from DEPCMD instead
+ * (udc_dwc3_ep_resolve_cmd()). A Start that completed leaves a running transfer,
+ * and it is ended here (4.1.8). EP0 continues its return to Setup. The STOPPING
+ * state blocks any new Start or Update meanwhile.
  */
 static UDC_DWC3_COLD void udc_dwc3_quiesce_settle(const struct device *const dev)
 {
@@ -6988,21 +6850,23 @@ static UDC_DWC3_COLD void udc_dwc3_quiesce_settle(const struct device *const dev
 
 #ifdef UDC_DWC3_CONTROLLER_RECOVER
 /*
- * Controller recovery, the only path that resets the controller:
- *   1. device-initiated disconnect (SPEC 3.30b 4.1.8: End Transfer for every
- *      active transfer, then RunStop=0 and wait for DevCtrlHlt);
- *   2. core soft reset;
- *   3. reconnect as after power-on (4.1.9 -> 4.1.1).
- * Runs from the heartbeat (it sleeps), for an erratic error (3.3.2: "Software
- * must reset the controller") or an event ring that stopped advancing.
+ * Controller recovery. This is the only path that resets the controller.
+ *   1. Device-initiated disconnect (SPEC 3.30b 4.1.8). End every active
+ *      transfer, clear RunStop and wait for DevCtrlHlt.
+ *   2. Core soft reset.
+ *   3. Reconnect as after power-on (4.1.9 -> 4.1.1).
+ * It runs from the heartbeat work, because it sleeps. It is used for an erratic
+ * error (3.3.2: "Software must reset the controller") or an event ring that has
+ * stopped advancing.
  */
 static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const dev,
                        const char *const reason)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    const uint32_t gsts = sys_read32(base + UDC_DWC3_GSTS);
-    int ret;
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const uint32_t              gsts = sys_read32(base + UDC_DWC3_GSTS);
+    bool                        reconnected = false;
+    int                         ret;
 
     LOG_ERR("%s: GSTS=0x%08x "
         "BusErrAddrVld=%u GBUSERRADDR=0x%08x%08x, DSTS=0x%08x - "
@@ -7020,13 +6884,13 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
      *     controller into the 'Setup a Control-Setup TRB / Start Transfer' state"
      *   - "Issue a DEPENDXFER command for any active transfers (except for the
      *     default control endpoint 0)"
-     * UDC_DWC3_RUN_STOPPING keeps every endpoint worker from starting a new
-     * transfer. The lock is released so the drain can deliver the End Transfer
-     * completions; the transfer-state writers wake this thread on each change
-     * until no transfer is left and EP0 is at Setup. The event ring may be what
-     * failed, so each wake-up, and at least every UDC_DWC3_QUIESCE_SETTLE_MS,
-     * also settles from DEPCMD what those events would have
-     * (udc_dwc3_quiesce_settle()). Bounded wait, then stop regardless.
+     * The STOPPING state stops the endpoint workers from starting new transfers.
+     * The lock is released so the drain can deliver the End Transfer events.
+     * Each transfer state change wakes this thread, until no transfer is left
+     * and EP0 is at Setup. The event ring itself may have failed, so each
+     * wake-up (and at least every UDC_DWC3_QUIESCE_SETTLE_MS) also reads the
+     * outcomes from DEPCMD (udc_dwc3_quiesce_settle()). The wait is bounded.
+     * After it, the device is stopped anyway.
      */
     priv->run.state = UDC_DWC3_RUN_STOPPING;
     k_sem_reset(&priv->run.quiesce_sem);
@@ -7058,9 +6922,9 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
     udc_lock_internal(dev, K_FOREVER);
 
     /*
-     * STEP 2. Clear RunStop only. Keep the interrupt unmasked (unlike
-     * udc_dwc3_disable()): if nobody acknowledges events, the controller never
-     * reaches DEVCTRLHLT.
+     * STEP 2. Clear RunStop only. The interrupt stays unmasked, unlike in
+     * udc_dwc3_disable(). The controller reaches DEVCTRLHLT only after its
+     * events are acknowledged.
      */
     udc_dwc3_dctl_update(base, UDC_DWC3_DCTL_RUNSTOP, 0U);
 
@@ -7068,8 +6932,8 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
 
     /*
      * STEP 3. Wait for the halt with the mutex released, so the drain thread
-     * can acknowledge events already written. Skipping this wait once reset a
-     * live core.
+     * can acknowledge the events already written. The core is reset only after
+     * this wait.
      */
     {
         bool halted = false;
@@ -7094,15 +6958,13 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
     }
 
     /*
-     * STEP 4. Re-initialise, only now that the controller is halted and writes
-     * nothing more. The drain is shut out first, before the mutex is taken, so
-     * no pass can copy between here and the ring reset and then dispatch old
-     * events into the new session. It stays out (RESETTING) until the
-     * re-initialised ring is enabled (udc_dwc3_enable()) or this function ends;
-     * the ring and drain state are reset together in udc_dwc3_on_soft_reset().
-     * The mutex is held through udc_dwc3_init(), which sleeps 2 x
-     * UDC_DWC3_PHY_RESET_MS across the PHY reset: bounded, and the controller is
-     * stopped, so callers waiting on the mutex lose nothing.
+     * STEP 4. Re-initialise, now that the controller is halted. The drain is
+     * blocked first, before the mutex is taken. This keeps old events from
+     * being dispatched into the new session. The drain stays blocked
+     * (RESETTING) until udc_dwc3_enable() runs or this function ends.
+     * udc_dwc3_on_soft_reset() resets the ring and the drain state together.
+     * The mutex is held through udc_dwc3_init(), which sleeps across the PHY
+     * reset. The controller is stopped, so nothing waiting on the mutex is lost.
      */
     (void)udc_dwc3_evt_block(dev);
     udc_lock_internal(dev, K_FOREVER);
@@ -7110,14 +6972,10 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
     udc_dwc3_disable(dev);
 
     /*
-     * shutdown() is required: udc_dwc3_disable() stops the timer, clears
-     * RunStop and masks the IRQ, but leaves the endpoints enabled
-     * (udc_ep_config.stat.enabled stays set).
-     */
-    /*
-     * The stack may have disabled or shut the device down while the mutex was
-     * released above: bring the controller back only as far as the stack has
-     * it (initialised, enabled), never further.
+     * udc_dwc3_disable() leaves the control endpoints enabled, so shut down
+     * as well. The stack may have disabled or shut down the device while the
+     * mutex was released. Bring the controller back only as far as the stack
+     * has it (initialised, enabled).
      */
     ret = udc_dwc3_shutdown(dev);
     if (ret != 0) {
@@ -7134,14 +6992,26 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
             ret = udc_dwc3_enable(dev);
             if (ret != 0) {
                 LOG_ERR("escalation: enable failed (%d)", ret);
+            } else {
+                reconnected = true;
             }
         }
     }
 
     /*
-     * RUN in every case. udc_dwc3_enable() leaves STOPPING alone; on any other
-     * exit the controller is stopped as udc_dwc3_disable() leaves it, RUN with
-     * RunStop clear, so a later enable starts from a known state.
+     * If the device did not reconnect, throw away any events still in the
+     * FIFO. They belong to the old connection. After a reconnect, keep them:
+     * they may already be from the new one.
+     */
+    if (!reconnected) {
+        priv->evt.handled += priv->evt.q_tail - priv->evt.q_head;
+        priv->evt.q_head = priv->evt.q_tail;
+    }
+
+    /*
+     * Set RUN on every exit. If the device did not reconnect, the controller
+     * is left as udc_dwc3_disable() leaves it, with RunStop clear. A later
+     * enable then starts from a known state.
      */
     priv->run.state = UDC_DWC3_RUN;
 
@@ -7150,28 +7020,26 @@ static UDC_DWC3_COLD void udc_dwc3_controller_recover(const struct device *const
 #endif /* UDC_DWC3_CONTROLLER_RECOVER */
 
 /*
- * EP0 SETUP telemetry: reports only, never recovers.
+ * EP0 SETUP check. It only reports, and never recovers.
  *
- * The control path is event-driven: XferNotReady says which phase the host wants
- * (4.4.1/4.4.2), SetupPending on a completion reports an abandoned transfer, and
- * the next SETUP resyncs everything. A stage the host stops addressing is idle,
- * not stuck. The one case events miss, a controller that posts nothing, no
- * command has ever cured: Update Transfer, Set Stall and device-initiated
- * disconnect either did nothing or turned a self-clearing stall (or a healthy
- * idle EP0) into a dead device.
+ * The control path is driven by events. XferNotReady says which phase the host
+ * wants (4.4.1/4.4.2). SetupPending on a completion reports an abandoned
+ * transfer. The next SETUP resyncs everything. A stage the host stops using is
+ * idle, not stuck. No command fixes a controller that posts no events, so this
+ * check only logs.
  *
- * So, once per armed SETUP, it reports the one signature worth recording: a
- * SETUP in the RxFIFO that the controller has not delivered.
+ * Once per armed SETUP, it reports a SETUP that sits in the RxFIFO but has not
+ * been delivered.
  */
 static UDC_DWC3_COLD void udc_dwc3_ctrl_setup_wd_check(const struct device *const dev)
 {
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
     const struct udc_dwc3_config *const cfg = dev->config;
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    struct udc_dwc3_ep_data *const ep0_out = &cfg->ep_data_out[0];
-    uint32_t dsts;
-    uint32_t trb_ctrl;
-    bool machine_owns;
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    struct udc_dwc3_ep_data *const      ep0_out = &cfg->ep_data_out[0];
+    uint32_t                            dsts;
+    uint32_t                            trb_ctrl;
+    bool                                machine_owns;
 
     if (priv->diag.watchdog_type != UDC_DWC3_TRB_CTRL_TRBCTL_CONTROL_SETUP) {
         priv->diag.ctrl_setup_wd_beats = 0U;
@@ -7179,8 +7047,8 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_setup_wd_check(const struct device *cons
     }
 
     /*
-     * Age the armed SETUP in heartbeats. A new SETUP since the last beat
-     * restarts the count; so does a check that finds nothing to report.
+     * Age the armed SETUP in heartbeats. A new SETUP restarts the count. So
+     * does each check once the threshold is reached.
      */
     if (priv->diag.ctrl_setup_wd_gen != priv->diag.ctrl_setup_wd_seen) {
         priv->diag.ctrl_setup_wd_seen = priv->diag.ctrl_setup_wd_gen;
@@ -7207,9 +7075,9 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_setup_wd_check(const struct device *cons
     }
 
     /*
-     * Occupancy alone is not evidence: the RxFIFO is shared with every bulk
-     * OUT endpoint. Report only if nothing at all has retired since the
-     * SETUP was armed.
+     * The RxFIFO is shared with every bulk OUT endpoint, so data in it is not
+     * enough. Report only if nothing at all has retired since the SETUP was
+     * armed.
      */
     if (priv->diag.ctrl_setup_done != priv->diag.ctrl_setup_wd_snap_setup ||
         priv->diag.nonctrl_done != priv->diag.ctrl_setup_wd_snap_nonctrl) {
@@ -7218,7 +7086,7 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_setup_wd_check(const struct device *cons
         return;
     }
 
-    /* Read under the mutex: commands are posted from another queue. */
+    /* Read under the mutex, because other threads post commands. */
     udc_lock_internal(dev, K_FOREVER);
     machine_owns = udc_dwc3_ep_cmd_busy(ep0_out);
     udc_unlock_internal(dev);
@@ -7233,14 +7101,14 @@ static UDC_DWC3_COLD void udc_dwc3_ctrl_setup_wd_check(const struct device *cons
         "TRB ctrl 0x%08x) - reported, not recovered (%u so far)",
         UDC_DWC3_SETUP_WD_REPORT_MS, dsts, trb_ctrl, priv->diag.ctrl_setup_wd_fire);
 
-    /* The core's own state, passively. One report per armed SETUP. */
+    /* Dump the core's state, read-only. */
     udc_dwc3_core_state_dump(dev);
 }
 
 /* Event buffer constraint (GEVNTSIZ): at least 32 bytes. */
 BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) >= 32,
          "DWC3 event buffer must be at least 32 bytes");
-/* The event FIFO indices run free; only a power of two wraps the array index correctly. */
+/* The event FIFO indices run free, so the size must be a power of two. */
 BUILD_ASSERT(IS_POWER_OF_TWO(UDC_DWC3_EVQ_NUM), "UDC_DWC3_EVQ_NUM must be a power of two");
 /* The event FIFO must hold a whole pass. */
 BUILD_ASSERT(UDC_DWC3_EVQ_NUM >= CONFIG_UDC_DWC3_EVENTS_NUM,
@@ -7248,24 +7116,22 @@ BUILD_ASSERT(UDC_DWC3_EVQ_NUM >= CONFIG_UDC_DWC3_EVENTS_NUM,
          "to CONFIG_UDC_DWC3_EVENTS_NUM");
 
 /*
- * The 64-byte cap is not from the databook, which allows up to 64KB
- * (GEVNTSIZ.EVENTSIZ is a 16-bit byte count). Both reasons are in the message.
+ * The databook allows up to 64KB (GEVNTSIZ.EVENTSIZ is a 16-bit byte count).
+ * The 64-byte cap is this design's. The message gives the reasons.
  */
 BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
          "DWC3 event ring is capped by the AXI block on this part, and "
          "a pass's copy in the event FIFO stays within 64 bytes");
 
 /*
- * Number of fast polls for the event word (a count, not a time). A wall-clock
- * ceiling also applies; it is defined at the top of this file, next to the
- * SETUP report threshold whose floor it sets.
+ * Number of fast polls for the event word. UDC_DWC3_EVT_ARRIVE_MAX_MS also caps
+ * the wait in time.
  */
 #define UDC_DWC3_EVT_ARRIVE_FAST_POLLS      16u
 /*
- * NUDGE command, issued only to make the controller write an event. 3.2.1
- * Table 3-2 says of command 02h "the controller does not use the programmed
- * value", so it is the one generic command with no side effect. Its completion
- * event is ignored.
+ * Generic command 02h, Set Periodic Parameters. 3.2.1 Table 3-2: "the
+ * controller does not use the programmed value", so issuing it has no side
+ * effect.
  */
 #define UDC_DWC3_DGCMD_SET_PERIODIC_PARAMS  0x02u
 
@@ -7275,55 +7141,52 @@ BUILD_ASSERT(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t) <= 64,
  */
 #define UDC_DWC3_EVT_FORCE_MAX_GEVNTCOUNT           \
     ((CONFIG_UDC_DWC3_EVENTS_NUM / 2u) * sizeof(uint32_t))
-/* Minimum gap between forced commands, so a stuck slot cannot cause a command storm. */
+/* Minimum gap between forced commands, so a stuck slot does not flood commands. */
 #define UDC_DWC3_EVT_FORCE_MIN_GAP_MS   500u
 
 /* Fast phase: busy-wait between two reads of the event word. */
 #define UDC_DWC3_EVT_ARRIVE_POLL_US     1u
 
 /*
- * Make the controller write an event, to release a slot that will not fill on
+ * Make the controller write an event, to release a slot that does not fill on
  * its own. See UDC_DWC3_DGCMD_SET_PERIODIC_PARAMS for the choice of command.
- *
- * Fire and forget: the completion (device event 10) is ignored by the dispatch
- * and never waited for.
+ * The command is not waited for, and its completion event is ignored.
  */
 static UDC_DWC3_COLD void udc_dwc3_evt_force(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
     /*
-     * Only while the ring has room: each forced command adds an event, which
-     * queues behind the stuck head slot.
+     * Only while the ring has room. Each forced command adds an event behind
+     * the stuck slot.
      */
     if (priv->evt.gc_last > UDC_DWC3_EVT_FORCE_MAX_GEVNTCOUNT) {
         return;
     }
 
-    /* Not issued over a command still executing; not waited for (see above). */
+    /* Skipped if a generic command is still executing. */
     if (udc_dwc3_dgcmd(dev, UDC_DWC3_DGCMD_SET_PERIODIC_PARAMS | UDC_DWC3_DGCMD_IOC,
                0U, false) != 0) {
         return;
     }
 
     /*
-     * Logged outside the lock: the FLIR build uses CONFIG_LOG_MODE_MINIMAL,
-     * which writes to the UART in the caller's context (~45 chars, ~3.9 ms at
-     * 115200).
+     * Logged after the command is issued. With CONFIG_LOG_MODE_MINIMAL the
+     * line goes to the UART in this context, which takes a few ms.
      */
     LOG_WRN_RATELIMIT("evNUDGE s%u",
               priv->evt.next);
 }
 
 /*
- * Issue the DGCMD the drain requested. The drain must not write DGCMD itself,
- * so it hands the request here. Rate-limited by UDC_DWC3_EVT_FORCE_MIN_GAP_MS.
+ * Issue the NUDGE that the drain requested. The drain queues this work instead
+ * of writing DGCMD itself. Rate-limited by UDC_DWC3_EVT_FORCE_MIN_GAP_MS.
  */
 static void udc_dwc3_nudge_worker(struct k_work *const work)
 {
     struct udc_dwc3_data *const priv =
         CONTAINER_OF(work, struct udc_dwc3_data, nudge_work);
-    const struct device *const dev = priv->dev;
+    const struct device *const  dev = priv->dev;
 
     if (k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt.force_t0) <
                     UDC_DWC3_EVT_FORCE_MIN_GAP_MS) {
@@ -7335,19 +7198,19 @@ static void udc_dwc3_nudge_worker(struct k_work *const work)
 }
 
 /*
- * The heartbeat's only job on the event ring: restart the drain if it has
- * stopped while the controller still owes events, or while events wait in the
- * event FIFO (dispatch blocked by a reset/error post: this is its retry).
- * Nothing more is safe from this context.
+ * Restart the drain if it has stopped while events are still owed. That is,
+ * the controller still counts events, or events wait in the event FIFO (a
+ * reset/error post did not fit, and this is its retry). This runs from the
+ * heartbeat timer in ISR context, so it does nothing more.
  */
 static UDC_DWC3_COLD void udc_dwc3_drain_helper(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
 
     /*
-     * The heartbeat's one GEVNTCOUNT read. The heartbeat worker and
-     * udc_dwc3_evt_force() use priv->evt.gc_last instead of the register.
+     * The heartbeat's only GEVNTCOUNT read. The heartbeat worker and
+     * udc_dwc3_evt_force() use this saved value.
      */
     priv->evt.gc_last = udc_dwc3_gevntcount(base);
 
@@ -7363,10 +7226,16 @@ static UDC_DWC3_COLD void udc_dwc3_drain_helper(const struct device *const dev)
 }
 
 /*
- * Wait for the first word of a pass. Only this word is worth waiting for: with
- * nothing copied yet, returning without it would just spin. Busy-wait only: the
- * longer, sleeping wait is the event thread's, between passes, so a pass never
- * sleeps with the UDC mutex or the ring state in hand.
+ * Event drain
+ *
+ * The controller writes events to a ring in shared memory. The interrupt
+ * only signals that events are waiting. The drain thread copies them out
+ * and dispatches them.
+ */
+
+/*
+ * Wait briefly for an empty slot that GEVNTCOUNT says is owed. This is a short
+ * busy-wait. Longer waits happen between passes, so a pass never sleeps.
  * Returns UDC_DWC3_WAIT_ARRIVED with *evt_out set, or UDC_DWC3_WAIT_EXPIRED.
  */
 static enum udc_dwc3_wait_result udc_dwc3_evt_wait_first(const struct device *const dev,
@@ -7375,15 +7244,16 @@ static enum udc_dwc3_wait_result udc_dwc3_evt_wait_first(const struct device *co
                              uint32_t *const evt_out)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const uint32_t t0 = k_cycle_get_32();
-    const uint32_t deadline = t0 + k_ms_to_cyc_ceil32(UDC_DWC3_EVT_ARRIVE_MAX_MS);
-    uint32_t polls = 0;
-    uint32_t evt;
-    int32_t  wait_cycles;
-    enum udc_dwc3_wait_result wait_result = UDC_DWC3_WAIT_EXPIRED;
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const uint32_t                      t0 = k_cycle_get_32();
+    const uint32_t                      deadline =
+        t0 + k_ms_to_cyc_ceil32(UDC_DWC3_EVT_ARRIVE_MAX_MS);
+    uint32_t                            polls = 0;
+    uint32_t                            evt;
+    int32_t                             wait_cycles;
+    enum udc_dwc3_wait_result           wait_result = UDC_DWC3_WAIT_EXPIRED;
 
-    /* Bounded busy-wait at microsecond resolution, no yield. */
+    /* Bounded busy-wait, polling every microsecond. */
     *evt_out = UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE;
     evt_idx %= CONFIG_UDC_DWC3_EVENTS_NUM;
     while ((evt = cfg->evt_buf[evt_idx]) == UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE)
@@ -7396,14 +7266,14 @@ static enum udc_dwc3_wait_result udc_dwc3_evt_wait_first(const struct device *co
         k_busy_wait(UDC_DWC3_EVT_ARRIVE_POLL_US);
     }
 
-    /* Accumulate time spent looking; report a missed event once per episode. */
+    /* Add up the time spent looking. Report a missed event once per episode. */
     uint32_t waited_us = k_cyc_to_us_near32(k_cycle_get_32() - t0);
     priv->evt.drain.watched_us += waited_us;
     if (!priv->evt.drain.counted &&
          k_cyc_to_ms_near32(k_cycle_get_32() - priv->evt.drain.since) >= UDC_DWC3_EVT_MISSED_MS)
     {
          const uint32_t gc_now = gc;    /* this pass's single read   */
-         const bool frozen = (gc_now == priv->evt.drain.gc0);  /* vs episode open */
+         const bool     frozen = (gc_now == priv->evt.drain.gc0);  /* vs episode open */
          priv->evt.drain.counted = true;
          priv->diag.evt_missed++;
          if (frozen) {
@@ -7443,16 +7313,16 @@ static enum udc_dwc3_wait_result udc_dwc3_evt_wait_first(const struct device *co
 static UDC_DWC3_COLD void udc_dwc3_evt_reconcile_endpoints(const struct device *const dev)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    uint32_t rescued = 0U;
-    bool ctrl_rearmed = false;
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    uint32_t                            rescued = 0U;
+    bool                                ctrl_rearmed = false;
 
     udc_lock_internal(dev, K_FOREVER);
 
     for (uint32_t pass = 0U; pass < 2U; pass++) {
         struct udc_dwc3_ep_data *const eps =
             (pass == 0U) ? cfg->ep_data_in : cfg->ep_data_out;
-        const uint32_t n = (pass == 0U) ? cfg->num_in_eps : cfg->num_out_eps;
+        const uint32_t                 n = (pass == 0U) ? cfg->num_in_eps : cfg->num_out_eps;
 
         for (uint32_t i = 0U; i < n; i++) {
             struct udc_dwc3_ep_data *const e = &eps[i];
@@ -7462,9 +7332,8 @@ static UDC_DWC3_COLD void udc_dwc3_evt_reconcile_endpoints(const struct device *
             }
 
             /*
-             * Non-control: udc_dwc3_pop_trb() checks whether the
-             * controller wrote the TRB back. The TRB is not affected
-             * by a lost event, so no other test is needed.
+             * Non-control: retire every TRB the controller has written
+             * back. A lost event does not affect the TRB, so this is enough.
              */
             if (USB_EP_GET_IDX(e->cfg.addr) != 0U) {
                 rescued += udc_dwc3_drain_completed(dev, e);
@@ -7472,14 +7341,9 @@ static UDC_DWC3_COLD void udc_dwc3_evt_reconcile_endpoints(const struct device *
             }
 
             /*
-             * EP0 (where this device actually fails): re-arm SETUP only
-             * if the control machine is CTRL_IDLE and none is armed.
-             *
-             * "No SETUP armed" alone does not mean EP0 is stuck: DATA
-             * and STATUS stages have none, and the lost event may have
-             * belonged to any endpoint. Any state other than CTRL_IDLE
-             * is a transfer in progress; leave it to finish or to the
-             * control recovery.
+             * EP0: re-arm SETUP only if the control machine is idle and no
+             * SETUP is armed. In any other state a control transfer is in
+             * progress. It is left to finish, or to the control recovery.
              */
             if (USB_EP_DIR_IS_OUT(e->cfg.addr) && !ctrl_rearmed &&
                 priv->ctrl.state == UDC_DWC3_CTRL_IDLE &&
@@ -7504,42 +7368,34 @@ static UDC_DWC3_COLD void udc_dwc3_evt_reconcile_endpoints(const struct device *
 
 /*
  * Decide how many event slots the controller will never fill, and step over
- * them. Returns the number skipped; the caller adds it to the pass's single
- * GEVNTCOUNT credit.
+ * them. Returns the number skipped. The caller adds it to the pass's single
+ * GEVNTCOUNT credit. This function touches no register.
  *
- * Touches no register. GEVNTCOUNT is decrement-on-write and updated by the
- * controller concurrently, so a credit cannot be verified by reading it back
- * (a concurrent event write looks like a refused credit). The pass credits
- * everything it consumed before returning, so nothing needs verifying.
- *
- * A full ring is recoverable: the controller queues events internally and
- * writes them out once software frees space. For the overflow event, "software
- * must free up space in the Event Buffer by acknowledging more than 1 event
- * (writing a value greater than 4 to the GEVNTCOUNTn register)".
+ * A full ring is not a dead slot. The controller holds events internally and
+ * writes them once software frees space (see udc_dwc3_evt_drain()).
  */
 static UDC_DWC3_COLD uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *const dev,
                     const uint32_t gc, const bool frozen,
                     const uint32_t gaveup_ms)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
-    /* The caller decided the slot is dead; this only acts. Words owed: */
+    /* The caller has decided the slot is dead. Count the words owed. */
     uint32_t owed = gc / sizeof(uint32_t);
     if (owed > (CONFIG_UDC_DWC3_EVENTS_NUM - 1u)) {
         owed = CONFIG_UDC_DWC3_EVENTS_NUM - 1u;
     }
 
     /*
-     * How many slots to skip (the controller fills the ring in order):
-     *   - Written slot at P+j: the j slots before it were passed over and are
-     *     lost. Skip exactly those; the written slot is read normally.
-     *   - No written slot in the owed range: nothing is proved, the words may
-     *     still be in flight. Skip all but the last and hold that one back.
+     * How many slots to skip. The controller fills the ring in order.
+     *   - A written slot at P+j: the j slots before it are lost. Skip exactly
+     *     those. The written slot is read normally.
+     *   - No written slot in the owed range: the words may still be in flight.
+     *     Skip all but the last, and hold that one back.
      *
-     * The held slot is a detector. It lies inside the stuck group, so no new
-     * event can land in it; if it fills, the skipped slots filled too and the
-     * skip was wrong. udc_dwc3_copy_valid_event() counts that as
+     * The held slot is a check. If it fills, the skipped events were late, not
+     * lost, and the skip was wrong. udc_dwc3_copy_valid_event() counts that in
      * evt_skip_refuted.
      */
     uint32_t skip = 1;
@@ -7548,7 +7404,7 @@ static UDC_DWC3_COLD uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *c
     if (owed > 1)
     {
         uint32_t j = 1;
-        bool slot_valid = false;
+        bool     slot_valid = false;
         for (; j < owed; j++) {
             const uint32_t idx = (priv->evt.next + j) % CONFIG_UDC_DWC3_EVENTS_NUM;
             if (cfg->evt_buf[idx] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
@@ -7561,9 +7417,9 @@ static UDC_DWC3_COLD uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *c
     }
 
     /*
-     * Act first, log after: the log line costs ~16 ms of synchronous UART
-     * output. Skipped slots already hold the sentinel, so nothing is written
-     * back; re-writing it could only erase an event that landed meanwhile.
+     * Act first and log after, because the log line is slow. The skipped slots
+     * are already empty, so they are not written. Writing them could erase an
+     * event that has just landed.
      */
     {
         const uint32_t held         = cfg->evt_buf[priv->evt.next];
@@ -7576,17 +7432,15 @@ static UDC_DWC3_COLD uint32_t udc_dwc3_evt_skip_dead_slot(const struct device *c
         priv->evt.drain.attempts = 0;
 
         /*
-         * Watch only a held slot. Otherwise (owed was 1, or a written slot
-         * proved the loss) the next slot is where the controller writes next,
-         * and a new event there refutes nothing.
+         * Watch only a held-back slot. Otherwise the next slot is where the
+         * controller writes next, and a new event there proves nothing.
          */
         priv->evt.drain.skip_watch      = held_back;
         priv->evt.drain.skip_watch_slot = priv->evt.next;
 
         /*
-         * Fields: h = slot value, skip = slots skipped, tot = cumulative,
-         * age = wall-clock, w = time actually spent looking (less than age by
-         * console output and time not scheduled).
+         * Fields: h = slot value, skip = slots skipped, tot = total skipped,
+         * age = wall-clock time, w = time actually spent looking.
          */
         LOG_ERR("evSKIP s%u age%ums w%ums n%u gc%u h%08x %s skip%u tot%u",
             was_slot, gaveup_ms, was_watched / 1000U, was_attempts,
@@ -7607,18 +7461,16 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
                                          const uint32_t gc)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
 
     if (cfg->evt_buf[priv->evt.next] != UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE) {
         return false;
     }
 
     /*
-     * Proof, with its own shorter floor: a written slot ahead of this one
-     * means the event is lost, since the controller fills the ring in order.
-     *
-     * GEVNTCOUNT alone proves nothing: gc = 8 with both slots empty may just
-     * be two late events. Only a written slot ahead tells late from lost.
+     * A written slot ahead of this one proves the event is lost, because the
+     * controller fills the ring in order. This test has a shorter floor.
+     * GEVNTCOUNT alone cannot tell a late event from a lost one.
      */
     uint32_t wait_tims_ms = priv->evt.drain.watched_us / 1000U;
     if ((wait_tims_ms >= UDC_DWC3_EVT_LOOKAHEAD_MIN_MS) &&
@@ -7628,7 +7480,7 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
         return true;
     }
 
-    /* No proof: fall back on the timeouts, above the minimum floor. */
+    /* Without proof, use the timeouts, above the minimum floor. */
     if (wait_tims_ms < UDC_DWC3_EVT_DEAD_SLOT_MIN_MS) {
         return false;
     }
@@ -7642,17 +7494,15 @@ static bool udc_dwc3_drain_slot_is_dead (const struct device *const dev,
 }
 
 /*
- * Take one event out of the ring: copy it to the event FIFO (copy_idx past its
- * tail; the pass publishes them) and mark
- * the slot empty. The caller owns evt_idx and advances it afterwards.
+ * Take one event out of the ring. Copy it to the event FIFO, copy_idx places
+ * past the tail, and mark the slot empty. The pass publishes the copies later.
+ * The caller advances evt_idx.
  *
- * The slot is stamped CONSUMED here, not at the GEVNTCOUNT credit (written once
- * at the end of the pass), so "is this slot written?" is correct on the next lap.
+ * The slot is marked empty now, not at the GEVNTCOUNT credit at the end of the
+ * pass. So the next lap sees correctly whether the slot was written.
  *
- * Also closes out an arrival wait if one preceded this event. Called from
- * DRAIN_RUNNING (slot already written) and DRAIN_WAITING (late write arrived);
- * doing the bookkeeping here keeps attempts, since and quiet from carrying over
- * to the next event.
+ * This also ends an arrival wait, if one came before this event. That keeps
+ * the wait's counters from carrying over to the next event.
  */
 static void udc_dwc3_copy_valid_event (struct udc_dwc3_data *const priv,
                                        const struct udc_dwc3_config *const cfg,
@@ -7662,9 +7512,8 @@ static void udc_dwc3_copy_valid_event (struct udc_dwc3_data *const priv,
     cfg->evt_buf[evt_idx % CONFIG_UDC_DWC3_EVENTS_NUM] = UDC_DWC3_EVT_CONSUMED_ENTRY_VALUE;
 
     /*
-     * If the held-back slot filled, the words were late, not lost, and the
-     * skipped slots were live events thrown away. One shot: the watch is
-     * dropped on the first event either way, so a later event is not miscounted.
+     * If the held-back slot filled, the skipped events were late, not lost.
+     * The watch ends on the first event either way.
      */
     if (priv->evt.drain.skip_watch) {
         if ((evt_idx % CONFIG_UDC_DWC3_EVENTS_NUM) == priv->evt.drain.skip_watch_slot) {
@@ -7676,7 +7525,7 @@ static void udc_dwc3_copy_valid_event (struct udc_dwc3_data *const priv,
     /* Only when an arrival wait preceded this event. */
     if (priv->evt.drain.since > 0)
     {
-        /* How long the slot stayed empty (the key number for the RTL question). */
+        /* Record how long the slot stayed empty. */
         if (priv->evt.drain.quiet) {
             const uint32_t us = k_cyc_to_us_near32(
                 k_cycle_get_32() - priv->evt.drain.since);
@@ -7694,26 +7543,21 @@ static void udc_dwc3_copy_valid_event (struct udc_dwc3_data *const priv,
 }
 
 /*
- * Copy the ring into the event FIFO, return every slot in one GEVNTCOUNT
- * acknowledge and publish the copies (q_tail), before any event is dispatched.
- * Then, if a dead slot was skipped, retire what its lost event would have.
+ * Copy the ring into the event FIFO. Return all slots in one GEVNTCOUNT write,
+ * then publish the copies (q_tail). No event is dispatched here. If a dead slot
+ * was skipped, finish what its lost event would have completed.
  *
- * One acknowledge of everything is also how the databook escapes an overflow:
- * "software must free up space in the Event Buffer by acknowledging more than
- * 1 event".
+ * One write for all events also clears an overflow: "software must free up
+ * space in the Event Buffer by acknowledging more than 1 event".
  */
 static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t cap)
 {
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    enum udc_dwc3_drain_state evt_drain_state;
+    struct udc_dwc3_data *const         priv = udc_get_private(dev);
+    const mm_reg_t                      base = DEVICE_MMIO_NAMED_GET(dev, base);
+    enum udc_dwc3_drain_state           evt_drain_state;
 
-    /*
-     * The pass's only GEVNTCOUNT read, taken before any event is processed as
-     * section 1.2.56 requires (see UDC_DWC3_GEVNTCOUNT_MASK). Also updates the
-     * high-water mark.
-     */
+    /* The pass's only GEVNTCOUNT read, before any event is processed. */
     const uint32_t gc = udc_dwc3_gevntcount(base);
     priv->evt.gc_last = gc;
     if (gc > priv->diag.evt_gevntcount_hwm) {
@@ -7738,13 +7582,13 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
     uint32_t n       = 0;   /* valid events read in this pass */
     uint32_t skipped = 0;   /* dead slots stepped over in this pass */
     uint32_t evt_idx = priv->evt.next;
-    bool exit_loop   = false;
+    bool     exit_loop   = false;
     evt_drain_state  = priv->evt.drain.state;
 
     /*
-     * Read until every owed slot is accounted for, read or skipped, or the pass
-     * must stop. A skipped slot is owed too: reading past 'want' would open a
-     * wait on a slot the controller has not been asked to fill.
+     * Read until every owed slot is read or skipped, or the pass stops.
+     * Skipped slots count too, so the pass never waits on a slot beyond
+     * 'want'.
      */
     while (((n + skipped) < want) && (false == exit_loop))
     {
@@ -7775,8 +7619,8 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
                 {
                     /*
                      * Some events were read, but later ones counted by
-                     * GEVNTCOUNT have not landed yet. Stop here; a later
-                     * pass picks up the late events.
+                     * GEVNTCOUNT have not landed yet. A later pass picks
+                     * them up.
                      */
                     priv->diag.evt_midzero++;
                 }
@@ -7797,7 +7641,7 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
         {
             enum udc_dwc3_wait_result   drain_result;
 
-            /* Once per episode: its first attempt. */
+            /* On the first attempt of an episode only. */
             if (0 == priv->evt.drain.attempts) {
                 priv->evt.drain.gc0 = gc;
                 if (priv->evt.drain.gc0 > sizeof(uint32_t)) {
@@ -7817,17 +7661,16 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
             else if (drain_result == UDC_DWC3_WAIT_EXPIRED)
             {
                 /*
-                 * Slot still unwritten: end the pass and the attempt. The pass
-                 * unmasks; the next event's interrupt, or the heartbeat's kick,
-                 * starts the next attempt.
+                 * The slot is still empty, so end this pass and attempt. The
+                 * next interrupt, or the heartbeat's kick, starts the next one.
                  */
                 exit_loop = true;
                 priv->evt.drain.attempts++;
 
                 /*
-                 * After the first failed attempt, request a NUDGE: the event
-                 * may be stuck in the bus FIFO. Request only;
-                 * udc_dwc3_nudge_worker() issues the DGCMD.
+                 * After the first failed attempt, request a NUDGE, because
+                 * the event may be stuck in the bus FIFO.
+                 * udc_dwc3_nudge_worker() issues it.
                  */
                 if (priv->evt.drain.attempts == 1U) {
                     k_work_submit_to_queue (udc_get_work_q(), &priv->nudge_work);
@@ -7839,15 +7682,15 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
                         k_cyc_to_ms_near32 ( k_cycle_get_32() - priv->evt.drain.since);
 
                     /*
-                     * The NUDGE did not help either. Skip the slot if it is
-                     * dead: unwritten too long, or a later slot is written.
+                     * The NUDGE did not help. Skip the slot if it is dead,
+                     * that is, empty too long or a later slot is written.
                      */
                     priv->evt.next = evt_idx % CONFIG_UDC_DWC3_EVENTS_NUM;
                     if (udc_dwc3_drain_slot_is_dead(dev, gc))
                     {
                         /*
                          * Step over the slot and add its words to this pass's
-                         * credit. Cannot fail: it only moves the read pointer.
+                         * credit. This only moves the read pointer.
                          */
                         skipped += udc_dwc3_evt_skip_dead_slot ( dev, gc,
                             (gc == priv->evt.drain.gc0), age_ms );
@@ -7873,15 +7716,11 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
 
     /*
      * The pass's only GEVNTCOUNT write: events read plus dead slots skipped.
-     * Zero is valid (it credits nothing and clears EVNT_HANDLER_BUSY), so the
-     * write is unconditional.
+     * It is written even when zero, because that clears EVNT_HANDLER_BUSY.
      */
     udc_dwc3_gevntcount_ack (base, (n + skipped));
 
-    /*
-     * A pass that consumed everything ends IDLE, so dumps do not report a
-     * running drain that is doing nothing.
-     */
+    /* A pass that consumed everything ends IDLE. */
     if (priv->evt.drain.state == UDC_DWC3_DRAIN_RUNNING && (n + skipped) >= want) {
         priv->evt.drain.state = UDC_DWC3_DRAIN_IDLE;
     }
@@ -7890,9 +7729,9 @@ static void udc_dwc3_evt_drain(const struct device *const dev, const uint32_t ca
     priv->evt.q_tail += n;
 
     /*
-     * A dead slot was skipped: retire what its lost event would have. Last, after
-     * the write-back and the publish: it takes the UDC mutex and may block, and a
-     * ring reset meanwhile (on_soft_reset()) must find nothing left to write.
+     * An event was lost (a slot was skipped), so finish the transfers it would
+     * have completed by checking the TRB rings. This is done last, after all
+     * ring updates are saved, because it takes the mutex and may wait for it.
      */
     if (skipped > 0U) {
         udc_dwc3_evt_reconcile_endpoints(dev);
@@ -7905,15 +7744,15 @@ static void udc_dwc3_event_drain_once(const struct device *const dev);
 /*
  * Event drain thread, woken by evt_sem.
  *
- * It cannot share udc_get_work_q() with ep_data->work and heartbeat_work. The
- * copy and credit need no UDC mutex, but the dispatch after them takes it; on a
- * shared queue a blocked dispatch would hold up the next drain. Section 3.2.2.5:
- * "Software must always service the event interrupts generated by the controller."
+ * It has its own thread, separate from the UDC work queue, so new events are
+ * always taken from the ring promptly, even while the endpoint or heartbeat
+ * work holds the mutex. Section 3.2.2.5: "Software must always service the
+ * event interrupts generated by the controller."
  */
 static void udc_dwc3_event_thread(void *const p1, void *const p2, void *const p3)
 {
     struct udc_dwc3_data *const priv = p1;
-    const struct device *const dev = priv->dev;
+    const struct device *const  dev = priv->dev;
 
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
@@ -7925,17 +7764,18 @@ static void udc_dwc3_event_thread(void *const p1, void *const p2, void *const p3
 }
 
 /*
- * One pass of the event drain: copy and GEVNTCOUNT credit without the UDC mutex
- * and without sleeping or blocking, then dispatch under the mutex. Skipped
- * entirely while the ring is being re-initialised (udc_dwc3_evt_block()); the
- * interrupt then stays masked until udc_dwc3_enable(). A late head slot ends
- * the pass like any other: the drain state (DRAIN_WAITING) carries the episode
- * to the next pass, started by the next event's interrupt or the heartbeat.
+ * One pass of the event drain. First copy the new events out of the ring and
+ * tell the controller they are taken; this part never takes the mutex or
+ * sleeps. Then handle the copied events with the mutex held.
+ *
+ * Does nothing while the ring is being reset. If an event the controller
+ * counted has not been written yet, the pass ends and the next pass (the next
+ * interrupt or the heartbeat) picks it up.
  */
 static void udc_dwc3_event_drain_once(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    uint32_t room;
+    uint32_t                    room;
 
     if (priv->run.state == UDC_DWC3_RUN_RESETTING) {
         return;
@@ -7954,21 +7794,13 @@ static void udc_dwc3_event_drain_once(const struct device *const dev)
         priv->diag.dispatch_t0 = k_cycle_get_32();
         udc_lock_internal(dev, K_FOREVER);
         /*
-         * RunStop clear: a disable or the controller recovery stopped the
-         * controller while this pass waited for the mutex, and has settled or
-         * forgotten every transfer itself. The events describe the session it
-         * tore down; dispatching them would act on endpoints it reset (e.g. arm
-         * a SETUP, or report a reset to the stack). Dropped, still counted as
-         * handled: the ring did advance.
+         * If the controller has been stopped, throw these events away. They
+         * belong to the old connection, and handling them would touch
+         * endpoints that are already reset.
          *
-         * Read from driver state; DCTL only while STOPPING. RunStop is clear
-         * (a) before an enable and after a disable: udc_dwc3_stack_enabled() is
-         * false, written with RunStop under the mutex held here; (b) in the recovery
-         * from its STEP 2 on: STOPPING, which also covers its STEP 1, where
-         * RunStop is still set and the End Transfer completions must be
-         * dispatched, hence the read; (c) after a recovery that could not
-         * reconnect: the core was reset and never started (no session for
-         * events to describe), with the IRQ masked and the heartbeat stopped.
+         * Stopped means the stack has disabled the device, or the recovery has
+         * cleared RunStop. Early in the recovery RunStop is still set and its
+         * End Transfer events must be handled, so the register is checked.
          */
         const bool stopped = !udc_dwc3_stack_enabled(dev) ||
             (priv->run.state == UDC_DWC3_RUN_STOPPING &&
@@ -7976,15 +7808,13 @@ static void udc_dwc3_event_drain_once(const struct device *const dev)
               UDC_DWC3_DCTL_RUNSTOP) == 0U);
 
         /*
-         * Indices in locals, written back once: the dispatch calls would force
-         * a reload and store of each field per event. Nothing else moves them
-         * meanwhile (on_soft_reset() needs the mutex held here), and the
-         * heartbeat's handled + (tail - head) is the same before and after.
+         * Keep the indices in locals and write them back once, to save a load
+         * and store per event. Nothing else moves them while the mutex is held.
          */
         const uint32_t tail = priv->evt.q_tail;
         uint32_t head = stopped ? tail : priv->evt.q_head;
 
-        /* A reset/error post did not fit: that event again on the next pass. */
+        /* Stop at a reset/error that did not fit. The next pass retries it. */
         while (head != tail &&
                udc_dwc3_dispatch_event(dev, priv->evt.q[head % UDC_DWC3_EVQ_NUM])) {
             head++;
@@ -7995,30 +7825,27 @@ static void udc_dwc3_event_drain_once(const struct device *const dev)
         udc_unlock_internal(dev);
     }
 
-    /* FIFO full: stay masked (the ring's events would re-raise it); the heartbeat retries. */
+    /* FIFO full: stay masked, and let the heartbeat retry. */
     if (priv->evt.q_tail - priv->evt.q_head >= UDC_DWC3_EVQ_NUM) {
         return;
     }
 
     /*
-     * Unmask. Events still owed raise the interrupt again, which starts the
-     * next pass; the heartbeat (udc_dwc3_drain_helper()) is the backstop.
+     * Unmask. Events still owed raise the interrupt again and start the next
+     * pass. The heartbeat (udc_dwc3_drain_helper()) is the backstop.
      */
     udc_dwc3_evt_irq(dev, true);
 
-    /*
-     * Done last, so it records when the pass finished; see
-     * UDC_DWC3_EVT_IDLE_KICK_MS for why the exit and not the entry.
-     */
+    /* Record when the pass finished (see UDC_DWC3_EVT_IDLE_KICK_MS). */
     priv->evt.worker_exit_t0 = k_cycle_get_32();
 }
 
 /*
- * Event interrupt: mask, and wake the drain thread.
+ * Event interrupt: wake the drain thread and mask the interrupt.
  */
 static void udc_dwc3_irq_handler(void *const ptr)
 {
-    const struct device *const dev = ptr;
+    const struct device *const  dev = ptr;
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
     priv->diag.evt_isr++;
@@ -8030,7 +7857,10 @@ static void udc_dwc3_irq_handler(void *const ptr)
 }
 
 /*
- * UDC API: the interface the Zephyr USB stack calls.
+ * UDC API
+ *
+ * The functions the Zephyr USB stack calls through udc_dwc3_api, and the
+ * endpoint work item that arms queued buffers.
  */
 
 static int udc_dwc3_ep_enqueue(const struct device *const dev,
@@ -8038,7 +7868,7 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
                    struct net_buf *const buf)
 {
     struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
-    const struct udc_buf_info bi = *udc_get_buf_info(buf);
+    const struct udc_buf_info      bi = *udc_get_buf_info(buf);
 
     LOG_DBG("enq %p d=%p sz=%u ln=%u EP%02x %u:%u:%u",
         buf, buf->data, buf->size, buf->len, ep_cfg->addr, bi.setup, bi.data, bi.status);
@@ -8053,9 +7883,8 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
         udc_dwc3_ctrl_next(dev);
     } else {
         /*
-         * Process this buffer along with other waiting. Whether a transfer may
-         * start (controller running, endpoint in DALEPENA) is the worker's
-         * check, made under the mutex from driver state.
+         * Let the worker arm this buffer with the others waiting. The worker
+         * checks, under the mutex, whether a transfer may start.
          */
         if (ep_cfg->stat.enabled) {
             LOG_DBG("submitting to EP%02x", ep_cfg->addr);
@@ -8067,8 +7896,8 @@ static int udc_dwc3_ep_enqueue(const struct device *const dev,
 }
 
 /*
- * UDC API: cancel queued buffers on an endpoint. The buffers the ring holds go
- * back through the endpoint recovery once the controller has let go of them.
+ * UDC API: cancel queued buffers on an endpoint. The endpoint recovery returns
+ * the buffers on the ring once the controller has released them.
  */
 static UDC_DWC3_COLD int udc_dwc3_ep_dequeue(const struct device *const dev,
                    struct udc_ep_config *const ep_cfg)
@@ -8087,28 +7916,25 @@ static UDC_DWC3_COLD int udc_dwc3_ep_dequeue(const struct device *const dev,
 }
 
 /*
- * Re-establish an endpoint: configure it (DEPCFG Init), enable it in DALEPENA and
- * arm whatever is queued. Reached only from an enable (udc_dwc3_ep_enable(), or
- * deferred, see below, through udc_dwc3_ep_recover()); the stack never
- * enables an endpoint that is already enabled, so DEPCFG Modify is not used here.
+ * Set up an endpoint: configure it (DEPCFG Init), enable it in DALEPENA and arm
+ * whatever is queued. Called from udc_dwc3_ep_enable(), or later from
+ * udc_dwc3_ep_recover() when deferred. The stack never enables an endpoint that
+ * is already enabled, so DEPCFG Modify is not used.
  */
 static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
                   struct udc_dwc3_ep_data *const ep_data)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct net_buf *buf;
-    int ret;
+    struct net_buf             *buf;
+    int                         ret;
 
     /*
-     * Deferred (PEND_RESUME, run by udc_dwc3_ep_recover()) while:
-     *   - the endpoint is not IDLE: a transfer or an open command outcome is
-     *     still there (e.g. a disable whose End has not reported, or a Start
-     *     still open). Clear Stall, DEPCFG, the ring rebuild and Start Transfer
-     *     would act on a ring the controller owns (3.2.2.7). Its completion, or
-     *     the heartbeat sweep (resume owed), re-enters the recovery, which ends
-     *     the transfer first;
-     *   - the controller recovery is stopping the device: 4.1.8 allows no new
-     *     transfer once they are being ended. The reset that follows forgets it.
+     * Defer the resume (PEND_RESUME, run later by udc_dwc3_ep_recover()) when:
+     *   - The endpoint is not IDLE. A transfer or a command is still open, and
+     *     the controller owns the ring (3.2.2.7). Its completion, or the
+     *     heartbeat, runs the recovery again, which ends the transfer first.
+     *   - The controller is stopping or resetting. 4.1.8 allows no new transfer
+     *     once transfers are being ended.
      */
     if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0 &&
         (ep_data->xfer.state != UDC_DWC3_EP_IDLE || udc_dwc3_run_halting(priv))) {
@@ -8119,7 +7945,7 @@ static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
         return 0;
     }
 
-    /* Leave any halt on a non-control endpoint, IN or OUT. */
+    /* Clear any halt on a non-control endpoint. */
     if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
         udc_dwc3_depcmd_clear_stall(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
     }
@@ -8128,15 +7954,12 @@ static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
 
     /*
      * INVARIANT 4: DEPXFERCFG only on enable, and only once per pool generation.
-     * priv->epcfg.epoch is the device's generation (bumped by each DEPSTARTCFG,
-     * the only command that frees resources); ep_data->rsc_epoch is the
-     * generation in which this endpoint took its transfer resource. Equal values
-     * mean it already holds one.
+     * Equal epochs mean this endpoint already holds a resource.
      *
-     * An alt-setting switch is disable/enable, and re-enabling an endpoint other
-     * than epcfg.first_ep runs no DEPSTARTCFG. Without the epoch check each switch
-     * leaks a transfer resource (End Transfer does not return it) until Start
-     * Transfer fails with CmdStatus 4'h1 permanently.
+     * An alt-setting switch disables and re-enables endpoints without a
+     * DEPSTARTCFG. End Transfer does not return the resource. Without this
+     * check, each switch would take another resource until Start Transfer
+     * fails with CmdStatus 4'h1 (no resource available).
      */
     if (ep_data->rsc_epoch != priv->epcfg.epoch) {
         udc_dwc3_depcmd_ep_xfer_config(dev, ep_data);
@@ -8145,9 +7968,9 @@ static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
 
     if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
         /*
-         * The ring is rebuilt from empty. Anything still on it (the endpoint is
-         * IDLE, so the controller owns none of it) is parked first and re-armed
-         * below with the rest, so head, tail and net_buf[] match the TRBs.
+         * Rebuild the ring from empty. Buffers still on it are parked first and
+         * re-armed below. The endpoint is IDLE, so the controller owns none of
+         * them.
          */
         udc_dwc3_ep_ring_release(ep_data);
         ret = udc_dwc3_trb_nonctrl_init(dev, ep_data);
@@ -8156,13 +7979,12 @@ static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
         }
     }
 
-    /* Starting from here, the endpoint can be used */
+    /* From here on, the endpoint can be used. */
     udc_dwc3_dalepena_set(dev, ep_data->epn, true);
 
     /*
-     * Re-arm the parked buffers (left by a refused Start, or released from the
-     * ring above). Peek, arm, then remove, as udc_dwc3_ep_worker() does, for the
-     * same reason.
+     * Re-arm the parked buffers. They come from a refused Start or from the
+     * ring release above. Peek, arm, then remove, as udc_dwc3_ep_worker() does.
      */
     while (true) {
         buf = k_fifo_peek_head(&ep_data->requeue_fifo);
@@ -8178,14 +8000,14 @@ static UDC_DWC3_COLD int udc_dwc3_ep_resume(const struct device *const dev,
 
         ret = udc_dwc3_trb_bulk(dev, ep_data, buf);
         if (ret != 0) {
-            /* Not armed - it stays in the fifo for the next resume. */
+            /* Not armed. It stays in the FIFO for the next resume. */
             return ret;
         }
 
         (void)k_fifo_get(&ep_data->requeue_fifo, K_NO_WAIT);
     }
 
-    /* We might have blocked transfers earlier */
+    /* Let the worker arm buffers that waited while the endpoint was down. */
     if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
         k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
     }
@@ -8200,13 +8022,14 @@ static UDC_DWC3_COLD int udc_dwc3_ep_enable(const struct device *const dev,
                     struct udc_ep_config *const ep_cfg)
 {
     struct udc_dwc3_ep_data *const ep_data = (struct udc_dwc3_ep_data *)ep_cfg;
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const    priv = udc_get_private(dev);
 
     LOG_DBG("EP%02x, first EP%02x", ep_data->cfg.addr, priv->epcfg.first_ep);
 
     /*
-     * Refuse isochronous rather than mis-arm it (see caps.iso). The capability
-     * is not advertised; this is the backstop for a class that uses one anyway.
+     * Refuse isochronous endpoints, which this driver does not support. The
+     * capability is not advertised (see caps.iso); this catches a class that
+     * uses one anyway.
      */
     if ((ep_cfg->attributes & USB_EP_TRANSFER_TYPE_MASK) ==
         USB_EP_TYPE_ISO) {
@@ -8219,6 +8042,13 @@ static UDC_DWC3_COLD int udc_dwc3_ep_enable(const struct device *const dev,
         if (priv->epcfg.first_ep == 0) {
             priv->epcfg.first_ep = ep_cfg->addr;
         }
+        /*
+         * Reassign the transfer-resource pool once per bus reset. DEPSTARTCFG
+         * resets every endpoint, so running it again on a SET_INTERFACE that
+         * touches first_ep would tear down streaming endpoints. If it was
+         * skipped or refused, the pool keeps its assignment and the next bus
+         * reset tries again.
+         */
         if (ep_cfg->addr == priv->epcfg.first_ep && !priv->epcfg.pool_assigned) {
             priv->epcfg.pool_assigned = true;
             udc_dwc3_on_set_config_or_interface(dev);
@@ -8229,32 +8059,27 @@ static UDC_DWC3_COLD int udc_dwc3_ep_enable(const struct device *const dev,
 }
 
 /*
- * UDC API: disable an endpoint. DALEPENA is cleared, then the endpoint recovery
- * ends any transfer and returns the armed buffers as cancelled once the
- * controller has let go of them.
+ * UDC API: disable an endpoint. Clear DALEPENA, then the endpoint recovery ends
+ * any transfer and returns the armed buffers as cancelled.
  */
 static UDC_DWC3_COLD int udc_dwc3_ep_disable(const struct device *const dev,
                     struct udc_ep_config *const ep_cfg)
 {
-    struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+    struct udc_dwc3_ep_data    *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
     LOG_DBG("Disabling EP%02x", ep_cfg->addr);
 
-    /*
-     * Drop any reference the control machinery holds to this endpoint before
-     * tearing it down.
-     */
+    /* Drop the watchdog's reference to this endpoint. */
     if (priv->diag.watchdog_ep == ep_data) {
         priv->diag.watchdog_ep = NULL;
         priv->diag.watchdog_type = UDC_DWC3_WATCHDOG_TYPE_NONE;
     }
 
     /*
-     * A resume or Clear Stall owed from before must not run against an
-     * endpoint that is going away. The armed buffers are owed back cancelled:
-     * usbd_ep_disable() follows with udc_ep_dequeue(), which reaches the driver
-     * only for buffers still in the stack's queue, never for those on the ring.
+     * Replace any owed resume or Clear Stall with a dequeue. The recovery then
+     * returns the armed buffers as cancelled. udc_ep_dequeue() reaches the
+     * driver only for buffers still in the stack's queue, not those on the ring.
      */
     ep_data->xfer.pending = UDC_DWC3_EP_PEND_DEQUEUE;
 
@@ -8274,27 +8099,21 @@ static UDC_DWC3_COLD int udc_dwc3_ep_set_halt(const struct device *const dev,
                 struct udc_ep_config *const ep_cfg)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct udc_dwc3_ep_data *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+    struct udc_dwc3_ep_data    *ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
     /*
-     * Log who halted the endpoint, to tell a stack-requested halt from one the
-     * controller raised itself. A data-endpoint halt can be the first sign of
-     * a failure that shows up elsewhere (e.g. control dying after the host
-     * clears it).
+     * Log stack-requested halts, to tell them apart from halts the controller
+     * raised itself.
      */
     LOG_INF("Set halt on EP%02x (requested by the stack)", ep_cfg->addr);
 
     switch (ep_data->cfg.addr) {
     case USB_CONTROL_EP_IN:
     case USB_CONTROL_EP_OUT:
-        /* The stack rejected the control request: run control-endpoint recovery. */
+        /* The stack rejected the control request. Run the control recovery. */
         udc_dwc3_ctrl_ep_recover(dev);
         break;
     default:
-        /*
-         * cfg.stat.halted is written by udc_dwc3_depcmd_set_stall(),
-         * after the hardware has actually taken the command.
-         */
         if (!udc_dwc3_depcmd_set_stall(dev, ep_data)) {
             LOG_ERR("EP%02x Set Stall was refused by the controller; "
                 "endpoint is NOT halted", ep_data->cfg.addr);
@@ -8307,10 +8126,10 @@ static UDC_DWC3_COLD int udc_dwc3_ep_set_halt(const struct device *const dev,
 }
 
 /*
- * UDC API: ClearFeature(ENDPOINT_HALT). The host's request is recorded and the
- * endpoint recovery does the rest. -EIO when the recovery issued the Clear Stall
- * and the controller refused it (still halted), so udc_common keeps
- * cfg.stat.halted; 0 when it is done or deferred behind an End Transfer.
+ * UDC API: ClearFeature(ENDPOINT_HALT). The request is recorded and the endpoint
+ * recovery carries it out. Returns -EIO if the controller refused the Clear
+ * Stall, so udc_common keeps the endpoint halted. Returns 0 when the stall is
+ * cleared or waits for an End Transfer to finish.
  */
 static UDC_DWC3_COLD int udc_dwc3_ep_clear_halt(const struct device *const dev,
                   struct udc_ep_config *const ep_cfg)
@@ -8350,7 +8169,7 @@ static int udc_dwc3_set_address_no_op(const struct device *const dev, const uint
 static UDC_DWC3_COLD int udc_dwc3_set_address(const struct device *const dev, const uint8_t addr)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
+    uint32_t       reg;
 
     LOG_INF("Setting address to %u", addr);
 
@@ -8383,8 +8202,8 @@ static enum udc_bus_speed udc_dwc3_device_speed(const struct device *const dev)
 static int udc_dwc3_enable(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    int ret;
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
+    int                         ret;
 
     LOG_INF("Enabling DWC3 driver");
 
@@ -8394,9 +8213,9 @@ static int udc_dwc3_enable(const struct device *const dev)
     }
 
     /*
-     * U1/U2 off until the host configures the device: DCTL says software sets
-     * AcceptU1/U2Ena "after receiving a SetConfiguration command" and
-     * InitU1/U2Ena after SetFeature(U1/U2_ENABLE) - see
+     * Keep U1/U2 off until the host configures the device. The DCTL spec says
+     * AcceptU1/U2Ena is set "after receiving a SetConfiguration command".
+     * InitU1/U2Ena is set after SetFeature(U1/U2_ENABLE). Both are set in
      * udc_dwc3_ctrl_apply_link_pm().
      */
     udc_dwc3_dctl_update(base,
@@ -8404,9 +8223,9 @@ static int udc_dwc3_enable(const struct device *const dev)
                  UDC_DWC3_DCTL_ACCEPTU2ENA | UDC_DWC3_DCTL_INITU2ENA, 0U);
 
     /*
-     * Not over STOPPING: an enable from the stack during the controller
-     * recovery's quiesce must not let transfers start; the recovery sets RUN
-     * itself once it has reconnected.
+     * Leave STOPPING alone. The controller recovery may be stopping the
+     * transfers, and no new transfer may start then. The recovery sets RUN
+     * itself when it finishes.
      */
     if (priv->run.state != UDC_DWC3_RUN_STOPPING) {
         priv->run.state = UDC_DWC3_RUN;
@@ -8423,22 +8242,25 @@ static int udc_dwc3_enable(const struct device *const dev)
 }
 
 /*
- * UDC API: detach from the bus, as a device-initiated disconnect (SPEC 3.30b 4.1.8
- * Table 4-7): end every active transfer and take EP0 back to Setup, then clear
- * RunStop, then forget the transfer state and return the buffers.
+ * UDC API: detach from the bus as a device-initiated disconnect (SPEC 3.30b
+ * 4.1.8, Table 4-7). The steps are:
+ * 1. End every active transfer and take EP0 back to Setup.
+ * 2. Clear RunStop.
+ * 3. Forget the transfer state and return the buffers.
  *
- * udc_common calls this with the UDC mutex held, and the drain dispatches under
- * that mutex, so the End Transfer completions cannot arrive as events here: their
- * outcomes are read from DEPCMD (udc_dwc3_quiesce_settle()), bounded like the
- * controller recovery's quiesce. DEVCTRLHLT is not waited for: the controller
- * halts only once its events are acknowledged, which a drain pass blocked on this
- * mutex may not do. The controller recovery calls this with RunStop already
- * cleared, after its own quiesce and halt wait; only the teardown runs then.
+ * The caller holds the UDC mutex. Event dispatch also needs that mutex, so End
+ * Transfer completions cannot arrive as events here. Their outcomes are read
+ * from DEPCMD instead (udc_dwc3_quiesce_settle()), with a time limit.
+ * DEVCTRLHLT is not waited for. The controller halts only after its events are
+ * acknowledged, and the drain may be blocked on this mutex.
+ *
+ * The controller recovery calls this with RunStop already cleared. Then only
+ * step 3 runs.
  */
 static int udc_dwc3_disable(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
 
     LOG_DBG("Disabling DWC3 driver");
 
@@ -8446,16 +8268,16 @@ static int udc_dwc3_disable(const struct device *const dev)
 
     if ((sys_read32(base + UDC_DWC3_DCTL) & UDC_DWC3_DCTL_RUNSTOP) != 0U) {
         const enum udc_dwc3_run_state prev = priv->run.state;
-        uint32_t polls = 0U;
+        uint32_t                      polls = 0U;
 
         /*
-         * A beat or nudge queued before now would act on the stopped device
-         * (a beat can even reconnect it through the controller recovery).
+         * Cancel any queued heartbeat or nudge. It would act on the stopped
+         * device, and a heartbeat could even reconnect it.
          */
         (void)k_work_cancel(&priv->heartbeat_work);
         (void)k_work_cancel(&priv->nudge_work);
 
-        /* STOPPING: no Start or resume from here on (4.1.8). */
+        /* STOPPING blocks any new Start or resume (4.1.8). */
         priv->run.state = UDC_DWC3_RUN_STOPPING;
         udc_dwc3_end_all_transfers(dev, false);
 
@@ -8475,8 +8297,8 @@ static int udc_dwc3_disable(const struct device *const dev)
     }
 
     /*
-     * With RunStop cleared the controller raises no further Endpoint Command
-     * Complete events, so anything still outstanding is stranded.
+     * With RunStop clear, the controller sends no more Endpoint Command
+     * Complete events. Drop whatever is still outstanding.
      */
     udc_dwc3_drop_xfer_state(dev, "controller disable");
 
@@ -8491,8 +8313,8 @@ static int udc_dwc3_disable(const struct device *const dev)
 static int udc_dwc3_init_core(const struct device *const dev)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
-    int ret;
+    uint32_t       reg;
+    int            ret;
 
     LOG_DBG("Initializing the DWC3 core");
 
@@ -8504,20 +8326,20 @@ static int udc_dwc3_init_core(const struct device *const dev)
     /*
      * Soft-reset the core and the USB2 and USB3 PHYs.
      *
-     * Two 100 ms holds, both required: the first lets the PHY finish its
-     * reset; the second gives the core stable PHY clocks before it leaves
-     * reset (released onto an unstable PIPE clock, its registers read zero).
+     * There are two waits, and both are needed. The first lets the PHY finish
+     * its reset. The second gives the core stable PHY clocks before it leaves
+     * reset. A core released onto an unstable PIPE clock reads all registers
+     * as zero.
      *
-     * Repeated if the register file does not come back; init fails if it never
-     * does. A core still in reset ignores register writes, so continuing would
-     * report a controller enabled that never moves data. Failing leaves the
-     * device off the bus, which the caller can see.
+     * The sequence is repeated if the registers do not come back. If they
+     * never do, init fails and the device stays off the bus. A core still in
+     * reset ignores register writes, so it would never move data.
      */
     for (uint32_t attempt = 1U; ; attempt++) {
         sys_set_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
         /*
-         * GCTL.CoreSoftReset clears DALEPENA, as does the DCTL.CSftRst that
-         * follows (3.30b register reset table): clear the driver's copy too.
+         * The core reset clears DALEPENA (3.30b register reset table), so
+         * clear the driver's copy too.
          */
         ((struct udc_dwc3_data *)udc_get_private(dev))->epcfg.dalepena = 0U;
         sys_set_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
@@ -8629,18 +8451,17 @@ static int udc_dwc3_init_core(const struct device *const dev)
 }
 
 /*
- * UDC API: bring the controller up and enable the control endpoints. Called by
- * the stack (UDC mutex held) and by udc_dwc3_controller_recover(). The drain is
- * shut out for the whole of it: the core reset and udc_dwc3_on_soft_reset()
- * re-initialise the event ring and the drain state, and the controller is not
- * running yet, so there is nothing to drain. On every return the run state is
- * restored; the recovery's own RESETTING stays until it ends.
+ * UDC API: bring the controller up and enable the control endpoints. The stack
+ * calls it with the UDC mutex held, and so does udc_dwc3_controller_recover().
+ * The event drain is blocked throughout, because the reset re-initialises the
+ * event ring. The controller is not running yet, so there are no events to
+ * miss. The previous run state is restored on return.
  */
 static int udc_dwc3_init(const struct device *const dev)
 {
-    struct udc_dwc3_data *const priv = udc_get_private(dev);
+    struct udc_dwc3_data *const   priv = udc_get_private(dev);
     const enum udc_dwc3_run_state prev = udc_dwc3_evt_block(dev);
-    const int ret = udc_dwc3_init_core(dev);
+    const int                     ret = udc_dwc3_init_core(dev);
 
     priv->run.state = prev;
 
@@ -8665,15 +8486,15 @@ static const struct udc_api udc_dwc3_api = {
 };
 
 /*
- * Endpoint work item: arm queued buffers. Takes the UDC mutex for its whole body.
+ * Endpoint work item: arm the queued buffers, under the UDC mutex.
  */
 static void udc_dwc3_ep_worker(struct k_work *const work)
 {
-    struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(work, struct udc_dwc3_ep_data, work);
-    const struct device *const dev = ep_data->dev;
+    struct udc_dwc3_ep_data *const    ep_data = CONTAINER_OF(work, struct udc_dwc3_ep_data, work);
+    const struct device *const        dev = ep_data->dev;
     const struct udc_dwc3_data *const priv = udc_get_private(dev);
-    struct net_buf *buf;
-    int ret;
+    struct net_buf                   *buf;
+    int                               ret;
 
     LOG_DBG("checking for pending transfers for EP%02x", ep_data->cfg.addr);
 
@@ -8681,28 +8502,25 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
     udc_lock_internal(dev, K_FOREVER);
 
     /*
-     * No new transfer while the controller is stopping or stopped: 4.1.8 ends
-     * every active transfer before RunStop is cleared, and after that the
-     * controller is halting, where commands are undefined. Buffers stay queued
-     * for the next enable (udc_dwc3_ep_enable() kicks this worker).
-     * Driver state, no register read: RunStop is clear only before an enable or
-     * after a disable (udc_dwc3_stack_enabled() false; both written under the mutex
-     * here), during the controller recovery (STOPPING until its last step), or
-     * after a recovery whose re-init failed, where the core reset left every
-     * endpoint out of DALEPENA (checked below).
+     * Start no transfer while the controller is stopping or stopped. 4.1.8 ends
+     * every transfer before RunStop is cleared, and commands are undefined
+     * while the controller halts. The buffers stay queued, and
+     * udc_dwc3_ep_enable() runs this worker again later.
+     *
+     * The check uses driver state, not RunStop. RunStop is clear only when the
+     * stack has not enabled the device, during the controller recovery, or
+     * after a failed re-init. In the last case no endpoint is in DALEPENA,
+     * which is checked below.
      */
     if (udc_dwc3_run_halting(priv) || !udc_dwc3_stack_enabled(dev)) {
         goto unlock;
     }
 
     /*
-     * Skip a disabled or halted endpoint. This worker can still be queued after
-     * udc_dwc3_ep_disable() clears DALEPENA and releases the ring; a TRB armed then
-     * goes to an endpoint the controller is not reading, and Update Transfer has
-     * no resource index. stat.enabled is written under the mutex held here.
-     * DALEPENA is checked too (the driver's copy): udc_dwc3_ep_start_refused() and
-     * a core reset take an endpoint out of it while the stack still counts it
-     * enabled.
+     * Skip a disabled or halted endpoint. This work can still run after
+     * udc_dwc3_ep_disable(), and a TRB armed then would never be read.
+     * DALEPENA is checked too, because a refused Start or a core reset removes
+     * the endpoint from it while the stack still sees it enabled.
      */
     if (!ep_data->cfg.stat.enabled || ep_data->cfg.stat.halted ||
         !udc_dwc3_ep_in_dalepena(priv, ep_data)) {
@@ -8711,10 +8529,10 @@ static void udc_dwc3_ep_worker(struct k_work *const work)
     }
 
     /*
-     * Defer while an End Transfer is outstanding or a Start/End outcome is
-     * unknown: a TRB pushed now needs an Update Transfer on a resource being
-     * ended, or not known to exist (3.2.2.7). The outcome's resolution re-enters
-     * udc_dwc3_ep_recover(), which submits this work again.
+     * Wait while an End Transfer is pending or a Start/End outcome is unknown.
+     * A new TRB would need an Update Transfer on a transfer that is ending or
+     * may not exist (3.2.2.7). Once the outcome is known, udc_dwc3_ep_recover()
+     * submits this work again.
      */
     if (udc_dwc3_ep_is_ending(ep_data) || udc_dwc3_ep_is_unknown(ep_data)) {
         LOG_DBG("EP%02x %s, deferring %s", ep_data->cfg.addr,
@@ -8743,20 +8561,26 @@ unlock:
 }
 
 /*
- * Initialize the controller and endpoints capabilities,
- * register endpoint structures, no hardware I/O yet.
+ * Driver instance
+ *
+ * Pre-init, which runs before the hardware is touched, and the per-instance
+ * data and device definition.
+ */
+
+/*
+ * Set up the controller and endpoint capabilities and register the endpoints.
+ * No hardware access yet.
  */
 static int udc_dwc3_driver_preinit(const struct device *const dev)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
 
-    /* Single controller instance; the stomp reporter needs a way to reach it. */
     udc_dwc3_stomp_priv = priv;
     const struct udc_dwc3_config *const cfg = dev->config;
-    struct udc_data *const data = dev->data;
-    struct udc_dwc3_ep_data *ep_data;
-    uint16_t mps = 0;
-    int ret;
+    struct udc_data *const              data = dev->data;
+    struct udc_dwc3_ep_data            *ep_data;
+    uint16_t                            mps = 0;
+    int                                 ret;
 
     ret = udc_dwc3_quirk_preinit(dev);
     if (ret != 0) {
@@ -8767,9 +8591,8 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
     k_mutex_init(&data->mutex);
     /*
-     * The event ring is drained by its own thread (udc_dwc3_event_thread()), not
-     * the UDC work queue. The IRQ vector is connected once, here, not on every
-     * enable.
+     * Connect the IRQ once, here. The event ring is drained by its own thread,
+     * udc_dwc3_event_thread(), created below.
      */
     if (cfg->irq_connect_func != NULL) {
         cfg->irq_connect_func();
@@ -8817,7 +8640,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
     }
 
     /* Control IN endpoint */
-
     ep_data = &cfg->ep_data_in[0];
     ep_data->dev = dev;
     ep_data->cfg.addr = USB_CONTROL_EP_IN;
@@ -8828,8 +8650,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
     ep_data->epn = 1;
 
     /*
-     * Same initialisations as EP0-OUT below, for the same reasons; the
-     * pre-init loops start at i = 1, so the control pair is set up by hand.
+     * The loops below skip the control pair, so both halves are set up here.
+     * Zero is a valid index, so mark "no index" explicitly. udc_dwc3_ep_resume()
+     * reads requeue_fifo on every endpoint, EP0 included.
      */
     ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
     ep_data->xfer.end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
@@ -8842,7 +8665,6 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
     }
 
     /* Control OUT endpoint */
-
     ep_data = &cfg->ep_data_out[0];
     ep_data->dev = dev;
     ep_data->cfg.addr = USB_CONTROL_EP_OUT;
@@ -8850,15 +8672,12 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
     ep_data->cfg.caps.control = 1;
     ep_data->cfg.caps.mps = mps;
     ep_data->trb_buf = cfg->trb_buf_out[0];
-    /* Static storage starts at 0, which is a legal index. */
+    /* Zero is a valid index, so mark "no index" explicitly. */
     ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
     ep_data->xfer.end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
     ep_data->epn = 0;
 
-    /*
-     * EP0 needs this too: the loops below start at i = 1, but
-     * udc_dwc3_ep_resume() calls k_fifo_get() on this queue for every endpoint.
-     */
+    /* udc_dwc3_ep_resume() reads this queue on every endpoint, EP0 included. */
     k_fifo_init(&ep_data->requeue_fifo);
 
     ret = udc_register_ep(dev, &ep_data->cfg);
@@ -8882,15 +8701,13 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
         ep_data->cfg.caps.interrupt = true;
         /*
          * Isochronous is not advertised. udc_dwc3_trb_bulk() arms every
-         * non-control endpoint with TRBCTL_NORMAL and a zero SOF/uframe field,
-         * giving the controller no interval to start on, so an ISO endpoint
-         * would be mis-armed silently. Refusing it at descriptor-build time
-         * fails early instead.
+         * non-control endpoint with NORMAL TRBs and no start frame, which is
+         * wrong for ISO. Not advertising it makes such a class fail early.
          */
         ep_data->cfg.caps.iso = false;
         ep_data->cfg.caps.mps = mps;
         ep_data->trb_buf = cfg->trb_buf_in[i];
-        /* Static storage starts at 0, which is a legal index. */
+        /* Zero is a valid index, so mark "no index" explicitly. */
         ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
         ep_data->xfer.end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
         ep_data->epn = (i << 1) | 1;
@@ -8918,15 +8735,13 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
         ep_data->cfg.caps.interrupt = true;
         /*
          * Isochronous is not advertised. udc_dwc3_trb_bulk() arms every
-         * non-control endpoint with TRBCTL_NORMAL and a zero SOF/uframe field,
-         * giving the controller no interval to start on, so an ISO endpoint
-         * would be mis-armed silently. Refusing it at descriptor-build time
-         * fails early instead.
+         * non-control endpoint with NORMAL TRBs and no start frame, which is
+         * wrong for ISO. Not advertising it makes such a class fail early.
          */
         ep_data->cfg.caps.iso = false;
         ep_data->cfg.caps.mps = mps;
         ep_data->trb_buf = cfg->trb_buf_out[i];
-        /* Static storage starts at 0, which is a legal index. */
+        /* Zero is a valid index, so mark "no index" explicitly. */
         ep_data->xferrscidx = UDC_DWC3_XFERRSCIDX_INVALID;
         ep_data->xfer.end_idx = UDC_DWC3_XFERRSCIDX_INVALID;
         ep_data->epn = (i << 1) | 0;
@@ -8942,9 +8757,9 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 }
 
 /*
- * The event buffer must be aligned to its own size, not a fixed 16 bytes
- * (GEVNTADR: "the lower n bits of the address must be GEVNTSIZn.EVNTSiz-aligned"),
- * which takes a power-of-two size.
+ * The event buffer must be aligned to its own size (GEVNTADR: "the lower n bits
+ * of the address must be GEVNTSIZn.EVNTSiz-aligned"). That needs a power-of-two
+ * size.
  */
 BUILD_ASSERT(IS_POWER_OF_TWO(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t)),
          "the event buffer is aligned to its own size, which must be a power of two");
@@ -8952,10 +8767,7 @@ BUILD_ASSERT(IS_POWER_OF_TWO(CONFIG_UDC_DWC3_EVENTS_NUM * sizeof(uint32_t)),
 #define UDC_DWC3_DEVICE_DEFINE(n)                       \
     UDC_DWC3_QUIRK_DEFINE(n);                       \
                                         \
-    /*                              \
-     * IRQ_CONNECT once, from preinit, not on every enable;     \
-     * enable/disable are then only irq_enable()/irq_disable(). \
-     */                             \
+    /* Called once from preinit; enable/disable only mask the IRQ. */ \
     static void udc_dwc3_irq_connect_func_##n(void)             \
     {                                   \
         IRQ_CONNECT(DT_INST_IRQN(n), DT_INST_IRQ(n, priority),      \
@@ -9122,6 +8934,11 @@ const struct udc_dwc3_reg {
     {.addr = UDC_DWC3_GHWPARAMS8, .name = "GHWPARAMS8"},
 };
 
+/*
+ * Queue types for the "dwc3 fifo" dump. WriteBack/EventQ and DescFetchQ can
+ * read 0/0. The queues exist, so the debug register probably does not report
+ * these types in this build.
+ */
 static const struct {
     char *name;
     uint32_t type;
@@ -9149,11 +8966,6 @@ static const struct {
         .type = UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_WREVENTQ
     },
     {
-        /*
-         * WriteBack/EventQ and DescFetchQ always read 0/0, though DescFetchQ
-         * certainly exists: the debug register likely does not report these
-         * queue types in this build, rather than the queues being absent.
-         */
         .name = "AuxEventQ",
         .type = UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_AUXEVENTQ
     },
@@ -9166,7 +8978,7 @@ static uint32_t udc_dwc3_read_fifo_space(const struct device *dev, uint32_t type
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
     const uint32_t mdwidth = (sys_read32(base + UDC_DWC3_GHWPARAMS0) >> 8) & 0xFF;
-    uint32_t reg;
+    uint32_t       reg;
 
     reg = type;
     reg |= FIELD_PREP(UDC_DWC3_GDBGFIFOSPACE_QUEUENUM_MASK, num);
@@ -9198,7 +9010,7 @@ static void udc_dwc3_init_fifo_space(const struct device *dev)
 static void udc_dwc3_dump_registers(const struct device *dev, const struct shell *sh)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
+    uint32_t       reg;
 
     for (size_t i = 0; i < ARRAY_SIZE(udc_dwc3_regs); i++) {
         const struct udc_dwc3_reg *ureg = &udc_dwc3_regs[i];
@@ -9230,7 +9042,7 @@ static void udc_dwc3_dump_bus_error(const struct device *dev, const struct shell
 static void udc_dwc3_dump_link_state(const struct device *dev, const struct shell *sh)
 {
     const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t reg;
+    uint32_t       reg;
 
     reg = sys_read32(base + UDC_DWC3_DSTS);
     switch (reg & UDC_DWC3_DSTS_CONNECTSPD_MASK) {
@@ -9322,20 +9134,17 @@ usb3:
 static void udc_dwc3_dump_events(const struct device *dev, const struct shell *sh)
 {
     const struct udc_dwc3_config *cfg = dev->config;
-    struct udc_dwc3_data *priv = udc_get_private(dev);
+    struct udc_dwc3_data         *priv = udc_get_private(dev);
 
     for (uint32_t i = 0; i < CONFIG_UDC_DWC3_EVENTS_NUM; i++) {
         uint32_t evt = cfg->evt_buf[i];
-        char *s = (i == priv->evt.next) ? "<-" : "  ";
+        char    *s = (i == priv->evt.next) ? "<-" : "  ";
 
         shell_print(sh, "evt 0x%02x: 0x%08x %s %s",
             i, evt, s, udc_dwc3_get_event_name(evt, 0));
     }
 
-    /*
-     * How often the controller's posted write had not landed when the event
-     * was read.
-     */
+    /* How often an event was read before the controller's write had landed. */
     shell_print(sh, "events %u, posted-write waits: late %u, gave up %u",
             priv->evt.handled, priv->diag.evt_late, priv->diag.evt_gaveup);
     shell_print(sh, "worst late wait: %u polls (lower bound), %u us (upper bound)",
@@ -9359,29 +9168,29 @@ static void udc_dwc3_dump_trb(const struct device *dev, struct udc_dwc3_ep_data 
 {
     for (uint32_t i = 0; i < CONFIG_UDC_DWC3_TRB_NUM; i++) {
         const volatile struct udc_dwc3_trb *const t = &ep_data->trb_buf[i];
-        struct udc_dwc3_trb trb;
+        struct udc_dwc3_trb                       trb;
 
-        /* ctrl first, then the words its write-back covers (see trb_snapshot). */
+        /* Read ctrl first, as udc_dwc3_trb_snapshot() does. */
         trb.ctrl = t->ctrl;
         trb.status = t->status;
         trb.addr_lo = t->addr_lo;
         trb.addr_hi = t->addr_hi;
 
-        bool hwo = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_HWO);
-        bool lst = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_LST);
-        bool chn = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_CHN);
-        bool csp = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_CSP);
-        bool isp = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_ISP_IMI);
-        bool ioc = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_IOC);
-        bool spr = !!(trb.status & UDC_DWC3_TRB_STATUS_SPR);
+        bool     hwo = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_HWO);
+        bool     lst = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_LST);
+        bool     chn = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_CHN);
+        bool     csp = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_CSP);
+        bool     isp = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_ISP_IMI);
+        bool     ioc = !!(trb.ctrl & UDC_DWC3_TRB_CTRL_IOC);
+        bool     spr = !!(trb.status & UDC_DWC3_TRB_STATUS_SPR);
         uint32_t trbctl = FIELD_GET(UDC_DWC3_TRB_CTRL_TRBCTL_MASK, trb.ctrl);
         uint32_t trbsts = FIELD_GET(UDC_DWC3_TRB_STATUS_TRBSTS_MASK, trb.status);
         uint32_t pcm1 = FIELD_GET(UDC_DWC3_TRB_STATUS_PCM1_MASK, trb.status);
         uint32_t sidsofn = FIELD_GET(UDC_DWC3_TRB_CTRL_SIDSOFN_MASK, trb.ctrl);
         uint32_t bufsiz = FIELD_GET(UDC_DWC3_TRB_STATUS_BUFSIZ_MASK, trb.status);
-        char *head = (i == ep_data->ring.head) ? " <HEAD" : "";
-        char *tail = (i == ep_data->ring.tail) ? " <TAIL" : "";
-        char *full = (i == ep_data->ring.head &&
+        char    *head = (i == ep_data->ring.head) ? " <HEAD" : "";
+        char    *tail = (i == ep_data->ring.tail) ? " <TAIL" : "";
+        char    *full = (i == ep_data->ring.head &&
                   ep_data->ring.net_buf[ep_data->ring.head] != NULL) ? " <FULL" : "";
 
         shell_print(sh, "%p EP%02x addr=0x%08x%08x ctl=%u sts=%u hwo=%u lst=%u chn=%u"
@@ -9404,12 +9213,8 @@ static void udc_dwc3_dump_each(const struct device *dev,
 
     for (int i = 0; i < cfg->num_in_eps; i++) {
         struct udc_dwc3_ep_data *ep_data = &cfg->ep_data_in[i];
-        uint8_t addr = ep_data->cfg.addr;
+        uint8_t                  addr = ep_data->cfg.addr;
 
-        /*
-         * xferrscidx: the transfer resource index Update and End Transfer use,
-         * UDC_DWC3_XFERRSCIDX_INVALID while no transfer holds one.
-         */
         shell_print(sh, "%s for IN endpoint 0x%02x (%u %s) xferrscidx=0x%x",
               label, addr, addr & 0x7f, (addr & 0x80) ? "IN" : "OUT",
               ep_data->xferrscidx);
@@ -9418,7 +9223,7 @@ static void udc_dwc3_dump_each(const struct device *dev,
 
     for (int i = 0; i < cfg->num_out_eps; i++) {
         struct udc_dwc3_ep_data *ep_data = &cfg->ep_data_out[i];
-        uint8_t addr = ep_data->cfg.addr;
+        uint8_t                  addr = ep_data->cfg.addr;
 
         shell_print(sh, "%s for OUT endpoint 0x%02x (%u %s) xferrscidx=0x%x",
               label, addr, addr & 0x7f, (addr & 0x80) ? "IN" : "OUT",
@@ -9435,18 +9240,16 @@ static void udc_dwc3_dump_each_trb(const struct device *dev, const struct shell 
     udc_dwc3_dump_each(dev, udc_dwc3_dump_trb, "trb", sh);
 }
 
-/*
- * Shell: dump the FIFO space counters.
- */
+/* Shell: dump the FIFO space counters. */
 static void udc_dwc3_dump_fifo_space(const struct device *dev, const struct shell *sh)
 {
     struct udc_dwc3_data *const priv = udc_get_private(dev);
-    const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-    uint32_t num_in_eps;
-    uint32_t num_eps;
-    uint32_t total_xfer_resources;
-    uint32_t avail;
-    uint32_t reg;
+    const mm_reg_t              base = DEVICE_MMIO_NAMED_GET(dev, base);
+    uint32_t                    num_in_eps;
+    uint32_t                    num_eps;
+    uint32_t                    total_xfer_resources;
+    uint32_t                    avail;
+    uint32_t                    reg;
 
     reg = sys_read32(base + UDC_DWC3_GHWPARAMS3);
     num_in_eps = FIELD_GET(UDC_DWC3_GHWPARAMS3_NUM_IN_EPS_MASK, reg);
@@ -9504,10 +9307,9 @@ static void udc_dwc3_dump_all(const struct device *dev, const struct shell *sh)
 }
 
 /*
- * Run a dwc3 shell command under the UDC mutex. Every command touches state the
- * work queue and the drain thread also use (endpoint commands, TRB rings, event
- * buffer), and the shell is used most while traffic is running and something is
- * wrong. The mutex is recursive, so a command that takes it itself is fine.
+ * Run a dwc3 shell command under the UDC mutex. The commands touch the same
+ * state as the work queue and the event thread. The mutex is recursive, so a
+ * command may also take it itself.
  */
 static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
                  void (*fn)(const struct device *, const struct shell *sh))
@@ -9522,7 +9324,7 @@ static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
         return -ENODEV;
     }
 
-    /* Every command casts dev->config and the private data to this driver's. */
+    /* The commands assume this driver's config and private data. */
     if (dev->api != &udc_dwc3_api) {
         shell_error(sh, "Device %s is not a DWC3 controller", argv[1]);
         return -EINVAL;
@@ -9536,7 +9338,7 @@ static int dump_cmd2_handler(const struct shell *sh, size_t argc, char **argv,
 }
 
 /*
- * Shell: inject a synthetic XferComplete.
+ * Shell: inject a synthetic XferComplete on EP0, in the last transfer direction.
  */
 static void udc_dwc3_cmd_fake_xfercomplete(const struct device *const dev, const struct shell *sh)
 {
@@ -9578,7 +9380,7 @@ static int cmd_fake_xfercomplete1(const struct shell *sh, size_t argc, char **ar
 }
 
 /*
- * Shell: run udc_dwc3_recover().
+ * Shell: run the control endpoint recovery (udc_dwc3_recover()).
  */
 static void udc_dwc3_cmd_recover(const struct device *dev, const struct shell *sh)
 {
