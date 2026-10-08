@@ -4247,8 +4247,7 @@ static void udc_dwc3_next_ctrl(const struct device *const dev,
  * IN FIFO must hold one burst (maxburst * (1024 + 8) + 8).
  *   0x82 ACM IN  bMaxBurst 0   FIFO2  384 words (3 KiB)
  *   0x84 RAW IN  bMaxBurst 0   FIFO4  192 words (1.5 KiB)
- *   0x85 UVC IN  bMaxBurst 15  FIFO5 1024 words (8 KiB; Lattice
- *                        advertises 15 on a ~4 KiB FIFO)
+ *   0x85 UVC IN  bMaxBurst 6   FIFO5 1024 words (8 KiB; seven packets)
  *   0x01 ACM OUT bMaxBurst 15  RxFIFO
  *   0x02 RAW OUT bMaxBurst 15  RxFIFO
  * Any other bulk endpoint keeps BrstSiz 0.
@@ -4261,7 +4260,7 @@ struct udc_dwc3_bulk_burst {
 static const struct udc_dwc3_bulk_burst udc_dwc3_bulk_burst[] = {
 	{ 0x82, 0 },
 	{ 0x84, 0 },
-	{ 0x85, 15 },
+	{ 0x85, 6 },
 	{ 0x01, 15 },
 	{ 0x02, 15 },
 };
