@@ -1083,6 +1083,10 @@ UDC_DWC3_XIP static void udc_dwc3_dbg_epinfo(const mm_reg_t base, uint32_t epn,
 
 static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag);
 static void udc_dwc3_wedge_pump(const struct device *const dev);
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+static void udc_dwc3_gap_put(const struct device *const dev, uint8_t tag, uint8_t mark);
+static void udc_dwc3_gap_dump(void);
+#endif
 static void udc_dwc3_rateprobe_print(void);
 
 /* Force the TRB write onto the CPU→SRAM path before a mailbox DEPCMD. */
@@ -1617,6 +1621,9 @@ static uint32_t udc_dwc3_depcmd_mailbox_raw(const struct device *const dev,
 		udc_dwc3_evt_trace_add(UDC_DWC3_EVT_TRACE_CMD_TAG |
 				       (((addr - UDC_DWC3_DEPCMD(0)) >> 4) << 16) |
 				       (cmd & 0xffffU), false);
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+		udc_dwc3_gap_put(dev, (uint8_t)'E', (uint8_t)cmd);
+#endif
 	}
 
 	udc_dwc3_health_cmd_n++;
@@ -1696,6 +1703,88 @@ UDC_DWC3_XIP static uint32_t udc_dwc3_depcmd_mailbox(const struct device *const 
 #define UDC_DWC3_DBGPORT_USBPIPED_W_LAST	0xb4010220U
 #define UDC_DWC3_DBGPORT_USBPIPED_AW		0xb4010224U
 #define UDC_DWC3_DBGPORT_USBPIPED_R_ERROR	0xb4010228U
+
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+/* Lead-up to a stuck descriptor-fetch queue. The wedge printk is 2.5 s
+ * after the slot stops, by which time AXI is already idle. Freeze this
+ * ring on the first sample where the fetch queue has no free slot and
+ * the AXI read count did not move, so the dump is the transition. */
+#define UDC_DWC3_GAP_N 16U
+struct udc_dwc3_gap_ent {
+	uint16_t ms;
+	uint16_t tx5;
+	uint16_t descq;
+	uint8_t tag;
+	uint8_t mark;
+	uint32_t ar;
+	uint32_t rlast;
+} __packed;
+static struct udc_dwc3_gap_ent udc_dwc3_gap[UDC_DWC3_GAP_N];
+static uint8_t udc_dwc3_gap_i;
+static uint8_t udc_dwc3_gap_n;
+static bool udc_dwc3_gap_freeze;
+static bool udc_dwc3_gap_armed;
+static uint32_t udc_dwc3_gap_ar_prev;
+
+UDC_DWC3_XIP static void udc_dwc3_gap_put(const struct device *const dev, uint8_t tag,
+					  uint8_t mark)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	struct udc_dwc3_gap_ent *ent;
+	uint32_t descq;
+	uint32_t tx5;
+	uint32_t ar;
+	uint32_t rlast;
+
+	if (dev == NULL || udc_dwc3_gap_freeze || !udc_dwc3_engine_enabled()) {
+		return;
+	}
+	descq = udc_dwc3_dbg_fifo_avail(base, 0U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_DESCFETCH);
+	tx5 = udc_dwc3_dbg_fifo_avail(base, 5U, UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
+	ar = sys_read32(UDC_DWC3_DBGPORT_USBPIPED_AR);
+	rlast = sys_read32(UDC_DWC3_DBGPORT_USBPIPED_R_LAST);
+	if (descq != 0U) {
+		udc_dwc3_gap_armed = true;
+	}
+	ent = &udc_dwc3_gap[udc_dwc3_gap_i];
+	ent->ms = (uint16_t)k_uptime_get_32();
+	ent->tx5 = (uint16_t)tx5;
+	ent->descq = (uint16_t)descq;
+	ent->tag = tag;
+	ent->mark = mark;
+	ent->ar = ar;
+	ent->rlast = rlast;
+	udc_dwc3_gap_i = (udc_dwc3_gap_i + 1U) % UDC_DWC3_GAP_N;
+	if (udc_dwc3_gap_n < UDC_DWC3_GAP_N) {
+		udc_dwc3_gap_n++;
+	}
+	if (udc_dwc3_gap_armed && descq == 0U && ar == rlast && ar == udc_dwc3_gap_ar_prev) {
+		udc_dwc3_gap_freeze = true;
+	}
+	udc_dwc3_gap_ar_prev = ar;
+}
+
+UDC_DWC3_XIP static void udc_dwc3_gap_dump(void)
+{
+	uint8_t start;
+	uint8_t n;
+
+	printk("PARK0 gap freeze=%u n=%u\n", udc_dwc3_gap_freeze ? 1U : 0U,
+	       udc_dwc3_gap_n);
+	if (udc_dwc3_gap_n == 0U) {
+		return;
+	}
+	start = (udc_dwc3_gap_i + UDC_DWC3_GAP_N - udc_dwc3_gap_n) % UDC_DWC3_GAP_N;
+	for (n = 0U; n < udc_dwc3_gap_n; n++) {
+		const struct udc_dwc3_gap_ent *ent =
+			&udc_dwc3_gap[(start + n) % UDC_DWC3_GAP_N];
+
+		printk("PARK0 gap %c %04x tx5=%u dq=%u ar=%u rl=%u m=%02x\n",
+		       ent->tag, ent->ms, ent->tx5, ent->descq, ent->ar,
+		       ent->rlast, ent->mark);
+	}
+}
+#endif
 
 /*
  * One line that splits a dead IN data stage in two.
@@ -1816,6 +1905,9 @@ UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device
 		printk(" %08x/%08x", udc_dwc3_evt_trace[j], udc_dwc3_evt_trace_t[j]);
 	}
 	printk("\n");
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+	udc_dwc3_gap_dump();
+#endif
 }
 
 /*
@@ -6789,6 +6881,16 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_video(const struct device *const de
 
 UDC_DWC3_XIP static void udc_dwc3_in_restart_tick(const struct device *const dev)
 {
+	static uint32_t gap_ms;
+	const uint32_t now = k_uptime_get_32();
+
+	/* Video doorbells are fabric-side. A 2 ms sample is as close as the
+	 * CPU can get without sitting on the DepCmd path. */
+	if ((now - gap_ms) >= 2U) {
+		gap_ms = now;
+		udc_dwc3_gap_put(dev, (uint8_t)'T',
+				 (uint8_t)sys_read32(USB_ENGINE_BASE + USB_ENGINE_VID_DB_COUNT));
+	}
 	udc_dwc3_open_hold_tick();
 	udc_dwc3_in_restart_bulk(dev, 1);
 	udc_dwc3_in_restart_bulk(dev, 0);
