@@ -25,6 +25,181 @@ static bool engine_seen;
 static bool engine_on;
 static bool engine_held_off;
 static bool engine_evt_own;
+
+
+/*
+ * Closed-loop video. 0 keeps the historical open-loop arrangement: EVT_OWN=0,
+ * no DEPEVTs on 0x85, video doorbells paced only by camera pages. 1 hands the
+ * event ring to EventDrain, adds IN 0x85 to EP_OWN, and (in udc_dwc3.c) turns
+ * on XferInProgress for the video endpoint, so the arbiter sees real video
+ * completions instead of inferring safety from a GDBGFIFOSPACE probe and a
+ * timer. Both reference stacks pace the next command from that event; this is
+ * the only data path here that does not.
+ *
+ * Risk if it misbehaves: with EVT_OWN=1 the CPU no longer services
+ * GEVNTCOUNT, so EP0/DEVT handling depends on FWD_POP keeping up with a
+ * 64-deep FIFO. Falling behind raises EVT_OVF and the engine stops retiring
+ * video descriptors - watch for the "engine: EVT_OVF" line.
+ *
+ * 26 Oct 2026: tried on the board and it does not work yet. Enumeration and
+ * one 8 s Y16 run at 60 fps were clean, then EP0 stalled permanently -
+ * uvcvideo "Failed to set UVC probe control" -71 then -110 every 5.12 s, the
+ * firmware console silent, no "engine: EVT_OVF". A silent stall rather than
+ * an overflow points at the handoff rather than FWD throughput: ENG_CTRL=0 at
+ * STREAMOFF takes EVT_OWN away mid-flight, and after that GEVNTCOUNT and the
+ * driver's ring read pointer no longer agree, so the CPU never sees another
+ * event. EP_OWN is not cleared on disable either. Fix that handoff before
+ * setting this to 1 again.
+ *
+ * Note for stage 3 (pacing the video doorbell off a completion event inside
+ * the fabric): EventDrain snoops the ring whatever EVT_OWN says, so the
+ * arbiter can see video completions with EVT_OWN=0. What EVT_OWN buys is
+ * keeping those ~9600 events/s off the CPU, not the events themselves.
+ */
+extern void udc_dwc3_evt_ring_resync(const char *why);
+
+/*
+ * 27 Oct 2026: back to 0 for good. EVT_OWN is not the way in, and the reason
+ * is structural, not a handoff bug: TinyClunx io.irq is
+ *   Mux(enable && evtOwn, usbEngine.irq, usbCore.io.irq)
+ * so EVT_OWN=1 repoints the CPU's only interrupt at ENG_IRQ, whose FWD bit is
+ * driven from fwdLevel =/= 0 and is cleared only by FWD_POP - which happens in
+ * udc_dwc3_engine_poll() on the event thread, never in the ISR. A forwarded
+ * EP0 event therefore raises a level interrupt the ISR cannot dismiss. That is
+ * the permanent EP0 stall, and it is why both attempts failed on iteration 1.
+ *
+ * ACK_OWNED below gets what EVT_OWN was wanted for - video events kept off the
+ * CPU - without touching the interrupt source.
+ */
+uint32_t udc_dwc3_vid_evt_own;
+/* See udc_dwc3.c: kept 0 so step 2 tests the EVT_OWN handoff alone. */
+uint32_t udc_dwc3_vid_inprog_en = 1U;
+
+/*
+ * ACK_OWNED (ENG_CTRL bit 5). EventDrain acks GEVNTCOUNT only for the owned
+ * DEPEVTs it consumes; DEVT and EP0 stay pending so the raw DWC3 interrupt
+ * still fires and the CPU drains them on its normal path. This also adds IN
+ * 0x85 to EP_OWN, which is what makes a video DEPEVT "owned" in the fabric.
+ *
+ * This is the piece that makes a video event affordable. Measured 26 Oct:
+ * with the CPU owning every slot, 2598 video events/s broke the bulk paths
+ * 4/4 on iteration 1. Here the CPU never dispatches them - it only steps its
+ * ring pointer over the slots the fabric already acked.
+ */
+/*
+ * ACK_OWNED is gone. It was the fabric acking GEVNTCOUNT for the video
+ * DEPEVTs it consumed, with the CPU stepping its ring pointer over those
+ * slots. Isolated on the board 27 Oct 2026 (config B, gate off, ctrl=0x39):
+ * EP0 errored immediately - "CTRL IN completion with no buffer". Splitting
+ * GEVNTCOUNT between two writers is the fault, and it needs no fix because it
+ * needs no existence: the CPU only had to stop *dispatching* those events,
+ * not stop retiring them. See udc_dwc3_evt_is_video() in udc_dwc3.c.
+ */
+
+/*
+ * VID_EVT (ENG_CTRL bit 2). Pace the video doorbell on the controller's own
+ * event in TRBRamSink instead of posting one per committed TRB. Needs a video
+ * event to exist, so udc_dwc3_vid_nrdy_en must be on too, and needs
+ * udc_dwc3_ack_owned so those events do not land on the CPU.
+ */
+/*
+ * Compile-time, not a variable. This firmware sits at the RAM ceiling: 65492
+ * bytes boots, 65508 does not (measured 27 Oct 2026 - four failed loads with
+ * no console output at all, against the same bitstream that boots at 65492).
+ * A third initialised global was enough to push .data padding over the edge,
+ * so the switch that only this file reads became a constant.
+ */
+#define UDC_DWC3_VID_DOORBELL_EVT	1U
+
+/* Defined in udc_dwc3.c; printed in the banner so one line states the
+ * whole event-pacing configuration. */
+extern uint32_t udc_dwc3_vid_nrdy_en;
+
+/*
+ * QUIET_OTHER, written at STREAMON. 60000 cycles = 800 us at 75 MHz.
+ *
+ * This used to be hardcoded 0, which with the pre-hold02 RTL deleted the whole
+ * CPU-command hold ladder for exactly the condition the wedge needs. hold02
+ * split the knob: acmIn/rawIn (the 0x82/0x84 packet hold, holdMin 0,
+ * event-released) now arm unconditionally, while everyOther and flatRest keep
+ * their (quietOther =/= 0) gate.
+ *
+ * So this value now controls *only* the flat hold on EP0 and the remaining CPU
+ * commands - the half with a hard holdMin, and the half that cost frames when
+ * the 800 us scheme was tried. hold02 with this at 0 wedged at ~30 min, so the
+ * packet hold alone is not sufficient; 60000 restores the full configuration
+ * that was measured to remove the wedge completely, with the packet hold no
+ * longer depending on it.
+ *
+ * 28 Oct 2026: 1500 (20 us) was TRIED AND WEDGED. Do not reduce this.
+ *
+ * Reasoning that failed: pace04 caps the video doorbell at ~4580/s and had
+ * ovf=0 across 6+ h, so the event-ring overflow mechanism was fixed and the
+ * flat hold looked redundant - keeping only its frame cost. It is not
+ * redundant. Measured at 1500 with the licensed pace04 bit:
+ *
+ *   dwc3: WEDGE ep=N again within holdoff   x89
+ *   PARK0 wedge ltssm/lsp/pipectl           x8
+ *   ERROR: timeout reading 9 bytes          x38   (0x82 stopped answering)
+ *   video dead, cmdrate vid=0, ovf=0
+ *
+ * It wedged within ~4 minutes. **ovf=0 is the point**: this is a different
+ * failure from the one pacing fixes. Pacing removes the event-ring overflow
+ * that loses ACM completions; the flat everyOther hold gaps CPU commands away
+ * from video DEPCMDs so the hard IP's single command engine is not handed
+ * back-to-back work. Two mechanisms, two mitigations, neither replaces the
+ * other.
+ *
+ * Note it failed FASTER than 0 did (~4 min vs ~30 min above), so this is not
+ * a monotonic "more is safer" dial. A short everyOther hold arms and then
+ * releases, plausibly inside the window it is meant to cover, which may be
+ * worse than never arming. Do not assume an untested intermediate value is
+ * between the two in safety.
+ *
+ * The ~1.5% frame loss under SRP (avg_fps ~58.97 vs 60.00 idle) is the price
+ * of wedge immunity and is NOT tunable from here. HOLD_SEL (0x54) cannot help
+ * either: it only reaches flatRest, gated on !io.engineEn, and the engine is
+ * enabled whenever video streams. HOLD_NARROW (0x5c) is read by nothing
+ * ("0x5c stays in the map. This build does not branch on it."). Recovering
+ * those frames needs the RTL fix in "The fix" - a bounded minimum gap after a
+ * no-response write (32-64 cycles) instead of an 800 us endpoint hold - not a
+ * firmware constant.
+ */
+/*
+ * 28 Oct 2026, verdict on 7500 (100 us): IT WEDGES. Reverted to 60000.
+ *
+ * Loaded 04:34:23, logs stop 04:42:34 - 8 min 11 s to the wedge. Same
+ * signature as always, so there is no doubt about what it was:
+ *   WEDGE ep=0x82 slot=2 st=0x00010273 trb=0x00000811   HWO still set
+ *   cmd5=0x00030007  cmd11=0x00080007                   the 0x82 cmd + the doorbell
+ *   to=0 tocmd=0x00000000                               CMDACT cleared every time
+ *   ovf=0                                               not the event ring
+ * Video and SRP were both healthy right up to it: vid=90850/20s (4543/s, the
+ * paced rate), 202/202 SRP responses OK, 0 CRC errors, fps mean 59.888.
+ *
+ * Dose-response, now three points:
+ *   20 us  (1500)   wedged in  ~4 min
+ *   100 us (7500)   wedged in  8 min 11 s
+ *   800 us (60000)  clean over 6+ h (3h52m + 2h18m + others)
+ *
+ * The important consequence is not that 100 us is too small; it is that the
+ * required gap is LARGER than the frame-slack ceiling (104 us = one 16 KiB
+ * page at 157.3 MB/s). So the ~1.7% frame loss cannot be fixed by shortening
+ * this constant at all - any safe value overruns the video slack by
+ * construction. Do not bisect between 100 and 800 us looking for a free
+ * value: the previous version of this comment already called that out, and
+ * the measurement confirmed it.
+ *
+ * The frame loss is a ring-depth problem, not a hold-length problem:
+ *   7 usable slots x 104 us = 729 us of buffered video  <  800 us hold
+ * so the ring drains to empty on every hold. The fix is trbIDBits 3 -> 4
+ * (16 entries, 15 usable = 1.56 ms of slack), which covers an 800 us hold
+ * with ~2x margin. That is RTL + a new licensed bitstream, not firmware.
+ *
+ * zephyr_quiet7500.bin must not be used again. Same status as
+ * zephyr_quiet1500.bin.
+ */
+uint32_t udc_dwc3_quiet_other = 60000U;
 static bool engine_ovf_seen;
 static uint8_t programmed;
 static uint32_t saved_evt_base;
@@ -73,6 +248,7 @@ bool udc_dwc3_engine_evt_own(void)
 {
 	return engine_on && engine_evt_own;
 }
+
 
 bool udc_dwc3_engine_owns(uint8_t addr)
 {
@@ -195,18 +371,40 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 		       (uint32_t)base, id);
 		return;
 	}
-	sys_write32(USB_ENGINE_EP_OWN_DEFAULT, base + USB_ENGINE_EP_OWN);
+	/* bitN = IN 0x8N. BIT(5) adds the video endpoint so EventDrain consumes
+	 * its DEPEVTs in the fabric and the CPU never takes the IRQ. */
+	/*
+	 * BIT(5) adds video IN 0x85 to EP_OWN, which is what makes EventDrain
+	 * route its DEPEVTs to ownedEvt - and therefore what makes vidAsk, and
+	 * the event-paced doorbell, work at all. Needed by VID_EVT on its own:
+	 * it does NOT imply ACK_OWNED.
+	 */
+	sys_write32(USB_ENGINE_EP_OWN_DEFAULT |
+		    (((udc_dwc3_vid_evt_own != 0U) ||
+		      (UDC_DWC3_VID_DOORBELL_EVT != 0U)) ? BIT(5) : 0U),
+		    base + USB_ENGINE_EP_OWN);
+
 	sys_write32(evt_base, base + USB_ENGINE_EVT_BASE);
 	sys_write32(evt_size, base + USB_ENGINE_EVT_SIZE);
 	/* Fair-share: yield to mailbox after this many video grants. */
 	sys_write32(32U, base + USB_ENGINE_VID_CREDIT);
-	sys_write32(0U, base + USB_ENGINE_QUIET_OTHER);
-	/* Mailbox quiet is 0, so everyOther does not arm. A CPU command still
-	 * occupies the arbiter until CMDACT clears. HOLD_SEL stays at its reset 0.
-	 * VID_CMD bit0 resets to 1, which writes a video UpdateXfer with CMDACT
-	 * clear and grants the next command without waiting. */
-	sys_write32(0U, (mm_reg_t)0xb4008000U + 0x38U);
+	sys_write32(udc_dwc3_quiet_other, base + USB_ENGINE_QUIET_OTHER);
+	/* A CPU command still occupies the arbiter until CMDACT clears.
+	 * HOLD_SEL stays at its reset 0. VID_CMD bit0 resets to 1, which writes
+	 * a video UpdateXfer with CMDACT clear and grants the next command
+	 * without waiting. */
+	sys_write32(udc_dwc3_quiet_other, (mm_reg_t)0xb4008000U + 0x38U);
 	sys_write32(0U, (mm_reg_t)0xb4008000U + 0x58U);
+	/*
+	 * HOLD_NARROW (0x5c) bit 1 = EARLY_FUSE_QUIET (fuse01 bitstream and
+	 * later). The 0x82/0x84 hold normally ends on evtRelease, microseconds
+	 * after the arm. Bit 1 bounds a *missed* event at QUIET_OTHER (800 us)
+	 * instead of the 20 ms cpuQuiet backstop. A miss then costs ~5% of a
+	 * 60 fps frame instead of 1.2 frames. Measured evidence the fuse does
+	 * fire: a wedge dump read maxus=1507507 against a 1500000-cycle fuse.
+	 * Bit 0 (acmNarrow) stays 0.
+	 */
+	sys_write32(BIT(1), (mm_reg_t)0xb4008000U + 0x5cU);
 	sys_write32(USB_ENGINE_IRQ_FWD | USB_ENGINE_IRQ_CMPL | USB_ENGINE_IRQ_ERR,
 		    base + USB_ENGINE_ENG_IRQ_ENA);
 	/*
@@ -216,13 +414,24 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	 */
 	ctrl = USB_ENGINE_CTRL_ENABLE | USB_ENGINE_CTRL_CREDIT_EN |
 	       USB_ENGINE_CTRL_IRQ_EN;
+	if (udc_dwc3_vid_evt_own != 0U) {
+		ctrl |= USB_ENGINE_CTRL_EVT_OWN;
+	}
+	if (UDC_DWC3_VID_DOORBELL_EVT != 0U) {
+		ctrl |= USB_ENGINE_CTRL_VID_EVT;
+	}
 	sys_write32(ctrl, base + USB_ENGINE_ENG_CTRL);
 	engine_on = true;
 	engine_held_off = false;
-	engine_evt_own = false;
+	engine_evt_own = (udc_dwc3_vid_evt_own != 0U);
 	engine_seen = true;
 	engine_ovf_seen = false;
-	printk("engine: ENABLE=1 EVT_OWN=0 id=0x%08x evt=0x%08x/%u map=0x%08x ctrl=0x%08x quiet=%u hold=%u vid=%u\n",
+	printk("engine: ENABLE=1 ackown=%u videvt=%u nrdy=%u EVT_OWN=%u ep_own=0x%08x id=0x%08x evt=0x%08x/%u map=0x%08x ctrl=0x%08x quiet=%u hold=%u vid=%u\n",
+	       0U,
+	       (UDC_DWC3_VID_DOORBELL_EVT != 0U) ? 1U : 0U,
+	       udc_dwc3_vid_nrdy_en,
+	       (udc_dwc3_vid_evt_own != 0U) ? 1U : 0U,
+	       sys_read32(base + USB_ENGINE_EP_OWN),
 	       id, evt_base, evt_size, sys_read32(base + USB_ENGINE_EP_MAP),
 	       sys_read32(base + USB_ENGINE_ENG_CTRL),
 	       sys_read32((mm_reg_t)0xb4008000U + 0x38U),
@@ -279,14 +488,41 @@ void udc_dwc3_engine_disable(void)
 	if (!engine_on && programmed == 0U) {
 		return;
 	}
+	const bool had_evt_own = engine_evt_own;
+
 	(void)k_work_cancel_delayable(&engine_go_work);
 	if (udc_dwc3_engine_present()) {
 		sys_write32(0, eng_base() + USB_ENGINE_ENG_CTRL);
+		/*
+		 * EP_OWN was never cleared here. EventDrain gates its
+		 * GEVNTCOUNT ack on io.enable, so with ENABLE=0 nothing acks
+		 * the ring - but a stale EP_OWN still declares those endpoints
+		 * fabric-owned to anything that reads it, and leaves the
+		 * register disagreeing with engine_on. Clear it with ENABLE.
+		 */
+		sys_write32(0, eng_base() + USB_ENGINE_EP_OWN);
 	}
 	engine_on = false;
 	engine_held_off = false;
 	engine_evt_own = false;
 	programmed = 0;
+	/*
+	 * The CPU is about to resume reading the event ring. Its read index
+	 * has been frozen for as long as the fabric owned the ring (the fabric
+	 * acked GEVNTCOUNT for the events it forwarded over FWD, which the CPU
+	 * consumed without advancing evt_next), so it no longer agrees with
+	 * the controller's write pointer. Re-synchronise before the first CPU
+	 * read, or EP0 stalls permanently on stale ring entries.
+	 *
+	 * Only this edge needs it. On 0->1 the CPU owns the ring right up to
+	 * the handoff, so its index is correct and the fabric simply starts
+	 * acking from wherever the controller is - and a resync there would
+	 * discard events in the middle of the control transfer that triggers
+	 * STREAMON.
+	 */
+	if (had_evt_own) {
+		udc_dwc3_evt_ring_resync("EVT_OWN 1->0");
+	}
 	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
 		posted_clear(i);
 		/* Queued slots abort on ENABLE=0; drain_cmpl hands them back. */
@@ -338,12 +574,13 @@ void udc_dwc3_engine_ring_unsync(uint8_t addr)
 	}
 }
 
-int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl)
+int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl,
+			      const void *dma)
 {
 	const int idx = usb_engine_bulk_idx(addr);
 	mm_reg_t epb;
 
-	if (!engine_on || idx < 0 || buf == NULL || !ring_synced[idx]) {
+	if (!engine_on || idx < 0 || buf == NULL || dma == NULL || !ring_synced[idx]) {
 		return -EINVAL;
 	}
 	epb = usb_engine_ep_base(idx);
@@ -352,7 +589,7 @@ int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_c
 	}
 	kicked[idx]++;
 	kicked_total[idx]++;
-	sys_write32((uint32_t)(uintptr_t)buf->data, epb + USB_ENGINE_EP_DESC_ADDR);
+	sys_write32((uint32_t)(uintptr_t)dma, epb + USB_ENGINE_EP_DESC_ADDR);
 	sys_write32(USB_EP_DIR_IS_IN(addr) ? buf->len : buf->size,
 		    epb + USB_ENGINE_EP_DESC_LEN);
 	/* DESC_CTRL write is the post. TRB dword3 comes from the TRB_CTRL

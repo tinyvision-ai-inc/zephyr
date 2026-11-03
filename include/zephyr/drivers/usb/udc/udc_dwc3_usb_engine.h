@@ -56,12 +56,27 @@ extern "C" {
 #define USB_ENGINE_EP_MAP		0x50U
 /* CPU DEPEVT the snoop missed. Write pulses ownedEvt into BulkRing. */
 #define USB_ENGINE_EVT_INJ		0x54U
+/*
+ * The ONE physical endpoint ACK_OWNED acks for. A constant on both sides, not
+ * a CSR: the endpoint is fixed by the design, and on a device already at 99%
+ * SLICE a new engine register cost a WB address decode, a load on the address
+ * bus and another input to the 32-bit readback mux. Must match
+ * EventDrain.VideoPhysEp. physEp = 2*ep + 1 for IN, so video IN 0x85 is 11.
+ */
+#define USB_ENGINE_ACK_PHYS_VIDEO	11U
 
 #define USB_ENGINE_CTRL_ENABLE		BIT(0)
 #define USB_ENGINE_CTRL_EVT_OWN		BIT(1)
 #define USB_ENGINE_CTRL_VID_EVT		BIT(2)
 #define USB_ENGINE_CTRL_CREDIT_EN	BIT(3)
 #define USB_ENGINE_CTRL_IRQ_EN		BIT(4)
+/*
+ * EventDrain acks GEVNTCOUNT for the owned DEPEVTs it consumes and for
+ * nothing else, leaving forwarded events pending so the raw DWC3 interrupt
+ * still fires. The CPU ring pointer must step over the acked slots; see
+ * udc_dwc3_evt_is_fabric_owned() in udc_dwc3.c.
+ */
+#define USB_ENGINE_CTRL_ACK_OWNED	BIT(5)
 
 #define USB_ENGINE_STAT_BUSY		BIT(0)
 #define USB_ENGINE_STAT_VID_LIVE	BIT(1)
@@ -180,7 +195,8 @@ int udc_dwc3_engine_ring_sync(uint8_t addr, uint32_t trb_base, uint8_t ring_n,
 			      uint8_t slot);
 bool udc_dwc3_engine_ring_synced(uint8_t addr);
 void udc_dwc3_engine_ring_unsync(uint8_t addr);
-int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl);
+int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf, uint32_t post_ctrl,
+			      const void *dma);
 uint32_t udc_dwc3_engine_kicked(uint8_t addr);
 
 /* udc_dwc3.c: a posted slot the ring aborted (ENABLE fell) must be armed
@@ -232,11 +248,12 @@ static inline void udc_dwc3_engine_ring_unsync(uint8_t addr)
 }
 
 static inline int udc_dwc3_engine_post_slot(uint8_t addr, struct net_buf *buf,
-					    uint32_t post_ctrl)
+					    uint32_t post_ctrl, const void *dma)
 {
 	ARG_UNUSED(addr);
 	ARG_UNUSED(buf);
 	ARG_UNUSED(post_ctrl);
+	ARG_UNUSED(dma);
 	return -ENOTSUP;
 }
 
