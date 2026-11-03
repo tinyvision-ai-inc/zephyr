@@ -130,12 +130,21 @@ extern const struct net_buf_data_cb net_buf_dma_cb;
  * @param fdestroy   Optional destroy callback when buffer is freed.
  */
 #define USB_BUF_POOL_VAR_DEFINE(pname, count, size, ud_size, fdestroy)		\
+	USB_BUF_POOL_VAR_DEFINE_ALIGN(pname, count, size, ud_size, fdestroy, 0)
+
+/* align is the net_buf data alignment. 0 keeps the historical
+ * pointer-sized skip. A non-zero power of two is passed to
+ * k_heap_aligned_alloc; net_buf then rejects a payload smaller than it.
+ */
+#define USB_BUF_POOL_VAR_DEFINE_ALIGN(pname, count, size, ud_size, fdestroy,	\
+				      align)					\
 	_NET_BUF_ARRAY_DEFINE(pname, count, ud_size);				\
 	USB_BUF_K_HEAP_DEFINE(net_buf_mem_pool_##pname, size);			\
 	static const struct net_buf_data_alloc net_buf_data_alloc_##pname = {	\
 		.cb = &net_buf_dma_cb,						\
 		.alloc_data = &net_buf_mem_pool_##pname,			\
 		.max_alloc_size = 0,						\
+		.alignment = (align),						\
 	};									\
 	static STRUCT_SECTION_ITERABLE(net_buf_pool, pname) =			\
 		NET_BUF_POOL_INITIALIZER(pname, &net_buf_data_alloc_##pname,	\

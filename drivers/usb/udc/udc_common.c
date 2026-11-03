@@ -24,9 +24,16 @@ LOG_MODULE_REGISTER(udc, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 static inline void udc_buf_destroy(struct net_buf *buf);
 
-UDC_BUF_POOL_VAR_DEFINE(udc_ep_pool,
-			CONFIG_UDC_BUF_COUNT, CONFIG_UDC_BUF_POOL_SIZE,
-			sizeof(struct udc_buf_info), udc_buf_destroy);
+/* DWC3 IN DMA is a 64-bit beat. Alignment 0 makes buf->data land 4
+ * bytes off an 8-byte boundary: the stuck 0x82 TRBs pointed at
+ * 0xb1002c64, inside this heap. 8 forces an aligned heap block and an
+ * 8-byte refcount skip, so the address programmed into the TRB is a
+ * multiple of 8. The UVC pool is left at 0; its heap is sized to the
+ * buffer count and must not grow per-allocation padding.
+ */
+USB_BUF_POOL_VAR_DEFINE_ALIGN(udc_ep_pool,
+			      CONFIG_UDC_BUF_COUNT, CONFIG_UDC_BUF_POOL_SIZE,
+			      sizeof(struct udc_buf_info), udc_buf_destroy, 8);
 
 /* EP0 SETUP/DATA/STATUS stay off the shared ACM/RAW pool.
  * 1024 B covers multi-frame UVC config descriptors (int_flir main advertises
@@ -708,6 +715,18 @@ ep_dequeue_error:
 	return ret;
 }
 
+/* net_buf rejects a payload smaller than the pool alignment. The
+ * extra bytes are capacity only; the TRB length is buf->len.
+ */
+static size_t udc_ep_pool_len(size_t size)
+{
+	if (size != 0U && size < 8U) {
+		return 8U;
+	}
+
+	return size;
+}
+
 struct net_buf *udc_ep_buf_alloc(const struct device *dev,
 				 const uint8_t ep,
 				 const size_t size)
@@ -718,7 +737,7 @@ struct net_buf *udc_ep_buf_alloc(const struct device *dev,
 
 	api->lock(dev);
 
-	buf = net_buf_alloc_len(&udc_ep_pool, size, K_NO_WAIT);
+	buf = net_buf_alloc_len(&udc_ep_pool, udc_ep_pool_len(size), K_NO_WAIT);
 	if (!buf) {
 		LOG_ERR("Failed to allocate net_buf %zd, ep 0x%02x", size, ep);
 		goto ep_alloc_error;
@@ -747,7 +766,7 @@ struct net_buf *udc_ctrl_alloc(const struct device *dev,
 	buf = net_buf_alloc_len(&udc_ep0_pool, size, K_NO_WAIT);
 	if (!buf) {
 		/* Large control-IN (config descriptor) falls back to the shared pool. */
-		buf = net_buf_alloc_len(&udc_ep_pool, size, K_NO_WAIT);
+		buf = net_buf_alloc_len(&udc_ep_pool, udc_ep_pool_len(size), K_NO_WAIT);
 	}
 	if (!buf) {
 		LOG_ERR("Failed to allocate EP0 net_buf %zd, ep 0x%02x", size, ep);
