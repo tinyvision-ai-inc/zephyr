@@ -1213,6 +1213,23 @@ static int cdc_acm_poll_in(const struct device *dev, unsigned char *const c)
 	return ret;
 }
 
+/* True when the bulk IN has finished and the TX ring has nothing left.
+ * poll_out only queues bytes; the USB transfer starts a millisecond later.
+ * Callers that post another endpoint must wait for this, or that doorbell
+ * lands in the status fetch window and the status TRB stays HWO. */
+static int cdc_acm_irq_tx_complete(const struct device *dev)
+{
+	struct cdc_acm_uart_data *const data = dev->data;
+
+	if (atomic_test_bit(&data->state, CDC_ACM_TX_FIFO_BUSY) ||
+	    data->zlp_needed ||
+	    !ring_buf_is_empty(data->tx_fifo.rb)) {
+		return 0;
+	}
+
+	return 1;
+}
+
 static void cdc_acm_poll_out(const struct device *dev, const unsigned char c)
 {
 	struct cdc_acm_uart_data *const data = dev->data;
@@ -1360,6 +1377,7 @@ static DEVICE_API(uart, cdc_acm_uart_api) = {
 	.irq_tx_enable = cdc_acm_irq_tx_enable,
 	.irq_tx_disable = cdc_acm_irq_tx_disable,
 	.irq_tx_ready = cdc_acm_irq_tx_ready,
+	.irq_tx_complete = cdc_acm_irq_tx_complete,
 	.irq_rx_enable = cdc_acm_irq_rx_enable,
 	.irq_rx_disable = cdc_acm_irq_rx_disable,
 	.irq_rx_ready = cdc_acm_irq_rx_ready,
