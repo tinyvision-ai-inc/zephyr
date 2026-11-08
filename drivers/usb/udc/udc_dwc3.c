@@ -672,6 +672,40 @@ static void udc_dwc3_unlock(const struct device *const dev)
  * is reset whenever the command completes.
  */
 
+/*
+ * DEPCMD arbiter mailbox.
+ *
+ * DWC3 has one endpoint-command engine. On the tinyCLUNX quad build the FPGA
+ * also drives it: each of the four TRBRamSink lanes used to run its own
+ * "poll CMDACT clear, write with CMDACT set, poll until clear" sequence on
+ * DEPCMD, and so did this function. Five independent agents doing a
+ * read-modify-poll on one register, over a single-outstanding LMMI port, is a
+ * race: any of them can observe CMDACT clear, lose it to another writer, and
+ * have its command dropped or applied to the wrong endpoint.
+ *
+ * DepCmdArbiter is now the sole writer. The RTL lanes post on internal
+ * ports and the CPU posts here, lowest port first. The arbiter sets CMDACT
+ * itself, so the word posted below must not carry it.
+ *
+ * MBX_TRB is deliberately left alone. Writing it arms the arbiter's TX-FIFO
+ * hold, which waits on the completion-event snoop; that snoop needs UsbEngine,
+ * which this design does not build. With MBX_TRB at 0 the arbiter never sets
+ * expectTrb, so no hold waits for an event that cannot arrive.
+ *
+ * Designs whose device tree has no mailbox node keep the direct write.
+ */
+#define UDC_DWC3_DEPCMD_MBX_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(tinyvision_depcmd_mailbox)
+
+#if DT_NODE_EXISTS(UDC_DWC3_DEPCMD_MBX_NODE)
+#define UDC_DWC3_DEPCMD_MBX_BASE DT_REG_ADDR(UDC_DWC3_DEPCMD_MBX_NODE)
+#define UDC_DWC3_MBX_ADDR	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x00)
+#define UDC_DWC3_MBX_DATA	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x04)
+#define UDC_DWC3_MBX_STATUS	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x08)
+#define UDC_DWC3_MBX_RESULT	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x0c)
+#define UDC_DWC3_MBX_STATUS_DONE BIT(1)
+#define UDC_DWC3_MBX_STATUS_ERR	 BIT(2)
+#endif
+
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 				const uint32_t addr, const uint32_t cmd)
 {
@@ -679,6 +713,25 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	k_timepoint_t end = sys_timepoint_calc(K_MSEC(1000));
 	uint32_t reg;
 
+#if DT_NODE_EXISTS(UDC_DWC3_DEPCMD_MBX_NODE)
+	/* MBX_ADDR takes the full byte address; the MBX_DATA write posts. */
+	sys_write32(base + addr, UDC_DWC3_MBX_ADDR);
+	sys_write32(cmd, UDC_DWC3_MBX_DATA);
+
+	do {
+		reg = sys_read32(UDC_DWC3_MBX_STATUS);
+
+		if (sys_timepoint_expired(end)) {
+			LOG_ERR("depcmd mailbox post expired");
+			break;
+		}
+	} while ((reg & (UDC_DWC3_MBX_STATUS_DONE | UDC_DWC3_MBX_STATUS_ERR)) == 0);
+
+	/* The arbiter's own 1 ms timeout means a wedged engine reports ERR
+	 * here rather than spinning until the 1 s timepoint above.
+	 */
+	reg = sys_read32(UDC_DWC3_MBX_RESULT);
+#else
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
 
 	do {
@@ -689,6 +742,7 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 			break;
 		}
 	} while ((reg & UDC_DWC3_DEPCMD_CMDACT) != 0);
+#endif
 
 	switch (reg & UDC_DWC3_DEPCMD_STATUS_MASK) {
 	case UDC_DWC3_DEPCMD_STATUS_OK:
