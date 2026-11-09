@@ -134,3 +134,29 @@ config UDC_DWC3_IN_RECOVER_EP_MASK
 	  may touch (bit 2 = 0x82). Recovery must never be aimed at an
 	  RTL-owned endpoint, and a mask makes that a build-time property
 	  rather than a runtime check that could be reached mid-handoff.
+
+config UDC_DWC3_ARM_PACKET_HOLD
+	bool "Arm the arbiter packet hold (MBX_TRB) on recoverable IN endpoints"
+	depends on UDC_DWC3_COMPLETION_POLL
+	help
+	  Writes MBX_TRB before a StartXfer/UpdateXfer on the endpoints
+	  IN_RECOVER_EP_MASK names, which arms the arbiter's packet hold: it
+	  keeps the next video doorbell off the pipe while a bulk IN short
+	  packet is still in its TX FIFO. Without the hold, a video UpdateXfer
+	  can run first, DWC3 drops the transfer, and the TRB stays HWO with
+	  its remaining count at the full length.
+
+	  Off by default, because on this design it is a measured cost with no
+	  measured benefit (2026-11-09): arming it took both 1640x1232 lanes
+	  from 27.00 to 24.01 fps -- about 11% of frames -- and the CDC-ACM
+	  endpoint still wedged at the same point. Adding the flat hold on top
+	  (QUIET_OTHER=60000) cost 22% and still wedged.
+
+	  The hold is bounded, not a hang risk: fifoStuckTo releases it after
+	  1,500,000 cycles plus the 7,500-cycle probe delay, and HOLD_MAX_US
+	  was measured at 1,507,508 -- that backstop firing, to within the
+	  8-cycle bus read latency. But a 20 ms video stall per occurrence is
+	  half a frame interval at 27 fps.
+
+	  Enable it only where the transfer-drop mechanism is known to be the
+	  failure, which on the reference single-UVC SRP configuration it is.
