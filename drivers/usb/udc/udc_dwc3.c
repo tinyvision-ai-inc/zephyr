@@ -779,10 +779,31 @@ static void udc_dwc3_unlock(const struct device *const dev)
  * ports and the CPU posts here, lowest port first. The arbiter sets CMDACT
  * itself, so the word posted below must not carry it.
  *
- * MBX_TRB is deliberately left alone. Writing it arms the arbiter's TX-FIFO
- * hold, which waits on the completion-event snoop; that snoop needs UsbEngine,
- * which this design does not build. With MBX_TRB at 0 the arbiter never sets
- * expectTrb, so no hold waits for an event that cannot arrive.
+ * MBX_TRB arms the arbiter's packet hold, and NOT arming it was a mistake.
+ *
+ * The hold keeps the next video doorbell off the pipe while a bulk IN short
+ * packet is still in its TX FIFO (FIFO 2 for 0x82). Without it, a video
+ * UpdateXfer can run before the packet has left, DWC3 DROPS that transfer, the
+ * TRB stays HWO with its remaining count at the full length, and the endpoint
+ * parks. That is exactly the wedge measured on 2026-11-09: 0x82 frozen at
+ * remain=11, our 11-byte echo frame, with video unaffected.
+ *
+ * This file previously skipped the write, reasoning that the hold's release
+ * needs the completion-event snoop and that the snoop needs UsbEngine, "which
+ * this design does not build". The premise is wrong: the snoop is wired
+ * unconditionally in TinyClunx.scala (evtPend/xferIp/takeXferIp), and
+ * UsbEngine is instantiated unconditionally. So the release path exists.
+ *
+ * The arm term is xferTrb = (startXfer || updateXfer) && !isEp0 && mbxTrb != 0,
+ * and acmIn = xferTrb && (physEp === 5) covers 0x82. This tree's arbiter also
+ * carries the hold02 split, so the packet hold arms WITHOUT QUIET_OTHER, and
+ * holdMin is 0 for earlyIn -- the hold ends on the endpoint's own completion
+ * event rather than a timer, so it imposes no flat minimum and costs no
+ * frames. QUIET_OTHER (reset 0 in this tree, 60000 in the reference) gates
+ * only the flat everyOther/flatRest holds, which are a separate mechanism.
+ *
+ * One-shot, written between MBX_ADDR and the posting MBX_DATA write, and
+ * re-armed per command by the caller.
  *
  * Designs whose device tree has no mailbox node keep the direct write.
  */
@@ -794,9 +815,62 @@ static void udc_dwc3_unlock(const struct device *const dev)
 #define UDC_DWC3_MBX_DATA	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x04)
 #define UDC_DWC3_MBX_STATUS	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x08)
 #define UDC_DWC3_MBX_RESULT	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x0c)
+#define UDC_DWC3_MBX_TRB	 (UDC_DWC3_DEPCMD_MBX_BASE + 0x14)
+/*
+ * udc_dwc3_depcmd() returns the command's XFERRSCIDX, so it cannot use 0 to
+ * mean failure: 0 is a legitimate index, and StartXfer assigns the return
+ * straight into ep_data->xferrscidx. A failed post that returned 0 therefore
+ * POISONED the index, and every later UpdateXfer was posted as 0x...7 with
+ * XFERRSCIDX=0, which matches no transfer resource, so DWC3 never retired it
+ * and CMDACT hung. Measured 2026-11-09: MBX_DATA 0x30007 (idx 3) before the
+ * wedge, 0x7 (idx 0) at it, MBX_RESULT 0, MBX_STATUS 0x6, seven CMDACT
+ * timeouts per 300 s run.
+ */
+#define UDC_DWC3_DEPCMD_FAILED 0xFFFFFFFFU
+
+/* Armed by udc_dwc3_mbx_arm_trb() for the next post only. */
+static uint32_t udc_dwc3_mbx_trb;
+
+#if defined(CONFIG_UDC_DWC3_COMPLETION_POLL)
+/*
+ * Software recovery must never be aimed at an endpoint the video RTL drives:
+ * a nudge or a retire there would act on the video ring's own transfer.
+ */
+BUILD_ASSERT((CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK &
+	      CONFIG_UDC_DWC3_HW_IN_EP_MASK) == 0,
+	     "UDC_DWC3_IN_RECOVER_EP_MASK must not include RTL (HW_IN) endpoints");
+#endif
+#define UDC_DWC3_MBX_STATUS_BUSY BIT(0)
 #define UDC_DWC3_MBX_STATUS_DONE BIT(1)
 #define UDC_DWC3_MBX_STATUS_ERR	 BIT(2)
 #endif
+
+/*
+ * Arm the arbiter's packet hold for the next DEPCMD on this endpoint.
+ *
+ * Limited to the endpoints IN_RECOVER_EP_MASK names, which by construction
+ * excludes the RTL-owned video endpoints: arming on those would hold a video
+ * doorbell against the video ring's own transfer.
+ */
+static void udc_dwc3_mbx_arm_trb(const struct udc_dwc3_ep_data *const ep_data,
+				 const void *const trb)
+{
+#if DT_NODE_EXISTS(UDC_DWC3_DEPCMD_MBX_NODE) && \
+	defined(CONFIG_UDC_DWC3_ARM_PACKET_HOLD)
+	if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		return;
+	}
+	if ((CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK &
+	     BIT(USB_EP_GET_IDX(ep_data->cfg.addr))) == 0U) {
+		return;
+	}
+
+	udc_dwc3_mbx_trb = LO32((uintptr_t)trb);
+#else
+	ARG_UNUSED(ep_data);
+	ARG_UNUSED(trb);
+#endif
+}
 
 static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 				const uint32_t addr, const uint32_t cmd)
@@ -806,22 +880,86 @@ static uint32_t udc_dwc3_depcmd(const struct device *const dev,
 	uint32_t reg;
 
 #if DT_NODE_EXISTS(UDC_DWC3_DEPCMD_MBX_NODE)
-	/* MBX_ADDR takes the full byte address; the MBX_DATA write posts. */
-	sys_write32(base + addr, UDC_DWC3_MBX_ADDR);
-	sys_write32(cmd, UDC_DWC3_MBX_DATA);
+	/*
+	 * There is exactly one poster, and a DATA write while the mailbox is
+	 * BUSY is DROPPED by the RTL:
+	 *
+	 *   when(io.mbxPost && !mbxBusy) { ...; mbxDone := False }
+	 *
+	 * The post is ignored and mbxDone keeps the PREVIOUS command's value.
+	 * The first cut of this function wrote ADDR and DATA with no BUSY
+	 * check and no mutual exclusion, then polled for DONE -- so a post
+	 * made while busy was silently discarded and the stale DONE was read
+	 * back as this command's own completion, returning the previous
+	 * command's result. Every caller then believed a command had executed
+	 * when it had never reached DWC3.
+	 *
+	 * That is consistent with what the bench showed on 2026-11-09: a
+	 * four-rung park-recovery ladder (TX FIFO flush, EndXfer+StartXfer,
+	 * DEPCFG MODIFY, SetStall/ClearStall) in which every rung reported
+	 * success while the endpoint stayed frozen at a constant BUFSIZ, and
+	 * MBX_STATUS latching ERR.
+	 *
+	 * So: wait for !BUSY, post ADDR and DATA with interrupts locked so the
+	 * pair cannot interleave with a post from another context, then
+	 * confirm the post was ACCEPTED (BUSY or DONE observed) before waiting
+	 * for completion. An immediate !BUSY must not be read as completion.
+	 */
+	unsigned int key;
 
+	for (;;) {
+		key = irq_lock();
+		if ((sys_read32(UDC_DWC3_MBX_STATUS) & UDC_DWC3_MBX_STATUS_BUSY) == 0) {
+			break;
+		}
+		irq_unlock(key);
+
+		if (sys_timepoint_expired(end)) {
+			LOG_ERR("depcmd mailbox busy, cmd 0x%x dropped", cmd);
+			return UDC_DWC3_DEPCMD_FAILED;
+		}
+	}
+
+	/* MBX_ADDR takes the full byte address; the MBX_DATA write posts.
+	 * MBX_TRB must land between the two, and is one-shot.
+	 */
+	sys_write32(base + addr, UDC_DWC3_MBX_ADDR);
+	if (udc_dwc3_mbx_trb != 0U) {
+		sys_write32(udc_dwc3_mbx_trb, UDC_DWC3_MBX_TRB);
+		udc_dwc3_mbx_trb = 0U;
+	}
+	sys_write32(cmd, UDC_DWC3_MBX_DATA);
+	irq_unlock(key);
+
+	/* BUSY is registered on the DATA write, so confirm acceptance first. */
 	do {
 		reg = sys_read32(UDC_DWC3_MBX_STATUS);
 
 		if (sys_timepoint_expired(end)) {
-			LOG_ERR("depcmd mailbox post expired");
-			break;
+			LOG_ERR("depcmd mailbox post not accepted, cmd 0x%x sts 0x%x",
+				cmd, reg);
+			return UDC_DWC3_DEPCMD_FAILED;
 		}
-	} while ((reg & (UDC_DWC3_MBX_STATUS_DONE | UDC_DWC3_MBX_STATUS_ERR)) == 0);
+	} while ((reg & (UDC_DWC3_MBX_STATUS_BUSY | UDC_DWC3_MBX_STATUS_DONE |
+			 UDC_DWC3_MBX_STATUS_ERR)) == 0);
 
-	/* The arbiter's own 1 ms timeout means a wedged engine reports ERR
-	 * here rather than spinning until the 1 s timepoint above.
-	 */
+	while ((reg & UDC_DWC3_MBX_STATUS_BUSY) != 0) {
+		reg = sys_read32(UDC_DWC3_MBX_STATUS);
+
+		if (sys_timepoint_expired(end)) {
+			LOG_ERR("depcmd mailbox never completed, cmd 0x%x sts 0x%x",
+				cmd, reg);
+			return UDC_DWC3_DEPCMD_FAILED;
+		}
+	}
+
+	if ((reg & UDC_DWC3_MBX_STATUS_ERR) != 0) {
+		/* The arbiter's CMDACT poll timed out: the command reached DWC3
+		 * and DWC3 never retired it. Distinct from a dropped post.
+		 */
+		LOG_ERR("depcmd CMDACT timeout in arbiter, cmd 0x%x addr 0x%x", cmd, addr);
+	}
+
 	reg = sys_read32(UDC_DWC3_MBX_RESULT);
 #else
 	sys_write32(cmd | UDC_DWC3_DEPCMD_CMDACT, base + addr);
@@ -1043,7 +1181,8 @@ static bool udc_dwc3_ep_refuse_if_hw_owned(const struct device *const dev,
  * dwc3_send_gadget_generic_command(). Nothing in this driver issued a DGCMD
  * before the TX-FIFO flush recovery below needed one.
  */
-static int udc_dwc3_dgcmd(const mm_reg_t base, const uint32_t cmd, const uint32_t param)
+__maybe_unused static int udc_dwc3_dgcmd(const mm_reg_t base, const uint32_t cmd,
+					 const uint32_t param)
 {
 	sys_write32(param, base + UDC_DWC3_DGCMDPAR);
 	sys_write32(cmd | UDC_DWC3_DGCMD_ACT, base + UDC_DWC3_DGCMD);
@@ -1082,6 +1221,25 @@ static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 
 	LOG_DBG("DepClearStall ep=0x%02x", ep_data->cfg.addr);
 
+	/*
+	 * Callers must not pass HIPRI_FORCERM here.
+	 *
+	 * Bit 11 is ForceRM, which DWC3 defines only for DEPENDXFER; Linux
+	 * issues CLEARSTALL bare, and so does the reference tree. Both call
+	 * sites in this file used to set it, and a ClearStall that never
+	 * retires leaves a halted endpoint that cannot be un-halted -- a dead
+	 * ACM by definition.
+	 *
+	 * Measured 2026-11-09: after the XFERRSCIDX poisoning was fixed, the
+	 * arbiter's CMDACT timeout moved from UpdateXfer (MBX_DATA 0x7) to
+	 * this command (MBX_DATA 0x5), with MBX_RESULT 0 and MBX_STATUS 0x6.
+	 * The reference's own note on the matching EndXfer case is that
+	 * "ForceRM is what is fatal with words loaded", which is exactly the
+	 * state a stalled bulk IN is in.
+	 */
+	__ASSERT((flags & UDC_DWC3_DEPCMD_HIPRI_FORCERM) == 0,
+		 "ForceRM is not valid on ClearStall");
+
 	flags |= UDC_DWC3_DEPCMD_DEPCSTALL;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
@@ -1096,6 +1254,7 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
+	uint32_t rsc;
 
 	/* Make sure the device is in U0 state, assuming TX FIFO is empty */
 	reg = sys_read32(base + UDC_DWC3_DCTL);
@@ -1106,8 +1265,22 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
-	ep_data->xferrscidx =
-		udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSTRTXFER);
+	udc_dwc3_mbx_arm_trb(ep_data, ep_data->trb_buf);
+
+	rsc = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			      UDC_DWC3_DEPCMD_DEPSTRTXFER);
+
+	if (rsc == UDC_DWC3_DEPCMD_FAILED) {
+		/*
+		 * Keep whatever index the endpoint already had. Overwriting it
+		 * with a failure value is what left UpdateXfer posting
+		 * XFERRSCIDX=0 into a controller that then hung on it.
+		 */
+		LOG_ERR("DepStartXfer failed ep=0x%02x, keeping xferrscidx=0x%x",
+			ep_data->cfg.addr, ep_data->xferrscidx);
+	} else {
+		ep_data->xferrscidx = rsc;
+	}
 
 	LOG_DBG("DepStartXfer done ep=0x%02x xferrscidx=0x%x",
 		ep_data->cfg.addr, ep_data->xferrscidx);
@@ -1120,10 +1293,24 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 		return;
 	}
 
+	/*
+	 * An UpdateXfer with XFERRSCIDX=0 matches no transfer resource, so the
+	 * controller accepts it and never retires it: CMDACT stays set and the
+	 * endpoint is dead. Refuse to post one -- an endpoint with no live
+	 * resource needs a StartXfer, not a doorbell.
+	 */
+	if (ep_data->xferrscidx == 0U) {
+		LOG_ERR("ep 0x%02x has no transfer resource; refusing UpdateXfer",
+			ep_data->cfg.addr);
+		return;
+	}
+
 	uint32_t flags = 0;
 
 	flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
+
+	udc_dwc3_mbx_arm_trb(ep_data, &ep_data->trb_buf[ep_data->tail]);
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
 
@@ -2147,6 +2334,12 @@ static void udc_dwc3_completion_poll_worker(struct k_work *work)
 	const struct device *const dev = priv->dev;
 	const struct udc_dwc3_config *const cfg = dev->config;
 
+	/*
+	 * The completion poll runs on OUT as well, and that is safe where park
+	 * recovery is not: it acts only when HWO is CLEAR with a buffer still
+	 * waiting, i.e. a transfer the controller finished and never reported.
+	 * An armed-and-waiting OUT has HWO SET and is skipped.
+	 */
 	udc_dwc3_completion_poll_dir(dev, cfg->ep_data_out, cfg->num_out_eps,
 				     priv->poll_grace_out,
 				     (int)ARRAY_SIZE(priv->poll_grace_out),
@@ -2157,8 +2350,28 @@ static void udc_dwc3_completion_poll_worker(struct k_work *work)
 				     &priv->poll_retired_in, true, "IN");
 
 #if defined(CONFIG_UDC_DWC3_PARK_NUDGE)
-	udc_dwc3_park_nudge_dir(dev, cfg->ep_data_out, cfg->num_out_eps,
-				&priv->park_nudged_out, false, "OUT");
+	/*
+	 * Park recovery is IN-only, deliberately.
+	 *
+	 * An idle bulk OUT SHOULD sit with HWO set and its remaining count at
+	 * the full buffer length: that is an armed endpoint waiting for the
+	 * host to write, not a stuck one, and from inside the driver it is
+	 * indistinguishable from a park. The reference tree established this
+	 * the hard way -- treating armed-and-waiting OUT as stuck produced
+	 * "false STUCK storms", and eager EndXfer recycling on it BROKE ACM
+	 * enumeration.
+	 *
+	 * This also retires an inference of mine: I read 0x01 freezing at
+	 * remain=1024 alongside 0x82 at remain=11 as two endpoints parking
+	 * together, and used it to argue the fault could not be transmit-side.
+	 * It is far more likely one symptom: once 0x82 wedges, the host stops
+	 * writing because its echo never returns, and 0x01 is then simply
+	 * idle-armed and innocent.
+	 *
+	 * A genuine OUT failure (host actively writing, TRB not retiring) needs
+	 * evidence the host was pushing bytes at the time, which this tick does
+	 * not have. Until it does, the OUT side is left alone.
+	 */
 	udc_dwc3_park_nudge_dir(dev, cfg->ep_data_in, cfg->num_in_eps,
 				&priv->park_nudged_in, true, "IN");
 #endif
@@ -2544,7 +2757,8 @@ static int udc_dwc3_ep_resume(const struct device *const dev,
 
 	/* Reset all ongoing transfers on non-control OUT endpoints */
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) > 0) {
-		udc_dwc3_depcmd_clear_stall(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+		/* No ForceRM: see udc_dwc3_depcmd_clear_stall(). */
+		udc_dwc3_depcmd_clear_stall(dev, ep_data, 0);
 	}
 
 	udc_dwc3_depcmd_ep_config(dev, ep_data);
@@ -2687,7 +2901,8 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	 */
 	const bool was_rtl = udc_dwc3_hw_owned_revoke(dev, ep_data, "clear-halt");
 
-	udc_dwc3_depcmd_clear_stall(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+	/* No ForceRM: see udc_dwc3_depcmd_clear_stall(). */
+	udc_dwc3_depcmd_clear_stall(dev, ep_data, 0);
 	ep_data->cfg.stat.halted = false;
 
 	/*
