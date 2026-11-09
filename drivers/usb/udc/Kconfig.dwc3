@@ -40,3 +40,97 @@ config UDC_DWC3_SHELL
 	  inspecting the list of ongoing transactions.
 
 endif # UDC_DWC3
+
+config UDC_DWC3_COMPLETION_POLL
+	bool "Recover bulk transfer completions the controller never reported"
+	help
+	  This Soft-IP sometimes clears HWO on a CPU-managed bulk TRB without
+	  posting a DEPEVT, under concurrent UVC + CDC load. The event thread
+	  then never retires the buffer: on OUT the received packet is never
+	  handed to the class and the host's write stalls forever, on IN the
+	  class stops enqueueing. Neither direction recovers on its own, and a
+	  host-side timeout on the stalled endpoint kills an URB, whose xHCI
+	  Stop Endpoint this device cannot retire -- which takes the whole host
+	  controller down.
+
+	  When enabled, a periodic tick on the UDC work queue retires bulk
+	  slots whose HWO has stayed clear for a grace interval, synthesising
+	  the XferInProgress that was dropped. Endpoints owned by the video
+	  RTL are skipped: the RTL retires those itself.
+
+config UDC_DWC3_COMPLETION_POLL_MS
+	int "Completion poll interval (ms)"
+	default 100
+	depends on UDC_DWC3_COMPLETION_POLL
+	help
+	  Keep this well below the host's bulk timeout so a dropped completion
+	  is recovered before the host gives up on the endpoint.
+
+config UDC_DWC3_COMPLETION_POLL_TICKS
+	int "Grace ticks before retiring a completion in software"
+	default 8
+	depends on UDC_DWC3_COMPLETION_POLL
+	help
+	  Ticks that HWO must stay clear before a software retire. Too short
+	  races a live DEPEVT and desyncs the ring; the reference tree found
+	  2 ticks (~200 ms) raced real events and settled on 8 (~800 ms).
+
+config UDC_DWC3_PARK_NUDGE
+	bool "Re-ring the doorbell on a bulk endpoint whose TRB is never fetched"
+	depends on UDC_DWC3_COMPLETION_POLL
+	help
+	  The completion poll recovers a transfer the controller finished but
+	  never reported. This recovers the other half of the same defect: a
+	  transfer the controller never started, because the UpdateXfer
+	  doorbell was dropped under UVC load. The tail TRB stays owned by
+	  hardware with its remaining count frozen, which no completion poll
+	  can see, and the endpoint is stuck until the host gives up.
+
+	  Measured on 2026-11-09: CDC-ACM ran normally for ~240 writes with
+	  both video lanes streaming, then the completion poll rescued 8 round
+	  trips, and then HWO stopped clearing at all -- a started-but-never-
+	  fetched transfer, not a dropped completion.
+
+	  Recovery here is only to re-issue UpdateXfer, capped and with a
+	  cooldown. It deliberately does NOT tear down and rebuild the ring
+	  (the reference tree's escalation path), because an armed TRB with a
+	  frozen remaining count is also the normal state of an endpoint the
+	  host has simply not polled yet, and re-ringing a doorbell is
+	  harmless there while rebuilding a live ring is not.
+
+config UDC_DWC3_PARK_NUDGE_MS
+	int "Time a bulk TRB may stay unfetched before a nudge (ms)"
+	default 2000
+	depends on UDC_DWC3_PARK_NUDGE
+	help
+	  Must be long enough that an idle host poll does not look like a
+	  park, and well inside the host's bulk timeout.
+
+config UDC_DWC3_PARK_NUDGE_CAP
+	int "Consecutive nudges before giving up on an endpoint"
+	default 6
+	depends on UDC_DWC3_PARK_NUDGE
+
+config UDC_DWC3_HW_IN_EP_MASK
+	hex "IN endpoints whose TRBs the video RTL owns"
+	default 0x0
+	help
+	  Bitmask of IN endpoint indexes driven by the UsbMgr RTL rather than
+	  the CPU (bit 3 = 0x83, bit 4 = 0x84; 0x18 for dual bulk UVC).
+
+	  These endpoints get no XferComplete/XferInProgress events. The RTL
+	  retires its own TRBs, so every such event is one the CPU does not
+	  need -- and at two lanes of 1640x1232 it is tens of thousands per
+	  second into an event ring sized in the tens of slots. The ring then
+	  starves of the ACM completions that do matter, which is the defect
+	  the completion poll was papering over.
+
+config UDC_DWC3_IN_RECOVER_EP_MASK
+	hex "IN endpoints eligible for software recovery"
+	default 0x0
+	depends on UDC_DWC3_COMPLETION_POLL
+	help
+	  Bitmask of IN endpoint indexes the completion poll and park nudge
+	  may touch (bit 2 = 0x82). Recovery must never be aimed at an
+	  RTL-owned endpoint, and a mask makes that a build-time property
+	  rather than a runtime check that could be reached mid-handoff.

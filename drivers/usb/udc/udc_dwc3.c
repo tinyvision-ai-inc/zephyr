@@ -20,6 +20,13 @@
 LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 
 #include "udc_common.h"
+/*
+ * Public Lattice USB23 API (endpoint ownership handoff). Note this is a
+ * DIFFERENT file from the same-named private quirks header included further
+ * down with quotes: that one needs this driver's structs and must stay
+ * below them, while the ownership typedef is needed by udc_dwc3_data.
+ */
+#include <zephyr/drivers/usb/udc/udc_dwc3_lattice_usb23.h>
 
 /* TRB memory buffer fields */
 #define UDC_DWC3_TRB_STATUS_BUFSIZ_MASK				GENMASK(23, 0)
@@ -449,6 +456,15 @@ LOG_MODULE_REGISTER(dwc3, CONFIG_UDC_DRIVER_LOG_LEVEL);
 #define UDC_DWC3_DGCMD_LINKFUNCTION				(1 << 0)
 #define UDC_DWC3_DGCMD_WAKENOTIFNUM				(3 << 0)
 #define UDC_DWC3_DGCMD_FIFOFLUSHONE				(9 << 0)
+/*
+ * DGCMDPAR for FIFOFLUSHONE: bits[4:0] are the FIFO number and bit 5 selects
+ * TX. Without bit 5 the command is still legal and still reports success --
+ * it flushes RxFIFO n instead. The reference tree lost three soak attempts to
+ * exactly that, with the bytes left sitting in the TX FIFO it meant to clear.
+ */
+#define UDC_DWC3_DGCMDPAR_FIFO_NUM(n)				((n) << 0)
+#define UDC_DWC3_DGCMDPAR_RX_FIFO				(0 << 5)
+#define UDC_DWC3_DGCMDPAR_TX_FIFO				(1 << 5)
 #define UDC_DWC3_DGCMD_FIFOFLUSHALL				(10 << 0)
 #define UDC_DWC3_DGCMD_ENDPOINTNRDY				(12 << 0)
 #define UDC_DWC3_DGCMD_LOOPBACKTEST				(16 << 0)
@@ -557,6 +573,40 @@ struct udc_dwc3_ep_data {
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
 	/*
+	 * True while the video RTL (UsbMgr / TRBRamSink) owns this endpoint:
+	 * it writes the TRBs and rings DEPCMD(UpdateXfer) itself, roughly
+	 * 56,000 times a second per streaming lane.
+	 *
+	 * DWC3 has ONE endpoint-command engine. A CPU-side EndXfer, ClearStall
+	 * or StartXfer issued while the RTL is driving that same endpoint
+	 * collides on it, the CPU command never retires against the right
+	 * transfer, and the endpoint never reaches Stopped. The host's xHCI
+	 * Stop Endpoint then times out after 5 s and Linux declares the
+	 * controller dead -- six times on this bench on 2026-11-09, always
+	 * logging "xHCI host not responding to stop endpoint command" with
+	 * nothing device-side before it.
+	 *
+	 * The reference stack avoids this by refusing every CPU-side doorbell,
+	 * stall and disable while the RTL owns the endpoint (its frozen rule
+	 * 3) and by halting the manager before any command it must issue. The
+	 * ownership API in udc_dwc3_lattice_usb23.h was already declared in
+	 * this tree; only the enforcement was missing, so the video driver
+	 * took the TRB address and the doorbell word via the getters and
+	 * started the manager without the UDC ever knowing.
+	 */
+	bool hw_owned;
+	/* CSR base of the UsbMgr instance driving this endpoint, or 0. */
+	uintptr_t hw_mgr_base;
+#if defined(CONFIG_UDC_DWC3_PARK_NUDGE)
+	/* Park detection: tail and remaining count last seen, and for how long */
+	uint32_t park_tail;
+	uint32_t park_remain;
+	uint16_t park_ticks;
+	uint8_t park_nudges;
+	/* Set once the escalation ladder has been run and did not recover */
+	uint8_t park_exhausted;
+#endif
+	/*
 	 * Whether DEPXFERCFG has allocated a transfer resource for this
 	 * endpoint out of the CURRENT pool generation.
 	 *
@@ -596,6 +646,25 @@ struct udc_dwc3_data {
 	struct k_work event_work;
 	/* First endpoint to be configured */
 	uint8_t first_ep;
+	/* CPU-side endpoint commands refused because the RTL owned the EP. */
+	uint32_t hw_owned_refused;
+	/* Managers that did not report idle within the halt timeout. */
+	uint32_t hw_mgr_halt_timeouts;
+	/* Notified after ownership is revoked, so video can stop its pipeline */
+	lattice_usb23_hw_owner_cb_t hw_owner_cb;
+	void *hw_owner_user;
+#if defined(CONFIG_UDC_DWC3_COMPLETION_POLL)
+	/* Periodic recovery of completions the controller never reported */
+	struct k_work_delayable poll_work;
+	uint8_t poll_grace_out[8];
+	uint8_t poll_grace_in[8];
+	uint32_t poll_retired_out;
+	uint32_t poll_retired_in;
+#if defined(CONFIG_UDC_DWC3_PARK_NUDGE)
+	uint32_t park_nudged_out;
+	uint32_t park_nudged_in;
+#endif
+#endif
 #if CONFIG_UDC_DWC3_SHELL
 	/* FIFO space initial values */
 	uint16_t max_bytes_avail[_NUM_FIFO_SPACE][_NUM_FIFO_REGS];
@@ -828,8 +897,26 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	}
 
 	/* Per-endpoint events */
-	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
-	param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	/*
+	 * Soft-IP UVC: skip XferComplete/XferInProgress on endpoints the
+	 * video RTL drives, or the event ring floods.
+	 *
+	 * The RTL writes those TRBs and retires them itself, so each event is
+	 * one the CPU has no use for -- and two 1640x1232 lanes post them by
+	 * the tens of thousands per second. The ring then has no room for the
+	 * ACM completions that do matter, the class never learns a transfer
+	 * finished, and the endpoint parks. Raising the ring from 16 to 128
+	 * slots only buys headroom against that flood; this removes it.
+	 */
+	if ((USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+	     (CONFIG_UDC_DWC3_HW_IN_EP_MASK &
+	      BIT(USB_EP_GET_IDX(ep_data->cfg.addr))) != 0U)) {
+		LOG_DBG("ep 0x%02x is RTL-owned: transfer events masked",
+			ep_data->cfg.addr);
+	} else {
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
+		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+	}
 	/* To log CTRL DATA/STATUS messages: UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN */
 
 	/* This is the usb protocol endpoint number, but the data encoding
@@ -871,9 +958,115 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 	}
 }
 
+/*
+ * UsbMgr control register, mirroring tvai_uvcmanager.c. Kept here rather than
+ * shared through a header because the UDC only ever needs to stop a manager
+ * and see it go idle; the video driver owns everything else about it.
+ */
+#define UDC_DWC3_UVCMGR_CONTROL_STATUS		0x0010U
+#define UDC_DWC3_UVCMGR_CONTROL_ENABLE		BIT(0)
+#define UDC_DWC3_UVCMGR_CONTROL_BUSY		BIT(1)
+#define UDC_DWC3_UVCMGR_CONTROL_CONTINUE	BIT(14)
+
+/* How long to wait for a halted manager to drop BUSY. One video TRB is about
+ * a kilobyte at SuperSpeed, so this is thousands of times the expected wait;
+ * it is a backstop against a manager that is already wedged, not a tuning
+ * knob. Timing out is counted and reported, never ignored.
+ */
+#define UDC_DWC3_UVCMGR_HALT_TIMEOUT_US		2000U
+
+/*
+ * Stop the manager driving @p ep_data and wait until it reports idle, so the
+ * caller can issue an endpoint command without racing it.
+ *
+ * Our RTL has no HALT_DOORBELL/HALT_ACK handshake (the reference RTL does:
+ * CONTROL bits 15 and 16, which defer the doorbell while video data keeps
+ * flowing into the FIFO). TRBRamSink has no halt at all, so the coarse
+ * ENABLE=0 + poll BUSY is what this platform can offer today. It costs the
+ * frames in flight, which is why it is used only on the rare quiesce paths
+ * where the host is already tearing the endpoint down -- never per packet.
+ */
+static int udc_dwc3_hw_mgr_halt(const struct device *const dev,
+				struct udc_dwc3_ep_data *const ep_data)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+	const uintptr_t mgr = ep_data->hw_mgr_base;
+
+	if (mgr == 0U) {
+		return 0;
+	}
+
+	sys_write32(0U, mgr + UDC_DWC3_UVCMGR_CONTROL_STATUS);
+
+	for (uint32_t us = 0; us < UDC_DWC3_UVCMGR_HALT_TIMEOUT_US; us += 10U) {
+		if ((sys_read32(mgr + UDC_DWC3_UVCMGR_CONTROL_STATUS) &
+		     UDC_DWC3_UVCMGR_CONTROL_BUSY) == 0U) {
+			return 0;
+		}
+		k_busy_wait(10);
+	}
+
+	priv->hw_mgr_halt_timeouts++;
+	LOG_ERR("UsbMgr at 0x%lx still busy %u us after halt; ep 0x%02x command "
+		"will race it", (unsigned long)mgr, UDC_DWC3_UVCMGR_HALT_TIMEOUT_US,
+		ep_data->cfg.addr);
+	return -ETIMEDOUT;
+}
+
+/*
+ * Refuse a CPU-side endpoint command on an RTL-owned endpoint.
+ *
+ * Returns true when the caller must do nothing. Callers that legitimately
+ * need the command first revoke ownership (udc_dwc3_hw_owned_revoke), which
+ * halts the manager; anything else reaching here is a driver bug and is
+ * counted so a soak can assert on it.
+ */
+static bool udc_dwc3_ep_refuse_if_hw_owned(const struct device *const dev,
+					   struct udc_dwc3_ep_data *const ep_data,
+					   const char *const what)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (!ep_data->hw_owned) {
+		return false;
+	}
+
+	priv->hw_owned_refused++;
+	LOG_ERR("ep 0x%02x RTL-owned: refusing %s (refused=%u)",
+		ep_data->cfg.addr, what, priv->hw_owned_refused);
+	return true;
+}
+
+/*
+ * Device generic command: write DGCMDPAR, then DGCMD with CMDACT, poll until
+ * it clears. Same shape and the same 500-iteration bound as Linux's
+ * dwc3_send_gadget_generic_command(). Nothing in this driver issued a DGCMD
+ * before the TX-FIFO flush recovery below needed one.
+ */
+static int udc_dwc3_dgcmd(const mm_reg_t base, const uint32_t cmd, const uint32_t param)
+{
+	sys_write32(param, base + UDC_DWC3_DGCMDPAR);
+	sys_write32(cmd | UDC_DWC3_DGCMD_ACT, base + UDC_DWC3_DGCMD);
+
+	for (uint32_t i = 0U; i < 500U; i++) {
+		const uint32_t reg = sys_read32(base + UDC_DWC3_DGCMD);
+
+		if ((reg & UDC_DWC3_DGCMD_ACT) == 0U) {
+			return ((reg & UDC_DWC3_DGCMD_STATUS_MASK) ==
+				UDC_DWC3_DGCMD_STATUS_OK) ? 0 : -EIO;
+		}
+	}
+
+	return -ETIMEDOUT;
+}
+
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)
 {
+	if (udc_dwc3_ep_refuse_if_hw_owned(dev, ep_data, "SetStall")) {
+		return;
+	}
+
 	LOG_DBG("DepSetStall: ep=0x%02x", ep_data->cfg.addr);
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPSETSTALL);
@@ -883,6 +1076,10 @@ static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data,
 					uint32_t flags)
 {
+	if (udc_dwc3_ep_refuse_if_hw_owned(dev, ep_data, "ClearStall")) {
+		return;
+	}
+
 	LOG_DBG("DepClearStall ep=0x%02x", ep_data->cfg.addr);
 
 	flags |= UDC_DWC3_DEPCMD_DEPCSTALL;
@@ -893,6 +1090,10 @@ static void udc_dwc3_depcmd_clear_stall(const struct device *const dev,
 static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 				       struct udc_dwc3_ep_data *const ep_data)
 {
+	if (udc_dwc3_ep_refuse_if_hw_owned(dev, ep_data, "StartXfer")) {
+		return;
+	}
+
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
@@ -915,6 +1116,10 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 					struct udc_dwc3_ep_data *const ep_data)
 {
+	if (udc_dwc3_ep_refuse_if_hw_owned(dev, ep_data, "UpdateXfer")) {
+		return;
+	}
+
 	uint32_t flags = 0;
 
 	flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
@@ -930,6 +1135,10 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 				     struct udc_dwc3_ep_data *const ep_data,
 				     uint32_t flags)
 {
+	if (udc_dwc3_ep_refuse_if_hw_owned(dev, ep_data, "EndXfer")) {
+		return;
+	}
+
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
@@ -1617,6 +1826,348 @@ static void udc_dwc3_on_xfer_done_nonctrl(const struct device *const dev, const 
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_COMPLETION_POLL)
+/*
+ * Retire bulk slots whose completion the controller never reported.
+ *
+ * This Soft-IP clears HWO on a CPU-managed bulk TRB without posting a DEPEVT
+ * when UVC and CDC run concurrently. Nothing then retires the buffer: the OUT
+ * packet is never handed to the class, so the host's write stalls forever,
+ * and the IN side stops enqueueing. Measured on 2026-11-09: CDC-ACM OUT
+ * parked after 91 writes with both video lanes streaming and stayed parked
+ * for the remaining 15 s of the run.
+ *
+ * The recovery is to notice HWO clear with a buffer still waiting and
+ * synthesise the XferInProgress that was dropped. HWO must stay clear for
+ * CONFIG_UDC_DWC3_COMPLETION_POLL_TICKS ticks first: a short grace races a
+ * DEPEVT that is merely late and double-pops the ring, which is worse than
+ * the stall. The reference tree measured that directly -- 2 ticks raced live
+ * events, 8 did not.
+ */
+static void udc_dwc3_completion_poll_dir(const struct device *const dev,
+					 struct udc_dwc3_ep_data *const eps,
+					 const int num_eps, uint8_t *const grace,
+					 const int grace_len, uint32_t *const retired,
+					 const bool is_in, const char *const dir)
+{
+	for (int idx = 1; idx < num_eps && idx < grace_len; idx++) {
+		struct udc_dwc3_ep_data *const ep_data = &eps[idx];
+
+		/*
+		 * IN recovery is limited to the endpoints the mask names.
+		 * An RTL-owned IN must never be retired in software, and the
+		 * mask settles that at build time rather than relying on a
+		 * runtime flag that a handoff could be in the middle of
+		 * changing.
+		 */
+		if (is_in && (CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK & BIT(idx)) == 0U) {
+			grace[idx] = 0;
+			continue;
+		}
+
+		/*
+		 * Skip anything that cannot be a dropped completion: no ring,
+		 * not bulk, nothing waiting, the transfer still owned by
+		 * hardware, or an endpoint the video RTL retires itself.
+		 */
+		if (ep_data->trb_buf == NULL || ep_data->hw_owned ||
+		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) !=
+			    USB_EP_TYPE_BULK ||
+		    ep_data->net_buf[ep_data->tail] == NULL ||
+		    (ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+			grace[idx] = 0;
+			continue;
+		}
+
+		if (grace[idx] < (uint8_t)CONFIG_UDC_DWC3_COMPLETION_POLL_TICKS) {
+			grace[idx]++;
+			continue;
+		}
+
+		grace[idx] = 0;
+
+		/* Re-check under lock so the event thread cannot double-pop. */
+		{
+			const unsigned int key = irq_lock();
+
+			if (ep_data->net_buf[ep_data->tail] == NULL ||
+			    (ep_data->trb_buf[ep_data->tail].ctrl &
+			     UDC_DWC3_TRB_CTRL_HWO) != 0U) {
+				irq_unlock(key);
+				continue;
+			}
+
+			(*retired)++;
+			udc_dwc3_on_xfer_done_nonctrl(
+				dev, UDC_DWC3_DEPEVT_XFERINPROGRESS(ep_data->epn));
+			irq_unlock(key);
+		}
+
+		LOG_WRN("%s-POLL: retired lost completion ep=0x%02x tail=%u (total=%u)",
+			dir, ep_data->cfg.addr, ep_data->tail, *retired);
+	}
+}
+
+#if defined(CONFIG_UDC_DWC3_PARK_NUDGE)
+/* Ticks of the poll interval that a frozen TRB must persist before a nudge. */
+#define UDC_DWC3_PARK_TICKS                                                    \
+	((CONFIG_UDC_DWC3_PARK_NUDGE_MS + CONFIG_UDC_DWC3_COMPLETION_POLL_MS - 1) /    \
+	 CONFIG_UDC_DWC3_COMPLETION_POLL_MS)
+/* Ticks between nudges, and how long to back off once the cap is reached. */
+#define UDC_DWC3_PARK_COOLDOWN_TICKS 4
+#define UDC_DWC3_PARK_BACKOFF_TICKS  50
+
+/*
+ * Re-ring the doorbell on a bulk endpoint whose tail TRB is still owned by
+ * hardware with a frozen remaining count: the UpdateXfer that should have
+ * started it was dropped. The completion poll cannot see this case, because
+ * HWO never clears.
+ *
+ * Only UpdateXfer is issued, never a ring rebuild. An armed TRB with a frozen
+ * remaining count is also exactly what an endpoint looks like when the host
+ * has not polled it yet, and that is indistinguishable from here; an extra
+ * doorbell costs nothing in that case, while tearing down a live ring does.
+ */
+/* Still owned by hardware with a buffer waiting: the park has not cleared. */
+static bool udc_dwc3_park_stuck(const struct udc_dwc3_ep_data *const ep_data)
+{
+	return ep_data->net_buf[ep_data->tail] != NULL &&
+	       (ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) != 0U;
+}
+
+/*
+ * Walk progressively harder resets of a parked endpoint's own state, stopping
+ * at the first that clears HWO. Returns true if one did.
+ *
+ * This runs as a SINGLE pass with a re-check after each rung, which is not a
+ * style choice. The first cut advanced one rung per 100 ms poll tick, and s2's
+ * StartXfer makes the core re-fetch and re-load the TRB -- which changes the
+ * remaining count, which the park detector then read as forward progress and
+ * reset the ladder to the bottom. s3 and s4 were never reached once in a
+ * 300 s soak (both counters zero while s1 and s2 logged twice each). Checking
+ * the endpoint directly after each step, inside one call, is what makes the
+ * ladder able to finish.
+ */
+static bool udc_dwc3_park_escalate(const struct device *const dev,
+				   struct udc_dwc3_ep_data *const ep_data,
+				   const char *const dir)
+{
+	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
+	const uint32_t fifo = USB_EP_GET_IDX(ep_data->cfg.addr);
+	int rc;
+
+	/*
+	 * s1: drop the orphaned bytes out of this endpoint's TX FIFO, then
+	 * re-ring once. Does not disturb the transfer. TX_FIFO is the bit that
+	 * makes this the TX FIFO and not RX n.
+	 */
+	rc = udc_dwc3_dgcmd(base, UDC_DWC3_DGCMD_FIFOFLUSHONE,
+			    UDC_DWC3_DGCMDPAR_TX_FIFO | UDC_DWC3_DGCMDPAR_FIFO_NUM(fifo));
+	LOG_WRN("%s-PARK: s1 flush TX fifo %u ep=0x%02x rc=%d",
+		dir, fifo, ep_data->cfg.addr, rc);
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	k_busy_wait(2000);
+	if (!udc_dwc3_park_stuck(ep_data)) {
+		LOG_WRN("%s-PARK: recovered at s1 ep=0x%02x", dir, ep_data->cfg.addr);
+		return true;
+	}
+
+	/*
+	 * s2: EndXfer WITHOUT ForceRM, then StartXfer the same slot. ForceRM
+	 * is the form that is fatal with words still loaded; plain EndXfer is
+	 * not, and the ring is left intact so the class completion path stays
+	 * in step.
+	 */
+	LOG_WRN("%s-PARK: s2 EndXfer(no ForceRM)+StartXfer ep=0x%02x",
+		dir, ep_data->cfg.addr);
+	udc_dwc3_depcmd_end_xfer(dev, ep_data, 0);
+	udc_dwc3_depcmd_start_xfer(dev, ep_data);
+	k_busy_wait(2000);
+	if (!udc_dwc3_park_stuck(ep_data)) {
+		LOG_WRN("%s-PARK: recovered at s2 ep=0x%02x", dir, ep_data->cfg.addr);
+		return true;
+	}
+
+	/*
+	 * s3: re-apply DEPCFG with ACTION_MODIFY, which
+	 * udc_dwc3_depcmd_ep_config picks once the endpoint is enabled, then
+	 * re-ring. MODIFY preserves endpoint state, so it comes before
+	 * anything that resets it.
+	 */
+	LOG_WRN("%s-PARK: s3 DEPCFG(MODIFY)+UpdateXfer ep=0x%02x", dir, ep_data->cfg.addr);
+	udc_dwc3_depcmd_ep_config(dev, ep_data);
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	k_busy_wait(2000);
+	if (!udc_dwc3_park_stuck(ep_data)) {
+		LOG_WRN("%s-PARK: recovered at s3 ep=0x%02x", dir, ep_data->cfg.addr);
+		return true;
+	}
+
+	/*
+	 * s4: SetStall then ClearStall, then re-ring.
+	 *
+	 * By here s1 has emptied the TX FIFO and s2's StartXfer has made the
+	 * core re-fetch and re-load the TRB, so TRB fetch, the AXI path and
+	 * FIFO fill all demonstrably work and the TRB still sits HWO. The only
+	 * stage left unaccounted for is transmit, and DEPCSTALL is the one
+	 * command that resets an endpoint's transmit state and its data
+	 * sequence number. Both halves are issued here, so no host
+	 * CLEAR_FEATURE(HALT) is needed.
+	 *
+	 * Raw DEPCMDs rather than the stall helpers: the clear-side helper
+	 * logs at INFO, which is compiled out at this log level, and a log
+	 * showing SetStall with no matching clear would leave it unclear
+	 * whether the endpoint had been left stalled.
+	 */
+	LOG_WRN("%s-PARK: s4 SetStall+ClearStall+UpdateXfer ep=0x%02x",
+		dir, ep_data->cfg.addr);
+	(void)udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			      UDC_DWC3_DEPCMD_DEPSETSTALL);
+	(void)udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
+			      UDC_DWC3_DEPCMD_DEPCSTALL);
+	ep_data->cfg.stat.halted = false;
+	udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	k_busy_wait(2000);
+	if (!udc_dwc3_park_stuck(ep_data)) {
+		LOG_WRN("%s-PARK: recovered at s4 ep=0x%02x", dir, ep_data->cfg.addr);
+		return true;
+	}
+
+	LOG_ERR("%s-PARK: ladder exhausted, ep=0x%02x still parked (remain=%u)",
+		dir, ep_data->cfg.addr,
+		(unsigned int)(ep_data->trb_buf[ep_data->tail].status &
+			       UDC_DWC3_TRB_STATUS_BUFSIZ_MASK));
+	return false;
+}
+
+static void udc_dwc3_park_nudge_dir(const struct device *const dev,
+				    struct udc_dwc3_ep_data *const eps,
+				    const int num_eps, uint32_t *const nudged,
+				    const bool is_in, const char *const dir)
+{
+	for (int idx = 1; idx < num_eps; idx++) {
+		struct udc_dwc3_ep_data *const ep_data = &eps[idx];
+		const struct udc_dwc3_trb *trb;
+		uint32_t remain;
+
+		/* Same rule as the completion poll: masked IN endpoints only. */
+		if (is_in && (CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK & BIT(idx)) == 0U) {
+			ep_data->park_ticks = 0;
+			ep_data->park_nudges = 0;
+			continue;
+		}
+
+		if (ep_data->trb_buf == NULL || ep_data->hw_owned ||
+		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) !=
+			    USB_EP_TYPE_BULK ||
+		    ep_data->net_buf[ep_data->tail] == NULL ||
+		    ep_data->xferrscidx == 0U) {
+			ep_data->park_ticks = 0;
+			ep_data->park_nudges = 0;
+			ep_data->park_exhausted = 0;
+			continue;
+		}
+
+		trb = &ep_data->trb_buf[ep_data->tail];
+		if ((trb->ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+			/* Finished but unreported: the completion poll owns this. */
+			ep_data->park_ticks = 0;
+			ep_data->park_nudges = 0;
+			continue;
+		}
+
+		remain = trb->status & UDC_DWC3_TRB_STATUS_BUFSIZ_MASK;
+
+		if (ep_data->tail != ep_data->park_tail ||
+		    remain != ep_data->park_remain) {
+			/* Forward progress; not parked. */
+			ep_data->park_tail = ep_data->tail;
+			ep_data->park_remain = remain;
+			ep_data->park_ticks = 0;
+			ep_data->park_nudges = 0;
+			ep_data->park_exhausted = 0;
+			continue;
+		}
+
+		ep_data->park_ticks++;
+
+		if (ep_data->park_nudges >= (uint8_t)CONFIG_UDC_DWC3_PARK_NUDGE_CAP) {
+			bool recovered;
+
+			if (ep_data->park_exhausted != 0U) {
+				/* Out of moves; wait for the host or a revoke. */
+				if (ep_data->park_ticks >= UDC_DWC3_PARK_BACKOFF_TICKS) {
+					ep_data->park_ticks = 0;
+					ep_data->park_nudges = 0;
+					ep_data->park_exhausted = 0;
+				}
+				continue;
+			}
+
+			if (ep_data->park_ticks < UDC_DWC3_PARK_TICKS +
+				    UDC_DWC3_PARK_COOLDOWN_TICKS *
+					    (uint16_t)CONFIG_UDC_DWC3_PARK_NUDGE_CAP) {
+				continue;
+			}
+
+			recovered = udc_dwc3_park_escalate(dev, ep_data, dir);
+
+			ep_data->park_ticks = 0;
+			ep_data->park_nudges = 0;
+			ep_data->park_remain =
+				ep_data->trb_buf[ep_data->tail].status &
+				UDC_DWC3_TRB_STATUS_BUFSIZ_MASK;
+			if (!recovered) {
+				ep_data->park_exhausted = 1;
+			}
+			continue;
+		}
+
+		if (ep_data->park_ticks < UDC_DWC3_PARK_TICKS +
+			    (uint16_t)ep_data->park_nudges * UDC_DWC3_PARK_COOLDOWN_TICKS) {
+			continue;
+		}
+
+		ep_data->park_nudges++;
+		(*nudged)++;
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+
+		LOG_WRN("%s-PARK: nudged ep=0x%02x tail=%u remain=%u (nudge %u, total=%u)",
+			dir, ep_data->cfg.addr, ep_data->tail, remain,
+			ep_data->park_nudges, *nudged);
+	}
+}
+#endif /* CONFIG_UDC_DWC3_PARK_NUDGE */
+
+static void udc_dwc3_completion_poll_worker(struct k_work *work)
+{
+	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
+	struct udc_dwc3_data *const priv =
+		CONTAINER_OF(dwork, struct udc_dwc3_data, poll_work);
+	const struct device *const dev = priv->dev;
+	const struct udc_dwc3_config *const cfg = dev->config;
+
+	udc_dwc3_completion_poll_dir(dev, cfg->ep_data_out, cfg->num_out_eps,
+				     priv->poll_grace_out,
+				     (int)ARRAY_SIZE(priv->poll_grace_out),
+				     &priv->poll_retired_out, false, "OUT");
+	udc_dwc3_completion_poll_dir(dev, cfg->ep_data_in, cfg->num_in_eps,
+				     priv->poll_grace_in,
+				     (int)ARRAY_SIZE(priv->poll_grace_in),
+				     &priv->poll_retired_in, true, "IN");
+
+#if defined(CONFIG_UDC_DWC3_PARK_NUDGE)
+	udc_dwc3_park_nudge_dir(dev, cfg->ep_data_out, cfg->num_out_eps,
+				&priv->park_nudged_out, false, "OUT");
+	udc_dwc3_park_nudge_dir(dev, cfg->ep_data_in, cfg->num_in_eps,
+				&priv->park_nudged_in, true, "IN");
+#endif
+
+	k_work_schedule_for_queue(udc_get_work_q(), &priv->poll_work,
+				  K_MSEC(CONFIG_UDC_DWC3_COMPLETION_POLL_MS));
+}
+#endif /* CONFIG_UDC_DWC3_COMPLETION_POLL */
+
 static const char *udc_dwc3_get_devt_ulstchng_name(const uint32_t dsts)
 {
 	switch (dsts & UDC_DWC3_DSTS_CONNECTSPD_MASK) {
@@ -1772,8 +2323,14 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		LOG_ERR("Event overflow");
 		break;
 	default:
-		LOG_ERR("unknown event: 0x%x", evt);
-		CODE_UNREACHABLE;
+		/*
+		 * Counted, not fatal. CODE_UNREACHABLE here is undefined
+		 * behaviour on an event the controller is entitled to post,
+		 * and this Soft-IP is known to post events this driver does
+		 * not model. Dropping one is survivable; faulting is not.
+		 */
+		LOG_ERR("unknown event: 0x%x (ignored)", evt);
+		break;
 	}
 }
 
@@ -1819,6 +2376,129 @@ static void udc_dwc3_irq_handler(void *const ptr)
  *
  * Interface called by Zehpyr from the upper levels of abstractions.
  */
+
+/*
+ * Drop the RTL's claim on @p ep_data and leave the endpoint quiesced.
+ *
+ * This is the sequence the reference stack runs on a forced revoke
+ * (clear-halt, reset, disconnect, ep-disable): stop that manager -- and only
+ * that manager, so the other camera keeps streaming -- wait for it to go
+ * idle, then end the transfer and scrub the ring. Only once the manager is
+ * silent may a CPU endpoint command be issued, which is the whole point:
+ * the two must never drive DWC3's single endpoint-command engine at once.
+ *
+ * Returns true when ownership was actually revoked, so the caller knows it
+ * has to re-arm the endpoint afterwards.
+ */
+static bool udc_dwc3_hw_owned_revoke(const struct device *const dev,
+				     struct udc_dwc3_ep_data *const ep_data,
+				     const char *const reason)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	if (!ep_data->hw_owned) {
+		return false;
+	}
+
+	/* Halt first. Everything below is a DEPCMD. */
+	(void)udc_dwc3_hw_mgr_halt(dev, ep_data);
+
+	ep_data->hw_owned = false;
+
+	LOG_INF("ep 0x%02x <- RTL forced revoke (%s)", ep_data->cfg.addr, reason);
+
+	/* Now safe: the guard above no longer refuses these. */
+	udc_dwc3_depcmd_end_xfer(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
+
+	/* Scrub the ring the RTL was writing into, keeping the Link TRB. */
+	memset(ep_data->trb_buf, 0,
+	       sizeof(*ep_data->trb_buf) * (CONFIG_UDC_DWC3_TRB_NUM - 1));
+	ep_data->head = ep_data->tail = 0;
+	ep_data->full = false;
+
+	if (priv->hw_owner_cb != NULL) {
+		priv->hw_owner_cb(dev, ep_data->cfg.addr, reason, priv->hw_owner_user);
+	}
+
+	return true;
+}
+
+int lattice_usb23_ep_give_to_rtl(const struct device *const dev, const uint8_t ep_addr,
+				 const uintptr_t mgr_base, uint32_t *const depupdxfer)
+{
+	struct udc_ep_config *const ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+	struct udc_dwc3_ep_data *ep_data;
+
+	if (ep_cfg == NULL || mgr_base == 0U) {
+		return -EINVAL;
+	}
+
+	ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+
+	/*
+	 * The endpoint must already have a live transfer resource: the RTL
+	 * reuses the xferrscidx that the CPU's StartXfer obtained at
+	 * ep_enable. Handing over without one leaves the manager ringing
+	 * UpdateXfer against an index DWC3 does not recognise.
+	 */
+	if (ep_data->xferrscidx == 0U) {
+		LOG_ERR("ep 0x%02x has no xferrscidx; refusing handoff", ep_addr);
+		return -EAGAIN;
+	}
+
+	ep_data->hw_mgr_base = mgr_base;
+	ep_data->hw_owned = true;
+
+	if (depupdxfer != NULL) {
+		*depupdxfer = UDC_DWC3_DEPCMD_DEPUPDXFER |
+			      FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK,
+					 ep_data->xferrscidx);
+	}
+
+	LOG_INF("ep 0x%02x -> RTL (xferrscidx=%u, mgr=0x%lx)", ep_addr,
+		ep_data->xferrscidx, (unsigned long)mgr_base);
+	return 0;
+}
+
+int lattice_usb23_ep_take_from_rtl(const struct device *const dev, const uint8_t ep_addr)
+{
+	struct udc_ep_config *const ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+	struct udc_dwc3_ep_data *ep_data;
+
+	if (ep_cfg == NULL) {
+		return -EINVAL;
+	}
+
+	ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
+
+	if (!ep_data->hw_owned) {
+		return -EALREADY;
+	}
+
+	(void)udc_dwc3_hw_owned_revoke(dev, ep_data, "take_from_rtl");
+	return 0;
+}
+
+bool lattice_usb23_ep_is_rtl_owned(const struct device *const dev, const uint8_t ep_addr)
+{
+	struct udc_ep_config *const ep_cfg = udc_get_ep_cfg(dev, ep_addr);
+
+	if (ep_cfg == NULL) {
+		return false;
+	}
+
+	return CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg)->hw_owned;
+}
+
+int lattice_usb23_set_hw_owner_cb(const struct device *const dev,
+				  const lattice_usb23_hw_owner_cb_t cb, void *const user)
+{
+	struct udc_dwc3_data *const priv = udc_get_private(dev);
+
+	priv->hw_owner_cb = cb;
+	priv->hw_owner_user = user;
+	return 0;
+}
 
 static int udc_dwc3_ep_enqueue(const struct device *const dev,
 			       struct udc_ep_config *const ep_cfg,
@@ -1926,6 +2606,14 @@ static int udc_dwc3_ep_disable(const struct device *const dev, struct udc_ep_con
 
 	LOG_DBG("Disabling EP 0x%02x", ep_cfg->addr);
 
+	/*
+	 * If the RTL is driving this endpoint, stop it before anything else.
+	 * The EndXfer below used to be issued with the manager still ringing
+	 * UpdateXfer on the same endpoint; that is the collision that leaves
+	 * the endpoint unstoppable and hangs the host's Stop Endpoint.
+	 */
+	(void)udc_dwc3_hw_owned_revoke(dev, ep_data, "ep_disable");
+
 	/* Disable the endpoint */
 	sys_clear_bits(base + UDC_DWC3_DALEPENA, UDC_DWC3_DALEPENA_USBACTEP(ep_data->epn));
 
@@ -1990,8 +2678,27 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 		return 0;
 	}
 
+	/*
+	 * A bulk UVC stream has a single alt setting, so uvcvideo signals
+	 * STREAMOFF with CLEAR_FEATURE(ENDPOINT_HALT) on the video endpoint --
+	 * which lands here while the RTL is still streaming it. Revoking
+	 * first halts that manager and ends its transfer; only then is the
+	 * ClearStall below a command against an endpoint nothing else drives.
+	 */
+	const bool was_rtl = udc_dwc3_hw_owned_revoke(dev, ep_data, "clear-halt");
+
 	udc_dwc3_depcmd_clear_stall(dev, ep_data, UDC_DWC3_DEPCMD_HIPRI_FORCERM);
 	ep_data->cfg.stat.halted = false;
+
+	/*
+	 * ClearStall resets the SuperSpeed sequence number, so an endpoint
+	 * that was RTL-owned needs a fresh StartXfer before it can carry
+	 * anything again; the video driver's next STREAMON hands back an
+	 * endpoint that is already armed.
+	 */
+	if (was_rtl) {
+		udc_dwc3_depcmd_start_xfer(dev, ep_data);
+	}
 
 	/* Resume halted previously transfers */
 	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
@@ -2226,6 +2933,16 @@ static int udc_dwc3_driver_preinit(const struct device *const dev)
 
 	k_mutex_init(&data->mutex);
 	k_work_init(&priv->event_work, udc_dwc3_event_worker);
+#if defined(CONFIG_UDC_DWC3_COMPLETION_POLL)
+	/*
+	 * Runs on the UDC work queue, the same one as the event worker and the
+	 * per-endpoint work, so a software retire is serialised against the
+	 * real event path rather than racing it from another thread.
+	 */
+	k_work_init_delayable(&priv->poll_work, udc_dwc3_completion_poll_worker);
+	k_work_schedule_for_queue(udc_get_work_q(), &priv->poll_work,
+				  K_MSEC(CONFIG_UDC_DWC3_COMPLETION_POLL_MS));
+#endif
 
 	data->caps.rwup = false;
 	data->caps.addr_before_status = true;
