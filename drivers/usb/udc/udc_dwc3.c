@@ -556,6 +556,29 @@ struct udc_dwc3_ep_data {
 	bool full;
 	/* Given by the hardware for use in endpoint commands */
 	uint32_t xferrscidx;
+	/*
+	 * Whether DEPXFERCFG has allocated a transfer resource for this
+	 * endpoint out of the CURRENT pool generation.
+	 *
+	 * DWC3 hands out transfer resources from a pool opened by
+	 * DEPSTARTCFG(XferRscIdx=2), sized once for every non-control
+	 * endpoint. DEPXFERCFG draws one. Drawing again without reopening the
+	 * pool runs past it: the reference tree saw "endpoint command failed"
+	 * four times over and one endpoint fall back to a STALE INDEX once the
+	 * endpoint count reached 9.
+	 *
+	 * udc_dwc3_ep_resume() issues DEPXFERCFG on every enable, and
+	 * udc_dwc3_on_set_config_or_interface() reopens the pool on every
+	 * SetConfiguration AND every SetInterface -- which UVC does on each
+	 * alt-setting switch, i.e. every stream start and stop. So the two run
+	 * against each other continuously once video and CDC-ACM share the
+	 * device, and not at all when ACM runs alone.
+	 *
+	 * This flag makes DEPXFERCFG once-per-endpoint-per-pool: set when the
+	 * resource is drawn, cleared for every non-control endpoint when the
+	 * pool is reopened.
+	 */
+	bool xfer_rsc_allocated;
 };
 
 /*
@@ -826,11 +849,26 @@ static void udc_dwc3_depcmd_ep_xfer_config(const struct device *const dev,
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
 	uint32_t reg;
 
+	/*
+	 * One transfer resource per endpoint per pool generation. Control
+	 * endpoints are not drawn from the DEPSTARTCFG(2) pool, so they are
+	 * exempt and keep the previous unconditional behaviour.
+	 */
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) != 0 && ep_data->xfer_rsc_allocated) {
+		LOG_DBG("DepXferConfig: ep=0x%02x already holds a transfer resource, skipping",
+			ep_data->cfg.addr);
+		return;
+	}
+
 	LOG_DBG("DepXferConfig: ep=0x%02x", ep_data->cfg.addr);
 
 	reg = FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPXFERCFG_NUMXFERRES_MASK, 1);
 	sys_write32(reg, base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), UDC_DWC3_DEPCMD_DEPXFERCFG);
+
+	if (USB_EP_GET_IDX(ep_data->cfg.addr) != 0) {
+		ep_data->xfer_rsc_allocated = true;
+	}
 }
 
 static void udc_dwc3_depcmd_set_stall(const struct device *const dev,
@@ -904,12 +942,29 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 static void udc_dwc3_depcmd_start_config(const struct device *const dev,
 					 bool is_control)
 {
+	const struct udc_dwc3_config *const cfg = dev->config;
 	uint32_t flags = 0;
 
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, is_control ? 0 : 2);
 	flags |= UDC_DWC3_DEPCMD_DEPSTARTCFG;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(0), flags);
+
+	/*
+	 * XferRscIdx=2 reopens the non-control transfer-resource pool, which
+	 * invalidates every resource previously drawn from it. Anything still
+	 * marked allocated would skip its DEPXFERCFG and keep using an index
+	 * the controller no longer recognises, so drop the marks here. The
+	 * control pool (XferRscIdx=0) is separate and does not affect them.
+	 */
+	if (!is_control) {
+		for (int i = 1; i < cfg->num_in_eps; i++) {
+			cfg->ep_data_in[i].xfer_rsc_allocated = false;
+		}
+		for (int i = 1; i < cfg->num_out_eps; i++) {
+			cfg->ep_data_out[i].xfer_rsc_allocated = false;
+		}
+	}
 
 	LOG_DBG("DepStartConfig done ep=%s", is_control ? "control" : "non-control");
 }
