@@ -160,3 +160,54 @@ config UDC_DWC3_ARM_PACKET_HOLD
 
 	  Enable it only where the transfer-drop mechanism is known to be the
 	  failure, which on the reference single-UVC SRP configuration it is.
+
+config UDC_DWC3_OUT_NOTREADY_RETAKE
+	bool "Nudge a bulk OUT whose doorbell was dropped (UpdateXfer only)"
+	help
+	  Enables XferNotReady on bulk OUT endpoints and issues UpdateXfer
+	  when one arrives while the tail TRB is already armed with HWO set.
+	  That combination means the doorbell was dropped: the TRB looks armed
+	  but no transfer was ever started, so the device NAKs the host
+	  forever while the host's write URB sits pending.
+
+	  UpdateXfer only, with a 200 ms per-endpoint cooldown.  Deliberately
+	  NOT EndXfer+StartXfer, which is what an earlier version of this help
+	  text described and what this tree briefly implemented.  new_arch
+	  abandoned that: the function is still present there as
+	  udc_dwc3_out_notready_recycle() and is called from nowhere, with the
+	  reasons recorded beside it -- "EndXfer spam under UVC wedges EP0
+	  (Malformed setup)" and "EndXfer(ForceRM) under Soft-IP UVC has
+	  wedged EP0".  Both peer sessions confirmed the dead-code status
+	  independently on 2026-11-10.
+
+	  Distinguish this from an idle OUT, which legitimately sits at HWO=1
+	  waiting for the host and must NOT be disturbed -- treating that as
+	  stuck causes false recoveries and can break ACM enumeration.  An
+	  UpdateXfer is harmless in that case, which is the point of
+	  preferring it.
+
+	  Default n, matching all three new_arch applications
+	  (fresh/app/prj.conf:59, fresh/app_flir/prj.conf:74,
+	  priv-flir/zephyr/app/prj.conf:81).  Neither peer tree has any soak
+	  evidence for this path; it is kept available, not recommended.
+
+config UDC_DWC3_OUT_STALL_REFRESH
+	bool "Refresh a stalled bulk OUT on a timer (UpdateXfer only)"
+	depends on UDC_DWC3_OUT_NOTREADY_RETAKE
+	help
+	  Soft-IP often never posts XferNotReady for a wedged ACM OUT, so an
+	  event handler alone cannot see the stall: measured here on
+	  2026-11-10, exactly ONE XferNotReady arrived across a 300 s soak
+	  that wedged.  Every UDC_DWC3_OUT_STALL_REFRESH_MS, UpdateXfer any
+	  armed bulk OUT tail.  UpdateXfer is a no-op on a healthy idle OUT
+	  and carries none of the EP0 risk that EndXfer spam did.
+
+	  Ported from new_arch udc_dwc3.c:6646-6681.  Default n: new_arch
+	  ships it off with the note "even at 1s it correlates with earlier
+	  ACM cliffs" (fresh/app/prj.conf:73), so it is available here for
+	  measurement rather than recommended.
+
+config UDC_DWC3_OUT_STALL_REFRESH_MS
+	int "OUT stall observation window (ms)"
+	default 250
+	depends on UDC_DWC3_OUT_STALL_REFRESH

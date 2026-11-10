@@ -1054,6 +1054,22 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	} else {
 		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERINPROGEN;
 		param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERCMPLEN;
+
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+		/*
+		 * Bulk OUT needs XferNotReady, or a dropped StartXfer doorbell
+		 * is invisible: the TRB looks armed with HWO set while no
+		 * transfer was ever started, and the device NAKs the host
+		 * forever. The host's write then times out, kills the URB, and
+		 * the resulting Stop Endpoint cannot be retired by an endpoint
+		 * that never started -- which takes the controller down.
+		 */
+		if (!USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) ==
+			    USB_EP_TYPE_BULK) {
+			param1 |= UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN;
+		}
+#endif
 	}
 	/* To log CTRL DATA/STATUS messages: UDC_DWC3_DEPCMDPAR1_DEPCFG_XFERNRDYEN */
 
@@ -1326,10 +1342,38 @@ static void udc_dwc3_depcmd_end_xfer(const struct device *const dev,
 		return;
 	}
 
+	/*
+	 * ForceRM=0, unconditionally, however the caller asked.
+	 *
+	 * Taken verbatim from new_arch udc_dwc3.c:3311-3317, which strips the
+	 * flag centrally so that none of its EndXfer call sites can set it:
+	 * "With ForceRM=1 the transfer was observed to stay active after
+	 * EndTransfer, and the next StartTransfer acted on that stale state.
+	 * CMDACT can clear before the teardown finishes, so wait 1 ms before
+	 * the caller touches TRBs. Lattice lsc_usb_stop_xfer."
+	 *
+	 * This tree copied the call sites and not the strip, so all four of
+	 * them were sending ForceRM=1 where the reference sends 0. The RTL is
+	 * specific that this is fatal rather than merely wrong: BulkRing.scala
+	 * endForce, quoted at new_arch:7890, documents EndXfer|ForceRM on a
+	 * FIFO with words loaded as wedging EVERY bulk IN until a bus reset,
+	 * and :7949 keeps the EndXfer while dropping ForceRM for exactly that
+	 * reason ("0x908: EndXfer, CmdIOC, ForceRM. 0x108 drops ForceRM").
+	 *
+	 * That is the signature measured here on 2026-11-10: both bulk UVC INs
+	 * and the ACM data IN all stopped together while EP0 kept answering,
+	 * the link stayed U0 and every device-side register read clean. One
+	 * ForceRM on 0x01 with words loaded accounts for all of it, including
+	 * why control was untouched -- control is not a bulk endpoint.
+	 */
+	flags &= ~UDC_DWC3_DEPCMD_HIPRI_FORCERM;
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
 	flags |= UDC_DWC3_DEPCMD_DEPENDXFER;
 
 	udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn), flags);
+
+	/* CMDACT can clear before the teardown finishes. */
+	k_busy_wait(1000);
 
 	LOG_DBG("DepEndXfer done ep=0x%02x", ep_data->cfg.addr);
 }
@@ -2326,6 +2370,11 @@ static void udc_dwc3_park_nudge_dir(const struct device *const dev,
 }
 #endif /* CONFIG_UDC_DWC3_PARK_NUDGE */
 
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE) && \
+	defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
+static void udc_dwc3_out_stall_refresh_tick(const struct device *dev);
+#endif
+
 static void udc_dwc3_completion_poll_worker(struct k_work *work)
 {
 	struct k_work_delayable *const dwork = k_work_delayable_from_work(work);
@@ -2374,6 +2423,19 @@ static void udc_dwc3_completion_poll_worker(struct k_work *work)
 	 */
 	udc_dwc3_park_nudge_dir(dev, cfg->ep_data_in, cfg->num_in_eps,
 				&priv->park_nudged_in, true, "IN");
+#endif
+
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE) && \
+	defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
+	/*
+	 * new_arch drives this from its event thread (udc_dwc3.c:8564). This
+	 * tree has no such loop, so it rides the completion-poll tick. The
+	 * mechanism is time-based (k_uptime_get against
+	 * OUT_STALL_REFRESH_MS), so the behaviour is the same as long as the
+	 * tick is faster than the window; it runs on the UDC work queue
+	 * rather than the event thread.
+	 */
+	udc_dwc3_out_stall_refresh_tick(dev);
 #endif
 
 	k_work_schedule_for_queue(udc_get_work_q(), &priv->poll_work,
@@ -2490,6 +2552,134 @@ static const char *udc_dwc3_get_event_name(const uint32_t evt, const uint32_t ds
 	}
 }
 
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+/*
+ * XferNotReady on a bulk OUT whose tail TRB is already armed: the controller
+ * wants to move data on an endpoint with no running transfer, which is the
+ * signature of a dropped doorbell.
+ *
+ * UpdateXfer only, never EndXfer. This is new_arch's
+ * udc_dwc3_on_xfer_not_ready_norm() (udc_dwc3.c:6048-6099) rather than the
+ * EndXfer+StartXfer retake its own Kconfig help text still describes; that
+ * text is stale, and the function implementing it,
+ * udc_dwc3_out_notready_recycle(), is defined and never called in the
+ * reference. Its comments record why:
+ *
+ *   "Cooldown: EndXfer spam under UVC wedges EP0 (Malformed setup)."
+ *   "Prefer UpdateXfer first. EndXfer(ForceRM) under Soft-IP UVC has wedged
+ *    EP0; only recycle if the armed TRB is still stuck after a nudge."
+ *   "Prefer UpdateXfer-only under Soft-IP; EndXfer kept as last resort."
+ *
+ * The escalation flag below is vestigial in the reference -- both branches
+ * issue the same command -- and is kept so the two trees read alike and so
+ * the retry is visible in the log.
+ *
+ * Gating is on device-side TRB state, not on the event's status nibble: the
+ * reference uses the status field only for control endpoints, and on bulk IN
+ * (TRANSFER_ACTIVE, BIT(15)) to pick UpdateXfer over StartXfer.
+ */
+static void udc_dwc3_on_out_not_ready(const struct device *const dev, const uint32_t evt)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+	struct udc_dwc3_ep_data *const ep_data = _EP_DATA_FROM_EPN(cfg, epn);
+	static int64_t last_retake_ms[16];
+	static uint8_t notready_escalated[16];
+	const int64_t now = k_uptime_get();
+	uint8_t oidx;
+
+	if (ep_data == NULL || ep_data->trb_buf == NULL ||
+	    USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
+		return;
+	}
+	if ((ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) != USB_EP_TYPE_BULK) {
+		return;
+	}
+	if (ep_data->net_buf[ep_data->tail] == NULL ||
+	    (ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+		return;
+	}
+
+	oidx = USB_EP_GET_IDX(ep_data->cfg.addr);
+	if (oidx >= ARRAY_SIZE(last_retake_ms)) {
+		return;
+	}
+
+	/* Cooldown: command spam under UVC wedges EP0 (Malformed setup). */
+	if ((now - last_retake_ms[oidx]) < 200) {
+		return;
+	}
+
+	if (notready_escalated[oidx] == 0U) {
+		LOG_WRN("OUT-NOTREADY ep=0x%02x armed, UpdateXfer (tail=%u)",
+			ep_data->cfg.addr, ep_data->tail);
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+		notready_escalated[oidx] = 1U;
+	} else {
+		LOG_WRN("OUT-NOTREADY ep=0x%02x armed, UpdateXfer-retry (tail=%u)",
+			ep_data->cfg.addr, ep_data->tail);
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+		notready_escalated[oidx] = 0U;
+	}
+
+	last_retake_ms[oidx] = now;
+}
+
+#if defined(CONFIG_UDC_DWC3_OUT_STALL_REFRESH)
+/*
+ * Timer backstop, new_arch udc_dwc3.c:6646-6681, verbatim in behaviour.
+ *
+ * This answers the measurement that only ONE XferNotReady arrived in a 300 s
+ * soak. The reference's Kconfig states the cause plainly: "Soft-IP often never
+ * posts XferNotReady for a wedged ACM OUT." The event is not a reliable
+ * trigger on this core, so the nudge has to come from a timer. An absence of
+ * XferNotReady is therefore NOT evidence that the host stopped scheduling
+ * bulk; it is consistent with a device-side park that never announced itself.
+ *
+ * UpdateXfer only, no EndXfer: a no-op on a healthy idle OUT, and it can
+ * unwedge a parked ring without the EP0 storms that EndXfer spam caused.
+ */
+static void udc_dwc3_out_stall_refresh_tick(const struct device *const dev)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	static int64_t last_nudge_ms;
+	const int64_t now = k_uptime_get();
+
+	if ((now - last_nudge_ms) < CONFIG_UDC_DWC3_OUT_STALL_REFRESH_MS) {
+		return;
+	}
+	last_nudge_ms = now;
+
+	for (int i = 1; i < cfg->num_out_eps; i++) {
+		struct udc_dwc3_ep_data *const ep_data = &cfg->ep_data_out[i];
+
+		if (ep_data->trb_buf == NULL || ep_data->hw_owned ||
+		    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) !=
+			    USB_EP_TYPE_BULK) {
+			continue;
+		}
+		/*
+		 * The reference also requires ep_data->xfer_active here. This
+		 * tree has no such flag; xferrscidx != 0 is the equivalent
+		 * test for "a transfer resource is live on this endpoint",
+		 * and update_xfer refuses index 0 anyway.
+		 */
+		if (ep_data->xferrscidx == 0U) {
+			continue;
+		}
+		if (ep_data->net_buf[ep_data->tail] == NULL) {
+			continue;
+		}
+		if ((ep_data->trb_buf[ep_data->tail].ctrl & UDC_DWC3_TRB_CTRL_HWO) == 0U) {
+			continue;
+		}
+
+		udc_dwc3_depcmd_update_xfer(dev, ep_data);
+	}
+}
+#endif /* CONFIG_UDC_DWC3_OUT_STALL_REFRESH */
+#endif /* CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE */
+
 static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t evt)
 {
 	const struct udc_dwc3_config *const cfg = dev->config;
@@ -2524,6 +2714,10 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_connect_done(dev);
 		break;
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
+#if defined(CONFIG_UDC_DWC3_OUT_NOTREADY_RETAKE)
+		udc_dwc3_on_out_not_ready(dev, evt);
+#endif
+		break;
 	case UDC_DWC3_DEVT_ULSTCHNG:
 	case UDC_DWC3_DEVT_DISCONNEVT:
 	case UDC_DWC3_DEVT_WKUPEVT:
