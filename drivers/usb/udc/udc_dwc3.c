@@ -648,6 +648,8 @@ struct udc_dwc3_data {
 	uint8_t first_ep;
 	/* CPU-side endpoint commands refused because the RTL owned the EP. */
 	uint32_t hw_owned_refused;
+	/* Refusals from the static HW_IN_EP_MASK predicate (no handoff window). */
+	uint32_t hw_mask_refused;
 	/* Managers that did not report idle within the halt timeout. */
 	uint32_t hw_mgr_halt_timeouts;
 	/* Notified after ownership is revoked, so video can stop its pipeline */
@@ -852,6 +854,42 @@ BUILD_ASSERT((CONFIG_UDC_DWC3_IN_RECOVER_EP_MASK &
  * excludes the RTL-owned video endpoints: arming on those would hold a video
  * doorbell against the video ring's own transfer.
  */
+/*
+ * Force a just-written TRB to be visible to the DWC3 descriptor fetcher before
+ * a doorbell is rung at it.
+ *
+ * Ported from new_arch udc_dwc3_trb_fence(). It is deliberately NOT a barrier
+ * instruction or a cache operation: this SoC has no data cache at all
+ * (SpinexConfig.scala dcacheConfig = None), so cache maintenance would be
+ * meaningless. The hazard is a POSTED WRITE still sitting in the fabric -- the
+ * CPU's store to the TRB has been accepted by the interconnect but has not yet
+ * landed in the RAM the fetcher reads.
+ *
+ * Three volatile READS of the words just written cannot complete until that
+ * write has retired through the bus, so when this returns the descriptor is
+ * visible. A read-back used as a write fence.
+ *
+ * Why this tree needs it: a doorbell that arrives before the TRB words land
+ * makes the core fetch descriptor state that is not there yet, which presents
+ * as a command DWC3 accepts and never retires -- CMDACT set, result 0x0. That
+ * is the 0x30007 UpdateXfer measured on 2026-11-10, and it terminates
+ * differently from the stale-index case in the reference trees, which ends as
+ * a CMDERR with a status code rather than never ending at all.
+ */
+static void udc_dwc3_trb_fence(volatile struct udc_dwc3_trb *const trb)
+{
+	volatile uint32_t sink;
+
+	if (trb == NULL) {
+		return;
+	}
+
+	sink = trb->addr_lo;
+	sink += trb->status;
+	sink += trb->ctrl;
+	ARG_UNUSED(sink);
+}
+
 static void udc_dwc3_mbx_arm_trb(const struct udc_dwc3_ep_data *const ep_data,
 				 const void *const trb)
 {
@@ -1181,6 +1219,36 @@ static bool udc_dwc3_ep_refuse_if_hw_owned(const struct device *const dev,
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
 
+	/*
+	 * Gate on the STATIC mask as well as the dynamic flag.
+	 *
+	 * hw_owned is set by lattice_usb23_ep_give_to_rtl() at STREAMON and
+	 * cleared on every revoke -- clear-halt, bus reset, disconnect,
+	 * ep_disable, and the SetConfiguration/SetInterface path that UVC
+	 * walks on every stream start and stop. Across those windows the flag
+	 * reads false while the RTL ring may still hold an armed TRB and a
+	 * live transfer resource, so a dynamic-flag-only guard lets a CPU
+	 * doorbell through at exactly the wrong moment.
+	 *
+	 * HW_IN_EP_MASK has no such window: a CPU DEPCMD on a mask-listed
+	 * video IN is never legitimate in this architecture, at any time. The
+	 * CPU's xferrscidx for such an endpoint is a software copy that does
+	 * not name the resource the ring armed, so a command built from it
+	 * references a transfer the core cannot match -- accepted, never
+	 * retired, CMDACT left set. That is the measured 0x30007.
+	 *
+	 * Counted separately from the dynamic refusals so a soak can tell
+	 * which predicate actually blocked something.
+	 */
+	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
+	    (CONFIG_UDC_DWC3_HW_IN_EP_MASK &
+	     BIT(USB_EP_GET_IDX(ep_data->cfg.addr))) != 0U) {
+		priv->hw_mask_refused++;
+		LOG_ERR("ep 0x%02x is in HW_IN_EP_MASK: refusing %s (mask_refused=%u)",
+			ep_data->cfg.addr, what, priv->hw_mask_refused);
+		return true;
+	}
+
 	if (!ep_data->hw_owned) {
 		return false;
 	}
@@ -1281,6 +1349,10 @@ static void udc_dwc3_depcmd_start_xfer(const struct device *const dev,
 	sys_write32(HI32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR0(ep_data->epn));
 	sys_write32(LO32((uintptr_t)ep_data->trb_buf), base + UDC_DWC3_DEPCMDPAR1(ep_data->epn));
 
+	/* Same hazard as UpdateXfer: the ring must be visible before the ring. */
+	udc_dwc3_trb_fence(ep_data->trb_buf);
+	udc_dwc3_trb_fence(&ep_data->trb_buf[ep_data->tail]);
+
 	udc_dwc3_mbx_arm_trb(ep_data, ep_data->trb_buf);
 
 	rsc = udc_dwc3_depcmd(dev, UDC_DWC3_DEPCMD(ep_data->epn),
@@ -1325,6 +1397,9 @@ static void udc_dwc3_depcmd_update_xfer(const struct device *const dev,
 
 	flags |= UDC_DWC3_DEPCMD_DEPUPDXFER;
 	flags |= FIELD_PREP(UDC_DWC3_DEPCMD_XFERRSCIDX_MASK, ep_data->xferrscidx);
+
+	/* Make the tail TRB visible before the doorbell reaches the core. */
+	udc_dwc3_trb_fence(&ep_data->trb_buf[ep_data->tail]);
 
 	udc_dwc3_mbx_arm_trb(ep_data, &ep_data->trb_buf[ep_data->tail]);
 
