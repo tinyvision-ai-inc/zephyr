@@ -24,7 +24,7 @@ config UDC_DWC3_EVENTS_NUM
 
 config UDC_DWC3_TRB_NUM
 	int "Number of buffers for each non-control endpoint"
-	default 4
+	default 8
 	range 3 32
 	help
 	  This is a general knob for the number of buffers present for each
@@ -32,182 +32,212 @@ config UDC_DWC3_TRB_NUM
 	  enough for most conditions, but for performance and debug purposes,
 	  increasing could reveal useful.
 
-config UDC_DWC3_SHELL
-	bool "Debug shell for inspecting DWC3 internals"
-	depends on SHELL
+config UDC_DWC3_THREAD_STACK_SIZE
+	int "DWC3 event thread stack size"
+	default 2048
 	help
-	  Enable debug shell commands for debugging DWC3 and USB low-level access, such as
-	  inspecting the list of ongoing transactions.
+	  Stack size for the bottom-half thread that drains the DWC3 event
+	  ring. Event handling must run in thread context because helpers
+	  such as udc_setup_received() take the UDC mutex.
 
-endif # UDC_DWC3
-
-config UDC_DWC3_COMPLETION_POLL
-	bool "Recover bulk transfer completions the controller never reported"
+config UDC_DWC3_THREAD_PRIORITY
+	int "DWC3 event thread priority"
+	default 2
 	help
-	  This Soft-IP sometimes clears HWO on a CPU-managed bulk TRB without
-	  posting a DEPEVT, under concurrent UVC + CDC load. The event thread
-	  then never retires the buffer: on OUT the received packet is never
-	  handed to the class and the host's write stalls forever, on IN the
-	  class stops enqueueing. Neither direction recovers on its own, and a
-	  host-side timeout on the stalled endpoint kills an URB, whose xHCI
-	  Stop Endpoint this device cannot retire -- which takes the whole host
-	  controller down.
+	  Cooperative priority for the DWC3 event thread. Keep this high so
+	  control transfers (e.g. large configuration descriptors) are not
+	  delayed by the system workqueue.
 
-	  When enabled, a periodic tick on the UDC work queue retires bulk
-	  slots whose HWO has stayed clear for a grace interval, synthesising
-	  the XferInProgress that was dropped. Endpoints owned by the video
-	  RTL are skipped: the RTL retires those itself.
-
-config UDC_DWC3_COMPLETION_POLL_MS
-	int "Completion poll interval (ms)"
-	default 100
-	depends on UDC_DWC3_COMPLETION_POLL
+config UDC_DWC3_RTL_DOORBELL
+	bool "RTL UsbMgr writes video TRBs and rings DEPCMD"
+	default y
 	help
-	  Keep this well below the host's bulk timeout so a dropped completion
-	  is recovered before the host gives up on the endpoint.
+	  When y, Soft-IP TRBRamSink owns the video TRB ring and doorbell
+	  (P0 / dual-IMX219). When n, the CPU owns every TRB and DEPCMD
+	  (IEBM / Lattice-ref model): pause_doorbell, hw_owned refuse, and
+	  HW_IN_EP_MASK event masking are compiled out.
 
-config UDC_DWC3_COMPLETION_POLL_TICKS
-	int "Grace ticks before retiring a completion in software"
-	default 8
-	depends on UDC_DWC3_COMPLETION_POLL
+config UDC_DWC3_TXFIFO_VIDEO_EP5
+	bool "TX FIFO map with video last (ACM0, RAW, UVC on 0x85)"
+	default VIDEO_TINYVISION_UVCMANAGER_IEBM
 	help
-	  Ticks that HWO must stay clear before a software retire. Too short
-	  races a live DEPEVT and desyncs the ring; the reference tree found
-	  2 ticks (~200 ms) raced real events and settled on 8 (~800 ms).
+	  app_flir enumerates ACM0, CDC-RAW, then UVC, so video lands on
+	  FIFO5 and needs the 1024-word (8 KiB) slot there. The other map is
+	  the dual-UVC product one (video on FIFO3/4), which leaves FIFO5 at
+	  64 words -- too small to start SuperSpeed bulk at MPS 1024, so the
+	  video endpoint accepts StartXfer but its TRB stays HWO forever.
+	  This tracks the endpoint layout, not IEBM vs doorbell; it only
+	  defaults off IEBM because that was the sole app_flir build.
 
-config UDC_DWC3_PARK_NUDGE
-	bool "Re-ring the doorbell on a bulk endpoint whose TRB is never fetched"
-	depends on UDC_DWC3_COMPLETION_POLL
+config UDC_DWC3_EVENT_BACKSTOP
+	bool "2 ms event-thread timeout backstop"
 	help
-	  The completion poll recovers a transfer the controller finished but
-	  never reported. This recovers the other half of the same defect: a
-	  transfer the controller never started, because the UpdateXfer
-	  doorbell was dropped under UVC load. The tail TRB stays owned by
-	  hardware with its remaining count frozen, which no completion poll
-	  can see, and the endpoint is stuck until the host gives up.
-
-	  Measured on 2026-11-09: CDC-ACM ran normally for ~240 writes with
-	  both video lanes streaming, then the completion poll rescued 8 round
-	  trips, and then HWO stopped clearing at all -- a started-but-never-
-	  fetched transfer, not a dropped completion.
-
-	  Recovery here is only to re-issue UpdateXfer, capped and with a
-	  cooldown. It deliberately does NOT tear down and rebuild the ring
-	  (the reference tree's escalation path), because an armed TRB with a
-	  frozen remaining count is also the normal state of an endpoint the
-	  host has simply not polled yet, and re-ringing a doorbell is
-	  harmless there while rebuilding a live ring is not.
-
-config UDC_DWC3_PARK_NUDGE_MS
-	int "Time a bulk TRB may stay unfetched before a nudge (ms)"
-	default 2000
-	depends on UDC_DWC3_PARK_NUDGE
-	help
-	  Must be long enough that an idle host poll does not look like a
-	  park, and well inside the host's bulk timeout.
-
-config UDC_DWC3_PARK_NUDGE_CAP
-	int "Consecutive nudges before giving up on an endpoint"
-	default 6
-	depends on UDC_DWC3_PARK_NUDGE
+	  Finite k_sem_take timeout so a lost ISR wakeup still drains the
+	  event ring. 100 ms until ConnectDone, then 2 ms so ACM does not
+	  park for a full host timeout window. Do not disable.
 
 config UDC_DWC3_HW_IN_EP_MASK
-	hex "IN endpoints whose TRBs the video RTL owns"
+	hex "IN endpoints offloaded to the RTL video path"
 	default 0x0
+	depends on UDC_DWC3_RTL_DOORBELL
 	help
-	  Bitmask of IN endpoint indexes driven by the UsbMgr RTL rather than
-	  the CPU (bit 3 = 0x83, bit 4 = 0x84; 0x18 for dual bulk UVC).
+	  Bitmask of IN endpoint indices whose TRBs the RTL (uvcmanager) drives.
+	  Software must ignore XferComplete/XferInProgress on those endpoints:
+	  bit 5 means endpoint 0x85.  Without this, the Soft-IP driver pops
+	  phantom buffers from the ring and races the hardware stream.
 
-	  These endpoints get no XferComplete/XferInProgress events. The RTL
-	  retires its own TRBs, so every such event is one the CPU does not
-	  need -- and at two lanes of 1640x1232 it is tens of thousands per
-	  second into an event ring sized in the tens of slots. The ring then
-	  starves of the ACM completions that do matter, which is the defect
-	  the completion poll was papering over.
+config UDC_DWC3_SKIP_GCTL_SOFTRESET
+	bool "Skip GCTL/PHY soft-reset (TinyCLUNX Lattice USB23)"
+	default y
+	help
+	  On TinyCLUNX Soft-IP, GCTL.CORESOFTRESET / PHYSOFTRST make
+	  GHWPARAMS7 read 0 and SuperSpeed enum dies. Skip both and rely
+	  on DCTL.CSFTRST. FLIR UAB hybrid_cmdact needs the documented
+	  GCTL/PHY reset or EP0 DEPCMD never completes — turn this off.
+
+config UDC_DWC3_CDC_TRACE
+	bool "Periodic CDC endpoint state trace on the console"
+	depends on UDC_DWC3_HW_IN_EP_MASK != 0x0
+	help
+	  Print a CDC-TRACE line for every CPU-managed endpoint whose ring
+	  state has not changed for a while. Debug aid only: the print runs
+	  in the DWC3 event thread and blocks on the console UART, so keep it
+	  off in soak/production builds.
 
 config UDC_DWC3_IN_RECOVER_EP_MASK
-	hex "IN endpoints eligible for software recovery"
-	default 0x0
-	depends on UDC_DWC3_COMPLETION_POLL
+	hex "IN endpoint indices eligible for Soft-IP IN recovery"
+	default 0x10
 	help
-	  Bitmask of IN endpoint indexes the completion poll and park nudge
-	  may touch (bit 2 = 0x82). Recovery must never be aimed at an
-	  RTL-owned endpoint, and a mask makes that a build-time property
-	  rather than a runtime check that could be reached mid-handoff.
+	  Bitmask of IN endpoint indices the completion-poll / park paths may
+	  touch.  On Soft-IP FLIR UAB, ACM claims 0x81/0x82 first and CDC-RAW
+	  bulk IN lands at 0x84 (bit 4).  Do not include ACM endpoints: those
+	  sit armed waiting for a host token and EndXfer recycle breaks SRP.
+	  Never include HW_IN bits (see UDC_DWC3_HW_IN_EP_MASK).
 
-config UDC_DWC3_ARM_PACKET_HOLD
-	bool "Arm the arbiter packet hold (MBX_TRB) on recoverable IN endpoints"
-	depends on UDC_DWC3_COMPLETION_POLL
+config UDC_DWC3_IN_COMPLETION_POLL
+	bool "Poll for dropped IN completions"
 	help
-	  Writes MBX_TRB before a StartXfer/UpdateXfer on the endpoints
-	  IN_RECOVER_EP_MASK names, which arms the arbiter's packet hold: it
-	  keeps the next video doorbell off the pipe while a bulk IN short
-	  packet is still in its TX FIFO. Without the hold, a video UpdateXfer
-	  can run first, DWC3 drops the transfer, and the TRB stays HWO with
-	  its remaining count at the full length.
+	  Under concurrent UVC + CDC bulk, this Soft-IP controller sometimes
+	  clears HWO on a CPU-managed IN TRB without posting a DEPEVT.  The
+	  event thread then never retires the buffer and the class stops
+	  enqueueing.  When enabled, each event-thread wake (including the
+	  100 ms lost-wakeup timeout) reclaims waiting slots whose HWO has
+	  been clear for a grace interval.  Limited to
+	  UDC_DWC3_IN_RECOVER_EP_MASK.
 
-	  Off by default, because on this design it is a measured cost with no
-	  measured benefit (2026-11-09): arming it took both 1640x1232 lanes
-	  from 27.00 to 24.01 fps -- about 11% of frames -- and the CDC-ACM
-	  endpoint still wedged at the same point. Adding the flat hold on top
-	  (QUIET_OTHER=60000) cost 22% and still wedged.
+config UDC_DWC3_OUT_COMPLETION_POLL
+	bool "Poll for dropped OUT completions"
+	help
+	  Mirror of UDC_DWC3_IN_COMPLETION_POLL for CPU-managed bulk OUT.
+	  Under Soft-IP isochronous UVC the controller clears HWO on a CDC OUT
+	  TRB without posting a DEPEVT, so the received packet is never handed
+	  to the class.  The slot is only retired when the next OUT completes,
+	  which leaves the pipe permanently one transfer behind: the host times
+	  out waiting for its reply and then receives the previous one.  When
+	  enabled, each event-thread wake retires waiting OUT slots whose HWO
+	  has been clear for a grace interval.
 
-	  The hold is bounded, not a hang risk: fifoStuckTo releases it after
-	  1,500,000 cycles plus the 7,500-cycle probe delay, and HOLD_MAX_US
-	  was measured at 1,507,508 -- that backstop firing, to within the
-	  8-cycle bus read latency. But a 20 ms video stall per occurrence is
-	  half a frame interval at 27 fps.
+config UDC_DWC3_OUT_COMPLETION_POLL_TICKS
+	int "Grace event-thread wakes before retiring an OUT completion"
+	default 8
+	depends on UDC_DWC3_OUT_COMPLETION_POLL
+	help
+	  Wakes of the 100 ms event-thread timeout that HWO must stay clear
+	  before a software retire.  Too short races a live DEPEVT and desyncs
+	  the ring, which is the same trade-off tuned for the IN poll.
 
-	  Enable it only where the transfer-drop mechanism is known to be the
-	  failure, which on the reference single-UVC SRP configuration it is.
+config UDC_DWC3_IN_PARK_RECOVER
+	bool "Recover an IN endpoint whose armed TRB is never fetched"
+	help
+	  Re-arm a CPU-managed IN endpoint whose tail TRB stays owned by
+	  hardware with no remaining-count progress for longer than
+	  UDC_DWC3_IN_PARK_RECOVER_MS.  That is the signature of a dropped
+	  UpdateXfer doorbell under UVC load (CDC-RAW IN 0x84).  Limited to
+	  UDC_DWC3_IN_RECOVER_EP_MASK so quiet ACM pipes are not recycled.
+
+config UDC_DWC3_IN_PARK_RECOVER_MS
+	int "Time an IN TRB may stay unfetched before re-arming (ms)"
+	default 100
+	depends on UDC_DWC3_IN_PARK_RECOVER
+	help
+	  Keep this below the host bulk-read stall timeout and long enough
+	  that a quiet host poll of ACM/CDC-RAW does not look like a park.
+
+config UDC_DWC3_IN_START_ENDXFER_ESCALATE
+	bool "Escalate parked IN with EndXfer(ForceRM)+StartXfer"
+	depends on UDC_DWC3_IN_PARK_RECOVER
+	default y
+	help
+	  After a few failed UpdateXfer nudges, tear the transfer resource
+	  and re-Start the same still-owned tail TRB.  Ring head/tail are
+	  left intact so the class completion path stays in sync.  Do not
+	  use the ordinary DepEndXfer helper (it zeroes the ring).
 
 config UDC_DWC3_OUT_NOTREADY_RETAKE
-	bool "Nudge a bulk OUT whose doorbell was dropped (UpdateXfer only)"
+	bool "Retake bulk OUT on XferNotReady (armed TRB ignored)"
 	help
-	  Enables XferNotReady on bulk OUT endpoints and issues UpdateXfer
-	  when one arrives while the tail TRB is already armed with HWO set.
-	  That combination means the doorbell was dropped: the TRB looks armed
-	  but no transfer was ever started, so the device NAKs the host
-	  forever while the host's write URB sits pending.
-
-	  UpdateXfer only, with a 200 ms per-endpoint cooldown.  Deliberately
-	  NOT EndXfer+StartXfer, which is what an earlier version of this help
-	  text described and what this tree briefly implemented.  new_arch
-	  abandoned that: the function is still present there as
-	  udc_dwc3_out_notready_recycle() and is called from nowhere, with the
-	  reasons recorded beside it -- "EndXfer spam under UVC wedges EP0
-	  (Malformed setup)" and "EndXfer(ForceRM) under Soft-IP UVC has
-	  wedged EP0".  Both peer sessions confirmed the dead-code status
-	  independently on 2026-11-10.
-
-	  Distinguish this from an idle OUT, which legitimately sits at HWO=1
-	  waiting for the host and must NOT be disturbed -- treating that as
-	  stuck causes false recoveries and can break ACM enumeration.  An
-	  UpdateXfer is harmless in that case, which is the point of
-	  preferring it.
-
-	  Default n, matching all three new_arch applications
-	  (fresh/app/prj.conf:59, fresh/app_flir/prj.conf:74,
-	  priv-flir/zephyr/app/prj.conf:81).  Neither peer tree has any soak
-	  evidence for this path; it is kept available, not recommended.
+	  Enable XferNotReady events on bulk OUT endpoints.  When one arrives
+	  while the tail TRB is armed and HWO, the StartXfer doorbell was
+	  dropped: EndXfer(ForceRM)+StartXfer retakes the resource without
+	  clearing the ring.  Without this, host Write timeout on ACM OUT
+	  under UVC can wedge the host xHCI controller.
 
 config UDC_DWC3_OUT_STALL_REFRESH
-	bool "Refresh a stalled bulk OUT on a timer (UpdateXfer only)"
+	bool "Refresh/retake a stalled bulk OUT (timer backstop)"
 	depends on UDC_DWC3_OUT_NOTREADY_RETAKE
 	help
-	  Soft-IP often never posts XferNotReady for a wedged ACM OUT, so an
-	  event handler alone cannot see the stall: measured here on
-	  2026-11-10, exactly ONE XferNotReady arrived across a 300 s soak
-	  that wedged.  Every UDC_DWC3_OUT_STALL_REFRESH_MS, UpdateXfer any
-	  armed bulk OUT tail.  UpdateXfer is a no-op on a healthy idle OUT
-	  and carries none of the EP0 risk that EndXfer spam did.
-
-	  Ported from new_arch udc_dwc3.c:6646-6681.  Default n: new_arch
-	  ships it off with the note "even at 1s it correlates with earlier
-	  ACM cliffs" (fresh/app/prj.conf:73), so it is available here for
-	  measurement rather than recommended.
+	  Soft-IP often never posts XferNotReady for a wedged ACM OUT.  Every
+	  UDC_DWC3_OUT_STALL_REFRESH_MS, UpdateXfer the armed OUT tail; after a
+	  few no-progress refreshes, EndXfer(ForceRM)+StartXfer.  UpdateXfer is
+	  a no-op on a healthy idle OUT; recycle only runs after the pipe has
+	  been stuck for multiple intervals (same trade-off as dual soak).
 
 config UDC_DWC3_OUT_STALL_REFRESH_MS
 	int "OUT stall observation window (ms)"
 	default 250
 	depends on UDC_DWC3_OUT_STALL_REFRESH
+
+config UDC_DWC3_DEPCMD_MAILBOX
+	bool "Post DEPCMD through the RTL mailbox (single writer)"
+	depends on UDC_DWC3_RTL_DOORBELL
+	help
+	  CPU writes MBX_ADDR/MBX_DATA at 0xb4008000. Soft-IP DepCmdArbiter
+	  is the only LMMI writer of DWC3 DEPCMD: it ORs CMDACT, waits for
+	  clear, and returns the retired word (XFERRSCIDX). pause_doorbell
+	  is unused. Requires the doorbell bitstream with DepCmdArbiter.
+	  Leave n on IEBM bits (CPU writes DEPCMD directly).
+
+config UDC_DWC3_QUIET_OTHER_CYCLES
+	int "DepCmd QUIET_OTHER video hold (75 MHz cycles)"
+	default 60000
+	depends on UDC_DWC3_DEPCMD_MAILBOX
+	help
+	  Accepted for configuration compatibility with the
+	  udc-quiet-acm-recover driver line (int_flir app_flir/prj.conf sets
+	  it). This driver does not program QUIET_OTHER from Kconfig: the
+	  engine path writes 0 at STREAMON and parks video with the
+	  uvcmanager HALT bit instead.
+
+config UDC_DWC3_CONSOLE_DEBUG
+	hex "Reset value of the UDC console-print gate"
+	default 0x0
+	help
+	  Initial value of udc_dwc3_dbg. bit0 enables the per-event console
+	  traces (ACM01/ACM82/SETUP/PARK0/IN-HOLD/IN-RECOVER/ring kicks),
+	  bit1 the 10 s summaries (RATEPROBE, DWC3HEALTH, ACM ring, engine
+	  dump). The console UART is polled, so these prints block the DWC3
+	  event thread for several ms per line. Fault prints are not gated.
+	  Keep 0x0 for production; set at runtime with the shell
+	  (devmem <&udc_dwc3_dbg> 32 0x3) when tracing in the lab.
+
+config UDC_DWC3_USB_ENGINE
+	bool "Post ACM/RAW through UsbEngine BulkRing (Track B)"
+	depends on UDC_DWC3_DEPCMD_MAILBOX
+	help
+	  After ENG_CTRL.ENABLE, RTL owns GEVNTCOUNT and ACM/RAW DEPCMD.
+	  CPU posts DESC_* and drains FWD_POP / CMPL_*. Video stays on the
+	  doorbell. Leave n on Track A (800 us QUIET_OTHER). Probe MAGIC
+	  0x5533 at 0xb400B000 before enabling; a Track A bit stays on the
+	  mailbox path.
+
+endif # UDC_DWC3
