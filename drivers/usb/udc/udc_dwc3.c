@@ -648,8 +648,6 @@ struct udc_dwc3_data {
 	uint8_t first_ep;
 	/* CPU-side endpoint commands refused because the RTL owned the EP. */
 	uint32_t hw_owned_refused;
-	/* Refusals from the static HW_IN_EP_MASK predicate (no handoff window). */
-	uint32_t hw_mask_refused;
 	/* Managers that did not report idle within the halt timeout. */
 	uint32_t hw_mgr_halt_timeouts;
 	/* Notified after ownership is revoked, so video can stop its pipeline */
@@ -1218,36 +1216,6 @@ static bool udc_dwc3_ep_refuse_if_hw_owned(const struct device *const dev,
 					   const char *const what)
 {
 	struct udc_dwc3_data *const priv = udc_get_private(dev);
-
-	/*
-	 * Gate on the STATIC mask as well as the dynamic flag.
-	 *
-	 * hw_owned is set by lattice_usb23_ep_give_to_rtl() at STREAMON and
-	 * cleared on every revoke -- clear-halt, bus reset, disconnect,
-	 * ep_disable, and the SetConfiguration/SetInterface path that UVC
-	 * walks on every stream start and stop. Across those windows the flag
-	 * reads false while the RTL ring may still hold an armed TRB and a
-	 * live transfer resource, so a dynamic-flag-only guard lets a CPU
-	 * doorbell through at exactly the wrong moment.
-	 *
-	 * HW_IN_EP_MASK has no such window: a CPU DEPCMD on a mask-listed
-	 * video IN is never legitimate in this architecture, at any time. The
-	 * CPU's xferrscidx for such an endpoint is a software copy that does
-	 * not name the resource the ring armed, so a command built from it
-	 * references a transfer the core cannot match -- accepted, never
-	 * retired, CMDACT left set. That is the measured 0x30007.
-	 *
-	 * Counted separately from the dynamic refusals so a soak can tell
-	 * which predicate actually blocked something.
-	 */
-	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr) &&
-	    (CONFIG_UDC_DWC3_HW_IN_EP_MASK &
-	     BIT(USB_EP_GET_IDX(ep_data->cfg.addr))) != 0U) {
-		priv->hw_mask_refused++;
-		LOG_ERR("ep 0x%02x is in HW_IN_EP_MASK: refusing %s (mask_refused=%u)",
-			ep_data->cfg.addr, what, priv->hw_mask_refused);
-		return true;
-	}
 
 	if (!ep_data->hw_owned) {
 		return false;
