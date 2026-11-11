@@ -3521,7 +3521,7 @@ static void udc_dwc3_hw_owned_revoke_all(const struct device *const dev,
  * short probe that has already stopped by then enables nothing. The engine
  * then stays on until USB reset/disconnect, as in the reference.
  */
-#define UDC_DWC3_ENGINE_AUTO_DELAY_MS 1500
+#define UDC_DWC3_ENGINE_AUTO_DELAY_MS CONFIG_UDC_DWC3_ENGINE_AUTO_DELAY_MS
 
 static const struct device *udc_dwc3_engine_auto_dev;
 
@@ -3628,8 +3628,10 @@ int lattice_usb23_ep_give_to_rtl(const struct device *dev, uint8_t ep_addr,
 	 * udc_dwc3_engine_auto_fn().
 	 */
 	udc_dwc3_engine_auto_dev = dev;
-	(void)k_work_reschedule(&udc_dwc3_engine_auto_work,
-				K_MSEC(UDC_DWC3_ENGINE_AUTO_DELAY_MS));
+	if (UDC_DWC3_ENGINE_AUTO_DELAY_MS != 0) {
+		(void)k_work_reschedule(&udc_dwc3_engine_auto_work,
+					K_MSEC(UDC_DWC3_ENGINE_AUTO_DELAY_MS));
+	}
 #endif
 
 	return 0;

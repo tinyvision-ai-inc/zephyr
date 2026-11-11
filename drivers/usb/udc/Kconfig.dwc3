@@ -146,6 +146,16 @@ config UDC_DWC3_OUT_COMPLETION_POLL_TICKS
 	  before a software retire.  Too short races a live DEPEVT and desyncs
 	  the ring, which is the same trade-off tuned for the IN poll.
 
+config UDC_DWC3_ENGINE_AUTO_DELAY_MS
+	int "Delay from video endpoint handover to UsbEngine enable (ms)"
+	depends on UDC_DWC3_USB_ENGINE
+	default 1500
+	help
+	  The engine is enabled this long after a video endpoint is handed to
+	  the RTL, and only if its stream manager is still running then. 0
+	  disables the deferred enable: the video driver must call
+	  udc_dwc3_engine_go() itself once the manager is started.
+
 config UDC_DWC3_VID_PACE
 	bool "Pace the RTL video doorbell on the fabric tick"
 	depends on UDC_DWC3_USB_ENGINE
