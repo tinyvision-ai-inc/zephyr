@@ -425,7 +425,7 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 	if (udc_dwc3_vid_evt_own != 0U) {
 		ctrl |= USB_ENGINE_CTRL_EVT_OWN;
 	}
-	if (UDC_DWC3_VID_DOORBELL_EVT != 0U) {
+	if (UDC_DWC3_VID_DOORBELL_EVT != 0U || IS_ENABLED(CONFIG_UDC_DWC3_VID_PACE)) {
 		ctrl |= USB_ENGINE_CTRL_VID_EVT;
 	}
 	sys_write32(ctrl, base + USB_ENGINE_ENG_CTRL);
