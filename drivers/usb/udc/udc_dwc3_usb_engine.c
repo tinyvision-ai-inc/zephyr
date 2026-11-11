@@ -379,17 +379,20 @@ static void engine_try_enable(uint32_t evt_base, uint32_t evt_size)
 		       (uint32_t)base, id);
 		return;
 	}
-	/* bitN = IN 0x8N. BIT(5) adds the video endpoint so EventDrain consumes
-	 * its DEPEVTs in the fabric and the CPU never takes the IRQ. */
 	/*
-	 * BIT(5) adds video IN 0x85 to EP_OWN, which is what makes EventDrain
-	 * route its DEPEVTs to ownedEvt - and therefore what makes vidAsk, and
-	 * the event-paced doorbell, work at all. Needed by VID_EVT on its own:
-	 * it does NOT imply ACK_OWNED.
+	 * bitN = IN 0x8N. Owning the video endpoints keeps their DEPEVTs out of
+	 * the 64-deep FWD FIFO: an unowned endpoint event is forwarded, and a
+	 * full FWD raises EVT_OVF, which stops the engine retiring descriptors.
+	 * It is not what paces the doorbell (that is the pace tick) and it does
+	 * not hide the events from the CPU, which still reads the ring itself.
+	 * BIT(5) is the reference's 0x85; with VID_PACE the RTL-owned video
+	 * endpoints of this build are taken from HW_IN_EP_MASK.
 	 */
 	sys_write32(USB_ENGINE_EP_OWN_DEFAULT |
 		    (((udc_dwc3_vid_evt_own != 0U) ||
-		      (UDC_DWC3_VID_DOORBELL_EVT != 0U)) ? BIT(5) : 0U),
+		      (UDC_DWC3_VID_DOORBELL_EVT != 0U)) ? BIT(5) : 0U) |
+		    (IS_ENABLED(CONFIG_UDC_DWC3_VID_PACE) ?
+		     (uint32_t)CONFIG_UDC_DWC3_HW_IN_EP_MASK : 0U),
 		    base + USB_ENGINE_EP_OWN);
 
 	sys_write32(evt_base, base + USB_ENGINE_EVT_BASE);
