@@ -2511,7 +2511,7 @@ uint32_t udc_dwc3_isoc_yield_en;
  * wedge detector, on an endpoint that has already stopped, so it cannot
  * disturb healthy traffic. On by default: this is the experiment.
  */
-uint32_t udc_dwc3_wedge_recover_en = 1U;
+uint32_t udc_dwc3_wedge_recover_en = IS_ENABLED(CONFIG_UDC_DWC3_WEDGE_RECOVER) ? 1U : 0U;
 
 static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 				      struct udc_dwc3_ep_data *const ep_data)

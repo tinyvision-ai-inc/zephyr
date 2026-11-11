@@ -146,6 +146,29 @@ config UDC_DWC3_OUT_COMPLETION_POLL_TICKS
 	  before a software retire.  Too short races a live DEPEVT and desyncs
 	  the ring, which is the same trade-off tuned for the IN poll.
 
+config UDC_DWC3_VID_PACE
+	bool "Pace the RTL video doorbell on the fabric tick"
+	depends on UDC_DWC3_USB_ENGINE
+	help
+	  Sets VID_EVT (ENG_CTRL bit 2) alone, without adding the video
+	  endpoint to EP_OWN.  The stream manager then posts UpdateXfer at
+	  most once per pace tick instead of once per committed page.  Needs a
+	  bitstream whose TRBRamSink has the pace input; on older ones the bit
+	  is not connected and this does nothing.
+
+config UDC_DWC3_WEDGE_RECOVER
+	bool "Run the recovery ladder when the engine IN ring looks wedged"
+	default y
+	depends on UDC_DWC3_USB_ENGINE
+	help
+	  The 2.5 s wedge detector on the engine-owned IN ring (0x82) cannot
+	  tell a wedged endpoint from a host that is not reading: both leave
+	  the tail TRB owned by hardware.  With this set the detector runs the
+	  ladder (FIFO flush, EndXfer+StartXfer, stall/clear, re-init), which
+	  leaves the endpoint dead when the host simply had the port closed
+	  with data pending while video streamed.  Clear it where the host may
+	  stop reading; detection and its snapshot stay on either way.
+
 config UDC_DWC3_IN_PARK_RECOVER
 	bool "Recover an IN endpoint whose armed TRB is never fetched"
 	help
