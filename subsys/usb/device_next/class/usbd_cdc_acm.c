@@ -724,7 +724,12 @@ static void cdc_acm_tx_fifo_handler(struct k_work *work)
 	}
 
 	if (data->echo_mitigated) {
-		len = ring_buf_get(data->tx_fifo.rb, buf->data, buf->size);
+		size_t max = buf->size;
+
+		if (CONFIG_USBD_CDC_ACM_TX_BUF_SIZE != 0) {
+			max = MIN(max, CONFIG_USBD_CDC_ACM_TX_BUF_SIZE);
+		}
+		len = ring_buf_get(data->tx_fifo.rb, buf->data, max);
 	}
 	net_buf_add(buf, len);
 

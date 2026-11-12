@@ -2497,6 +2497,19 @@ uint32_t udc_dwc3_vid_nrdy_en;
 static uint32_t udc_dwc3_vid_nrdy_n;
 
 /*
+ * Stamp written over every event-ring slot the CPU has consumed.
+ *
+ * A device event of type 7 (SOF), which is never enabled in DEVTEN, so it
+ * cannot be a real event. EventDrain and the arbiter's ring snoop see CPU
+ * writes into the ring too, and both ignore this word; a zero stamp decodes
+ * as an EP0 endpoint event and is forwarded into the FWD FIFO.
+ */
+#define UDC_DWC3_EVT_SLOT_STAMP 0x00000701U
+#define UDC_DWC3_EVT_SLOT_FILLED(e) ((e) != 0U && (e) != UDC_DWC3_EVT_SLOT_STAMP)
+/* GEVNTCOUNT reported an event the controller had not written. */
+static uint32_t udc_dwc3_evt_phantom_n;
+
+/*
  * The video yield. Proven not to be the fix: at the iteration-45 wedge the
  * reply's whole packet was in TX FIFO 2 (f2=16 bytes for a 13-byte status)
  * and stayed there with the TRB HWO through a sample where FIFO 5 was empty
@@ -8428,7 +8441,7 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_tick(const struct device *const dev
 					udc_dwc3_health_dev, 0x82U);
 				printk("dwc3: cmdrate vid=%u cpu=%u nrdy=%u skip=%u in %ums "
 				       "hmax=%uus hsum=%uus e01=%u r01=%u e82=%u r82=%u "
-				       "xa82=%u idx82=%u hwo82=0x%x cerr=%u\n",
+				       "xa82=%u idx82=%u hwo82=0x%x cerr=%u phantom=%u\n",
 				       cmdsplit_vid_acc, cmdsplit_cpu_acc,
 				       udc_dwc3_vid_nrdy_n, 0U,
 				       cmdsplit_win_ms,
@@ -8440,7 +8453,7 @@ UDC_DWC3_XIP static void udc_dwc3_in_restart_tick(const struct device *const dev
 				       ep82 != NULL ? ep82->xferrscidx : 0U,
 				       ep82 != NULL ?
 					       udc_dwc3_ring_data_hwo_mask(ep82) : 0U,
-				       udc_dwc3_acm_cmd_err);
+				       udc_dwc3_acm_cmd_err, udc_dwc3_evt_phantom_n);
 				udc_dwc3_vid_nrdy_n = 0U;
 				cmdsplit_vid_acc = 0U;
 				cmdsplit_cpu_acc = 0U;
@@ -8551,11 +8564,13 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 				unsigned int key = irq_lock();
 				uint32_t evt;
 
-				if (sys_read32(base + UDC_DWC3_GEVNTCOUNT(0)) == 0U) {
+				uint32_t evc = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0));
+
+#if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
+				if (evc == 0U) {
 					irq_unlock(key);
 					break;
 				}
-#if !defined(CONFIG_UDC_DWC3_RTL_DOORBELL)
 				/*
 				 * Video DEPEVT at the head: do not ack it.
 				 * Leave the ring to the ISR fast lane. Acking
@@ -8571,8 +8586,55 @@ static void udc_dwc3_evt_thread(void *arg1, void *arg2, void *arg3)
 				}
 #endif
 				evt = cfg->evt_buf[priv->evt_next];
-dispatch:
-				sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+				/*
+				 * The slot contents decide what is consumed, not the
+				 * count alone. Every consumed slot is stamped, so a
+				 * stamp at evt_next means the controller has not
+				 * written this slot.
+				 *
+				 * Measured on the dual IMX219 design with both streams
+				 * running: about once every two minutes GEVNTCOUNT
+				 * reports one event more than the controller wrote.
+				 * Trusting it advanced evt_next one slot past the
+				 * write pointer, and from then on every slot was read
+				 * before it was filled. Bulk OUT completions were
+				 * never seen again (only OUT_COMPLETION_POLL moved
+				 * data), and ACM IN parked shortly after.
+				 *
+				 * So a count with no word is acked without advancing,
+				 * and a word with no count is consumed without acking.
+				 * The CPU stays the only writer of GEVNTCOUNT.
+				 */
+				if (!UDC_DWC3_EVT_SLOT_FILLED(evt)) {
+					uint32_t spins = 0U;
+
+					if (evc == 0U) {
+						irq_unlock(key);
+						break;
+					}
+					/* Give a write that is still in flight 200 us. */
+					while (!UDC_DWC3_EVT_SLOT_FILLED(evt) && spins < 40U) {
+						irq_unlock(key);
+						k_busy_wait(5U);
+						key = irq_lock();
+						evt = cfg->evt_buf[priv->evt_next];
+						spins++;
+					}
+					evc = sys_read32(base + UDC_DWC3_GEVNTCOUNT(0));
+					if (!UDC_DWC3_EVT_SLOT_FILLED(evt)) {
+						if (evc > 0U) {
+							sys_write32(sizeof(uint32_t),
+								    base + UDC_DWC3_GEVNTCOUNT(0));
+						}
+						udc_dwc3_evt_phantom_n++;
+						irq_unlock(key);
+						continue;
+					}
+				}
+				cfg->evt_buf[priv->evt_next] = UDC_DWC3_EVT_SLOT_STAMP;
+				if (evc > 0U) {
+					sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
+				}
 				udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
 				udc_dwc3_evt_trace_add(evt, false);
 				irq_unlock(key);
@@ -8826,6 +8888,8 @@ __ramfunc static void udc_dwc3_irq_handler(void *const ptr)
 			} else {
 				n++;
 			}
+			/* Keep the thread drain's slot stamp invariant. */
+			cfg->evt_buf[priv->evt_next] = UDC_DWC3_EVT_SLOT_STAMP;
 			sys_write32(sizeof(uint32_t), base + UDC_DWC3_GEVNTCOUNT(0));
 			udc_dwc3_ring_inc(&priv->evt_next, CONFIG_UDC_DWC3_EVENTS_NUM);
 			udc_dwc3_evt_trace_add(evt_raw, true);
@@ -9323,17 +9387,42 @@ static int udc_dwc3_init(const struct device *const dev)
 	       sys_read32(base + UDC_DWC3_GHWPARAMS7),
 	       sys_read32(base + UDC_DWC3_GCTL));
 #else
-	/* Documented Synopsys sequence — required on FLIR UAB hybrid_cmdact. */
-	sys_set_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
-	sys_set_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
-	sys_set_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
-	k_sleep(K_USEC(100));
-	sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL, UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
-	sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG, UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
-	sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
-	printk("dwc3: GCTL/PHY softrst done GCTL=0x%08x GHWPARAMS7=0x%08x\n",
-	       sys_read32(base + UDC_DWC3_GCTL),
-	       sys_read32(base + UDC_DWC3_GHWPARAMS7));
+	/*
+	 * Documented Synopsys sequence — required on FLIR UAB hybrid_cmdact.
+	 *
+	 * Soon after power-on the core can come out of this reset dead:
+	 * GHWPARAMS7 reads 0, register writes do not stick, every DEPCMD
+	 * returns 0 and the host gets no answer to SET_ADDRESS (-71). The
+	 * register read back correctly before the reset, so check it after and
+	 * repeat the reset until it does again.
+	 */
+	{
+		const uint32_t hwp7 = sys_read32(base + UDC_DWC3_GHWPARAMS7);
+		uint32_t tries = 0U;
+
+		do {
+			sys_set_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+			sys_set_bits(base + UDC_DWC3_GUSB3PIPECTL,
+				     UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
+			sys_set_bits(base + UDC_DWC3_GUSB2PHYCFG,
+				     UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
+			k_sleep(K_USEC(100));
+			sys_clear_bits(base + UDC_DWC3_GUSB3PIPECTL,
+				       UDC_DWC3_GUSB3PIPECTL_PHYSOFTRST);
+			sys_clear_bits(base + UDC_DWC3_GUSB2PHYCFG,
+				       UDC_DWC3_GUSB2PHYCFG_PHYSOFTRST);
+			sys_clear_bits(base + UDC_DWC3_GCTL, UDC_DWC3_GCTL_CORESOFTRESET);
+			tries++;
+			if (hwp7 == 0U ||
+			    sys_read32(base + UDC_DWC3_GHWPARAMS7) == hwp7) {
+				break;
+			}
+			k_sleep(K_MSEC(100));
+		} while (sys_read32(base + UDC_DWC3_GHWPARAMS7) != hwp7 && tries < 100U);
+		printk("dwc3: GCTL/PHY softrst done GCTL=0x%08x GHWPARAMS7=0x%08x tries=%u t=%ums\n",
+		       sys_read32(base + UDC_DWC3_GCTL),
+		       sys_read32(base + UDC_DWC3_GHWPARAMS7), tries, k_uptime_get_32());
+	}
 #endif
 
 	/* The USB core was reset, configure it as documented */

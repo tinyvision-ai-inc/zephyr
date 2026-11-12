@@ -29,6 +29,16 @@ config USBD_CDC_ACM_STACK_SIZE
 	help
 	  USB CDC ACM workqueue stack size.
 
+config USBD_CDC_ACM_TX_BUF_SIZE
+	int "Largest device-to-host transfer (0 = buffer size)"
+	default 0
+	range 0 1024
+	help
+	  Upper bound on the length of one bulk IN transfer. The default (0)
+	  fills the whole transfer buffer. A UDC driver that copies IN data
+	  into a smaller bounce buffer needs the class to send shorter
+	  transfers instead; the class then simply sends more of them.
+
 config USBD_CDC_ACM_BUF_POOL
 	bool "Use dedicated buffer pool"
 	default y if !USBD_MAX_SPEED_FULL
