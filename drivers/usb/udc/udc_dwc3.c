@@ -1996,15 +1996,13 @@ static int udc_dwc3_init(const struct device *const dev)
 		LOG_ERR("could not enable control OUT ep");
 		return ret;
 	}
-	LOG_DBG("Here %d", __LINE__);
+
 	/* Configure the control IN endpoint */
 	ret = udc_ep_enable_internal(dev, USB_CONTROL_EP_IN, USB_EP_TYPE_CONTROL, 512, 0);
 	if (ret != 0) {
 		LOG_ERR("could not enable control IN ep");
 		return ret;
 	}
-
-	LOG_DBG("Here %d", __LINE__);
 
 #if CONFIG_UDC_DWC3_SHELL
 	/* Initialize default queue sizes */
