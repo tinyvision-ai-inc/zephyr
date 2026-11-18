@@ -230,6 +230,19 @@ config UDC_DWC3_OUT_STALL_REFRESH_MS
 	default 250
 	depends on UDC_DWC3_OUT_STALL_REFRESH
 
+config UDC_DWC3_UVCMGR_HALT
+	bool "Pause the UsbMgr doorbell around a CPU DEPCMD"
+	depends on UDC_DWC3_HW_IN_EP_MASK != 0
+	depends on !UDC_DWC3_DEPCMD_MAILBOX
+	default y
+	help
+	  Before a CPU DepCmd, set the manager HALT_DOORBELL bit and wait
+	  for HALT_ACK. Only a bitstream whose uvcmanager control register
+	  implements those bits (15 and 16) can use this. The ORB-era
+	  manager ends at bit 14 (shouldContinue). Waiting for an ack that
+	  is not there holds interrupts for 500 us, then issues DepCmd
+	  anyway, racing the video doorbell on the one command engine.
+
 config UDC_DWC3_DEPCMD_MAILBOX
 	bool "Post DEPCMD through the RTL mailbox (single writer)"
 	depends on UDC_DWC3_RTL_DOORBELL
@@ -272,5 +285,13 @@ config UDC_DWC3_USB_ENGINE
 	  doorbell. Leave n on Track A (800 us QUIET_OTHER). Probe MAGIC
 	  0x5533 at 0xb400B000 before enabling; a Track A bit stays on the
 	  mailbox path.
+
+config UDC_DWC3_SOFTIP_DEBUG_PORT
+	bool "Read the Soft-IP debug port at 0xb4010000"
+	depends on UDC_DWC3
+	help
+	  usbPiped counters at 0xb40102xx exist only in a bitstream generated
+	  with withDebugRegisters. A load of a hole there is a bus fault.
+	  Leave n for single_imx219_srp.
 
 endif # UDC_DWC3

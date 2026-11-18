@@ -235,6 +235,20 @@ static mm_reg_t eng_base(void)
 	return USB_ENGINE_BASE;
 }
 
+/* EP_MAP is one address byte per ring that was built. This bitstream has
+ * two (0x84, 0x82); ring 2's window is not decoded and a load there faults.
+ */
+static int engine_ring_n(void)
+{
+	const uint32_t map = sys_read32(eng_base() + USB_ENGINE_EP_MAP);
+	int n = 0;
+
+	while (n < USB_ENGINE_BULK_N && ((map >> (8 * n)) & 0xffU) != 0U) {
+		n++;
+	}
+	return n;
+}
+
 bool udc_dwc3_engine_present(void)
 {
 	if (engine_seen) {
@@ -291,7 +305,7 @@ void udc_dwc3_engine_dump(void)
 	       kicked_total[2], kicked[2],
 	       kicked_abort[1] + kicked_abort[0] + kicked_abort[2],
 	       ring_synced[1], ring_synced[0], ring_synced[2]);
-	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
+	for (int i = 0; i < engine_ring_n(); i++) {
 		const mm_reg_t epb = usb_engine_ep_base(i);
 
 		DWC3_STATS("engine: ep%u 0x%02x free=%u cmpl=%u st=0x%x\n",
@@ -865,7 +879,7 @@ void udc_dwc3_engine_poll(const struct device *dev,
 		}
 	}
 
-	for (int i = 0; i < USB_ENGINE_BULK_N; i++) {
+	for (int i = 0; i < engine_ring_n(); i++) {
 		drain_cmpl(dev, i);
 	}
 
@@ -875,8 +889,14 @@ void udc_dwc3_engine_poll(const struct device *dev,
 	{
 		static uint32_t acm82_edges;
 		const mm_reg_t epb = usb_engine_ep_base(1);
-		const uint32_t st = sys_read32(epb + USB_ENGINE_EP_STATE);
-		const uint32_t prev = acm82_prev;
+		uint32_t st;
+		uint32_t prev;
+
+		if (engine_ring_n() < 2) {
+			return;
+		}
+		st = sys_read32(epb + USB_ENGINE_EP_STATE);
+		prev = acm82_prev;
 
 		if ((st & BIT(1)) && !(prev & BIT(1))) {
 			acm82_saw_cmpl = false;

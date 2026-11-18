@@ -1594,6 +1594,10 @@ static void udc_dwc3_uvcmgr_clear_halt(const uint32_t mask)
 
 static int udc_dwc3_uvcmgr_pause_doorbell(void)
 {
+#if !defined(CONFIG_UDC_DWC3_UVCMGR_HALT)
+	/* This manager has no HALT_ACK. A CMDACT glance still runs below. */
+	return 0;
+#else
 	static uint32_t timeouts;
 	uint32_t mask = 0U;
 	uint32_t acked = 0U;
@@ -1643,11 +1647,16 @@ static int udc_dwc3_uvcmgr_pause_doorbell(void)
 		       timeouts, acked, mask);
 	}
 	return -1;
+#endif
 }
 
 /* Must be called with interrupts locked. */
 static void udc_dwc3_uvcmgr_resume_doorbell(const bool paused)
 {
+#if !defined(CONFIG_UDC_DWC3_UVCMGR_HALT)
+	ARG_UNUSED(paused);
+	return;
+#else
 	__ASSERT_NO_MSG(udc_dwc3_uvcmgr_halt_depth > 0U);
 	udc_dwc3_uvcmgr_halt_depth--;
 
@@ -1657,6 +1666,7 @@ static void udc_dwc3_uvcmgr_resume_doorbell(const bool paused)
 
 	udc_dwc3_uvcmgr_clear_halt(udc_dwc3_uvcmgr_paused_mask);
 	udc_dwc3_uvcmgr_paused_mask = 0U;
+#endif
 }
 
 static bool udc_dwc3_uvcmgr_any_enabled(void)
@@ -1999,8 +2009,13 @@ UDC_DWC3_XIP static void udc_dwc3_gap_put(const struct device *const dev, uint8_
 	prev = (udc_dwc3_gap_n != 0U) ?
 		udc_dwc3_gap[(udc_dwc3_gap_i + UDC_DWC3_GAP_N - 1U) %
 			     UDC_DWC3_GAP_N].vdb : vdb;
+#if defined(CONFIG_UDC_DWC3_SOFTIP_DEBUG_PORT)
 	ar = sys_read32(UDC_DWC3_DBGPORT_USBPIPED_AR);
 	rlast = sys_read32(UDC_DWC3_DBGPORT_USBPIPED_R_LAST);
+#else
+	ar = 0U;
+	rlast = 0U;
+#endif
 	ent = &udc_dwc3_gap[udc_dwc3_gap_i];
 	ent->ms = (uint16_t)now;
 	ent->vdb = (uint16_t)vdb;
@@ -2084,6 +2099,7 @@ UDC_DWC3_XIP static void udc_dwc3_wedge_pump(const struct device *const dev)
 	       "psq=%u ep0=0x%08x/0x%08x lsp0=0x%08x lsp1=0x%08x\n",
 	       sys_read32(base + UDC_DWC3_GDBGBMU),
 	       tx0, tx2, tx5, rxreq, rxinfo, psq, ep0_0, ep0_1, lsp0, lsp1);
+#if defined(CONFIG_UDC_DWC3_SOFTIP_DEBUG_PORT)
 	/* Soft-IP debug port (TinyvisionTopLevel DebugPort, 0xb4010000, on
 	 * when withDebugRegisters is left at its default): usbPiped AXI
 	 * counters on the USB23 master. ar > r_last with both frozen means a
@@ -2125,6 +2141,7 @@ UDC_DWC3_XIP static void udc_dwc3_wedge_pump(const struct device *const dev)
 		       sys_read32(UDC_DWC3_DBGPORT_USBIN_WATCH),
 		       xmr & 0xfU, (xmr >> 4) & 1U);
 	}
+#endif
 }
 
 UDC_DWC3_XIP UDC_DWC3_XIP static void udc_dwc3_park_snapshot(const struct device *const dev, const char *tag)
@@ -2450,7 +2467,22 @@ extern uint32_t udc_dwc3_vid_evt_own;
  * EVT_OWN=1 with no extra video events; the fabric then owns the ring for the
  * events that already exist.
  */
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
 extern uint32_t udc_dwc3_vid_inprog_en;
+#else
+/* Engine object file is not linked. Keep the flag clear and drop traces. */
+uint32_t udc_dwc3_vid_inprog_en;
+
+void udc_dwc3_trace(const char *fmt, ...)
+{
+	ARG_UNUSED(fmt);
+}
+
+void udc_dwc3_stats(const char *fmt, ...)
+{
+	ARG_UNUSED(fmt);
+}
+#endif
 
 /*
  * Video XferNotReady (step 1 of the event-driven doorbell plan).
@@ -4572,9 +4604,11 @@ UDC_DWC3_XIP static int udc_dwc3_acm82_claim(uint8_t slot, uint16_t len,
 	if (dst == NULL || slot >= CONFIG_UDC_DWC3_TRB_NUM) {
 		return -EINVAL;
 	}
+#if defined(CONFIG_UDC_DWC3_SOFTIP_DEBUG_PORT)
 	/* Arm before the doorbell. Later video reads stay outside this window. */
 	sys_write32((uint32_t)(uintptr_t)udc_dwc3_acm82_tx,
 		    UDC_DWC3_DBGPORT_USBIN_WATCH);
+#endif
 	if (len > UDC_DWC3_ACM82_TX_LEN) {
 		return -EINVAL;
 	}
@@ -9338,7 +9372,10 @@ static int udc_dwc3_ep_enable(const struct device *const dev,
 	    (ep_data->cfg.attributes & USB_EP_TRANSFER_TYPE_MASK) == USB_EP_TYPE_ISO &&
 	    (CONFIG_UDC_DWC3_HW_IN_EP_MASK &
 	     BIT(USB_EP_GET_IDX(ep_data->cfg.addr))) != 0U) {
+#if defined(CONFIG_UDC_DWC3_USB_ENGINE)
+		/* UDC_DWC3_IN_HOLD_BASE is only declared on the engine path. */
 		udc_dwc3_isoc_arm.softip_base = UDC_DWC3_IN_HOLD_BASE;
+#endif
 		udc_dwc3_isoc_arm.ep_addr = ep_data->cfg.addr;
 		printk("dwc3: isoc arm ep=0x%02x softip=0x%08x pending=%u yield_en=%u\n",
 		       ep_data->cfg.addr, (uint32_t)udc_dwc3_isoc_arm.softip_base,
