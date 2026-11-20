@@ -207,7 +207,7 @@ extern uint32_t udc_dwc3_vid_nrdy_en;
  * zephyr_quiet7500.bin must not be used again. Same status as
  * zephyr_quiet1500.bin.
  */
-uint32_t udc_dwc3_quiet_other = 60000U;
+uint32_t udc_dwc3_quiet_other = CONFIG_UDC_DWC3_QUIET_OTHER_CYCLES;
 static bool engine_ovf_seen;
 static uint8_t programmed;
 static uint32_t saved_evt_base;

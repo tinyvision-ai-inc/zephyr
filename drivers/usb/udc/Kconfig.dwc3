@@ -258,11 +258,11 @@ config UDC_DWC3_QUIET_OTHER_CYCLES
 	default 60000
 	depends on UDC_DWC3_DEPCMD_MAILBOX
 	help
-	  Accepted for configuration compatibility with the
-	  udc-quiet-acm-recover driver line (int_flir app_flir/prj.conf sets
-	  it). This driver does not program QUIET_OTHER from Kconfig: the
-	  engine path writes 0 at STREAMON and parks video with the
-	  uvcmanager HALT bit instead.
+	  How long the arbiter keeps video doorbells away after a CPU
+	  DEPCMD. The engine programs it when it starts. 60000 is 800 us.
+	  A stream must be able to buffer the hold: 7 ring slots of 16 KiB
+	  cover 800 us, 7 slots of 8 KiB need 45000 (600 us). 1500 and 7500
+	  wedged the device.
 
 config UDC_DWC3_CONSOLE_DEBUG
 	hex "Reset value of the UDC console-print gate"
