@@ -292,6 +292,6 @@ config UDC_DWC3_SOFTIP_DEBUG_PORT
 	help
 	  usbPiped counters at 0xb40102xx exist only in a bitstream generated
 	  with withDebugRegisters. A load of a hole there is a bus fault.
-	  Leave n for single_imx219_srp.
+	  Leave n for single_imx219.
 
 endif # UDC_DWC3
