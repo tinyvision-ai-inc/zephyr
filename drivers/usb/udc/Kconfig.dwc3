@@ -69,6 +69,13 @@ config UDC_DWC3_TXFIFO_VIDEO_EP5
 	  This tracks the endpoint layout, not IEBM vs doorbell; it only
 	  defaults off IEBM because that was the sole app_flir build.
 
+config UDC_DWC3_SIX_IN_EP_FIFO_MAP
+	bool "Fit six IN endpoints on the five TX FIFOs"
+	help
+	  The core has TX FIFOs 1..5 for IN endpoints. With this set, endpoint
+	  0x86 takes FIFO 1 and endpoint 0x81 shares FIFO 2 with 0x82. Only for
+	  layouts where 0x81 is an ACM notify endpoint that never sends.
+
 config UDC_DWC3_EVENT_BACKSTOP
 	bool "2 ms event-thread timeout backstop"
 	help

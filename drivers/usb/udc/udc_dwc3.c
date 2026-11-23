@@ -1201,6 +1201,22 @@ UDC_DWC3_XIP static uint32_t udc_dwc3_dbg_fifo_avail(const mm_reg_t base, uint32
 	return UDC_DWC3_FIFO_AVAIL_UNKNOWN;
 }
 
+/* TX FIFO behind an IN endpoint; the endpoint number unless remapped. */
+UDC_DWC3_XIP static uint32_t udc_dwc3_tx_fifo_num(uint8_t ep_addr)
+{
+	const uint32_t n = ep_addr & 0x7fU;
+
+	if (IS_ENABLED(CONFIG_UDC_DWC3_SIX_IN_EP_FIFO_MAP)) {
+		if (n == 6U) {
+			return 1U;
+		}
+		if (n == 1U) {
+			return 2U;
+		}
+	}
+	return n;
+}
+
 /* TxFIFO depth in MDWIDTH words, straight from GTXFIFOSIZ. The empty level is
  * this value; do not hardcode it. */
 UDC_DWC3_XIP static uint32_t udc_dwc3_txfifo_dep(const mm_reg_t base, uint32_t n)
@@ -2625,7 +2641,7 @@ static void udc_dwc3_depcmd_ep_config(const struct device *const dev,
 	/* Set the FIFO number, must be 0 for all OUT EPs */
 	if (USB_EP_DIR_IS_IN(ep_data->cfg.addr)) {
 		param0 |= FIELD_PREP(UDC_DWC3_DEPCMDPAR0_DEPCFG_FIFONUM_MASK,
-				     ep_data->cfg.addr & 0x7f);
+				     udc_dwc3_tx_fifo_num(ep_data->cfg.addr));
 	}
 
 	/*
@@ -8034,7 +8050,7 @@ UDC_DWC3_XIP static bool udc_dwc3_wedge_stuck(const struct device *const dev,
 					      const char *tag)
 {
 	const mm_reg_t base = DEVICE_MMIO_NAMED_GET(dev, base);
-	const uint32_t fifo = (uint32_t)(ep->cfg.addr & 0x7fU);
+	const uint32_t fifo = udc_dwc3_tx_fifo_num(ep->cfg.addr);
 	const uint32_t dep = udc_dwc3_txfifo_dep(base, fifo);
 	const uint32_t av = udc_dwc3_dbg_fifo_avail(base, fifo,
 						    UDC_DWC3_GDBGFIFOSPACE_QUEUETYPE_TX);
@@ -8109,7 +8125,7 @@ UDC_DWC3_XIP static void udc_dwc3_wedge_recover(const struct device *const dev,
 		return;
 	}
 	addr = UDC_DWC3_DEPCMD(ep->epn);
-	fifo = (uint32_t)(ep->cfg.addr & 0x7fU);
+	fifo = udc_dwc3_tx_fifo_num(ep->cfg.addr);
 	trb = &ep->trb_buf[ep->tail];
 	rsc = ep->xferrscidx;
 	if (rsc == 0U) {
