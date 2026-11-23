@@ -1873,7 +1873,6 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
 	LOG_INF("Clearing stall for ep 0x%02x", ep_cfg->addr);
-
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 		return 0;
 	}
@@ -1881,7 +1880,17 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
 
-	/* Resume halted previously transfers */
+	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM - 1; i++) {
+		if (ep_data->net_buf[i] != NULL) {
+			udc_submit_ep_event(dev, ep_data->net_buf[i], -ECANCELED);
+			ep_data->net_buf[i] = NULL;
+		}
+	}
+	ep_data->head = 0;
+	ep_data->tail = 0;
+	ep_data->full = false;
+
+	udc_dwc3_trb_nonctrl_init(dev, ep_data);
 	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 
 	return 0;
