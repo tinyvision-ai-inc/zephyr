@@ -355,9 +355,11 @@ static void msc_queue_cbw(struct usbd_class_data *const c_data)
 	uint8_t ep;
 	int ret;
 
-	if (ctx->num_out_queued) {
-		/* Already queued */
-		return;
+	if (ctx->num_out_queued || ctx->num_in_queued || ctx->scsi_bufs_used) {
+	   /* Outstanding transfers not released yet; wait for their
+	    * completion/cancel events before arming a new CBW.
+	    */
+	    return;
 	}
 
 	__ASSERT(ctx->scsi_bufs_used == 0,
@@ -387,10 +389,15 @@ static void msc_queue_cbw(struct usbd_class_data *const c_data)
 
 static void msc_reset_handler(struct usbd_class_data *c_data)
 {
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
 	struct msc_bot_ctx *ctx = usbd_class_get_private(c_data);
 	int i;
 
 	LOG_INF("Bulk-Only Mass Storage Reset");
+
+	usbd_ep_dequeue(uds_ctx, msc_get_bulk_in(c_data));
+	usbd_ep_dequeue(uds_ctx, msc_get_bulk_out(c_data));
+
 	ctx->state = MSC_BBB_EXPECT_CBW;
 	for (i = 0; i < ctx->registered_luns; i++) {
 		scsi_reset(&ctx->luns[i]);
