@@ -1393,6 +1393,21 @@ static void udc_dwc3_on_xfer_not_ready(const struct device *const dev, const uin
 	}
 }
 
+static void udc_dwc3_on_xfer_not_ready_nonctrl(const struct device *const dev,
+					       const uint32_t evt)
+{
+	const struct udc_dwc3_config *const cfg = dev->config;
+	const int epn = FIELD_GET(UDC_DWC3_DEPEVT_EPN_MASK, evt);
+	struct udc_dwc3_ep_data *const ep_data = _EP_DATA_FROM_EPN(cfg, epn);
+
+	if (ep_data->net_buf[ep_data->tail] != NULL ||
+	    udc_buf_peek(&ep_data->cfg) != NULL) {
+		udc_dwc3_depcmd_start_xfer(dev, ep_data);
+	}
+
+	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
+}
+
 static void udc_dwc3_on_xfer_done(const struct device *const dev,
 				  struct udc_dwc3_ep_data *const ep_data)
 {
@@ -1632,6 +1647,8 @@ static void udc_dwc3_handle_event(const struct device *const dev, const uint32_t
 		udc_dwc3_on_connect_done(dev);
 		break;
 	case LISTIFY(30, _NORMAL_EP, (: case), UDC_DWC3_DEPEVT_XFERNOTREADY):
+		udc_dwc3_on_xfer_not_ready_nonctrl(dev, evt);
+		break;
 	case UDC_DWC3_DEVT_ULSTCHNG:
 	case UDC_DWC3_DEVT_DISCONNEVT:
 	case UDC_DWC3_DEVT_WKUPEVT:
@@ -1856,7 +1873,6 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	struct udc_dwc3_ep_data *const ep_data = CONTAINER_OF(ep_cfg, struct udc_dwc3_ep_data, cfg);
 
 	LOG_INF("Clearing stall for ep 0x%02x", ep_cfg->addr);
-
 	if (USB_EP_GET_IDX(ep_data->cfg.addr) == 0) {
 		return 0;
 	}
@@ -1864,7 +1880,17 @@ static int udc_dwc3_ep_clear_halt(const struct device *const dev,
 	udc_dwc3_depcmd_clear_stall(dev, ep_data);
 	ep_data->cfg.stat.halted = false;
 
-	/* Resume halted previously transfers */
+	for (int i = 0; i < CONFIG_UDC_DWC3_TRB_NUM - 1; i++) {
+		if (ep_data->net_buf[i] != NULL) {
+			udc_submit_ep_event(dev, ep_data->net_buf[i], -ECANCELED);
+			ep_data->net_buf[i] = NULL;
+		}
+	}
+	ep_data->head = 0;
+	ep_data->tail = 0;
+	ep_data->full = false;
+
+	udc_dwc3_trb_nonctrl_init(dev, ep_data);
 	k_work_submit_to_queue(udc_get_work_q(), &ep_data->work);
 
 	return 0;
@@ -1973,7 +1999,6 @@ static int udc_dwc3_init(const struct device *const dev)
 
 	/* The USB core was reset, configure it as documented */
 	udc_dwc3_on_soft_reset(dev);
-
 	/* Configure the control OUT endpoint */
 	ret = udc_ep_enable_internal(dev, USB_CONTROL_EP_OUT, USB_EP_TYPE_CONTROL, 512, 0);
 	if (ret != 0) {

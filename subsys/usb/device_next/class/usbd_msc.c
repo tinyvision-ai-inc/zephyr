@@ -183,21 +183,24 @@ static size_t clamp_transfer_length(struct usbd_context *uds_ctx,
 				    struct scsi_ctx *lun,
 				    size_t len)
 {
+	size_t mps;
+
 	len = MIN(CONFIG_USBD_MSC_SCSI_BUFFER_SIZE, len);
 
-	/* Limit transfer to bulk endpoint wMaxPacketSize multiple */
 	if (USBD_SUPPORTS_HIGH_SPEED &&
 	    usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
-		len = ROUND_DOWN(len, 512);
+		mps = 512;
 	} else if (USBD_SUPPORTS_SUPER_SPEED &&
-	    usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
-		len = ROUND_DOWN(len, 1024);
-	}else {
-		/* Full-Speed */
-		len = ROUND_DOWN(len, 64);
+		   usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		mps = 1024;
+	} else {
+		mps = 64;
 	}
 
-	/* Round down to sector size multiple */
+	if (len > mps) {
+		len = ROUND_DOWN(len, mps);
+	}
+
 	if (lun->sector_size) {
 		len = ROUND_DOWN(len, lun->sector_size);
 	}
@@ -303,11 +306,20 @@ static void msc_stall_and_wait_for_recovery(struct msc_bot_ctx *ctx)
 
 static void msc_queue_write(struct msc_bot_ctx *ctx)
 {
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(ctx->class_node);
 	struct net_buf *buf;
 	uint8_t *scsi_buf;
 	uint8_t ep;
-	size_t len;
+	size_t len, alloc_len, mps;
 	int ret;
+
+	/* Determine MPS for the current bus speed */
+	mps = 64;
+	if (USBD_SUPPORTS_HIGH_SPEED && usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
+		mps = 512;
+	} else if (USBD_SUPPORTS_SUPER_SPEED && usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		mps = 1024;
+	}
 
 	ep = msc_get_bulk_out(ctx->class_node);
 
@@ -315,11 +327,11 @@ static void msc_queue_write(struct msc_bot_ctx *ctx)
 	while ((ctx->num_out_queued < MSC_NUM_BUFFERS) &&
 	       (len = msc_next_out_transfer_length(ctx->class_node))) {
 		scsi_buf = msc_alloc_scsi_buf(ctx);
-		buf = msc_buf_alloc_data(ep, scsi_buf, len);
 
-		/* The pool is large enough to support all allocations. Failing
-		 * alloc indicates either a memory leak or logic error.
-		 */
+		alloc_len = (len < mps) ? mps : len;
+
+		buf = msc_buf_alloc_data(ep, scsi_buf, alloc_len);
+
 		__ASSERT_NO_MSG(buf);
 
 		ret = usbd_ep_enqueue(ctx->class_node, buf);
@@ -327,7 +339,6 @@ static void msc_queue_write(struct msc_bot_ctx *ctx)
 			LOG_ERR("Failed to enqueue net_buf for 0x%02x", ep);
 			net_buf_unref(buf);
 			msc_free_scsi_buf(ctx, scsi_buf);
-			/* 6.6.2 Internal Device Error */
 			msc_stall_and_wait_for_recovery(ctx);
 			return;
 		}
@@ -344,9 +355,11 @@ static void msc_queue_cbw(struct usbd_class_data *const c_data)
 	uint8_t ep;
 	int ret;
 
-	if (ctx->num_out_queued) {
-		/* Already queued */
-		return;
+	if (ctx->num_out_queued || ctx->num_in_queued || ctx->scsi_bufs_used) {
+	   /* Outstanding transfers not released yet; wait for their
+	    * completion/cancel events before arming a new CBW.
+	    */
+	    return;
 	}
 
 	__ASSERT(ctx->scsi_bufs_used == 0,
@@ -376,10 +389,15 @@ static void msc_queue_cbw(struct usbd_class_data *const c_data)
 
 static void msc_reset_handler(struct usbd_class_data *c_data)
 {
+	struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
 	struct msc_bot_ctx *ctx = usbd_class_get_private(c_data);
 	int i;
 
 	LOG_INF("Bulk-Only Mass Storage Reset");
+
+	usbd_ep_dequeue(uds_ctx, msc_get_bulk_in(c_data));
+	usbd_ep_dequeue(uds_ctx, msc_get_bulk_out(c_data));
+
 	ctx->state = MSC_BBB_EXPECT_CBW;
 	for (i = 0; i < ctx->registered_luns; i++) {
 		scsi_reset(&ctx->luns[i]);
