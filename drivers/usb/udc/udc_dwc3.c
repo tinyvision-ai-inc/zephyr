@@ -4310,8 +4310,7 @@ static void udc_dwc3_ep0_patch_uvc_config(volatile uint8_t *buf, size_t len)
 					buf[p + 6] = (uint8_t)(640 >> 8);
 					buf[p + 7] = (uint8_t)(480);
 					buf[p + 8] = (uint8_t)(480 >> 8);
-				} else if (h == 720 || w == 1280 || w == 1284 ||
-					   (w & ~0x4U) == 1280) {
+				} else if (h == 720 || w == 1284) {
 					buf[p + 5] = (uint8_t)(1280);
 					buf[p + 6] = (uint8_t)(1280 >> 8);
 					buf[p + 7] = (uint8_t)(720);
