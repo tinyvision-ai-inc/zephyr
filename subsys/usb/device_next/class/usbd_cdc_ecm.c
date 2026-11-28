@@ -36,9 +36,16 @@ enum {
  * Transfers through two endpoints proceed in a synchronous manner,
  * with maximum block of NET_ETH_MAX_FRAME_SIZE.
  */
+/*
+ * A controller may only accept whole packets into an OUT buffer, so a buffer
+ * that is not a multiple of the bulk packet size (1024 at SuperSpeed) cannot
+ * take the second packet of a frame of 1024 bytes or more.
+ */
+#define CDC_ECM_EP_BUF_SIZE ROUND_UP(NET_ETH_MAX_FRAME_SIZE, 1024)
+
 UDC_BUF_POOL_DEFINE(cdc_ecm_ep_pool,
 		    DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) * 2,
-		    NET_ETH_MAX_FRAME_SIZE,
+		    CDC_ECM_EP_BUF_SIZE,
 		    sizeof(struct udc_buf_info), NULL);
 
 struct cdc_ecm_notification {
