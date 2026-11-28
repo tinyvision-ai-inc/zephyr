@@ -5085,7 +5085,10 @@ static int udc_dwc3_trb_bulk(const struct device *const dev,
 
 	if (udc_ep_buf_has_zlp(buf)) {
 		LOG_DBG("Buffer has a ZLP flag, terminating the transfer");
-		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP;
+		/* Without IOC the TRB retires silently and the buffer is
+		 * never handed back to the class.
+		 */
+		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL_ZLP | UDC_DWC3_TRB_CTRL_IOC;
 		ep_data->total = 0;
 	} else {
 		ctrl |= UDC_DWC3_TRB_CTRL_TRBCTL_NORMAL;
