@@ -62,7 +62,7 @@ struct cdc_ecm_notification {
 /*
  * Collection of descriptors used to assemble specific function descriptors.
  * This structure is used by CDC ECM implementation to update and fetch
- * properties at runtime. We currently support full and high speed.
+ * properties at runtime, for full, high and SuperSpeed.
  */
 struct usbd_cdc_ecm_desc {
 	struct usb_association_descriptor iad;
@@ -73,6 +73,8 @@ struct usbd_cdc_ecm_desc {
 	struct cdc_ecm_descriptor if0_ecm;
 	struct usb_ep_descriptor if0_int_ep;
 	struct usb_ep_descriptor if0_hs_int_ep;
+	struct usb_ep_descriptor if0_ss_int_ep;
+	struct usb_ss_endpoint_companion_descriptor if0_ss_int_ep_co;
 
 	struct usb_if_descriptor if1_0;
 
@@ -81,6 +83,10 @@ struct usbd_cdc_ecm_desc {
 	struct usb_ep_descriptor if1_1_out_ep;
 	struct usb_ep_descriptor if1_1_hs_in_ep;
 	struct usb_ep_descriptor if1_1_hs_out_ep;
+	struct usb_ep_descriptor if1_1_ss_in_ep;
+	struct usb_ss_endpoint_companion_descriptor if1_1_ss_in_ep_co;
+	struct usb_ep_descriptor if1_1_ss_out_ep;
+	struct usb_ss_endpoint_companion_descriptor if1_1_ss_out_ep_co;
 
 	struct usb_desc_header nil_desc;
 };
@@ -91,6 +97,7 @@ struct cdc_ecm_eth_data {
 	struct usbd_cdc_ecm_desc *const desc;
 	const struct usb_desc_header **const fs_desc;
 	const struct usb_desc_header **const hs_desc;
+	const struct usb_desc_header **const ss_desc;
 
 	struct net_if *iface;
 	uint8_t mac_addr[6];
@@ -118,6 +125,11 @@ static uint8_t cdc_ecm_get_int_in(struct usbd_class_data *const c_data)
 		return desc->if0_hs_int_ep.bEndpointAddress;
 	}
 
+	if (USBD_SUPPORTS_SUPER_SPEED &&
+	    usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		return desc->if0_ss_int_ep.bEndpointAddress;
+	}
+
 	return desc->if0_int_ep.bEndpointAddress;
 }
 
@@ -133,6 +145,11 @@ static uint8_t cdc_ecm_get_bulk_in(struct usbd_class_data *const c_data)
 		return desc->if1_1_hs_in_ep.bEndpointAddress;
 	}
 
+	if (USBD_SUPPORTS_SUPER_SPEED &&
+	    usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		return desc->if1_1_ss_in_ep.bEndpointAddress;
+	}
+
 	return desc->if1_1_in_ep.bEndpointAddress;
 }
 
@@ -143,6 +160,11 @@ static uint16_t cdc_ecm_get_bulk_in_mps(struct usbd_class_data *const c_data)
 	if (USBD_SUPPORTS_HIGH_SPEED &&
 	    usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
 		return 512U;
+	}
+
+	if (USBD_SUPPORTS_SUPER_SPEED &&
+	    usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		return 1024U;
 	}
 
 	return 64U;
@@ -158,6 +180,11 @@ static uint8_t cdc_ecm_get_bulk_out(struct usbd_class_data *const c_data)
 	if (USBD_SUPPORTS_HIGH_SPEED &&
 	    usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
 		return desc->if1_1_hs_out_ep.bEndpointAddress;
+	}
+
+	if (USBD_SUPPORTS_SUPER_SPEED &&
+	    usbd_bus_speed(uds_ctx) == USBD_SPEED_SS) {
+		return desc->if1_1_ss_out_ep.bEndpointAddress;
 	}
 
 	return desc->if1_1_out_ep.bEndpointAddress;
@@ -497,8 +524,17 @@ static void *usbd_cdc_ecm_get_desc(struct usbd_class_data *const c_data,
 		return data->hs_desc;
 	}
 
+	if (USBD_SUPPORTS_SUPER_SPEED && speed == USBD_SPEED_SS) {
+		return data->ss_desc;
+	}
+
 	return data->fs_desc;
 }
+
+#if defined(CONFIG_USBD_CDC_ECM_EXTERNAL_TX)
+/* Sends one frame of len bytes on the bulk IN endpoint; 0 or a negative errno. */
+int usbd_cdc_ecm_external_tx(struct net_pkt *pkt, size_t len);
+#endif
 
 static int cdc_ecm_send(const struct device *dev, struct net_pkt *const pkt)
 {
@@ -519,6 +555,10 @@ static int cdc_ecm_send(const struct device *dev, struct net_pkt *const pkt)
 		LOG_INF("Configuration is not enabled or interface not ready");
 		return -EACCES;
 	}
+
+#if defined(CONFIG_USBD_CDC_ECM_EXTERNAL_TX)
+	return usbd_cdc_ecm_external_tx(pkt, len);
+#endif
 
 	ep = cdc_ecm_get_bulk_in(c_data);
 	buf = cdc_ecm_buf_alloc(ep);
@@ -665,6 +705,16 @@ static const struct ethernet_api cdc_ecm_eth_api = {
 	.stop = cdc_ecm_iface_stop,
 };
 
+/*
+ * An external transmitter may send whole words, so a full frame can arrive
+ * padded. The host sizes its receive buffers from this value.
+ */
+#if defined(CONFIG_USBD_CDC_ECM_EXTERNAL_TX)
+#define CDC_ECM_MAX_SEGMENT ROUND_UP(NET_ETH_MAX_FRAME_SIZE, 8)
+#else
+#define CDC_ECM_MAX_SEGMENT NET_ETH_MAX_FRAME_SIZE
+#endif
+
 #define CDC_ECM_DEFINE_DESCRIPTOR(n)						\
 static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 	.iad = {								\
@@ -711,7 +761,7 @@ static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 		.bDescriptorSubtype = ETHERNET_FUNC_DESC,			\
 		.iMACAddress = 0,						\
 		.bmEthernetStatistics = sys_cpu_to_le32(0),			\
-		.wMaxSegmentSize = sys_cpu_to_le16(NET_ETH_MAX_FRAME_SIZE),	\
+		.wMaxSegmentSize = sys_cpu_to_le16(CDC_ECM_MAX_SEGMENT),	\
 		.wNumberMCFilters = sys_cpu_to_le16(0),				\
 		.bNumberPowerFilters = 0,					\
 	},									\
@@ -732,6 +782,23 @@ static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 		.bmAttributes = USB_EP_TYPE_INTERRUPT,				\
 		.wMaxPacketSize = sys_cpu_to_le16(CDC_ECM_EP_MPS_INT),		\
 		.bInterval = CDC_ECM_HS_INT_EP_INTERVAL,			\
+	},									\
+										\
+	.if0_ss_int_ep = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x81,					\
+		.bmAttributes = USB_EP_TYPE_INTERRUPT,				\
+		.wMaxPacketSize = sys_cpu_to_le16(CDC_ECM_EP_MPS_INT),		\
+		.bInterval = CDC_ECM_HS_INT_EP_INTERVAL,			\
+	},									\
+										\
+	.if0_ss_int_ep_co = {							\
+		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = sys_cpu_to_le16(CDC_ECM_EP_MPS_INT),	\
 	},									\
 										\
 	.if1_0 = {								\
@@ -794,6 +861,40 @@ static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 		.bInterval = 0,							\
 	},									\
 										\
+	.if1_1_ss_in_ep = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x82,					\
+		.bmAttributes = USB_EP_TYPE_BULK,				\
+		.wMaxPacketSize = sys_cpu_to_le16(1024U),			\
+		.bInterval = 0,							\
+	},									\
+										\
+	.if1_1_ss_in_ep_co = {							\
+		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 0,							\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = sys_cpu_to_le16(0),			\
+	},									\
+										\
+	.if1_1_ss_out_ep = {							\
+		.bLength = sizeof(struct usb_ep_descriptor),			\
+		.bDescriptorType = USB_DESC_ENDPOINT,				\
+		.bEndpointAddress = 0x01,					\
+		.bmAttributes = USB_EP_TYPE_BULK,				\
+		.wMaxPacketSize = sys_cpu_to_le16(1024U),			\
+		.bInterval = 0,							\
+	},									\
+										\
+	.if1_1_ss_out_ep_co = {							\
+		.bLength = sizeof(struct usb_ss_endpoint_companion_descriptor),	\
+		.bDescriptorType = USB_DESC_ENDPOINT_COMPANION,			\
+		.bMaxBurst = 15,						\
+		.bmAttributes = 0,						\
+		.wBytesPerInterval = sys_cpu_to_le16(0),			\
+	},									\
+										\
 	.nil_desc = {								\
 		.bLength = 0,							\
 		.bDescriptorType = 0,						\
@@ -826,6 +927,23 @@ static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_hs_in_ep,	\
 		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_hs_out_ep,	\
 		(struct usb_desc_header *) &cdc_ecm_desc_##n.nil_desc,		\
+	};									\
+										\
+	const static struct usb_desc_header *cdc_ecm_ss_desc_##n[] = {		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.iad,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0_header,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0_union,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0_ecm,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0_ss_int_ep,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if0_ss_int_ep_co,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_0,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1,		\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_ss_in_ep,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_ss_in_ep_co,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_ss_out_ep,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.if1_1_ss_out_ep_co,	\
+		(struct usb_desc_header *) &cdc_ecm_desc_##n.nil_desc,		\
 	}
 
 #define USBD_CDC_ECM_DT_DEVICE_DEFINE(n)					\
@@ -846,6 +964,7 @@ static struct usbd_cdc_ecm_desc cdc_ecm_desc_##n = {				\
 		.desc = &cdc_ecm_desc_##n,					\
 		.fs_desc = cdc_ecm_fs_desc_##n,					\
 		.hs_desc = cdc_ecm_hs_desc_##n,					\
+		.ss_desc = cdc_ecm_ss_desc_##n,					\
 	};									\
 										\
 	ETH_NET_DEVICE_DT_INST_DEFINE(n, usbd_cdc_ecm_preinit, NULL,		\

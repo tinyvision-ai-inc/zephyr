@@ -12,6 +12,14 @@ config USBD_CDC_ECM_CLASS
 
 if USBD_CDC_ECM_CLASS
 
+config USBD_CDC_ECM_EXTERNAL_TX
+	bool "Hand transmit frames to usbd_cdc_ecm_external_tx()"
+	help
+	  For hardware that owns the bulk IN endpoint and builds some of the
+	  Ethernet frames itself. The class does not enqueue on that endpoint;
+	  it passes each frame of the network stack to
+	  usbd_cdc_ecm_external_tx(), which the application provides.
+
 module = USBD_CDC_ECM
 module-str = usbd cdc_ecm
 default-count = 1
